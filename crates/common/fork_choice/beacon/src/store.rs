@@ -640,16 +640,25 @@ impl Store {
             self.sync_committee_pool
                 .clean_sync_committee_contributions(current_slot);
 
-            let cutoff_epoch = std::cmp::max(
-                self.db.finalized_checkpoint_provider().get()?.epoch + 1,
+            // A finalized checkpoint only finalizes the checkpoint slot, not every block in its
+            // epoch. Keep pending blocks from later slots in that epoch while pruning entries at
+            // or before the finalized slot and entries outside the sidecar retention window.
+            let finalized_slot = compute_start_slot_at_epoch(
+                self.db.finalized_checkpoint_provider().get()?.epoch,
+            );
+            let retention_cutoff_slot = compute_start_slot_at_epoch(
                 self.get_current_store_epoch()?
                     .saturating_sub(MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS),
             );
-            let cutoff_slot = compute_start_slot_at_epoch(cutoff_epoch);
+            let cutoff_slot = std::cmp::max(
+                finalized_slot.saturating_add(1),
+                retention_cutoff_slot,
+            );
             let pruned_availability = self.data_availability_checker.prune(cutoff_slot);
             if pruned_availability > 0 {
                 debug!("Pruned {pruned_availability} stale pending availability entries");
             }
+
             // Drop attestations that have aged out of the inclusion window (nothing else prunes
             // them, and they can never be included again).
             self.operation_pool
@@ -935,14 +944,6 @@ mod tests {
             .init_beacon_db()
             .unwrap();
         (db, temp_dir)
-    }
-
-    fn store() -> (Store, TempDir) {
-        let (db, temp_dir) = test_db();
-        (
-            Store::new(db, Arc::new(OperationPool::default()), None),
-            temp_dir,
-        )
     }
 
     fn signed_block(slot: u64) -> SignedBeaconBlock {
