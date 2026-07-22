@@ -2690,11 +2690,11 @@ mod tests {
                 .parse()
                 .expect("root should be a valid B256");
 
-            // Make sure node_2 has imported the same block before checking its column storage.
+            // Importing the target block proves that node_2 received enough validated columns to
+            // complete the pending availability check.
             wait_for_head_slot_at_least(node_2_http_port, target_slot).await;
 
-            // `on_block` no longer waits on availability, so head can advance before all 128
-            // columns have propagated - wait for them explicitly on both nodes.
+            // Verify that all columns were persisted on both nodes as well.
             wait_for_all_data_column_sidecars(&node_1_db_for_check, block_root).await;
             wait_for_all_data_column_sidecars(&node_2_db_for_check, block_root).await;
 

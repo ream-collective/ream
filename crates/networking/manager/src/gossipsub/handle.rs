@@ -545,9 +545,18 @@ pub async fn handle_gossipsub_message(
                     }
                 };
 
+                let current_time_ms = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                    Ok(duration) => u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+                    Err(err) => {
+                        error!("Failed to get current time for data column validation: {err}");
+                        return MessageAcceptance::Ignore;
+                    }
+                };
+
                 let validation_result = match validate_data_column_sidecar_full(
                     &data_column_sidecar,
                     beacon_chain,
+                    current_time_ms,
                     subnet_id,
                     cached_db,
                 )
@@ -563,24 +572,35 @@ pub async fn handle_gossipsub_message(
                 let acceptance = message_acceptance(&validation_result);
                 match validation_result {
                     ValidationResult::Accept => {
-                        if let Err(err) = beacon_chain
+                        let block_root = data_column_sidecar
+                            .signed_block_header
+                            .message
+                            .tree_hash_root();
+                        let column_index = data_column_sidecar.index;
+                        let slot = data_column_sidecar.signed_block_header.message.slot;
+                        let insert_result = beacon_chain
                             .store
                             .lock()
                             .await
                             .db
                             .column_sidecars_provider()
                             .insert(
-                                ColumnIdentifier::new(
-                                    data_column_sidecar
-                                        .signed_block_header
-                                        .message
-                                        .tree_hash_root(),
-                                    data_column_sidecar.index,
-                                ),
+                                ColumnIdentifier::new(block_root, column_index),
                                 *data_column_sidecar,
-                            )
-                        {
-                            error!("Failed to insert data_column_sidecar: {err}");
+                            );
+
+                        match insert_result {
+                            Ok(()) => {
+                                if let Err(err) = beacon_chain
+                                    .process_data_column_sidecar(block_root, column_index, slot)
+                                    .await
+                                {
+                                    error!("Failed to process data_column_sidecar: {err}");
+                                }
+                            }
+                            Err(err) => {
+                                error!("Failed to insert data_column_sidecar: {err}");
+                            }
                         }
                     }
                     ValidationResult::Reject(reason) => {

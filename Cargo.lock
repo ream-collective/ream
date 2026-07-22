@@ -6127,6 +6127,7 @@ dependencies = [
  "ream-sync-committee-pool",
  "tokio",
  "tracing",
+ "tree_hash",
 ]
 
 [[package]]
@@ -6276,6 +6277,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ream-data-availability"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "ream-consensus-beacon",
+ "ream-consensus-misc",
+ "ssz_types",
+]
+
+[[package]]
 name = "ream-discv5"
 version = "0.1.0"
 dependencies = [
@@ -6393,6 +6404,7 @@ dependencies = [
  "ream-consensus-beacon",
  "ream-consensus-lean",
  "ream-consensus-misc",
+ "ream-data-availability",
  "ream-execution-engine",
  "ream-execution-rpc-types",
  "ream-network-spec",
@@ -6405,6 +6417,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "ssz_types",
+ "tempdir",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
