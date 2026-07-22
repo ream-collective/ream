@@ -643,17 +643,14 @@ impl Store {
             // A finalized checkpoint only finalizes the checkpoint slot, not every block in its
             // epoch. Keep pending blocks from later slots in that epoch while pruning entries at
             // or before the finalized slot and entries outside the sidecar retention window.
-            let finalized_slot = compute_start_slot_at_epoch(
-                self.db.finalized_checkpoint_provider().get()?.epoch,
-            );
+            let finalized_slot =
+                compute_start_slot_at_epoch(self.db.finalized_checkpoint_provider().get()?.epoch);
             let retention_cutoff_slot = compute_start_slot_at_epoch(
                 self.get_current_store_epoch()?
                     .saturating_sub(MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS),
             );
-            let cutoff_slot = std::cmp::max(
-                finalized_slot.saturating_add(1),
-                retention_cutoff_slot,
-            );
+            let cutoff_slot =
+                std::cmp::max(finalized_slot.saturating_add(1), retention_cutoff_slot);
             let pruned_availability = self.data_availability_checker.prune(cutoff_slot);
             if pruned_availability > 0 {
                 debug!("Pruned {pruned_availability} stale pending availability entries");
