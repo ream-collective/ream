@@ -1,4 +1,3 @@
-use anyhow::anyhow;
 use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::data_column_sidecar::DataColumnSidecar;
 use ream_consensus_misc::misc::compute_start_slot_at_epoch;
@@ -38,23 +37,11 @@ pub async fn validate_data_column_sidecar_full(
     }
 
     let finalized_checkpoint = store.db.finalized_checkpoint_provider().get()?;
-    let head_root = store.get_head()?;
-    let state = store
-        .db
-        .state_provider()
-        .get(head_root)?
-        .ok_or_else(|| anyhow!("No beacon state found for head root: {head_root}"))?;
 
     if header.slot <= compute_start_slot_at_epoch(finalized_checkpoint.epoch) {
         return Ok(ValidationResult::Ignore(
             "The sidecar is from a slot less than or equal to the latest finalized slot"
                 .to_string(),
-        ));
-    }
-
-    if !state.verify_block_header_signature(&data_column_sidecar.signed_block_header)? {
-        return Ok(ValidationResult::Reject(
-            "Invalid proposer signature on data column sidecar's block header".to_string(),
         ));
     }
 
@@ -70,6 +57,23 @@ pub async fn validate_data_column_sidecar_full(
     if header.slot <= parent_block.message.slot {
         return Ok(ValidationResult::Reject(
             "Sidecar slot not higher than parent block's slot".to_string(),
+        ));
+    }
+
+    let Some(mut state) = store.db.state_provider().get(header.parent_root)? else {
+        return Ok(ValidationResult::Reject(
+            "Sidecar's parent failed validation".to_string(),
+        ));
+    };
+    if let Err(err) = state.process_slots(header.slot) {
+        return Ok(ValidationResult::Ignore(format!(
+            "Could not advance parent state to sidecar slot: {err:?}"
+        )));
+    }
+
+    if !state.verify_block_header_signature(&data_column_sidecar.signed_block_header)? {
+        return Ok(ValidationResult::Reject(
+            "Invalid proposer signature on data column sidecar's block header".to_string(),
         ));
     }
 
@@ -98,21 +102,7 @@ pub async fn validate_data_column_sidecar_full(
         ));
     }
 
-    let tuple = (
-        header.slot,
-        header.proposer_index,
-        data_column_sidecar.index,
-    );
-    let mut seen = cached_db.seen_data_column_sidecars.write().await;
-    if seen.contains(&tuple) {
-        return Ok(ValidationResult::Ignore(
-            "Duplicate data column sidecar for (slot, proposer_index, index)".to_string(),
-        ));
-    }
-    seen.put(tuple, ());
-    drop(seen);
-
-    match state.get_beacon_proposer_index(Some(header.slot)) {
+    match state.get_beacon_proposer_index(None) {
         Ok(expected_index) => {
             if expected_index != header.proposer_index {
                 return Ok(ValidationResult::Reject(format!(
@@ -127,6 +117,19 @@ pub async fn validate_data_column_sidecar_full(
             )));
         }
     }
+
+    let tuple = (
+        header.slot,
+        header.proposer_index,
+        data_column_sidecar.index,
+    );
+    let mut seen = cached_db.seen_data_column_sidecars.write().await;
+    if seen.contains(&tuple) {
+        return Ok(ValidationResult::Ignore(
+            "Duplicate data column sidecar for (slot, proposer_index, index)".to_string(),
+        ));
+    }
+    seen.put(tuple, ());
 
     Ok(ValidationResult::Accept)
 }
