@@ -58,7 +58,7 @@ use ream_keystore::keystore::EncryptedKeystore;
 use ream_metrics::{
     ATTESTATION_COMMITTEE_SUBNET, NODE_INFO, NODE_START_TIME_SECONDS, set_int_gauge_vec,
 };
-use ream_network_manager::service::NetworkManagerService;
+use ream_network_manager::{config::ManagerConfig, service::NetworkManagerService};
 use ream_network_spec::networks::{
     beacon_network_spec, lean_network_spec, set_beacon_network_spec, set_lean_network_spec,
 };
@@ -485,7 +485,7 @@ pub async fn run_lean_node(config: LeanNodeConfig, executor: ReamExecutor, ream_
 /// 1. The HTTP server that serves Beacon API, Engine API.
 /// 2. The P2P network that handles peer discovery (discv5), gossiping (gossipsub) and Req/Resp API.
 pub async fn run_beacon_node(config: BeaconNodeConfig, executor: ReamExecutor, ream_db: ReamDB) {
-    run_beacon_node_inner(config, executor, ream_db, true, false).await;
+    run_beacon_node_inner(config, executor, ream_db, true, false, None).await;
 }
 
 // `initialize_globals` is `false` only in tests, which set the globals themselves beforehand.
@@ -495,6 +495,7 @@ async fn run_beacon_node_inner(
     ream_db: ReamDB,
     initialize_globals: bool,
     force_data_availability_checks: bool,
+    gossipsub_history_length: Option<usize>,
 ) {
     info!("starting up beacon node...");
 
@@ -599,9 +600,11 @@ async fn run_beacon_node_inner(
     let beacon_chain = Arc::new(beacon_chain);
 
     // Create network manager
+    let mut manager_config = ManagerConfig::from(config);
+    manager_config.gossipsub_history_length = gossipsub_history_length;
     let network_manager = NetworkManagerService::new(
         executor.clone(),
-        config.into(),
+        manager_config,
         beacon_db.clone(),
         beacon_db.data_dir.clone(),
         beacon_chain.clone(),
@@ -651,6 +654,7 @@ async fn run_beacon_node_for_test(
     executor: ReamExecutor,
     ream_db: ReamDB,
     force_data_availability_checks: bool,
+    gossipsub_history_length: Option<usize>,
 ) {
     run_beacon_node_inner(
         config,
@@ -658,6 +662,7 @@ async fn run_beacon_node_for_test(
         ream_db,
         false,
         force_data_availability_checks,
+        gossipsub_history_length,
     )
     .await;
 }
@@ -1050,6 +1055,9 @@ mod tests {
     const BEACON_E2E_VALIDATOR_COUNT: usize = 8;
     const BEACON_E2E_VALIDATOR_NODE_COUNT: usize = 2;
     const BEACON_E2E_SLOT_DURATION_MS: u64 = 3_000;
+    // CI debug builds can spend longer than the default 8.4-second cache window validating KZG
+    // proofs before the relay reports the gossip message as accepted.
+    const BEACON_E2E_GOSSIPSUB_HISTORY_LENGTH: usize = 64;
     const BEACON_E2E_KEYSTORE_PASSWORD: &str = "password";
 
     // Production's `BEACON_NETWORK_SPEC`/`GENESIS_VALIDATORS_ROOT` OnceLocks only allow one set
@@ -1143,7 +1151,7 @@ mod tests {
         db: ReamDB,
         executor: ReamExecutor,
     ) -> tokio::task::JoinHandle<()> {
-        spawn_beacon_test_node_inner(config, db, executor, false)
+        spawn_beacon_test_node_inner(config, db, executor, false, None)
     }
 
     fn spawn_beacon_test_node_with_data_availability(
@@ -1151,7 +1159,16 @@ mod tests {
         db: ReamDB,
         executor: ReamExecutor,
     ) -> tokio::task::JoinHandle<()> {
-        spawn_beacon_test_node_inner(config, db, executor, true)
+        spawn_beacon_test_node_inner(config, db, executor, true, None)
+    }
+
+    fn spawn_beacon_test_node_with_gossipsub_history(
+        config: BeaconNodeConfig,
+        db: ReamDB,
+        executor: ReamExecutor,
+        gossipsub_history_length: usize,
+    ) -> tokio::task::JoinHandle<()> {
+        spawn_beacon_test_node_inner(config, db, executor, false, Some(gossipsub_history_length))
     }
 
     fn spawn_beacon_test_node_inner(
@@ -1159,6 +1176,7 @@ mod tests {
         db: ReamDB,
         executor: ReamExecutor,
         force_data_availability_checks: bool,
+        gossipsub_history_length: Option<usize>,
     ) -> tokio::task::JoinHandle<()> {
         use tracing::{Instrument, info_span};
 
@@ -1170,8 +1188,14 @@ mod tests {
         );
         tokio::spawn(
             async move {
-                run_beacon_node_for_test(config, executor, db, force_data_availability_checks)
-                    .await;
+                run_beacon_node_for_test(
+                    config,
+                    executor,
+                    db,
+                    force_data_availability_checks,
+                    gossipsub_history_length,
+                )
+                .await;
             }
             .instrument(span),
         )
@@ -2715,6 +2739,7 @@ mod tests {
                     warmup_head.0
                 )
             });
+
             let commitment_count = target_block["data"]["message"]["body"]["blob_kzg_commitments"]
                 .as_array()
                 .map(Vec::len)
@@ -2946,8 +2971,12 @@ mod tests {
             node_2_config.execution_endpoint = Some(execution_endpoint.clone());
             node_2_config.execution_jwt_secret = Some(jwt_secret_path.clone());
             let node_2_http_port = node_2_config.http_port;
-            let node_2_handle =
-                spawn_beacon_test_node(node_2_config, node_2_db, node_2_executor_handle.clone());
+            let node_2_handle = spawn_beacon_test_node_with_gossipsub_history(
+                node_2_config,
+                node_2_db,
+                node_2_executor_handle.clone(),
+                BEACON_E2E_GOSSIPSUB_HISTORY_LENGTH,
+            );
             let node_2_identity = wait_for_beacon_identity(node_2_http_port).await;
             let node_2_enr = node_2_identity["data"]["enr"]
                 .as_str()

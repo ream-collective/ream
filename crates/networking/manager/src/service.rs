@@ -91,7 +91,7 @@ impl NetworkManagerService {
             custody_group_count: CustodyGroupCount::default(),
         };
 
-        let gossipsub_config = init_gossipsub_config_with_topics();
+        let gossipsub_config = init_gossipsub_config_with_topics(config.gossipsub_history_length);
 
         let network_config = NetworkConfig {
             discv5_config,

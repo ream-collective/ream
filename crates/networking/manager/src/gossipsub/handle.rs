@@ -50,8 +50,11 @@ use crate::{
     p2p_sender::P2PSender,
 };
 
-pub fn init_gossipsub_config_with_topics() -> GossipsubConfig {
-    let mut gossipsub_config = GossipsubConfig::default();
+pub fn init_gossipsub_config_with_topics(history_length: Option<usize>) -> GossipsubConfig {
+    let mut gossipsub_config = history_length.map_or_else(
+        GossipsubConfig::default,
+        GossipsubConfig::with_history_length,
+    );
     let fork_digest = beacon_network_spec().fork_digest(FULU_FORK_EPOCH, genesis_validators_root());
 
     let mut topics = vec![
@@ -791,7 +794,6 @@ mod tests {
             sequence_number: None,
             topic,
         };
-
         let acceptance =
             handle_gossipsub_message(message, &beacon_chain, &cached_db, &p2p_sender).await;
 
