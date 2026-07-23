@@ -2503,8 +2503,14 @@ mod tests {
             let peer_counts =
                 wait_for_connected_beacon_peer(&[node_1_http_port, node_2_http_port]).await;
 
+            let validator_http_ports = if wait_for_finality {
+                // Keep one canonical validator view while node 2 verifies sidecar propagation.
+                vec![node_1_http_port]
+            } else {
+                vec![node_1_http_port, node_2_http_port]
+            };
             let validator_handles = spawn_validator_test_nodes(
-                &[node_1_http_port, node_2_http_port],
+                &validator_http_ports,
                 &test_dir,
                 &validator_executor_handles,
             );
@@ -2770,11 +2776,9 @@ mod tests {
                 // blob block (typically slot 1-3) can expire before this fixture finalizes epoch 1.
                 wait_for_head_slot_at_least(node_1_http_port, SLOTS_PER_EPOCH * 2 + 4).await;
                 let target_epoch = compute_epoch_at_slot(target_slot);
-                let finality_statuses = wait_for_finality_checkpoints_advanced_all(
-                    &[node_1_http_port, node_2_http_port],
-                    target_epoch,
-                )
-                .await;
+                let finality_statuses =
+                    wait_for_finality_checkpoints_advanced_all(&[node_1_http_port], target_epoch)
+                        .await;
                 for status in finality_statuses {
                     assert!(
                         status.finalized_epoch > target_epoch,
