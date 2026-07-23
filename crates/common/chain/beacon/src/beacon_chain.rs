@@ -39,6 +39,7 @@ pub struct BeaconChain {
     pub store: Mutex<Store>,
     pub execution_engine: Option<ExecutionEngine>,
     pub event_sender: Option<broadcast::Sender<BeaconEvent>>,
+    force_data_availability_checks: bool,
 }
 
 impl BeaconChain {
@@ -54,16 +55,25 @@ impl BeaconChain {
             store: Mutex::new(Store::new(db, operation_pool, Some(sync_committee_pool))),
             execution_engine,
             event_sender,
+            force_data_availability_checks: false,
         }
+    }
+
+    /// Enables data availability checks independently of the configured Fulu fork epoch.
+    /// Intended for test networks that exercise Fulu data flow on an Electra state fixture.
+    pub fn force_data_availability_checks(mut self) -> Self {
+        self.force_data_availability_checks = true;
+        self
     }
 
     pub async fn process_block(&self, signed_block: SignedBeaconBlock) -> anyhow::Result<()> {
         let mut store = self.store.lock().await;
-        let verify_data_availability = is_data_availability_check_required(
-            compute_epoch_at_slot(signed_block.message.slot),
-            store.get_current_store_epoch()?,
-            beacon_network_spec().fulu_fork_epoch,
-        );
+        let verify_data_availability = self.force_data_availability_checks
+            || is_data_availability_check_required(
+                compute_epoch_at_slot(signed_block.message.slot),
+                store.get_current_store_epoch()?,
+                beacon_network_spec().fulu_fork_epoch,
+            );
 
         let outcome = on_block(
             &mut store,
