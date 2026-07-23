@@ -62,6 +62,14 @@ impl NetworkManagerService {
         sync_committee_pool: Arc<SyncCommitteePool>,
         cached_db: Arc<BeaconCacheDB>,
     ) -> anyhow::Result<Self> {
+        // Initialize the KZG trusted setup before validating data column sidecars to avoid delaying
+        // the first gossipsub validation decision.
+        executor
+            .spawn_blocking(|| {
+                ream_polynomial_commitments::trusted_setup::blst_settings();
+            })
+            .await?;
+
         let discv5_config = discv5::ConfigBuilder::new(discv5::ListenConfig::from_ip(
             config.socket_address,
             config.discovery_port,

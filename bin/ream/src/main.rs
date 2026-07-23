@@ -2855,7 +2855,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_beacon_nodes_propagate_data_column_sidecars_multi_hop() {
+    fn test_multi_hop_beacon_nodes_propagate_data_column_sidecars() {
         init_test_tracing();
 
         let port_offset = beacon_port_offset();
