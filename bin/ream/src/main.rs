@@ -2503,14 +2503,8 @@ mod tests {
             let peer_counts =
                 wait_for_connected_beacon_peer(&[node_1_http_port, node_2_http_port]).await;
 
-            let validator_http_ports = if wait_for_finality {
-                // Keep one canonical validator view while node 2 verifies sidecar propagation.
-                vec![node_1_http_port]
-            } else {
-                vec![node_1_http_port, node_2_http_port]
-            };
             let validator_handles = spawn_validator_test_nodes(
-                &validator_http_ports,
+                &[node_1_http_port, node_2_http_port],
                 &test_dir,
                 &validator_executor_handles,
             );
@@ -2717,8 +2711,14 @@ mod tests {
             let peer_counts =
                 wait_for_connected_beacon_peer(&[node_1_http_port, node_2_http_port]).await;
 
+            let validator_http_ports = if wait_for_finality {
+                // Keep one canonical validator view while node 2 verifies sidecar propagation.
+                vec![node_1_http_port]
+            } else {
+                vec![node_1_http_port, node_2_http_port]
+            };
             let validator_handles = spawn_validator_test_nodes(
-                &[node_1_http_port, node_2_http_port],
+                &validator_http_ports,
                 &test_dir,
                 &validator_executor_handles,
             );
