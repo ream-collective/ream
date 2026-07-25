@@ -7,9 +7,7 @@ use ream_consensus_beacon::{
     electra::beacon_block::SignedBeaconBlock,
 };
 use ream_consensus_misc::{
-    constants::beacon::{
-        FULU_FORK_EPOCH, MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS, genesis_validators_root,
-    },
+    constants::beacon::{FULU_FORK_EPOCH, genesis_validators_root},
     misc::compute_epoch_at_slot,
 };
 use ream_events_beacon::{BeaconEvent, BeaconEventSender, event::chain::BlockEvent};
@@ -68,11 +66,13 @@ impl BeaconChain {
 
     pub async fn process_block(&self, signed_block: SignedBeaconBlock) -> anyhow::Result<()> {
         let mut store = self.store.lock().await;
+        let network_spec = beacon_network_spec();
         let verify_data_availability = self.force_data_availability_checks
             || is_data_availability_check_required(
                 compute_epoch_at_slot(signed_block.message.slot),
                 store.get_current_store_epoch()?,
-                beacon_network_spec().fulu_fork_epoch,
+                network_spec.fulu_fork_epoch,
+                network_spec.min_epochs_for_data_column_sidecars_requests,
             );
 
         let outcome = on_block(
@@ -226,10 +226,11 @@ fn is_data_availability_check_required(
     block_epoch: u64,
     current_epoch: u64,
     fulu_fork_epoch: u64,
+    retention_epochs: u64,
 ) -> bool {
     let boundary_epoch = std::cmp::max(
         fulu_fork_epoch,
-        current_epoch.saturating_sub(MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS),
+        current_epoch.saturating_sub(retention_epochs),
     );
 
     block_epoch >= boundary_epoch
@@ -242,19 +243,32 @@ mod tests {
     #[test]
     fn data_availability_boundary_tracks_fulu_and_retention_window() {
         let fulu_epoch = 10;
-        assert!(!is_data_availability_check_required(9, 10, fulu_epoch));
-        assert!(is_data_availability_check_required(10, 10, fulu_epoch));
+        let retention_epochs = 100;
+        assert!(!is_data_availability_check_required(
+            9,
+            10,
+            fulu_epoch,
+            retention_epochs,
+        ));
+        assert!(is_data_availability_check_required(
+            10,
+            10,
+            fulu_epoch,
+            retention_epochs,
+        ));
 
-        let current_epoch = fulu_epoch + MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS + 10;
+        let current_epoch = fulu_epoch + retention_epochs + 10;
         assert!(!is_data_availability_check_required(
             fulu_epoch + 9,
             current_epoch,
             fulu_epoch,
+            retention_epochs,
         ));
         assert!(is_data_availability_check_required(
             fulu_epoch + 10,
             current_epoch,
             fulu_epoch,
+            retention_epochs,
         ));
     }
 }
