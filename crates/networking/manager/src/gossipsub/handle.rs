@@ -56,7 +56,10 @@ pub fn init_gossipsub_config_with_topics(history_length: Option<usize>) -> Gossi
         GossipsubConfig::default,
         GossipsubConfig::with_history_length,
     );
-    let fork_digest = beacon_network_spec().fork_digest(FULU_FORK_EPOCH, genesis_validators_root());
+    let fork_digest = beacon_network_spec().fork_digest(
+        beacon_network_spec().current_epoch(),
+        genesis_validators_root(),
+    );
 
     let mut topics = vec![
         GossipTopic {
