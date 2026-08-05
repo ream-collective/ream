@@ -11,9 +11,13 @@ pub struct BlobParameters {
     pub max_blobs_per_block: u64,
 }
 
-/// Returns the blob parameters in effect at `epoch` per the network's BPO (EIP-7892) schedule.
-pub fn get_blob_parameters(blob_schedule: &[BlobParameters], epoch: u64) -> BlobParameters {
-    blob_schedule
+pub fn get_blob_parameters(epoch: u64) -> BlobParameters {
+    let schedule = [BlobParameters {
+        epoch: ELECTRA_FORK_EPOCH,
+        max_blobs_per_block: MAX_BLOBS_PER_BLOCK_ELECTRA,
+    }];
+
+    schedule
         .iter()
         .rev()
         .find(|entry| epoch >= entry.epoch)
