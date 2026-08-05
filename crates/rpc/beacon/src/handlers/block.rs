@@ -679,7 +679,10 @@ async fn broadcast_data_column_sidecars(
         }
     };
 
-    let fork_digest = beacon_network_spec().fork_digest(FULU_FORK_EPOCH, genesis_validators_root());
+    let fork_digest = beacon_network_spec().fork_digest(
+        beacon_network_spec().current_epoch(),
+        genesis_validators_root(),
+    );
     for sidecar in sidecars {
         let topic = GossipTopic {
             fork: fork_digest,
