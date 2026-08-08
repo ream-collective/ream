@@ -6361,6 +6361,7 @@ dependencies = [
  "ream-consensus-misc",
  "ream-events-beacon",
  "ream-execution-engine",
+ "ream-execution-rpc-types",
  "ream-fork-choice-beacon",
  "ream-metrics",
  "ream-network-spec",
