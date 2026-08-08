@@ -6831,6 +6831,7 @@ dependencies = [
  "ethereum_serde_utils",
  "ream-consensus-misc",
  "serde",
+ "serde_json",
  "serde_yaml",
  "tracing",
 ]
