@@ -231,6 +231,9 @@ impl NetworkManagerService {
             disable_discovery: config.disable_discovery,
             attestation_subnets: AttestationSubnets::new(),
             sync_committee_subnets: SyncCommitteeSubnets::new(),
+            // Must match the count advertised in our MetaData: peers cross-check the ENR
+            // `cgc` against it and treat a mismatch, or a value below CUSTODY_REQUIREMENT,
+            // as a fault worth banning us for.
             custody_group_count,
         };
 
