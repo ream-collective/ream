@@ -10,7 +10,10 @@ mod tests {
         bls_to_execution_change::BLSToExecutionChange,
         electra::{beacon_block::SignedBeaconBlock, beacon_state::BeaconState},
     };
-    use ream_consensus_misc::{checkpoint::Checkpoint, misc::compute_start_slot_at_epoch};
+    use ream_consensus_misc::{
+        checkpoint::Checkpoint,
+        misc::{compute_epoch_at_slot, compute_start_slot_at_epoch},
+    };
     use ream_network_manager::gossipsub::validate::{
         beacon_block::validate_gossip_beacon_block, result::DependencyValidationResult,
     };
@@ -204,6 +207,30 @@ mod tests {
                 .unwrap();
 
         assert_eq!(result, DependencyValidationResult::Accept);
+    }
+
+    #[tokio::test]
+    pub async fn test_block_signature_uses_the_signed_header_epoch() {
+        initialize_test_network_spec();
+        let (_beacon_chain, _cached_db, _parent_root, _, mut parent_state) =
+            db_setup_with_parent(false).await;
+        let signed_block = read_ssz_snappy_file::<SignedBeaconBlock>(
+            "./assets/sepolia/blocks/child_9552076.ssz_snappy",
+        )
+        .unwrap();
+        let block_epoch = compute_epoch_at_slot(signed_block.message.slot);
+
+        // Model an exact parent state at the slot before a fork. The signed header must use the
+        // block's epoch and current fork version, not the parent's epoch and previous version.
+        parent_state.slot = compute_start_slot_at_epoch(block_epoch) - 1;
+        parent_state.fork.epoch = block_epoch;
+        parent_state.fork.previous_version[0] ^= 0xff;
+
+        assert!(
+            parent_state
+                .verify_block_header_signature(&signed_block.signed_header())
+                .unwrap()
+        );
     }
 
     #[tokio::test]
