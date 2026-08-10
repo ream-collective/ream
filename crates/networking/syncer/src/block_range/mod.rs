@@ -16,7 +16,7 @@ use futures::task::noop_waker;
 use libp2p::PeerId;
 use peer_manager::PeerManager;
 use peer_range_downloader::{PeerBlobIdentifierDownloader, PeerRootsDownloader};
-use ream_chain_beacon::beacon_chain::{BeaconChain, BlockProcessingOutcome};
+use ream_chain_beacon::beacon_chain::{BeaconChain, BlockImportEvent, BlockProcessingOutcome};
 use ream_consensus_beacon::{
     blob_sidecar::{BlobIdentifier, BlobSidecar},
     electra::beacon_block::SignedBeaconBlock,
@@ -24,7 +24,7 @@ use ream_consensus_beacon::{
 use ream_executor::ReamExecutor;
 use ream_p2p::network::beacon::{channel::P2PMessage, network_state::NetworkState};
 use ream_req_resp::MAX_CONCURRENT_REQUESTS;
-use ream_storage::tables::table::CustomTable;
+use ream_storage::tables::table::{CustomTable, REDBTable};
 use tokio::{sync::mpsc::UnboundedSender, task::JoinHandle, time::sleep};
 use tracing::{info, warn};
 
@@ -204,6 +204,9 @@ impl BlockRangeSyncer {
                 block_cache.downloaded_blob_count(),
             );
 
+            // Subscribe before processing so a fast DA completion cannot be missed.
+            let mut block_import_receiver = self.beacon_chain.subscribe_block_imports();
+
             // execute all the blocks downloaded
             for BlockAndBlobBundle { block, blobs } in block_cache.get_blocks_and_blobs()?  {
                 info!("Processing block with slot {}",
@@ -228,9 +231,40 @@ impl BlockRangeSyncer {
                     BlockProcessingOutcome::PendingAvailability { block_root } => {
                         info!(
                             ?block_root,
-                            "Range-sync block is pending data availability; handing control back before processing descendants"
+                            "Range-sync block is pending data availability; waiting before processing descendants"
                         );
-                        return Ok(self);
+                        loop {
+                            match block_import_receiver.recv().await {
+                                Ok(BlockImportEvent::Imported {
+                                    block_root: imported_root,
+                                }) if imported_root == block_root => break,
+                                Ok(_) => {}
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                    warn!(
+                                        skipped,
+                                        ?block_root,
+                                        "Block import notifications lagged; checking range-sync dependency"
+                                    );
+                                    let store = self.beacon_chain.store.lock().await;
+                                    let has_block = store
+                                        .db
+                                        .block_provider()
+                                        .get(block_root)?
+                                        .is_some();
+                                    let has_state = store
+                                        .db
+                                        .state_provider()
+                                        .get(block_root)?
+                                        .is_some();
+                                    if has_block && has_state {
+                                        break;
+                                    }
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                    bail!("Block import notification channel closed");
+                                }
+                            }
+                        }
                     }
                 }
             }
