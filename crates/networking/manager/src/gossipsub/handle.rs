@@ -189,8 +189,9 @@ fn dependency_message_acceptance(
     match validation_result {
         DependencyValidationResult::Accept => MessageAcceptance::Accept,
         DependencyValidationResult::Reject(_) => MessageAcceptance::Reject,
-        DependencyValidationResult::Ignore(_)
-        | DependencyValidationResult::ParentPendingAvailability { .. } => MessageAcceptance::Ignore,
+        DependencyValidationResult::Ignore(_) => MessageAcceptance::Ignore,
+        // Fully validated messages should propagate even while their local import is deferred.
+        DependencyValidationResult::ParentPendingAvailability { .. } => MessageAcceptance::Accept,
     }
 }
 

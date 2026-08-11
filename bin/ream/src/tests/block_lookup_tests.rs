@@ -538,7 +538,7 @@ async fn test_pending_parent_block_imports_after_parent_becomes_available() {
     };
 
     let (acceptance, insert_outcomes) = harness.deliver_block(&child.signed_block).await;
-    assert!(matches!(acceptance, MessageAcceptance::Ignore));
+    assert!(matches!(acceptance, MessageAcceptance::Accept));
     assert!(matches!(
         insert_outcomes.as_slice(),
         [InsertOutcome::Inserted]
@@ -587,7 +587,7 @@ async fn test_pending_parent_block_imports_after_parent_becomes_available() {
     );
 
     let (acceptance, insert_outcomes) = harness.deliver_block(&failed_child.signed_block).await;
-    assert!(matches!(acceptance, MessageAcceptance::Ignore));
+    assert!(matches!(acceptance, MessageAcceptance::Accept));
     assert!(matches!(
         insert_outcomes.as_slice(),
         [InsertOutcome::Inserted]
@@ -600,14 +600,14 @@ async fn test_pending_parent_block_imports_after_parent_becomes_available() {
 
     for column in [&child.column, &failed_child.column] {
         let (acceptance, insert_outcomes) = harness.deliver_column(column).await;
-        assert!(matches!(acceptance, MessageAcceptance::Ignore));
+        assert!(matches!(acceptance, MessageAcceptance::Accept));
         assert!(matches!(
             insert_outcomes.as_slice(),
             [InsertOutcome::Inserted]
         ));
     }
     let (acceptance, insert_outcomes) = harness.deliver_column(&late_child.column).await;
-    assert!(matches!(acceptance, MessageAcceptance::Ignore));
+    assert!(matches!(acceptance, MessageAcceptance::Accept));
     assert!(matches!(
         insert_outcomes.as_slice(),
         [InsertOutcome::Inserted]
@@ -745,13 +745,13 @@ async fn test_pending_child_is_dropped_if_finality_advances_past_it() {
     assert!(matches!(acceptance, MessageAcceptance::Accept));
     assert!(insert_outcomes.is_empty());
     let (acceptance, insert_outcomes) = harness.deliver_block(&child.signed_block).await;
-    assert!(matches!(acceptance, MessageAcceptance::Ignore));
+    assert!(matches!(acceptance, MessageAcceptance::Accept));
     assert!(matches!(
         insert_outcomes.as_slice(),
         [InsertOutcome::Inserted]
     ));
     let (acceptance, insert_outcomes) = harness.deliver_column(&child.column).await;
-    assert!(matches!(acceptance, MessageAcceptance::Ignore));
+    assert!(matches!(acceptance, MessageAcceptance::Accept));
     assert!(matches!(
         insert_outcomes.as_slice(),
         [InsertOutcome::Inserted]
@@ -835,11 +835,11 @@ async fn test_finality_advance_before_column_release_does_not_import_pending_chi
     ));
     assert!(matches!(
         harness.deliver_block(&child.signed_block).await.0,
-        MessageAcceptance::Ignore
+        MessageAcceptance::Accept
     ));
     assert!(matches!(
         harness.deliver_column(&child.column).await.0,
-        MessageAcceptance::Ignore
+        MessageAcceptance::Accept
     ));
     assert!(matches!(
         harness.deliver_column(&parent.column).await.0,

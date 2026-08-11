@@ -10,29 +10,82 @@ use std::{
 };
 
 use alloy_primitives::B256;
-use anyhow::{anyhow, bail};
+use anyhow::{anyhow, bail, ensure};
 use block_cache::{BlockAndBlobBundle, BlockCache, DataToFetch};
 use futures::task::noop_waker;
 use libp2p::PeerId;
 use peer_manager::PeerManager;
 use peer_range_downloader::{PeerBlobIdentifierDownloader, PeerRootsDownloader};
-use ream_chain_beacon::beacon_chain::{BeaconChain, BlockImportEvent, BlockProcessingOutcome};
+use ream_chain_beacon::beacon_chain::{BeaconChain, BlockProcessingOutcome};
 use ream_consensus_beacon::{
     blob_sidecar::{BlobIdentifier, BlobSidecar},
+    data_column_sidecar::{DataColumnSidecar, get_data_column_sidecars_from_block},
     electra::beacon_block::SignedBeaconBlock,
+    matrix_entry::{compute_cells_and_kzg_proofs, das_context},
 };
 use ream_executor::ReamExecutor;
 use ream_p2p::network::beacon::{channel::P2PMessage, network_state::NetworkState};
+use ream_polynomial_commitments::handlers::verify_blob_kzg_proof_batch;
 use ream_req_resp::MAX_CONCURRENT_REQUESTS;
 use ream_storage::tables::table::{CustomTable, REDBTable};
 use tokio::{sync::mpsc::UnboundedSender, task::JoinHandle, time::sleep};
 use tracing::{info, warn};
+use tree_hash::TreeHash;
 
 use crate::block_range::peer_range_downloader::{PeerRangeDownloader, Range};
 
 const MAX_BLOBS_PER_REQUEST: usize = 6;
 const MAX_BLOCKS_PER_REQUEST: u64 = 10;
 const SLEEP_DURATION: Duration = Duration::from_secs(5);
+
+/// Validates downloaded blob sidecars and derives the columns needed for data availability.
+fn build_data_columns_from_blob_sidecars(
+    block: &SignedBeaconBlock,
+    blob_sidecars: &std::collections::HashMap<BlobIdentifier, BlobSidecar>,
+) -> anyhow::Result<Vec<DataColumnSidecar>> {
+    let block_root = block.message.tree_hash_root();
+    let expected_header = block.signed_header();
+    let commitments = &block.message.body.blob_kzg_commitments;
+
+    ensure!(
+        blob_sidecars.len() == commitments.len(),
+        "Expected {} blob sidecars for block {block_root}, got {}",
+        commitments.len(),
+        blob_sidecars.len()
+    );
+
+    let mut blobs = Vec::with_capacity(commitments.len());
+    let mut proofs = Vec::with_capacity(commitments.len());
+    for (index, expected_commitment) in commitments.iter().enumerate() {
+        let identifier = BlobIdentifier::new(block_root, index as u64);
+        let sidecar = blob_sidecars
+            .get(&identifier)
+            .ok_or_else(|| anyhow!("Missing blob sidecar {index} for block {block_root}"))?;
+        ensure!(
+            sidecar.signed_block_header == expected_header,
+            "Blob sidecar {index} does not belong to block {block_root}"
+        );
+        ensure!(
+            sidecar.kzg_commitment == *expected_commitment,
+            "Blob sidecar {index} commitment does not match block {block_root}"
+        );
+
+        blobs.push(sidecar.blob.clone());
+        proofs.push(sidecar.kzg_proof);
+    }
+
+    ensure!(
+        verify_blob_kzg_proof_batch(&blobs, commitments, &proofs)?,
+        "Invalid blob KZG proof for block {block_root}"
+    );
+
+    let cells_and_kzg_proofs = blobs
+        .iter()
+        .map(|blob| compute_cells_and_kzg_proofs(blob, das_context()))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    get_data_column_sidecars_from_block(block, cells_and_kzg_proofs)
+        .map_err(|err| anyhow!("Failed to build data columns for block {block_root}: {err}"))
+}
 
 pub struct BlockRangeSyncer {
     pub beacon_chain: Arc<BeaconChain>,
@@ -204,67 +257,55 @@ impl BlockRangeSyncer {
                 block_cache.downloaded_blob_count(),
             );
 
-            // Subscribe before processing so a fast DA completion cannot be missed.
-            let mut block_import_receiver = self.beacon_chain.subscribe_block_imports();
-
             // execute all the blocks downloaded
             for BlockAndBlobBundle { block, blobs } in block_cache.get_blocks_and_blobs()?  {
                 info!("Processing block with slot {}",
                     block.message.slot,
                 );
-                for (blob_identifier, blob_sidecar) in blobs {
-                    if let Err(err) = self
-                        .beacon_chain
-                        .store
-                        .lock()
-                        .await
-                        .db
-                        .blobs_and_proofs_provider()
-                        .insert(blob_identifier, blob_sidecar.into())
-                    {
-                        warn!("Failed to insert blob into database: {err}");
-                    }
-                }
+
+                let (block, columns) = if blobs.is_empty() {
+                    (block, Vec::new())
+                } else {
+                    let (blobs_provider, required_columns) = {
+                        let store = self.beacon_chain.store.lock().await;
+                        (
+                            store.db.blobs_and_proofs_provider(),
+                            store.data_availability_checker.required_columns().clone(),
+                        )
+                    };
+                    tokio::task::spawn_blocking(move || {
+                        let columns = build_data_columns_from_blob_sidecars(&block, &blobs)?
+                            .into_iter()
+                            .filter(|column| required_columns.contains(&column.index))
+                            .collect::<Vec<_>>();
+                        for (identifier, sidecar) in blobs {
+                            blobs_provider.insert(identifier, sidecar.into())?;
+                        }
+                        Ok::<_, anyhow::Error>((block, columns))
+                    })
+                    .await
+                    .map_err(|err| anyhow!("Range-sync data-column task failed: {err}"))??
+                };
 
                 match self.beacon_chain.process_block(block).await? {
                     BlockProcessingOutcome::Imported { .. } => {}
                     BlockProcessingOutcome::PendingAvailability { block_root } => {
-                        info!(
-                            ?block_root,
-                            "Range-sync block is pending data availability; waiting before processing descendants"
-                        );
-                        loop {
-                            match block_import_receiver.recv().await {
-                                Ok(BlockImportEvent::Imported {
-                                    block_root: imported_root,
-                                }) if imported_root == block_root => break,
-                                Ok(_) => {}
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                                    warn!(
-                                        skipped,
-                                        ?block_root,
-                                        "Block import notifications lagged; checking range-sync dependency"
-                                    );
-                                    let store = self.beacon_chain.store.lock().await;
-                                    let has_block = store
-                                        .db
-                                        .block_provider()
-                                        .get(block_root)?
-                                        .is_some();
-                                    let has_state = store
-                                        .db
-                                        .state_provider()
-                                        .get(block_root)?
-                                        .is_some();
-                                    if has_block && has_state {
-                                        break;
-                                    }
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                    bail!("Block import notification channel closed");
-                                }
-                            }
+                        for column in columns {
+                            self.beacon_chain
+                                .import_data_column_sidecar_if(column, |_| Ok(()))
+                                .await?;
                         }
+                        ensure!(
+                            self.beacon_chain
+                                .store
+                                .lock()
+                                .await
+                                .db
+                                .block_provider()
+                                .get(block_root)?
+                                .is_some(),
+                            "Range-sync block {block_root} remained pending after processing its downloaded data"
+                        );
                     }
                 }
             }
@@ -505,4 +546,63 @@ fn poll_ready_tasks(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use kzg::{G1, eip_4844::compute_blob_kzg_proof_raw};
+    use ream_consensus_beacon::data_column_sidecar::NUMBER_OF_COLUMNS;
+    use ream_consensus_misc::polynomial_commitments::{
+        kzg_commitment::KZGCommitment, kzg_proof::KZGProof,
+    };
+    use ream_execution_rpc_types::get_blobs::{Blob, BlobAndProofV1};
+
+    use super::*;
+
+    #[test]
+    fn range_blob_sidecars_build_valid_columns_and_reject_bad_proofs() {
+        let blob = Blob::default();
+        let blob_bytes = blob.to_fixed_bytes();
+        let raw_commitment = das_context()
+            .blob_to_kzg_commitment(&blob_bytes)
+            .expect("test blob should produce a commitment");
+        let commitment = KZGCommitment(raw_commitment);
+        let proof = KZGProof::from(
+            compute_blob_kzg_proof_raw(
+                blob_bytes,
+                raw_commitment,
+                ream_polynomial_commitments::trusted_setup::blst_settings(),
+            )
+            .expect("test blob should produce a proof")
+            .to_bytes(),
+        );
+        let mut block = SignedBeaconBlock {
+            message: Default::default(),
+            signature: Default::default(),
+        };
+        block
+            .message
+            .body
+            .blob_kzg_commitments
+            .push(commitment)
+            .expect("one commitment should fit");
+        let block_root = block.message.tree_hash_root();
+        let identifier = BlobIdentifier::new(block_root, 0);
+        let sidecar = block
+            .blob_sidecar(BlobAndProofV1 { blob, proof }, 0)
+            .expect("test sidecar should be constructed");
+        let mut sidecars = HashMap::from([(identifier, sidecar)]);
+
+        let columns = build_data_columns_from_blob_sidecars(&block, &sidecars)
+            .expect("valid blobs should produce data columns");
+        assert_eq!(columns.len() as u64, NUMBER_OF_COLUMNS);
+
+        sidecars
+            .get_mut(&identifier)
+            .expect("test sidecar should exist")
+            .kzg_proof[0] ^= 1;
+        assert!(build_data_columns_from_blob_sidecars(&block, &sidecars).is_err());
+    }
 }
