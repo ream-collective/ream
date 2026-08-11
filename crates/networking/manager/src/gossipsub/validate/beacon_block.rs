@@ -101,32 +101,6 @@ pub async fn validate_gossip_beacon_block(
         }
     }
 
-    let validator = &state.validators[block.message.proposer_index as usize];
-    let proposer_slot = AddressSlotIdentifier {
-        address: validator.public_key.clone(),
-        slot: block.message.slot,
-    };
-    let mut seen_proposer_signatures = cached_db.seen_proposer_signature.write().await;
-    if seen_proposer_signatures.contains(&proposer_slot) {
-        return Ok(DependencyValidationResult::Ignore(
-            "Signature already received".to_string(),
-        ));
-    }
-    seen_proposer_signatures.put(proposer_slot, block.signature.clone());
-    drop(seen_proposer_signatures);
-
-    for signed_bls_execution_change in &block.message.body.bls_to_execution_changes {
-        let validator =
-            &state.validators[signed_bls_execution_change.message.validator_index as usize];
-        cached_db.seen_bls_to_execution_signature.write().await.put(
-            AddressSlotIdentifier {
-                address: validator.public_key.clone(),
-                slot: block.message.slot,
-            },
-            signed_bls_execution_change.message.clone(),
-        );
-    }
-
     if parent.is_some_and(|parent| parent.pending_availability) {
         Ok(DependencyValidationResult::ParentPendingAvailability {
             parent_root: block.message.parent_root,
@@ -290,6 +264,33 @@ async fn validate_beacon_block(
         return Ok(ValidationResult::Reject(
             "Length of KZG commitments is greater than the limit".to_string(),
         ));
+    }
+
+    // Epoch processing can extend the validator registry, so cache against the block-slot state.
+    let validator = &state.validators[block.message.proposer_index as usize];
+    let proposer_slot = AddressSlotIdentifier {
+        address: validator.public_key.clone(),
+        slot: block.message.slot,
+    };
+    let mut seen_proposer_signatures = cached_db.seen_proposer_signature.write().await;
+    if seen_proposer_signatures.contains(&proposer_slot) {
+        return Ok(ValidationResult::Ignore(
+            "Signature already received".to_string(),
+        ));
+    }
+    seen_proposer_signatures.put(proposer_slot, block.signature.clone());
+    drop(seen_proposer_signatures);
+
+    for signed_bls_execution_change in &block.message.body.bls_to_execution_changes {
+        let validator =
+            &state.validators[signed_bls_execution_change.message.validator_index as usize];
+        cached_db.seen_bls_to_execution_signature.write().await.put(
+            AddressSlotIdentifier {
+                address: validator.public_key.clone(),
+                slot: block.message.slot,
+            },
+            signed_bls_execution_change.message.clone(),
+        );
     }
 
     Ok(ValidationResult::Accept)

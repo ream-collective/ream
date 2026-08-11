@@ -16,14 +16,18 @@ use futures::task::noop_waker;
 use libp2p::PeerId;
 use peer_manager::PeerManager;
 use peer_range_downloader::{PeerBlobIdentifierDownloader, PeerRootsDownloader};
-use ream_chain_beacon::beacon_chain::{BeaconChain, BlockProcessingOutcome};
+use ream_chain_beacon::beacon_chain::{
+    BeaconChain, BlockProcessingOutcome, is_data_availability_check_required,
+};
 use ream_consensus_beacon::{
     blob_sidecar::{BlobIdentifier, BlobSidecar},
     data_column_sidecar::{DataColumnSidecar, get_data_column_sidecars_from_block},
     electra::beacon_block::SignedBeaconBlock,
     matrix_entry::{compute_cells_and_kzg_proofs, das_context},
 };
+use ream_consensus_misc::misc::compute_epoch_at_slot;
 use ream_executor::ReamExecutor;
+use ream_network_spec::networks::beacon_network_spec;
 use ream_p2p::network::beacon::{channel::P2PMessage, network_state::NetworkState};
 use ream_polynomial_commitments::handlers::verify_blob_kzg_proof_batch;
 use ream_req_resp::MAX_CONCURRENT_REQUESTS;
@@ -42,7 +46,12 @@ const SLEEP_DURATION: Duration = Duration::from_secs(5);
 fn build_data_columns_from_blob_sidecars(
     block: &SignedBeaconBlock,
     blob_sidecars: &std::collections::HashMap<BlobIdentifier, BlobSidecar>,
+    verify_data_availability: bool,
 ) -> anyhow::Result<Vec<DataColumnSidecar>> {
+    if !verify_data_availability {
+        return Ok(Vec::new());
+    }
+
     let block_root = block.message.tree_hash_root();
     let expected_header = block.signed_header();
     let commitments = &block.message.body.blob_kzg_commitments;
@@ -276,18 +285,29 @@ impl BlockRangeSyncer {
                     );
                     (block, Vec::new())
                 } else {
-                    let (blobs_provider, required_columns) = {
+                    let (blobs_provider, required_columns, verify_data_availability) = {
                         let store = self.beacon_chain.store.lock().await;
+                        let network_spec = beacon_network_spec();
                         (
                             store.db.blobs_and_proofs_provider(),
                             store.data_availability_checker.required_columns().clone(),
+                            is_data_availability_check_required(
+                                compute_epoch_at_slot(block.message.slot),
+                                store.get_current_store_epoch()?,
+                                network_spec.fulu_fork_epoch,
+                                network_spec.min_epochs_for_data_column_sidecars_requests,
+                            ),
                         )
                     };
                     tokio::task::spawn_blocking(move || {
-                        let columns = build_data_columns_from_blob_sidecars(&block, &blobs)?
-                            .into_iter()
-                            .filter(|column| required_columns.contains(&column.index))
-                            .collect::<Vec<_>>();
+                        let columns = build_data_columns_from_blob_sidecars(
+                            &block,
+                            &blobs,
+                            verify_data_availability,
+                        )?
+                        .into_iter()
+                        .filter(|column| required_columns.contains(&column.index))
+                        .collect::<Vec<_>>();
                         for (identifier, sidecar) in blobs {
                             blobs_provider.insert(identifier, sidecar.into())?;
                         }
@@ -605,7 +625,14 @@ mod tests {
             .expect("test sidecar should be constructed");
         let mut sidecars = HashMap::from([(identifier, sidecar)]);
 
-        let columns = build_data_columns_from_blob_sidecars(&block, &sidecars)
+        assert!(
+            build_data_columns_from_blob_sidecars(&block, &HashMap::new(), false)
+                .expect("expired blocks should not require blob sidecars")
+                .is_empty()
+        );
+        assert!(build_data_columns_from_blob_sidecars(&block, &HashMap::new(), true).is_err());
+
+        let columns = build_data_columns_from_blob_sidecars(&block, &sidecars, true)
             .expect("valid blobs should produce data columns");
         assert_eq!(columns.len() as u64, NUMBER_OF_COLUMNS);
 
@@ -613,6 +640,6 @@ mod tests {
             .get_mut(&identifier)
             .expect("test sidecar should exist")
             .kzg_proof[0] ^= 1;
-        assert!(build_data_columns_from_blob_sidecars(&block, &sidecars).is_err());
+        assert!(build_data_columns_from_blob_sidecars(&block, &sidecars, true).is_err());
     }
 }
