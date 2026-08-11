@@ -171,7 +171,13 @@ impl BlockRangeSyncer {
                     }
                 };
 
-                let data_to_fetch = block_cache.data_to_fetch(finalized_slot);
+                let current_epoch = self
+                    .beacon_chain
+                    .store
+                    .lock()
+                    .await
+                    .get_current_store_epoch()?;
+                let data_to_fetch = block_cache.data_to_fetch(finalized_slot, current_epoch);
                 info!(
                     "Forward sync status: Downloaded Blocks {}, Downloaded Blobs {}/{}, Stage {data_to_fetch}",
                     block_cache.block_count(),
@@ -263,7 +269,11 @@ impl BlockRangeSyncer {
                     block.message.slot,
                 );
 
-                let (block, columns) = if blobs.is_empty() {
+                let (block, columns) = if block.message.body.blob_kzg_commitments.is_empty() {
+                    ensure!(
+                        blobs.is_empty(),
+                        "Range-sync block without blob commitments had downloaded blob sidecars"
+                    );
                     (block, Vec::new())
                 } else {
                     let (blobs_provider, required_columns) = {

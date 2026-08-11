@@ -328,9 +328,9 @@ impl BeaconChain {
     }
 }
 
-// Check data availability only for blocks within the sidecar retention window.
-// Sidecars for blocks older than roughly 18 days may no longer be available.
-fn is_data_availability_check_required(
+/// Check data availability only for blocks within the sidecar retention window.
+/// Sidecars for blocks older than roughly 18 days may no longer be available.
+pub fn is_data_availability_check_required(
     block_epoch: u64,
     current_epoch: u64,
     fulu_fork_epoch: u64,
