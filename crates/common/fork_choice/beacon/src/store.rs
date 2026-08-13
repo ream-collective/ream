@@ -670,15 +670,21 @@ impl Store {
 
         // If a new epoch, pull-up justification and finalization from previous epoch
         if current_slot > previous_slot && compute_slots_since_epoch_start(current_slot) == 0 {
-            let head = self.get_head()?;
-            if let Some(state) = self.db.state_provider().get(head)? {
-                let active_count = state
-                    .get_active_validator_indices(state.get_current_epoch())
-                    .len();
-                BEACON_CURRENT_ACTIVE_VALIDATORS.set(active_count as i64);
-            } else {
-                tracing::warn!("Could not find head state for active validators metric");
-            }
+            match self.get_head() {
+                Ok(head) => {
+                    if let Some(state) = self.db.state_provider().get(head)? {
+                        let active_count = state
+                            .get_active_validator_indices(state.get_current_epoch())
+                            .len();
+                        BEACON_CURRENT_ACTIVE_VALIDATORS.set(active_count as i64);
+                    } else {
+                        tracing::warn!("Could not find head state for active validators metric");
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!("Failed to get head for active validators metric: {err:?}");
+                }
+            };
 
             let unrealized_justified = self.db.unrealized_justified_checkpoint_provider().get()?;
             let unrealized_finalized = self.db.unrealized_finalized_checkpoint_provider().get()?;
