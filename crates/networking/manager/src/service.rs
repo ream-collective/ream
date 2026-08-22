@@ -4,8 +4,11 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use alloy_primitives::B256;
 use ream_chain_beacon::beacon_chain::BeaconChain;
-use ream_consensus_misc::misc::compute_start_slot_at_epoch;
+use ream_consensus_misc::{
+    constants::beacon::NUM_CUSTODY_GROUPS, misc::compute_start_slot_at_epoch,
+};
 use ream_discv5::{
     config::DiscoveryConfig,
     subnet::{AttestationSubnets, CustodyGroupCount, SyncCommitteeSubnets},
@@ -24,7 +27,10 @@ use ream_storage::{
     tables::{field::REDBField, table::REDBTable},
 };
 use ream_sync_committee_pool::SyncCommitteePool;
-use ream_syncer::block_range::BlockRangeSyncer;
+use ream_syncer::{
+    block_range::BlockRangeSyncer,
+    unknown_parent_lookups::{MAX_LOOKUPS, UnknownBlockMeta, UnknownParentLookupCoordinator},
+};
 use tokio::{sync::mpsc, time::interval};
 use tracing::{error, info, warn};
 use tree_hash::TreeHash;
@@ -36,9 +42,11 @@ use crate::{
         spawn_block_lookup_worker,
     },
     config::ManagerConfig,
+    data_availability_fetch::{ColumnFetchTracker, fetch_missing_columns},
     gossipsub::handle::{handle_gossipsub_message, init_gossipsub_config_with_topics},
     p2p_sender::P2PSender,
     req_resp::handle_req_resp_message,
+    unknown_parent_lookup::{apply_unknown_parent_update, spawn_unknown_parent_action},
 };
 
 pub struct NetworkManagerService {
@@ -55,6 +63,30 @@ pub struct NetworkManagerService {
 struct ReconciledBlockLookupState {
     imported_roots: Vec<alloy_primitives::B256>,
     pending_availability_roots: Vec<alloy_primitives::B256>,
+}
+
+fn spawn_queued_column_fetches(
+    tracker: &mut ColumnFetchTracker,
+    beacon_chain: &Arc<BeaconChain>,
+    p2p_sender: &P2PSender,
+    network_state: &NetworkState,
+    done_sender: &mpsc::UnboundedSender<(B256, bool)>,
+) {
+    let peers = network_state
+        .connected_peers()
+        .into_iter()
+        .map(|peer| peer.peer_id)
+        .collect::<Vec<_>>();
+    while let Some((block_root, peers)) = tracker.next_fetch(&peers, std::time::Instant::now()) {
+        let beacon_chain = beacon_chain.clone();
+        let p2p_sender = p2p_sender.clone();
+        let done_sender = done_sender.clone();
+        tokio::spawn(async move {
+            let complete =
+                fetch_missing_columns(&beacon_chain, &p2p_sender, block_root, peers).await;
+            let _ = done_sender.send((block_root, complete));
+        });
+    }
 }
 
 async fn reconcile_block_lookup_state(
@@ -128,7 +160,8 @@ impl NetworkManagerService {
         ))
         .build();
 
-        let custody_group_count = CustodyGroupCount::default();
+        // Ream's DA checker currently runs as a supernode and requires every custody group.
+        let custody_group_count = CustodyGroupCount(NUM_CUSTODY_GROUPS);
         BEACON_CUSTODY_GROUPS.set(custody_group_count.0 as i64);
 
         let bootnodes = config
@@ -214,11 +247,37 @@ impl NetworkManagerService {
         let (block_lookup_action_sender, mut block_lookup_update_receiver) =
             spawn_block_lookup_worker(beacon_chain.clone());
         let mut block_lookup_worker_active = true;
+        let mut unknown_parent_lookups = UnknownParentLookupCoordinator::default();
+        let (unknown_parent_update_sender, mut unknown_parent_update_receiver) =
+            mpsc::channel(MAX_LOOKUPS);
+        let mut column_fetch_tracker = ColumnFetchTracker::default();
+        let (column_fetch_done_sender, mut column_fetch_done_receiver) =
+            mpsc::unbounded_channel::<(B256, bool)>();
         let mut syncer_handle = block_range_syncer.start();
         // Avoid polling a completed JoinHandle after the syncer has caught up.
         let mut syncer_active = true;
         loop {
             tokio::select! {
+                // Drive unknown-parent lookup actions and results.
+                _ = std::future::ready(()), if unknown_parent_lookups.pending_action_count() > 0 => {
+                    if let Some(action) = unknown_parent_lookups.next_action() {
+                        spawn_unknown_parent_action(
+                            action,
+                            beacon_chain.clone(),
+                            cached_db.clone(),
+                            p2p_sender.clone(),
+                            unknown_parent_update_sender.clone(),
+                        );
+                    }
+                }
+                Some(update) = unknown_parent_update_receiver.recv() => {
+                    apply_unknown_parent_update(
+                        &mut unknown_parent_lookups,
+                        &beacon_chain,
+                        update,
+                    ).await;
+                }
+                // Drive pending-availability lookup actions and results.
                 permit = block_lookup_action_sender.reserve(), if block_lookup_worker_active
                     && block_lookup_coordinator.pending_action_count() > 0
                     && block_lookup_coordinator.in_flight_action_count() == 0 => {
@@ -237,10 +296,16 @@ impl NetworkManagerService {
                 }
                 update = block_lookup_update_receiver.recv(), if block_lookup_worker_active => {
                     match update {
-                        Some(update) => apply_coordinator_update(
-                            &mut block_lookup_coordinator,
-                            update,
-                        ),
+                        Some(update) => {
+                            if let crate::block_lookup::CoordinatorUpdate::BlockFailed {
+                                block_root,
+                                ..
+                            } = update
+                            {
+                                unknown_parent_lookups.block_failed_elsewhere(block_root);
+                            }
+                            apply_coordinator_update(&mut block_lookup_coordinator, update);
+                        }
                         None => {
                             block_lookup_worker_active = false;
                             block_lookup_coordinator.fail_in_flight_action();
@@ -248,15 +313,38 @@ impl NetworkManagerService {
                         }
                     }
                 }
+                // Reconcile block imports with lookup and column-fetch state.
                 import_event = block_import_receiver.recv(), if block_import_receiver_active => {
                     match import_event {
-                        Ok(event) => apply_block_import_event(
-                            &mut block_lookup_coordinator,
-                            event,
-                        ),
+                        Ok(event) => {
+                            apply_block_import_event(&mut block_lookup_coordinator, event);
+                            match event {
+                                ream_chain_beacon::beacon_chain::BlockImportEvent::Imported { block_root } => {
+                                    unknown_parent_lookups.block_imported(block_root);
+                                    column_fetch_tracker.remove(&block_root);
+                                }
+                                ream_chain_beacon::beacon_chain::BlockImportEvent::PendingAvailability { block_root } => {
+                                    unknown_parent_lookups.block_pending_availability(block_root);
+                                    // Gossip will not redeliver columns for a block that is no
+                                    // longer near the head, so fetch them regardless of which
+                                    // ingress path left this block pending.
+                                    column_fetch_tracker.enqueue(block_root);
+                                    spawn_queued_column_fetches(
+                                        &mut column_fetch_tracker,
+                                        &beacon_chain,
+                                        &p2p_sender,
+                                        &network_state,
+                                        &column_fetch_done_sender,
+                                    );
+                                }
+                            }
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                             warn!(skipped, "Block import notifications lagged; reconciling pending parents");
-                            let roots = block_lookup_coordinator.reconciliation_roots();
+                            let mut roots = block_lookup_coordinator.reconciliation_roots();
+                            roots.extend(unknown_parent_lookups.reconciliation_roots());
+                            roots.sort_unstable();
+                            roots.dedup();
                             let reconciliation = reconcile_block_lookup_state(
                                 &beacon_chain,
                                 roots,
@@ -264,11 +352,21 @@ impl NetworkManagerService {
                             .await;
                             for block_root in reconciliation.imported_roots {
                                 block_lookup_coordinator.parent_imported(block_root);
+                                unknown_parent_lookups.block_imported(block_root);
                             }
                             for block_root in reconciliation.pending_availability_roots {
                                 block_lookup_coordinator
                                     .mark_block_pending_availability(block_root);
+                                unknown_parent_lookups.block_pending_availability(block_root);
+                                column_fetch_tracker.enqueue(block_root);
                             }
+                            spawn_queued_column_fetches(
+                                &mut column_fetch_tracker,
+                                &beacon_chain,
+                                &p2p_sender,
+                                &network_state,
+                                &column_fetch_done_sender,
+                            );
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             block_import_receiver_active = false;
@@ -276,6 +374,18 @@ impl NetworkManagerService {
                         }
                     }
                 }
+                // Continue queued data-column fetches.
+                Some((block_root, complete)) = column_fetch_done_receiver.recv() => {
+                    column_fetch_tracker.finish(block_root, complete, std::time::Instant::now());
+                    spawn_queued_column_fetches(
+                        &mut column_fetch_tracker,
+                        &beacon_chain,
+                        &p2p_sender,
+                        &network_state,
+                        &column_fetch_done_sender,
+                    );
+                }
+                // Restart range sync until the finalized target is reached.
                 result = &mut syncer_handle, if syncer_active => {
                     syncer_active = false;
                     let joined_result = match result {
@@ -307,6 +417,7 @@ impl NetworkManagerService {
                         syncer_active = true;
                     }
                 }
+                // Advance the chain clock and prune stale lookup state.
                 _ = interval.tick() => {
                     let time = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -322,30 +433,49 @@ impl NetworkManagerService {
                         (
                             store.get_current_slot(),
                             store.db.finalized_checkpoint_provider().get(),
+                            store.data_availability_checker.pending_block_roots(),
                         )
                     };
                     match slots {
-                        (Ok(current_slot), Ok(finalized_checkpoint)) => {
+                        (Ok(current_slot), Ok(finalized_checkpoint), pending_roots) => {
+                            let finalized_slot =
+                                compute_start_slot_at_epoch(finalized_checkpoint.epoch);
                             block_lookup_coordinator.prune(
                                 current_slot,
-                                compute_start_slot_at_epoch(finalized_checkpoint.epoch),
+                                finalized_slot,
+                            );
+                            unknown_parent_lookups.prune();
+                            unknown_parent_lookups.prune_finalized(finalized_slot);
+                            column_fetch_tracker.retain_pending(&pending_roots);
+                            for block_root in pending_roots {
+                                column_fetch_tracker.enqueue(block_root);
+                            }
+                            spawn_queued_column_fetches(
+                                &mut column_fetch_tracker,
+                                &beacon_chain,
+                                &p2p_sender,
+                                &network_state,
+                                &column_fetch_done_sender,
                             );
                         }
-                        (Err(err), _) => error!("Failed to read current slot: {err}"),
-                        (_, Err(err)) => error!("Failed to read finalized checkpoint: {err}"),
+                        (Err(err), _, _) => error!("Failed to read current slot: {err}"),
+                        (_, Err(err), _) => error!("Failed to read finalized checkpoint: {err}"),
                     }
                 }
+                // Handle inbound network events.
                 Some(event) = manager_receiver.recv() => {
                     match event {
                         // Handles Gossipsub messages from other peers.
                         ReamNetworkEvent::GossipsubMessage { propagation_source, message_id, message } => {
                             let mut pending_item = None;
+                            let mut unknown_parent_block = None;
                             let acceptance = handle_gossipsub_message(
                                 message,
                                 &beacon_chain,
                                 &cached_db,
                                 &p2p_sender,
                                 &mut pending_item,
+                                &mut unknown_parent_block,
                             ).await;
                             p2p_sender.report_gossip_validation(
                                 message_id,
@@ -353,7 +483,27 @@ impl NetworkManagerService {
                                 acceptance,
                             );
 
+                            if let Some(unknown) = unknown_parent_block {
+                                let meta = UnknownBlockMeta {
+                                    block_root: unknown.block.message.tree_hash_root(),
+                                    parent_root: unknown.parent_root,
+                                    slot: unknown.block.message.slot,
+                                };
+                                match unknown_parent_lookups.insert_gossip_block(
+                                    meta,
+                                    unknown.block,
+                                    propagation_source,
+                                ) {
+                                    ream_syncer::unknown_parent_lookups::InsertOutcome::Inserted
+                                    | ream_syncer::unknown_parent_lookups::InsertOutcome::Duplicate => {}
+                                    ream_syncer::unknown_parent_lookups::InsertOutcome::Rejected(error) => {
+                                        warn!(block_root = ?meta.block_root, ?error, "Rejected unknown-parent lookup");
+                                    }
+                                }
+                            }
+
                             if let Some(item) = pending_item {
+                                let is_block = matches!(&item, PendingGossipItem::Block { .. });
                                 let block_root = match &item {
                                     PendingGossipItem::Block { block, .. } => {
                                         block.block().message.tree_hash_root()
@@ -367,14 +517,23 @@ impl NetworkManagerService {
                                     store.get_current_slot()
                                 };
                                 match current_slot {
-                                    Ok(current_slot) => log_insert_outcome(
-                                        block_root,
-                                        insert_pending_item(
+                                    Ok(current_slot) => {
+                                        let outcome = insert_pending_item(
                                             &mut block_lookup_coordinator,
                                             item,
                                             current_slot,
-                                        ),
-                                    ),
+                                        );
+                                        let retained = matches!(
+                                            outcome,
+                                            ream_syncer::block_lookups::InsertOutcome::Inserted
+                                                | ream_syncer::block_lookups::InsertOutcome::Duplicate
+                                        );
+                                        log_insert_outcome(block_root, outcome);
+                                        if is_block && retained {
+                                            unknown_parent_lookups
+                                                .block_deferred_elsewhere(block_root);
+                                        }
+                                    }
                                     Err(err) => {
                                         error!("Failed to read current slot for pending gossip: {err}")
                                     }
@@ -384,6 +543,9 @@ impl NetworkManagerService {
                         // Handles Req/Resp messages from other peers.
                         ReamNetworkEvent::RequestMessage { peer_id, stream_id, connection_id, message } =>
                             handle_req_resp_message(peer_id, stream_id, connection_id, message, &p2p_sender, &ream_db, network_state.clone()).await,
+                        ReamNetworkEvent::PeerDisconnected(peer_id) => {
+                            column_fetch_tracker.peer_disconnected(peer_id);
+                        }
                         // Log and skip unrecognized requests.
                         unhandled_request => {
                             info!("Unhandled request: {unhandled_request:?}");
