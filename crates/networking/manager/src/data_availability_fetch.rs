@@ -341,7 +341,7 @@ async fn request_columns_by_root(
             Ok(P2PCallbackResponse::EndOfStream) => return Ok(sidecars),
             Ok(P2PCallbackResponse::Disconnected) => anyhow::bail!("peer disconnected"),
             Ok(P2PCallbackResponse::Timeout) => anyhow::bail!("request timed out"),
-            Err(error) => anyhow::bail!("callback failed: {error}"),
+            Err(err) => anyhow::bail!("callback failed: {err}"),
         }
     }
 

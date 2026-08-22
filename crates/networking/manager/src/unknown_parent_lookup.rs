@@ -81,10 +81,10 @@ async fn execute_unknown_parent_action(
                 requested_root: block_root,
                 block: Box::new(block),
             },
-            Err(error) => UnknownParentLookupUpdate::DownloadFailed {
+            Err(err) => UnknownParentLookupUpdate::DownloadFailed {
                 action_id,
                 requested_root: block_root,
-                error,
+                error: err,
             },
         },
         UnknownParentAction::ProcessBlock {
@@ -104,12 +104,12 @@ async fn execute_unknown_parent_action(
                             error: format!("gossip validation returned {other:?}"),
                         };
                     }
-                    Err(error) => {
+                    Err(err) => {
                         return UnknownParentLookupUpdate::BlockFailed {
                             action_id,
                             block_root: meta.block_root,
                             retry_by_download: false,
-                            error: error.to_string(),
+                            error: err.to_string(),
                         };
                     }
                 }
@@ -128,11 +128,11 @@ async fn execute_unknown_parent_action(
                         block_root,
                     }
                 }
-                Err(error) => UnknownParentLookupUpdate::BlockFailed {
+                Err(err) => UnknownParentLookupUpdate::BlockFailed {
                     action_id,
                     block_root: meta.block_root,
                     retry_by_download: true,
-                    error: error.to_string(),
+                    error: err.to_string(),
                 },
             }
         }
@@ -177,20 +177,20 @@ pub async fn apply_unknown_parent_update(
             };
             match parent_status(beacon_chain, meta.parent_root).await {
                 Ok(status) => {
-                    if let Err(error) =
+                    if let Err(err) =
                         coordinator.download_succeeded(action_id, meta, *block, status)
                     {
                         warn!(
                             ?requested_root,
-                            ?error,
+                            ?err,
                             "Dropping invalid parent lookup chain"
                         );
                     }
                 }
-                Err(error) => {
+                Err(err) => {
                     warn!(
                         ?requested_root,
-                        ?error,
+                        ?err,
                         "Failed to classify downloaded parent"
                     );
                     coordinator.download_failed(action_id, requested_root);
@@ -325,7 +325,7 @@ pub async fn request_single_block_by_root(
             Ok(P2PCallbackResponse::Timeout) => {
                 return Err(ParentLookupRequestError::Timeout);
             }
-            Err(error) => return Err(ParentLookupRequestError::Callback(error.to_string())),
+            Err(err) => return Err(ParentLookupRequestError::Callback(err.to_string())),
         }
     }
 
