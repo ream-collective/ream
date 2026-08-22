@@ -651,6 +651,7 @@ where
 
         let depth = self
             .descendant_height(child_root, &mut HashSet::new())
+            .saturating_sub(1)
             .saturating_add(ancestors);
         if depth > self.config.max_parent_depth {
             Err(InsertError::ParentDepthExceeded)
@@ -1106,7 +1107,7 @@ mod tests {
     }
 
     #[test]
-    fn depth_limit_and_cycles_are_rejected() {
+    fn depth_limit_counts_parent_edges_and_rejects_cycles() {
         let mut cfg = config();
         cfg.max_parent_depth = 2;
         let mut coordinator = UnknownParentLookupCoordinator::new(cfg);
@@ -1114,6 +1115,11 @@ mod tests {
         let (request_id, _, _) = request_action(&mut coordinator);
         assert_eq!(
             coordinator.download_succeeded(request_id, meta(1, 9, 1), 10, ParentStatus::Unknown,),
+            Ok(true)
+        );
+        let (request_id, _, _) = request_action(&mut coordinator);
+        assert_eq!(
+            coordinator.download_succeeded(request_id, meta(9, 8, 0), 90, ParentStatus::Unknown,),
             Err(InsertError::ParentDepthExceeded)
         );
         assert!(coordinator.is_empty());
