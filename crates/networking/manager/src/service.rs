@@ -259,7 +259,7 @@ impl NetworkManagerService {
         loop {
             tokio::select! {
                 // Drive unknown-parent lookup actions and results.
-                _ = std::future::ready(()), if unknown_parent_lookups.pending_action_count() > 0 => {
+                _ = std::future::ready(()), if unknown_parent_lookups.has_dispatchable_action() => {
                     if let Some(action) = unknown_parent_lookups.next_action() {
                         spawn_unknown_parent_action(
                             action,

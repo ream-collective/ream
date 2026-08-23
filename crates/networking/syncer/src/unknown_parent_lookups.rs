@@ -162,7 +162,7 @@ enum PendingAction {
 pub struct UnknownParentLookupCoordinator<BlockPayload, Peer> {
     config: UnknownParentLookupConfig,
     entries: HashMap<B256, LookupEntry<BlockPayload, Peer>>,
-    children_by_parent: HashMap<B256, HashSet<B256>>,
+    children_by_parent: HashMap<B256, VecDeque<B256>>,
     pending_actions: VecDeque<PendingAction>,
     failed_roots: HashMap<B256, Instant>,
     next_action_id: u64,
@@ -249,10 +249,7 @@ where
         entry.awaiting_parent = Some(meta.parent_root);
         entry.state = LookupState::AwaitingParent;
 
-        self.children_by_parent
-            .entry(meta.parent_root)
-            .or_default()
-            .insert(meta.block_root);
+        self.insert_child(meta.parent_root, meta.block_root);
         self.ensure_parent_lookup(meta.parent_root, peer, now);
         InsertOutcome::Inserted
     }
@@ -316,10 +313,7 @@ where
             ParentStatus::PendingAvailability | ParentStatus::Unknown => {
                 entry.awaiting_parent = Some(meta.parent_root);
                 entry.state = LookupState::AwaitingParent;
-                self.children_by_parent
-                    .entry(meta.parent_root)
-                    .or_default()
-                    .insert(root);
+                self.insert_child(meta.parent_root, root);
 
                 if parent_status == ParentStatus::Unknown {
                     let now = Instant::now();
@@ -444,7 +438,13 @@ where
     }
 
     pub fn next_action(&mut self) -> Option<UnknownParentAction<BlockPayload, Peer>> {
-        while let Some(pending) = self.pending_actions.pop_front() {
+        let actions_to_check = self.pending_actions.len();
+        for _ in 0..actions_to_check {
+            let pending = self.pending_actions.pop_front()?;
+            if matches!(pending, PendingAction::ProcessBlock(_)) && self.has_in_flight_process() {
+                self.pending_actions.push_back(pending);
+                continue;
+            }
             let action_id = self.next_action_id();
             match pending {
                 PendingAction::RequestBlock(block_root) => {
@@ -486,6 +486,17 @@ where
             }
         }
         None
+    }
+
+    /// Block downloads may run concurrently, but block replays are serialized so ready siblings
+    /// cannot race the seen cache.
+    pub fn has_dispatchable_action(&self) -> bool {
+        !self.pending_actions.is_empty()
+            && (!self.has_in_flight_process()
+                || self
+                    .pending_actions
+                    .iter()
+                    .any(|action| matches!(action, PendingAction::RequestBlock(_))))
     }
 
     /// Drops entries whose absolute lifetime exceeds the stuck-lookup bound. An expired ancestor
@@ -546,7 +557,7 @@ where
     pub fn children(&self, parent_root: &B256) -> HashSet<B256> {
         self.children_by_parent
             .get(parent_root)
-            .cloned()
+            .map(|children| children.iter().copied().collect())
             .unwrap_or_default()
     }
 
@@ -685,18 +696,35 @@ where
             .is_some_and(|entry| entry.state == expected)
     }
 
+    fn has_in_flight_process(&self) -> bool {
+        self.entries
+            .values()
+            .any(|entry| matches!(entry.state, LookupState::Processing(_)))
+    }
+
+    fn insert_child(&mut self, parent_root: B256, child_root: B256) {
+        let children = self.children_by_parent.entry(parent_root).or_default();
+        if !children.contains(&child_root) {
+            children.push_back(child_root);
+        }
+    }
+
+    fn remove_child(&mut self, parent_root: B256, child_root: B256) {
+        if let Some(children) = self.children_by_parent.get_mut(&parent_root) {
+            children.retain(|child| *child != child_root);
+            if children.is_empty() {
+                self.children_by_parent.remove(&parent_root);
+            }
+        }
+    }
+
     fn park_pending_availability(&mut self, root: B256) {
         let parent = self
             .entries
             .get(&root)
             .and_then(|entry| entry.awaiting_parent);
-        if let Some(parent) = parent
-            && let Some(children) = self.children_by_parent.get_mut(&parent)
-        {
-            children.remove(&root);
-            if children.is_empty() {
-                self.children_by_parent.remove(&parent);
-            }
+        if let Some(parent) = parent {
+            self.remove_child(parent, root);
         }
         if let Some(entry) = self.entries.get_mut(&root) {
             entry.payload = None;
@@ -749,13 +777,8 @@ where
             self.remove_queued_actions(root);
             return;
         };
-        if let Some(parent) = entry.awaiting_parent
-            && let Some(children) = self.children_by_parent.get_mut(&parent)
-        {
-            children.remove(&root);
-            if children.is_empty() {
-                self.children_by_parent.remove(&parent);
-            }
+        if let Some(parent) = entry.awaiting_parent {
+            self.remove_child(parent, root);
         }
         self.remove_queued_actions(root);
     }
@@ -940,6 +963,25 @@ mod tests {
     }
 
     #[test]
+    fn ready_gossip_siblings_are_processed_in_arrival_order() {
+        let mut coordinator = UnknownParentLookupCoordinator::new(config());
+        coordinator.insert_gossip_block(meta(2, 1, 2), 20, 7);
+        coordinator.insert_gossip_block(meta(3, 1, 2), 30, 8);
+
+        coordinator.block_imported(root(1));
+        let (first_action, first_meta, _, _) = process_action(&mut coordinator);
+        assert_eq!(first_meta.block_root, root(2));
+        assert!(
+            coordinator.next_action().is_none(),
+            "the later sibling must wait until the first arrival finishes validation"
+        );
+        assert!(!coordinator.has_dispatchable_action());
+
+        assert!(coordinator.process_imported(first_action, root(2)));
+        assert_eq!(process_action(&mut coordinator).1.block_root, root(3));
+    }
+
+    #[test]
     fn another_coordinator_can_take_ownership_without_releasing_descendants() {
         let mut coordinator = UnknownParentLookupCoordinator::new(config());
         coordinator.insert_gossip_block(meta(2, 1, 2), 20, 7);
@@ -1046,16 +1088,16 @@ mod tests {
         coordinator.insert_gossip_block(meta(3, 1, 3), 30, 8);
         coordinator.block_imported(root(1));
 
-        let first = process_action(&mut coordinator);
-        let second = process_action(&mut coordinator);
-        let (failed, sibling) = if first.1.block_root == root(2) {
-            (first, second)
+        let failed = process_action(&mut coordinator);
+        let sibling_root = if failed.1.block_root == root(2) {
+            root(3)
         } else {
-            (second, first)
+            root(2)
         };
         assert!(coordinator.process_failed(failed.0, failed.1.block_root, false));
         assert!(!coordinator.contains(&failed.1.block_root));
-        assert!(coordinator.contains(&sibling.1.block_root));
+        assert!(coordinator.contains(&sibling_root));
+        assert_eq!(process_action(&mut coordinator).1.block_root, sibling_root);
     }
 
     #[test]
