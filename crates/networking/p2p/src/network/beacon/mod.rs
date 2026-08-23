@@ -364,7 +364,7 @@ impl Network {
                                     warn!("Failed to send error response: {err:?}");
                                 }
                             },
-                            P2PRequest::ColumnIdentifiers { peer_id, column_identifiers, callback } => {
+                            P2PRequest::DataColumnIdentifiers { peer_id, column_identifiers, callback } => {
                                 if let Some(request_id) = self.send_request(peer_id, BeaconRequestMessage::DataColumnSidecarsByRoot(DataColumnSidecarsByRootV1Request::new(column_identifiers))) {
                                     self.callbacks.insert(request_id, callback);
                                 } else if let Err(err) = callback.send(Ok(P2PCallbackResponse::Disconnected)).await {

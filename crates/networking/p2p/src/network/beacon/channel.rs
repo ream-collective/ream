@@ -56,7 +56,7 @@ pub enum P2PRequest {
         blob_identifiers: Vec<BlobIdentifier>,
         callback: mpsc::Sender<anyhow::Result<P2PCallbackResponse>>,
     },
-    ColumnIdentifiers {
+    DataColumnIdentifiers {
         peer_id: PeerId,
         column_identifiers: Vec<DataColumnsByRootIdentifier>,
         callback: mpsc::Sender<anyhow::Result<P2PCallbackResponse>>,

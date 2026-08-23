@@ -28,8 +28,12 @@ use tree_hash::TreeHash;
 use crate::{block_lookup::ensure_pending_item_is_importable_with_store, p2p_sender::P2PSender};
 
 /// If no untried peer is available for 30 seconds, the fetch is parked. This matches Lighthouse's
-/// stale no-peer timeout for custody requests; a new or reconnected peer can still wake it later.
+/// stale no-peer timeout for custody requests; transiently failed peers may also be retried then.
 pub const NO_COLUMN_PEER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Lighthouse makes at most three custody-column requests to one peer. Applying the same bound
+/// lets transient failures recover without retrying a persistently unavailable peer forever.
+const MAX_TRANSIENT_PEER_ATTEMPTS: u8 = 3;
 
 /// One full 128-column response is about 2.5 MiB at the current blob limit. Limiting fetches to 32
 /// therefore keeps buffered column responses around 80 MiB while allowing parallel fork recovery.
@@ -38,7 +42,7 @@ pub const MAX_CONCURRENT_COLUMN_FETCHES: usize = 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FetchActionState {
     Queued,
-    InFlight,
+    InFlight { peer: PeerId },
     WaitingForPeers { since: Instant },
     Parked,
 }
@@ -47,6 +51,15 @@ enum FetchActionState {
 struct FetchEntry {
     action_state: FetchActionState,
     tried_peers: HashSet<PeerId>,
+    retryable_peers: HashSet<PeerId>,
+    transient_failures: HashMap<PeerId, u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnFetchOutcome {
+    Complete,
+    Incomplete,
+    Retryable,
 }
 
 /// Deduplicates pending roots, queues work beyond the concurrency cap, and retries incomplete
@@ -67,18 +80,20 @@ impl ColumnFetchTracker {
             FetchEntry {
                 action_state: FetchActionState::Queued,
                 tried_peers: HashSet::new(),
+                retryable_peers: HashSet::new(),
+                transient_failures: HashMap::new(),
             },
         );
         self.queued.push_back(block_root);
         true
     }
 
-    /// Returns every connected peer that has not yet been tried for the next queued root.
+    /// Returns one untried peer for the next queued root so a slow peer holds only one fetch slot.
     pub fn next_fetch(
         &mut self,
         connected_peers: &[PeerId],
         now: Instant,
-    ) -> Option<(B256, Vec<PeerId>)> {
+    ) -> Option<(B256, PeerId)> {
         self.refresh_connected_peers(connected_peers, now);
         if self.in_flight_count() >= MAX_CONCURRENT_COLUMN_FETCHES {
             return None;
@@ -91,35 +106,55 @@ impl ColumnFetchTracker {
                 continue;
             }
 
-            let mut selected = HashSet::new();
-            let peers = connected_peers
+            let Some(peer) = connected_peers
                 .iter()
                 .copied()
-                .filter(|peer| !entry.tried_peers.contains(peer) && selected.insert(*peer))
-                .collect::<Vec<_>>();
-            if peers.is_empty() {
+                .find(|peer| !entry.tried_peers.contains(peer))
+            else {
                 entry.action_state = FetchActionState::WaitingForPeers { since: now };
                 continue;
-            }
+            };
 
-            entry.tried_peers.extend(peers.iter().copied());
-            entry.action_state = FetchActionState::InFlight;
-            return Some((block_root, peers));
+            entry.tried_peers.insert(peer);
+            entry.action_state = FetchActionState::InFlight { peer };
+            return Some((block_root, peer));
         }
         None
     }
 
-    pub fn finish(&mut self, block_root: B256, complete: bool, now: Instant) {
+    pub fn finish(
+        &mut self,
+        block_root: B256,
+        peer: PeerId,
+        outcome: ColumnFetchOutcome,
+        now: Instant,
+    ) {
         let Some(entry) = self.entries.get_mut(&block_root) else {
             return;
         };
-        if entry.action_state != FetchActionState::InFlight {
+        if !matches!(
+            entry.action_state,
+            FetchActionState::InFlight {
+                peer: in_flight_peer
+            } if in_flight_peer == peer
+        ) {
             return;
         }
-        if complete {
-            self.entries.remove(&block_root);
-        } else {
-            entry.action_state = FetchActionState::WaitingForPeers { since: now };
+        match outcome {
+            ColumnFetchOutcome::Complete => {
+                self.entries.remove(&block_root);
+            }
+            ColumnFetchOutcome::Incomplete => {
+                entry.action_state = FetchActionState::WaitingForPeers { since: now };
+            }
+            ColumnFetchOutcome::Retryable => {
+                let failures = entry.transient_failures.entry(peer).or_default();
+                *failures = failures.saturating_add(1);
+                if *failures < MAX_TRANSIENT_PEER_ATTEMPTS {
+                    entry.retryable_peers.insert(peer);
+                }
+                entry.action_state = FetchActionState::WaitingForPeers { since: now };
+            }
         }
     }
 
@@ -128,6 +163,9 @@ impl ColumnFetchTracker {
         let connected = connected_peers.iter().copied().collect::<HashSet<_>>();
         for (block_root, entry) in &mut self.entries {
             entry.tried_peers.retain(|peer| connected.contains(peer));
+            entry
+                .retryable_peers
+                .retain(|peer| connected.contains(peer));
 
             let can_try_peer = connected
                 .iter()
@@ -142,7 +180,18 @@ impl ColumnFetchTracker {
                 FetchActionState::WaitingForPeers { since }
                     if now.saturating_duration_since(since) >= NO_COLUMN_PEER_TIMEOUT =>
                 {
-                    entry.action_state = FetchActionState::Parked;
+                    for peer in entry.retryable_peers.drain() {
+                        entry.tried_peers.remove(&peer);
+                    }
+                    if connected
+                        .iter()
+                        .any(|peer| !entry.tried_peers.contains(peer))
+                    {
+                        entry.action_state = FetchActionState::Queued;
+                        self.queued.push_back(*block_root);
+                    } else {
+                        entry.action_state = FetchActionState::Parked;
+                    }
                 }
                 _ => {}
             }
@@ -156,6 +205,7 @@ impl ColumnFetchTracker {
     pub fn peer_disconnected(&mut self, peer_id: PeerId) {
         for entry in self.entries.values_mut() {
             entry.tried_peers.remove(&peer_id);
+            entry.retryable_peers.remove(&peer_id);
         }
     }
 
@@ -170,105 +220,102 @@ impl ColumnFetchTracker {
     pub fn in_flight_count(&self) -> usize {
         self.entries
             .values()
-            .filter(|entry| entry.action_state == FetchActionState::InFlight)
+            .filter(|entry| matches!(entry.action_state, FetchActionState::InFlight { .. }))
             .count()
     }
 }
 
 /// Requests the columns `block_root` still needs, then validates and imports each one.
 ///
-/// Peers are tried in the order supplied. A response is accepted only when it carries the requested
-/// root and a column this node actually custodies, so a peer cannot use the reply to push unrelated
-/// data. Returns true once the root no longer needs columns.
+/// A response is accepted only when it carries the requested root and a column this node actually
+/// custodies, so a peer cannot use the reply to push unrelated data.
 pub async fn fetch_missing_columns(
     beacon_chain: &BeaconChain,
     p2p_sender: &P2PSender,
     block_root: B256,
-    peers: Vec<PeerId>,
-) -> bool {
-    for peer_id in peers {
-        // Re-read on every attempt: a concurrent gossip arrival may have completed the block, and
-        // an earlier attempt may have imported part of the set.
-        let Some((missing, expected_header)) = ({
-            let store = beacon_chain.store.lock().await;
-            store
-                .data_availability_checker
-                .pending_block(&block_root)
-                .map(|pending| {
-                    (
-                        store.data_availability_checker.missing_columns(&block_root),
-                        pending.signed_block.signed_header(),
-                    )
-                })
-        }) else {
-            return true;
-        };
-        if missing.is_empty() {
-            return true;
+    peer_id: PeerId,
+) -> ColumnFetchOutcome {
+    // Re-read on every attempt: gossip or an earlier peer may have completed part of the set.
+    let Some((missing, expected_header)) = ({
+        let store = beacon_chain.store.lock().await;
+        store
+            .data_availability_checker
+            .pending_block(&block_root)
+            .map(|pending| {
+                (
+                    store.data_availability_checker.missing_columns(&block_root),
+                    pending.signed_block.signed_header(),
+                )
+            })
+    }) else {
+        return ColumnFetchOutcome::Complete;
+    };
+    if missing.is_empty() {
+        return ColumnFetchOutcome::Complete;
+    }
+
+    let sidecars = match request_columns_by_root(p2p_sender, peer_id, block_root, &missing).await {
+        Ok(sidecars) => sidecars,
+        Err(err) => {
+            debug!(?block_root, %peer_id, %err, "Data column request failed");
+            return if err.is_retryable() {
+                ColumnFetchOutcome::Retryable
+            } else {
+                ColumnFetchOutcome::Incomplete
+            };
+        }
+    };
+
+    for sidecar in sidecars {
+        if !missing.contains(&sidecar.index) {
+            warn!(
+                ?block_root,
+                %peer_id,
+                index = sidecar.index,
+                "Peer returned a data column that was not requested"
+            );
+            continue;
+        }
+        if !is_valid_rpc_column(&sidecar, block_root, &expected_header) {
+            warn!(
+                ?block_root,
+                %peer_id,
+                index = sidecar.index,
+                "Peer returned an invalid data column"
+            );
+            continue;
         }
 
-        let sidecars =
-            match request_columns_by_root(p2p_sender, peer_id, block_root, &missing).await {
-                Ok(sidecars) => sidecars,
-                Err(err) => {
-                    debug!(?block_root, %peer_id, %err, "Data column request failed");
-                    continue;
-                }
-            };
-
-        for sidecar in sidecars {
-            if !missing.contains(&sidecar.index) {
-                warn!(
-                    ?block_root,
-                    %peer_id,
-                    index = sidecar.index,
-                    "Peer returned a data column that was not requested"
+        let sidecar_header = sidecar.signed_block_header.clone();
+        let parent_root = sidecar_header.message.parent_root;
+        let slot = sidecar_header.message.slot;
+        match beacon_chain
+            .import_data_column_sidecar_if(sidecar, move |store| {
+                ensure_pending_item_is_importable_with_store(
+                    store,
+                    slot,
+                    parent_root,
+                    Some(block_root),
+                )?;
+                let pending = store
+                    .data_availability_checker
+                    .pending_block(&block_root)
+                    .ok_or_else(|| anyhow::anyhow!("block is no longer pending availability"))?;
+                ensure!(
+                    pending.signed_block.signed_header() == sidecar_header,
+                    "data column signed header does not match the pending block"
                 );
-                continue;
-            }
-            if !is_valid_rpc_column(&sidecar, block_root, &expected_header) {
-                warn!(
-                    ?block_root,
-                    %peer_id,
-                    index = sidecar.index,
-                    "Peer returned an invalid data column"
-                );
-                continue;
-            }
-
-            let sidecar_header = sidecar.signed_block_header.clone();
-            let parent_root = sidecar_header.message.parent_root;
-            let slot = sidecar_header.message.slot;
-            match beacon_chain
-                .import_data_column_sidecar_if(sidecar, move |store| {
-                    ensure_pending_item_is_importable_with_store(
-                        store,
-                        slot,
-                        parent_root,
-                        Some(block_root),
-                    )?;
-                    let pending = store
-                        .data_availability_checker
-                        .pending_block(&block_root)
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("block is no longer pending availability")
-                        })?;
-                    ensure!(
-                        pending.signed_block.signed_header() == sidecar_header,
-                        "data column signed header does not match the pending block"
-                    );
-                    Ok(())
-                })
-                .await
-            {
-                Ok(()) => {}
-                Err(err) => warn!(?block_root, ?err, "Failed to import fetched data column"),
-            }
+                Ok(())
+            })
+            .await
+        {
+            Ok(()) => {}
+            Err(err) => warn!(?block_root, ?err, "Failed to import fetched data column"),
         }
     }
 
     let store = beacon_chain.store.lock().await;
-    store
+    if store
         .data_availability_checker
         .pending_block(&block_root)
         .is_none_or(|_| {
@@ -277,6 +324,11 @@ pub async fn fetch_missing_columns(
                 .missing_columns(&block_root)
                 .is_empty()
         })
+    {
+        ColumnFetchOutcome::Complete
+    } else {
+        ColumnFetchOutcome::Incomplete
+    }
 }
 
 /// Applies the checks that are meaningful for a column obtained over req/resp. Gossip-only
@@ -299,23 +351,46 @@ fn is_valid_rpc_column(
     verify_data_column_sidecar_kzg_proofs(sidecar).unwrap_or(false)
 }
 
+#[derive(Debug)]
+enum ColumnRequestError {
+    Retryable(String),
+    Fatal(String),
+}
+
+impl ColumnRequestError {
+    fn is_retryable(&self) -> bool {
+        matches!(self, Self::Retryable(_))
+    }
+}
+
+impl std::fmt::Display for ColumnRequestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Retryable(message) | Self::Fatal(message) => formatter.write_str(message),
+        }
+    }
+}
+
 async fn request_columns_by_root(
     p2p_sender: &P2PSender,
     peer_id: PeerId,
     block_root: B256,
     columns: &[u64],
-) -> anyhow::Result<Vec<DataColumnSidecar>> {
-    let identifier = DataColumnsByRootIdentifier::new(block_root, columns.to_vec())?;
+) -> Result<Vec<DataColumnSidecar>, ColumnRequestError> {
+    let identifier = DataColumnsByRootIdentifier::new(block_root, columns.to_vec())
+        .map_err(|err| ColumnRequestError::Fatal(err.to_string()))?;
     let requested_indices = columns.iter().copied().collect::<HashSet<_>>();
     let (callback, mut response_receiver) = mpsc::channel(2);
     p2p_sender
         .0
-        .send(P2PMessage::Request(P2PRequest::ColumnIdentifiers {
+        .send(P2PMessage::Request(P2PRequest::DataColumnIdentifiers {
             peer_id,
             column_identifiers: vec![identifier],
             callback,
         }))
-        .map_err(|err| anyhow::anyhow!("data column request channel closed: {err}"))?;
+        .map_err(|err| {
+            ColumnRequestError::Retryable(format!("data column request channel closed: {err}"))
+        })?;
 
     let mut sidecars = Vec::new();
     let mut received_indices = HashSet::new();
@@ -324,28 +399,46 @@ async fn request_columns_by_root(
             Ok(P2PCallbackResponse::ResponseMessage(message)) => {
                 let BeaconResponseMessage::DataColumnSidecarsByRoot(sidecar) = message.as_ref()
                 else {
-                    anyhow::bail!("unexpected response type for data columns by root");
+                    return Err(ColumnRequestError::Fatal(
+                        "unexpected response type for data columns by root".to_string(),
+                    ));
                 };
-                ensure!(
-                    requested_indices.contains(&sidecar.index),
-                    "peer returned unrequested data column index {}",
-                    sidecar.index
-                );
-                ensure!(
-                    received_indices.insert(sidecar.index),
-                    "peer returned data column index {} more than once",
-                    sidecar.index
-                );
+                if !requested_indices.contains(&sidecar.index) {
+                    return Err(ColumnRequestError::Fatal(format!(
+                        "peer returned unrequested data column index {}",
+                        sidecar.index
+                    )));
+                }
+                if !received_indices.insert(sidecar.index) {
+                    return Err(ColumnRequestError::Fatal(format!(
+                        "peer returned data column index {} more than once",
+                        sidecar.index
+                    )));
+                }
                 sidecars.push(sidecar.clone());
             }
             Ok(P2PCallbackResponse::EndOfStream) => return Ok(sidecars),
-            Ok(P2PCallbackResponse::Disconnected) => anyhow::bail!("peer disconnected"),
-            Ok(P2PCallbackResponse::Timeout) => anyhow::bail!("request timed out"),
-            Err(err) => anyhow::bail!("callback failed: {err}"),
+            Ok(P2PCallbackResponse::Disconnected) => {
+                return Err(ColumnRequestError::Retryable(
+                    "peer disconnected".to_string(),
+                ));
+            }
+            Ok(P2PCallbackResponse::Timeout) => {
+                return Err(ColumnRequestError::Retryable(
+                    "request timed out".to_string(),
+                ));
+            }
+            Err(err) => {
+                return Err(ColumnRequestError::Retryable(format!(
+                    "callback failed: {err}"
+                )));
+            }
         }
     }
 
-    anyhow::bail!("response channel closed before end-of-stream")
+    Err(ColumnRequestError::Retryable(
+        "response channel closed before end-of-stream".to_string(),
+    ))
 }
 
 #[cfg(test)]
@@ -379,17 +472,14 @@ mod tests {
         for index in 0..MAX_CONCURRENT_COLUMN_FETCHES {
             tracker.enqueue(B256::repeat_byte(index as u8 + 2));
         }
+        let peer = PeerId::random();
         for _ in 0..MAX_CONCURRENT_COLUMN_FETCHES {
-            assert!(
-                tracker
-                    .next_fetch(&[PeerId::random()], Instant::now())
-                    .is_some()
-            );
+            assert!(tracker.next_fetch(&[peer], Instant::now()).is_some());
         }
         assert_eq!(tracker.in_flight_count(), MAX_CONCURRENT_COLUMN_FETCHES);
         assert!(tracker.next_fetch(&[], Instant::now()).is_none());
 
-        tracker.finish(root, true, Instant::now());
+        tracker.finish(root, peer, ColumnFetchOutcome::Complete, Instant::now());
         assert!(
             tracker
                 .next_fetch(&[PeerId::random()], Instant::now())
@@ -399,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn tracker_tries_each_peer_once_and_wakes_for_a_new_peer() {
+    fn tracker_tries_another_peer_before_retrying_a_transient_failure() {
         let mut tracker = ColumnFetchTracker::default();
         let root = B256::repeat_byte(1);
         let first_peer = PeerId::random();
@@ -409,9 +499,9 @@ mod tests {
 
         assert_eq!(
             tracker.next_fetch(&[first_peer], now),
-            Some((root, vec![first_peer]))
+            Some((root, first_peer))
         );
-        tracker.finish(root, false, now);
+        tracker.finish(root, first_peer, ColumnFetchOutcome::Retryable, now);
         assert!(tracker.next_fetch(&[first_peer], now).is_none());
         assert!(
             !tracker.enqueue(root),
@@ -420,7 +510,7 @@ mod tests {
 
         assert_eq!(
             tracker.next_fetch(&[first_peer, second_peer], now),
-            Some((root, vec![second_peer]))
+            Some((root, second_peer))
         );
     }
 
@@ -432,8 +522,8 @@ mod tests {
         let now = Instant::now();
         tracker.enqueue(root);
 
-        assert_eq!(tracker.next_fetch(&[peer], now), Some((root, vec![peer])));
-        tracker.finish(root, false, now);
+        assert_eq!(tracker.next_fetch(&[peer], now), Some((root, peer)));
+        tracker.finish(root, peer, ColumnFetchOutcome::Incomplete, now);
         assert!(
             tracker
                 .next_fetch(&[peer], now + NO_COLUMN_PEER_TIMEOUT)
@@ -447,7 +537,7 @@ mod tests {
         tracker.peer_disconnected(peer);
         assert_eq!(
             tracker.next_fetch(&[peer], now + NO_COLUMN_PEER_TIMEOUT),
-            Some((root, vec![peer]))
+            Some((root, peer))
         );
 
         tracker.retain_pending(&[]);
@@ -455,6 +545,60 @@ mod tests {
             tracker.enqueue(root),
             "a pruned root may start fresh if seen later"
         );
+    }
+
+    #[test]
+    fn tracker_retries_transient_failures_with_a_bound() {
+        let mut tracker = ColumnFetchTracker::default();
+        let root = B256::repeat_byte(1);
+        let peer = PeerId::random();
+        let mut now = Instant::now();
+        tracker.enqueue(root);
+
+        for attempt in 1..=MAX_TRANSIENT_PEER_ATTEMPTS {
+            assert_eq!(tracker.next_fetch(&[peer], now), Some((root, peer)));
+            tracker.finish(root, peer, ColumnFetchOutcome::Retryable, now);
+            assert!(tracker.next_fetch(&[peer], now).is_none());
+
+            now += NO_COLUMN_PEER_TIMEOUT;
+            if attempt == MAX_TRANSIENT_PEER_ATTEMPTS {
+                assert!(tracker.next_fetch(&[peer], now).is_none());
+                assert_eq!(
+                    tracker.entries.get(&root).map(|entry| entry.action_state),
+                    Some(FetchActionState::Parked)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_is_retryable() {
+        let (p2p_sender, mut p2p_receiver) = mpsc::unbounded_channel();
+        let request = tokio::spawn(async move {
+            request_columns_by_root(
+                &P2PSender(p2p_sender),
+                PeerId::random(),
+                B256::repeat_byte(1),
+                &[0],
+            )
+            .await
+        });
+
+        let P2PMessage::Request(P2PRequest::DataColumnIdentifiers { callback, .. }) =
+            p2p_receiver.recv().await.expect("request should be sent")
+        else {
+            panic!("expected a data-columns-by-root request");
+        };
+        callback
+            .send(Ok(P2PCallbackResponse::Timeout))
+            .await
+            .expect("timeout should be delivered");
+
+        let error = request
+            .await
+            .expect("request task should join")
+            .expect_err("timeout must fail the response");
+        assert!(error.is_retryable());
     }
 
     #[tokio::test]
@@ -470,7 +614,7 @@ mod tests {
             .await
         });
 
-        let P2PMessage::Request(P2PRequest::ColumnIdentifiers { callback, .. }) =
+        let P2PMessage::Request(P2PRequest::DataColumnIdentifiers { callback, .. }) =
             p2p_receiver.recv().await.expect("request should be sent")
         else {
             panic!("expected a data-columns-by-root request");
@@ -485,14 +629,12 @@ mod tests {
             .await
             .expect("duplicate response should be delivered");
 
-        assert!(
-            request
-                .await
-                .expect("request task should join")
-                .expect_err("duplicate index must fail the response")
-                .to_string()
-                .contains("more than once")
-        );
+        let error = request
+            .await
+            .expect("request task should join")
+            .expect_err("duplicate index must fail the response");
+        assert!(error.to_string().contains("more than once"));
+        assert!(!error.is_retryable());
     }
 
     #[tokio::test]
@@ -508,7 +650,7 @@ mod tests {
             .await
         });
 
-        let P2PMessage::Request(P2PRequest::ColumnIdentifiers { callback, .. }) =
+        let P2PMessage::Request(P2PRequest::DataColumnIdentifiers { callback, .. }) =
             p2p_receiver.recv().await.expect("request should be sent")
         else {
             panic!("expected a data-columns-by-root request");

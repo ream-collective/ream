@@ -5,6 +5,7 @@ use std::{
 };
 
 use alloy_primitives::B256;
+use libp2p::PeerId;
 use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_misc::{
     constants::beacon::NUM_CUSTODY_GROUPS, misc::compute_start_slot_at_epoch,
@@ -42,7 +43,7 @@ use crate::{
         spawn_block_lookup_worker,
     },
     config::ManagerConfig,
-    data_availability_fetch::{ColumnFetchTracker, fetch_missing_columns},
+    data_availability_fetch::{ColumnFetchOutcome, ColumnFetchTracker, fetch_missing_columns},
     gossipsub::handle::{handle_gossipsub_message, init_gossipsub_config_with_topics},
     p2p_sender::P2PSender,
     req_resp::handle_req_resp_message,
@@ -70,21 +71,22 @@ fn spawn_queued_column_fetches(
     beacon_chain: &Arc<BeaconChain>,
     p2p_sender: &P2PSender,
     network_state: &NetworkState,
-    done_sender: &mpsc::UnboundedSender<(B256, bool)>,
+    done_sender: &mpsc::UnboundedSender<(B256, PeerId, ColumnFetchOutcome)>,
 ) {
-    let peers = network_state
+    let connected_peers = network_state
         .connected_peers()
         .into_iter()
         .map(|peer| peer.peer_id)
         .collect::<Vec<_>>();
-    while let Some((block_root, peers)) = tracker.next_fetch(&peers, std::time::Instant::now()) {
+    while let Some((block_root, peer)) =
+        tracker.next_fetch(&connected_peers, std::time::Instant::now())
+    {
         let beacon_chain = beacon_chain.clone();
         let p2p_sender = p2p_sender.clone();
         let done_sender = done_sender.clone();
         tokio::spawn(async move {
-            let complete =
-                fetch_missing_columns(&beacon_chain, &p2p_sender, block_root, peers).await;
-            let _ = done_sender.send((block_root, complete));
+            let outcome = fetch_missing_columns(&beacon_chain, &p2p_sender, block_root, peer).await;
+            let _ = done_sender.send((block_root, peer, outcome));
         });
     }
 }
@@ -252,7 +254,7 @@ impl NetworkManagerService {
             mpsc::channel(MAX_LOOKUPS);
         let mut column_fetch_tracker = ColumnFetchTracker::default();
         let (column_fetch_done_sender, mut column_fetch_done_receiver) =
-            mpsc::unbounded_channel::<(B256, bool)>();
+            mpsc::unbounded_channel::<(B256, PeerId, ColumnFetchOutcome)>();
         let mut syncer_handle = block_range_syncer.start();
         // Avoid polling a completed JoinHandle after the syncer has caught up.
         let mut syncer_active = true;
@@ -375,8 +377,13 @@ impl NetworkManagerService {
                     }
                 }
                 // Continue queued data-column fetches.
-                Some((block_root, complete)) = column_fetch_done_receiver.recv() => {
-                    column_fetch_tracker.finish(block_root, complete, std::time::Instant::now());
+                Some((block_root, peer, outcome)) = column_fetch_done_receiver.recv() => {
+                    column_fetch_tracker.finish(
+                        block_root,
+                        peer,
+                        outcome,
+                        std::time::Instant::now(),
+                    );
                     spawn_queued_column_fetches(
                         &mut column_fetch_tracker,
                         &beacon_chain,

@@ -32,7 +32,7 @@ use ream_network_manager::{
         BlockLookupConfig, BlockLookupCoordinator, InsertOutcome, apply_block_import_event,
         apply_coordinator_update, execute_coordinator_action, insert_pending_item,
     },
-    data_availability_fetch::fetch_missing_columns,
+    data_availability_fetch::{ColumnFetchOutcome, fetch_missing_columns},
     gossipsub::handle::{Message, MessageAcceptance, handle_gossipsub_message},
     p2p_sender::P2PSender,
     service::NetworkManagerService,
@@ -340,7 +340,7 @@ impl GossipLookupHarness {
             .await
             .expect("data-column request should not time out")
             .expect("P2P request channel should remain open");
-        let P2PMessage::Request(P2PRequest::ColumnIdentifiers {
+        let P2PMessage::Request(P2PRequest::DataColumnIdentifiers {
             peer_id,
             column_identifiers,
             callback,
@@ -1226,17 +1226,17 @@ async fn test_unknown_parent_block_imports_after_parent_arrives() {
         let beacon_chain = harness.beacon_chain.clone();
         let p2p_sender = harness.p2p_sender.clone();
         let fetch = tokio::spawn(async move {
-            fetch_missing_columns(&beacon_chain, &p2p_sender, expected_root, vec![source_peer])
-                .await
+            fetch_missing_columns(&beacon_chain, &p2p_sender, expected_root, source_peer).await
         });
         harness
             .respond_to_column_request(source_peer, expected_root, expected_column)
             .await;
-        assert!(
+        assert_eq!(
             timeout(TEST_TIMEOUT, fetch)
                 .await
                 .expect("data-column fetch should finish")
-                .expect("data-column fetch task should join")
+                .expect("data-column fetch task should join"),
+            ColumnFetchOutcome::Complete
         );
         harness.assert_imported(expected_root).await;
         coordinator.block_imported(expected_root);
@@ -1554,16 +1554,17 @@ async fn test_rpc_column_fetch_rechecks_finality_before_import() {
     let beacon_chain = harness.beacon_chain.clone();
     let p2p_sender = harness.p2p_sender.clone();
     let fetch = tokio::spawn(async move {
-        fetch_missing_columns(&beacon_chain, &p2p_sender, block_root, vec![source_peer]).await
+        fetch_missing_columns(&beacon_chain, &p2p_sender, block_root, source_peer).await
     });
     harness
         .respond_to_column_request(source_peer, block_root, pending.column)
         .await;
-    assert!(
-        !timeout(TEST_TIMEOUT, fetch)
+    assert_eq!(
+        timeout(TEST_TIMEOUT, fetch)
             .await
             .expect("data-column fetch should finish")
-            .expect("data-column fetch task should join")
+            .expect("data-column fetch task should join"),
+        ColumnFetchOutcome::Incomplete
     );
 
     let store = harness.beacon_chain.store.lock().await;
