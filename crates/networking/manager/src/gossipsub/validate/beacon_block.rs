@@ -99,9 +99,7 @@ pub async fn validate_gossip_beacon_block(
         });
     };
 
-    match validate_beacon_block(beacon_chain, cached_db, block, &parent.state, Some(&parent))
-        .await?
-    {
+    match validate_beacon_block(beacon_chain, cached_db, block, &parent.state, &parent).await? {
         ValidationResult::Accept => {}
         ValidationResult::Ignore(reason) => {
             return Ok(DependencyValidationResult::Ignore(reason));
@@ -126,7 +124,7 @@ async fn validate_beacon_block(
     cached_db: &BeaconCacheDB,
     block: &SignedBeaconBlock,
     state: &BeaconState,
-    parent: Option<&ParentContext>,
+    parent: &ParentContext,
 ) -> anyhow::Result<ValidationResult> {
     let store = beacon_chain.store.lock().await;
 
@@ -177,14 +175,6 @@ async fn validate_beacon_block(
             )));
         }
     }
-
-    let Some(parent) = parent else {
-        // Unknown-parent lookup is intentionally deferred to #1532. A parent held only by the
-        // coordinator has no post-state with which to validate a grandchild.
-        return Ok(ValidationResult::Ignore(
-            "Parent block not found".to_string(),
-        ));
-    };
 
     // [REJECT] The block is from a higher slot than its parent.
     if block.message.slot <= parent.block.message.slot {
