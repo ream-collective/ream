@@ -223,6 +223,10 @@ impl ColumnFetchTracker {
             .filter(|entry| matches!(entry.action_state, FetchActionState::InFlight { .. }))
             .count()
     }
+
+    pub fn tracked_count(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 /// Requests the columns `block_root` still needs, then validates and imports each one.

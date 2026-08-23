@@ -16,7 +16,12 @@ use ream_discv5::{
 };
 use ream_executor::ReamExecutor;
 use ream_fork_choice_beacon::data_availability::AvailabilityEntryStatus;
-use ream_metrics::BEACON_CUSTODY_GROUPS;
+use ream_metrics::{
+    BEACON_BLOCK_LOOKUP_ENTRIES, BEACON_BLOCK_LOOKUP_EVENTS_TOTAL, BEACON_CUSTODY_GROUPS,
+    BEACON_DATA_COLUMN_FETCH_ATTEMPTS_TOTAL, BEACON_DATA_COLUMN_FETCH_DURATION_SECONDS,
+    BEACON_DATA_COLUMN_FETCH_ENTRIES, inc_int_counter_vec, inc_int_counter_vec_by,
+    observe_histogram, set_int_gauge_vec,
+};
 use ream_network_spec::networks::beacon_network_spec;
 use ream_p2p::{
     config::NetworkConfig,
@@ -47,8 +52,51 @@ use crate::{
     gossipsub::handle::{handle_gossipsub_message, init_gossipsub_config_with_topics},
     p2p_sender::P2PSender,
     req_resp::handle_req_resp_message,
-    unknown_parent_lookup::{apply_unknown_parent_update, spawn_unknown_parent_action},
+    unknown_parent_lookup::{
+        UnknownParentLookupUpdate, apply_unknown_parent_update, spawn_unknown_parent_action,
+    },
 };
+
+const PENDING_AVAILABILITY_LOOKUP: &str = "pending_availability";
+const UNKNOWN_PARENT_LOOKUP: &str = "unknown_parent";
+
+fn record_removed_lookup_entries(kind: &str, event: &str, before: usize, after: usize) {
+    let removed = before.saturating_sub(after);
+    if removed > 0 {
+        inc_int_counter_vec_by(
+            &BEACON_BLOCK_LOOKUP_EVENTS_TOTAL,
+            removed as u64,
+            &[kind, event],
+        );
+    }
+}
+
+fn update_lookup_gauges<BlockPayload>(
+    block_lookup_coordinator: &BlockLookupCoordinator,
+    unknown_parent_lookups: &UnknownParentLookupCoordinator<BlockPayload, PeerId>,
+    column_fetch_tracker: &ColumnFetchTracker,
+) {
+    set_int_gauge_vec(
+        &BEACON_BLOCK_LOOKUP_ENTRIES,
+        block_lookup_coordinator.pending_entry_count() as i64,
+        &[PENDING_AVAILABILITY_LOOKUP],
+    );
+    set_int_gauge_vec(
+        &BEACON_BLOCK_LOOKUP_ENTRIES,
+        unknown_parent_lookups.len() as i64,
+        &[UNKNOWN_PARENT_LOOKUP],
+    );
+    set_int_gauge_vec(
+        &BEACON_DATA_COLUMN_FETCH_ENTRIES,
+        column_fetch_tracker.tracked_count() as i64,
+        &["tracked"],
+    );
+    set_int_gauge_vec(
+        &BEACON_DATA_COLUMN_FETCH_ENTRIES,
+        column_fetch_tracker.in_flight_count() as i64,
+        &["in_flight"],
+    );
+}
 
 pub struct NetworkManagerService {
     pub beacon_chain: Arc<BeaconChain>,
@@ -85,7 +133,12 @@ fn spawn_queued_column_fetches(
         let p2p_sender = p2p_sender.clone();
         let done_sender = done_sender.clone();
         tokio::spawn(async move {
+            let started_at = std::time::Instant::now();
             let outcome = fetch_missing_columns(&beacon_chain, &p2p_sender, block_root, peer).await;
+            observe_histogram(
+                &BEACON_DATA_COLUMN_FETCH_DURATION_SECONDS,
+                started_at.elapsed().as_secs_f64(),
+            );
             let _ = done_sender.send((block_root, peer, outcome));
         });
     }
@@ -273,11 +326,19 @@ impl NetworkManagerService {
                     }
                 }
                 Some(update) = unknown_parent_update_receiver.recv() => {
+                    let before = unknown_parent_lookups.len();
+                    let completed = matches!(&update, UnknownParentLookupUpdate::BlockImported { .. });
                     apply_unknown_parent_update(
                         &mut unknown_parent_lookups,
                         &beacon_chain,
                         update,
                     ).await;
+                    record_removed_lookup_entries(
+                        UNKNOWN_PARENT_LOOKUP,
+                        if completed { "completed" } else { "failed" },
+                        before,
+                        unknown_parent_lookups.len(),
+                    );
                 }
                 // Drive pending-availability lookup actions and results.
                 permit = block_lookup_action_sender.reserve(), if block_lookup_worker_active
@@ -291,7 +352,14 @@ impl NetworkManagerService {
                         }
                         Err(err) => {
                             block_lookup_worker_active = false;
+                            let before = block_lookup_coordinator.pending_entry_count();
                             block_lookup_coordinator.fail_in_flight_action();
+                            record_removed_lookup_entries(
+                                PENDING_AVAILABILITY_LOOKUP,
+                                "failed",
+                                before,
+                                block_lookup_coordinator.pending_entry_count(),
+                            );
                             error!("Block lookup worker action channel closed: {err}");
                         }
                     }
@@ -299,18 +367,42 @@ impl NetworkManagerService {
                 update = block_lookup_update_receiver.recv(), if block_lookup_worker_active => {
                     match update {
                         Some(update) => {
-                            if let crate::block_lookup::CoordinatorUpdate::BlockFailed {
-                                block_root,
-                                ..
-                            } = update
-                            {
+                            let pending_before = block_lookup_coordinator.pending_entry_count();
+                            let unknown_before = unknown_parent_lookups.len();
+                            let failed_block_root = match &update {
+                                crate::block_lookup::CoordinatorUpdate::BlockFailed {
+                                    block_root,
+                                    ..
+                                } => Some(*block_root),
+                                _ => None,
+                            };
+                            if let Some(block_root) = failed_block_root {
                                 unknown_parent_lookups.block_failed_elsewhere(block_root);
                             }
                             apply_coordinator_update(&mut block_lookup_coordinator, update);
+                            record_removed_lookup_entries(
+                                PENDING_AVAILABILITY_LOOKUP,
+                                if failed_block_root.is_some() { "failed" } else { "completed" },
+                                pending_before,
+                                block_lookup_coordinator.pending_entry_count(),
+                            );
+                            record_removed_lookup_entries(
+                                UNKNOWN_PARENT_LOOKUP,
+                                "failed",
+                                unknown_before,
+                                unknown_parent_lookups.len(),
+                            );
                         }
                         None => {
                             block_lookup_worker_active = false;
+                            let before = block_lookup_coordinator.pending_entry_count();
                             block_lookup_coordinator.fail_in_flight_action();
+                            record_removed_lookup_entries(
+                                PENDING_AVAILABILITY_LOOKUP,
+                                "failed",
+                                before,
+                                block_lookup_coordinator.pending_entry_count(),
+                            );
                             error!("Block lookup worker result channel closed");
                         }
                     }
@@ -319,6 +411,8 @@ impl NetworkManagerService {
                 import_event = block_import_receiver.recv(), if block_import_receiver_active => {
                     match import_event {
                         Ok(event) => {
+                            let pending_before = block_lookup_coordinator.pending_entry_count();
+                            let unknown_before = unknown_parent_lookups.len();
                             apply_block_import_event(&mut block_lookup_coordinator, event);
                             match event {
                                 ream_chain_beacon::beacon_chain::BlockImportEvent::Imported { block_root } => {
@@ -340,6 +434,18 @@ impl NetworkManagerService {
                                     );
                                 }
                             }
+                            record_removed_lookup_entries(
+                                PENDING_AVAILABILITY_LOOKUP,
+                                "completed",
+                                pending_before,
+                                block_lookup_coordinator.pending_entry_count(),
+                            );
+                            record_removed_lookup_entries(
+                                UNKNOWN_PARENT_LOOKUP,
+                                "completed",
+                                unknown_before,
+                                unknown_parent_lookups.len(),
+                            );
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                             warn!(skipped, "Block import notifications lagged; reconciling pending parents");
@@ -352,6 +458,8 @@ impl NetworkManagerService {
                                 roots,
                             )
                             .await;
+                            let pending_before = block_lookup_coordinator.pending_entry_count();
+                            let unknown_before = unknown_parent_lookups.len();
                             for block_root in reconciliation.imported_roots {
                                 block_lookup_coordinator.parent_imported(block_root);
                                 unknown_parent_lookups.block_imported(block_root);
@@ -369,6 +477,18 @@ impl NetworkManagerService {
                                 &network_state,
                                 &column_fetch_done_sender,
                             );
+                            record_removed_lookup_entries(
+                                PENDING_AVAILABILITY_LOOKUP,
+                                "completed",
+                                pending_before,
+                                block_lookup_coordinator.pending_entry_count(),
+                            );
+                            record_removed_lookup_entries(
+                                UNKNOWN_PARENT_LOOKUP,
+                                "completed",
+                                unknown_before,
+                                unknown_parent_lookups.len(),
+                            );
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             block_import_receiver_active = false;
@@ -378,6 +498,15 @@ impl NetworkManagerService {
                 }
                 // Continue queued data-column fetches.
                 Some((block_root, peer, outcome)) = column_fetch_done_receiver.recv() => {
+                    let outcome_label = match outcome {
+                        ColumnFetchOutcome::Complete => "complete",
+                        ColumnFetchOutcome::Incomplete => "incomplete",
+                        ColumnFetchOutcome::Retryable => "retryable",
+                    };
+                    inc_int_counter_vec(
+                        &BEACON_DATA_COLUMN_FETCH_ATTEMPTS_TOTAL,
+                        &[outcome_label],
+                    );
                     column_fetch_tracker.finish(
                         block_root,
                         peer,
@@ -447,12 +576,27 @@ impl NetworkManagerService {
                         (Ok(current_slot), Ok(finalized_checkpoint), pending_roots) => {
                             let finalized_slot =
                                 compute_start_slot_at_epoch(finalized_checkpoint.epoch);
-                            block_lookup_coordinator.prune(
+                            let pruned_pending = block_lookup_coordinator.prune(
                                 current_slot,
                                 finalized_slot,
                             );
-                            unknown_parent_lookups.prune();
-                            unknown_parent_lookups.prune_finalized(finalized_slot);
+                            if pruned_pending > 0 {
+                                inc_int_counter_vec_by(
+                                    &BEACON_BLOCK_LOOKUP_EVENTS_TOTAL,
+                                    pruned_pending as u64,
+                                    &[PENDING_AVAILABILITY_LOOKUP, "pruned"],
+                                );
+                            }
+                            let pruned_unknown = unknown_parent_lookups
+                                .prune()
+                                .saturating_add(unknown_parent_lookups.prune_finalized(finalized_slot));
+                            if pruned_unknown > 0 {
+                                inc_int_counter_vec_by(
+                                    &BEACON_BLOCK_LOOKUP_EVENTS_TOTAL,
+                                    pruned_unknown as u64,
+                                    &[UNKNOWN_PARENT_LOOKUP, "pruned"],
+                                );
+                            }
                             column_fetch_tracker.retain_pending(&pending_roots);
                             for block_root in pending_roots {
                                 column_fetch_tracker.enqueue(block_root);
@@ -496,14 +640,29 @@ impl NetworkManagerService {
                                     parent_root: unknown.parent_root,
                                     slot: unknown.block.message.slot,
                                 };
-                                match unknown_parent_lookups.insert_gossip_block(
+                                let before = unknown_parent_lookups.len();
+                                let outcome = unknown_parent_lookups.insert_gossip_block(
                                     meta,
                                     unknown.block,
                                     propagation_source,
-                                ) {
-                                    ream_syncer::unknown_parent_lookups::InsertOutcome::Inserted
-                                    | ream_syncer::unknown_parent_lookups::InsertOutcome::Duplicate => {}
+                                );
+                                match outcome {
+                                    ream_syncer::unknown_parent_lookups::InsertOutcome::Inserted => {
+                                        let created = unknown_parent_lookups.len().saturating_sub(before);
+                                        if created > 0 {
+                                            inc_int_counter_vec_by(
+                                                &BEACON_BLOCK_LOOKUP_EVENTS_TOTAL,
+                                                created as u64,
+                                                &[UNKNOWN_PARENT_LOOKUP, "created"],
+                                            );
+                                        }
+                                    }
+                                    ream_syncer::unknown_parent_lookups::InsertOutcome::Duplicate => {}
                                     ream_syncer::unknown_parent_lookups::InsertOutcome::Rejected(error) => {
+                                        inc_int_counter_vec(
+                                            &BEACON_BLOCK_LOOKUP_EVENTS_TOTAL,
+                                            &[UNKNOWN_PARENT_LOOKUP, "rejected"],
+                                        );
                                         warn!(block_root = ?meta.block_root, ?error, "Rejected unknown-parent lookup");
                                     }
                                 }
@@ -525,6 +684,10 @@ impl NetworkManagerService {
                                 };
                                 match current_slot {
                                     Ok(current_slot) => {
+                                        let entry_existed = block_lookup_coordinator
+                                            .contains_entry(&block_root);
+                                        let entries_before =
+                                            block_lookup_coordinator.pending_entry_count();
                                         let outcome = insert_pending_item(
                                             &mut block_lookup_coordinator,
                                             item,
@@ -535,6 +698,36 @@ impl NetworkManagerService {
                                             ream_syncer::block_lookups::InsertOutcome::Inserted
                                                 | ream_syncer::block_lookups::InsertOutcome::Duplicate
                                         );
+                                        match outcome {
+                                            ream_syncer::block_lookups::InsertOutcome::Inserted
+                                                if !entry_existed =>
+                                            {
+                                                inc_int_counter_vec(
+                                                    &BEACON_BLOCK_LOOKUP_EVENTS_TOTAL,
+                                                    &[PENDING_AVAILABILITY_LOOKUP, "created"],
+                                                );
+                                                let evicted = entries_before
+                                                    .saturating_add(1)
+                                                    .saturating_sub(
+                                                        block_lookup_coordinator
+                                                            .pending_entry_count(),
+                                                    );
+                                                if evicted > 0 {
+                                                    inc_int_counter_vec_by(
+                                                        &BEACON_BLOCK_LOOKUP_EVENTS_TOTAL,
+                                                        evicted as u64,
+                                                        &[PENDING_AVAILABILITY_LOOKUP, "pruned"],
+                                                    );
+                                                }
+                                            }
+                                            ream_syncer::block_lookups::InsertOutcome::Rejected(_) => {
+                                                inc_int_counter_vec(
+                                                    &BEACON_BLOCK_LOOKUP_EVENTS_TOTAL,
+                                                    &[PENDING_AVAILABILITY_LOOKUP, "rejected"],
+                                                );
+                                            }
+                                            _ => {}
+                                        }
                                         log_insert_outcome(block_root, outcome);
                                         if is_block && retained {
                                             unknown_parent_lookups
@@ -560,6 +753,11 @@ impl NetworkManagerService {
                     }
                 }
             }
+            update_lookup_gauges(
+                &block_lookup_coordinator,
+                &unknown_parent_lookups,
+                &column_fetch_tracker,
+            );
         }
     }
 }
