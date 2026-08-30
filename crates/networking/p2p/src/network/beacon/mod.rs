@@ -31,7 +31,7 @@ use libp2p_identity::{Keypair, PublicKey, secp256k1};
 use network_state::NetworkState;
 use parking_lot::{Mutex, RwLock};
 use peer::CachedPeer;
-use ream_consensus_misc::constants::beacon::{NUM_CUSTODY_GROUPS, genesis_validators_root};
+use ream_consensus_misc::constants::beacon::genesis_validators_root;
 use ream_discv5::discovery::{Discovery, DiscoveryOutEvent, QueryType};
 use ream_executor::ReamExecutor;
 use ream_metrics::set_peer_count;
@@ -926,6 +926,7 @@ mod tests {
     use discv5::enr::CombinedKey;
     use k256::ecdsa::SigningKey;
     use libp2p_identity::{Keypair, PeerId};
+    use ream_consensus_misc::constants::beacon::NUM_CUSTODY_GROUPS;
     use ream_discv5::{
         config::DiscoveryConfig,
         subnet::{AttestationSubnets, CustodyGroupCount, SyncCommitteeSubnets},
