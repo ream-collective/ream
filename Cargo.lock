@@ -7061,6 +7061,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tree_hash",
+ "url",
 ]
 
 [[package]]

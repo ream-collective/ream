@@ -1,19 +1,17 @@
 use std::{str::FromStr, sync::Arc};
 
 use actix_web::{
-    HttpResponse, Responder, get,
-    web::{Data, Path, Query},
+    HttpRequest, HttpResponse, Responder, get,
+    web::{Data, Path},
 };
 use discv5::Enr;
 use libp2p::{Multiaddr, PeerId};
-use ream_api_types_beacon::{
-    query::{ConnectionStateQuery, DirectionQuery},
-    responses::{DataResponse, DataResponseWithMeta},
-};
+use ream_api_types_beacon::responses::{DataResponse, DataResponseWithMeta};
 use ream_api_types_common::error::ApiError;
 use ream_p2p::network::beacon::network_state::NetworkState;
 use ream_peer::{ConnectionState, Direction, PeerCount, PeersMetadata};
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
+use url::form_urlencoded;
 
 /// GET /eth/v1/node/peers/{peer_id}
 #[get("/node/peers/{peer_id}")]
@@ -58,27 +56,52 @@ pub async fn get_peer_count(
     Ok(HttpResponse::Ok().json(DataResponse::new(peer_count)))
 }
 
+/// Collect every occurrence of `name` from the raw query string, returning `None` when the
+/// parameter is absent so callers can tell "no filter" from "filter that matches nothing".
+fn parse_repeated_query<T: DeserializeOwned>(
+    request: &HttpRequest,
+    name: &str,
+) -> Result<Option<Vec<T>>, ApiError> {
+    let values = form_urlencoded::parse(request.query_string().as_bytes())
+        .filter(|(key, _)| key == name)
+        .map(|(_, value)| {
+            serde_json::from_value::<T>(serde_json::Value::String(value.into_owned())).map_err(
+                |err| {
+                    ApiError::BadRequest(format!("Invalid value for query parameter {name}: {err}"))
+                },
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok((!values.is_empty()).then_some(values))
+}
+
 /// GET /eth/v1/node/peers
 #[get("/node/peers")]
 pub async fn get_peers(
     network_state: Data<Arc<NetworkState>>,
-    state: Query<ConnectionStateQuery>,
-    direction: Query<DirectionQuery>,
+    request: HttpRequest,
 ) -> Result<impl Responder, ApiError> {
+    // `state` and `direction` are repeatable query parameters, which the form encoding behind
+    // `Query` cannot express: it hands a bare `?state=connected` to a `Vec` and rejects the
+    // request outright. Collect the repeats from the raw query string instead.
+    let states = parse_repeated_query(&request, "state")?;
+    let directions = parse_repeated_query(&request, "direction")?;
+
     let peer_table = network_state.peer_table.read();
 
     let peers: Vec<Peer> = peer_table
         .values()
         .filter(|cached_peer| {
             // Filter by state if provided
-            if let Some(ref states) = state.state
+            if let Some(ref states) = states
                 && !states.contains(&cached_peer.state)
             {
                 return false;
             }
 
             // Filter by direction if provided
-            if let Some(ref directions) = direction.direction {
+            if let Some(ref directions) = directions {
                 // Unknown direction doesn't match any filter (not in spec)
                 if cached_peer.direction == Direction::Unknown {
                     return false;
