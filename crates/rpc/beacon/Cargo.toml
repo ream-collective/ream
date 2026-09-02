@@ -28,12 +28,12 @@ libp2p.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-url.workspace = true
 ssz_types.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tree_hash.workspace = true
+url.workspace = true
 
 #ream-dependencies
 ream-api-types-beacon.workspace = true
