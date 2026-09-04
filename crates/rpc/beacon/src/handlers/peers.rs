@@ -56,8 +56,7 @@ pub async fn get_peer_count(
     Ok(HttpResponse::Ok().json(DataResponse::new(peer_count)))
 }
 
-/// Collect every occurrence of `name` from the raw query string, returning `None` when the
-/// parameter is absent so callers can tell "no filter" from "filter that matches nothing".
+/// Parses every occurrence of `name`, preserving `None` when the filter is absent.
 fn parse_repeated_query<T: DeserializeOwned>(
     request: &HttpRequest,
     name: &str,
@@ -82,9 +81,7 @@ pub async fn get_peers(
     network_state: Data<Arc<NetworkState>>,
     request: HttpRequest,
 ) -> Result<impl Responder, ApiError> {
-    // `state` and `direction` are repeatable query parameters, which the form encoding behind
-    // `Query` cannot express: it hands a bare `?state=connected` to a `Vec` and rejects the
-    // request outright. Collect the repeats from the raw query string instead.
+    // Actix's query extractor cannot deserialize repeated keys into `Vec<T>`, so parse them here.
     let states = parse_repeated_query(&request, "state")?;
     let directions = parse_repeated_query(&request, "direction")?;
 

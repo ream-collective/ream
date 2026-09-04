@@ -28,11 +28,9 @@ enum ValidatorIndexRequest {
     String(String),
 }
 
-/// The slot whose block root the proposer shuffling for `epoch` is decided by.
-///
-/// Fulu made the proposer shuffling deterministic a whole `MIN_SEED_LOOKAHEAD` earlier, so from
-/// then on the decision moves back to the end of epoch `N - 2`. The fork epoch itself is still
-/// decided the old way, which is why the fork is tested one epoch below the request.
+/// Returns the slot whose block root fixes the proposer shuffling for `epoch`.
+/// Fulu moves it from the end of `N - 1` to `N - 2`; checking `epoch - 1` keeps the fork epoch on
+/// the legacy boundary.
 fn proposer_shuffling_decision_slot(epoch: u64) -> u64 {
     if epoch.saturating_sub(1) >= beacon_network_spec().fulu_fork_epoch {
         compute_start_slot_at_epoch(epoch.saturating_sub(MIN_SEED_LOOKAHEAD)).saturating_sub(1)
@@ -41,13 +39,7 @@ fn proposer_shuffling_decision_slot(epoch: u64) -> u64 {
     }
 }
 
-/// The furthest epoch whose proposer shuffling is already decided, and so the furthest one this
-/// endpoint will answer for.
-///
-/// Without this an arbitrarily large epoch is turned straight into a slot and walked back one
-/// slot at a time, so a single request can spend the node in database lookups. The multiplication
-/// into slots would overflow long before that, wrapping a nonsense epoch onto a real one and
-/// answering 200 with genesis duties instead of rejecting it.
+/// Reads the current epoch so future requests can be rejected before epoch-to-slot conversion.
 fn current_epoch(db: &BeaconDB) -> Result<u64, ApiError> {
     let slot = Store::new(db.clone(), Arc::new(OperationPool::default()), None)
         .get_current_slot()
@@ -56,8 +48,7 @@ fn current_epoch(db: &BeaconDB) -> Result<u64, ApiError> {
     Ok(compute_epoch_at_slot(slot))
 }
 
-/// Which block root a client is told the shuffling depends on. v1 always reports the end of
-/// epoch `N - 1`; v2 reports the slot that actually decides it.
+/// Selects the dependent-root semantics returned by v1 and v2.
 enum DependentRoot {
     Legacy,
     ForkAware,
@@ -75,7 +66,7 @@ async fn proposer_duties(
         )));
     }
 
-    // Only past the bound check is turning the epoch into slots safe from overflow.
+    // Convert only after the guard because epoch-to-slot multiplication is unchecked.
     let decision_slot = match dependent_root_kind {
         DependentRoot::Legacy => compute_start_slot_at_epoch(epoch).saturating_sub(1),
         DependentRoot::ForkAware => proposer_shuffling_decision_slot(epoch),
@@ -83,11 +74,8 @@ async fn proposer_duties(
     let start_slot = compute_start_slot_at_epoch(epoch);
     let (state, state_block_root) =
         get_state_and_block_root_at_or_before_slot(db, start_slot).await?;
-    // Walk the state's own history rather than the global slot index. That index maps a slot to
-    // whichever block was imported for it last, including one from a branch fork choice discarded,
-    // so it can name a root the returned duties were never derived from. It also only holds blocks
-    // this node imported, so after a checkpoint sync it answers 404 for a decision slot the state
-    // still remembers.
+    // Keep the duties and root on the same state branch. The global slot index can point to a
+    // discarded fork or omit blocks from before checkpoint sync.
     let dependent_root = if state.slot <= decision_slot {
         state_block_root
     } else {
@@ -115,8 +103,7 @@ async fn proposer_duties(
     Ok(HttpResponse::Ok().json(DutiesResponse::new(Some(dependent_root), duties)))
 }
 
-/// Reports the legacy dependent root — the block root at the end of epoch `N - 1` — whatever the
-/// fork. Kept for clients that have not moved to v2.
+/// Serves v1 proposer duties with the legacy end-of-`N - 1` dependent root.
 #[get("/validator/duties/proposer/{epoch}")]
 pub async fn get_proposer_duties(
     db: Data<BeaconDB>,
@@ -126,9 +113,7 @@ pub async fn get_proposer_duties(
     proposer_duties(&db, epoch, DependentRoot::Legacy).await
 }
 
-/// Reports the fork-aware dependent root. Identical to v1 before Fulu; after it the shuffling is
-/// decided a `MIN_SEED_LOOKAHEAD` earlier, so a validator client polling v1 would re-fetch duties
-/// against a root that no longer decides them.
+/// Serves v2 proposer duties with the fork-aware dependent root.
 #[get("/validator/duties/proposer/{epoch}")]
 pub async fn get_proposer_duties_v2(
     db: Data<BeaconDB>,
@@ -250,8 +235,7 @@ fn parse_validator_indices(
         .collect()
 }
 
-/// Returns the state at `slot` alongside the root of the block it was built on, which callers
-/// need to name the state's own branch.
+/// Loads the state at `slot` and the root of the block it was built on.
 async fn get_state_and_block_root_at_or_before_slot(
     db: &BeaconDB,
     slot: u64,
