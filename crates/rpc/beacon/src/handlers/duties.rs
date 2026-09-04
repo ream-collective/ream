@@ -31,12 +31,22 @@ enum ValidatorIndexRequest {
 /// Returns the slot whose block root fixes the proposer shuffling for `epoch`.
 /// Fulu moves it from the end of `N - 1` to `N - 2`; checking `epoch - 1` keeps the fork epoch on
 /// the legacy boundary.
-fn proposer_shuffling_decision_slot(epoch: u64) -> u64 {
-    if epoch.saturating_sub(1) >= beacon_network_spec().fulu_fork_epoch {
+fn proposer_shuffling_decision_slot(epoch: u64, fulu_fork_epoch: u64) -> u64 {
+    if epoch.saturating_sub(1) >= fulu_fork_epoch {
         compute_start_slot_at_epoch(epoch.saturating_sub(MIN_SEED_LOOKAHEAD)).saturating_sub(1)
     } else {
         compute_start_slot_at_epoch(epoch).saturating_sub(1)
     }
+}
+
+fn validate_proposer_duties_epoch(epoch: u64, current_epoch: u64) -> Result<(), ApiError> {
+    if epoch > current_epoch.saturating_add(1) {
+        return Err(ApiError::BadRequest(format!(
+            "Request epoch {epoch} is more than one epoch past the current epoch {current_epoch}"
+        )));
+    }
+
+    Ok(())
 }
 
 /// Reads the current epoch so future requests can be rejected before epoch-to-slot conversion.
@@ -60,16 +70,14 @@ async fn proposer_duties(
     dependent_root_kind: DependentRoot,
 ) -> Result<HttpResponse, ApiError> {
     let current_epoch = current_epoch(db)?;
-    if epoch > current_epoch + 1 {
-        return Err(ApiError::BadRequest(format!(
-            "Request epoch {epoch} is more than one epoch past the current epoch {current_epoch}"
-        )));
-    }
+    validate_proposer_duties_epoch(epoch, current_epoch)?;
 
     // Convert only after the guard because epoch-to-slot multiplication is unchecked.
     let decision_slot = match dependent_root_kind {
         DependentRoot::Legacy => compute_start_slot_at_epoch(epoch).saturating_sub(1),
-        DependentRoot::ForkAware => proposer_shuffling_decision_slot(epoch),
+        DependentRoot::ForkAware => {
+            proposer_shuffling_decision_slot(epoch, beacon_network_spec().fulu_fork_epoch)
+        }
     };
     let start_slot = compute_start_slot_at_epoch(epoch);
     let (state, state_block_root) =
@@ -284,4 +292,48 @@ fn get_block_root_at_or_before_slot(db: &BeaconDB, slot: u64) -> Result<B256, Ap
     Err(ApiError::NotFound(format!(
         "Failed to find block root at or before slot {slot}"
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proposer_decision_slot_preserves_the_fulu_boundary() {
+        let fulu_fork_epoch = 5;
+
+        assert_eq!(
+            proposer_shuffling_decision_slot(4, fulu_fork_epoch),
+            4 * SLOTS_PER_EPOCH - 1
+        );
+        assert_eq!(
+            proposer_shuffling_decision_slot(5, fulu_fork_epoch),
+            5 * SLOTS_PER_EPOCH - 1
+        );
+        assert_eq!(
+            proposer_shuffling_decision_slot(6, fulu_fork_epoch),
+            5 * SLOTS_PER_EPOCH - 1
+        );
+    }
+
+    #[test]
+    fn proposer_decision_slot_saturates_at_genesis() {
+        assert_eq!(proposer_shuffling_decision_slot(0, 0), 0);
+        assert_eq!(proposer_shuffling_decision_slot(1, 0), 0);
+        assert_eq!(proposer_shuffling_decision_slot(2, 0), SLOTS_PER_EPOCH - 1);
+    }
+
+    #[test]
+    fn proposer_duties_reject_epochs_beyond_the_lookahead() {
+        assert!(validate_proposer_duties_epoch(10, 10).is_ok());
+        assert!(validate_proposer_duties_epoch(11, 10).is_ok());
+        assert!(matches!(
+            validate_proposer_duties_epoch(12, 10),
+            Err(ApiError::BadRequest(_))
+        ));
+        assert!(matches!(
+            validate_proposer_duties_epoch(u64::MAX, 10),
+            Err(ApiError::BadRequest(_))
+        ));
+    }
 }

@@ -143,3 +143,59 @@ pub struct Peer {
     /// Direction of the most recent connection (inbound/outbound)
     pub direction: Direction,
 }
+
+#[cfg(test)]
+mod tests {
+    use actix_web::{ResponseError, http::StatusCode, test::TestRequest};
+
+    use super::*;
+
+    #[test]
+    fn repeated_query_preserves_absent_filters() {
+        let request = TestRequest::with_uri("/node/peers?direction=inbound").to_http_request();
+
+        assert_eq!(
+            parse_repeated_query::<ConnectionState>(&request, "state")
+                .expect("absent state filter parses"),
+            None
+        );
+    }
+
+    #[test]
+    fn repeated_query_accepts_single_and_repeated_values() {
+        let request = TestRequest::with_uri("/node/peers?state=connected").to_http_request();
+        assert_eq!(
+            parse_repeated_query::<ConnectionState>(&request, "state")
+                .expect("single state filter parses"),
+            Some(vec![ConnectionState::Connected])
+        );
+
+        let request = TestRequest::with_uri(
+            "/node/peers?state=connected&state=disconnected&direction=inbound&direction=outbound",
+        )
+        .to_http_request();
+
+        assert_eq!(
+            parse_repeated_query::<ConnectionState>(&request, "state")
+                .expect("repeated state filters parse"),
+            Some(vec![
+                ConnectionState::Connected,
+                ConnectionState::Disconnected
+            ])
+        );
+        assert_eq!(
+            parse_repeated_query::<Direction>(&request, "direction")
+                .expect("repeated direction filters parse"),
+            Some(vec![Direction::Inbound, Direction::Outbound])
+        );
+    }
+
+    #[test]
+    fn repeated_query_rejects_invalid_values_with_bad_request() {
+        let request = TestRequest::with_uri("/node/peers?state=CONNECTED").to_http_request();
+        let error = parse_repeated_query::<ConnectionState>(&request, "state")
+            .expect_err("uppercase state is invalid");
+
+        assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
+    }
+}
