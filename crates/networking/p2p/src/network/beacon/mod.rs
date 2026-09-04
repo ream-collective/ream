@@ -12,7 +12,7 @@ use std::{
 };
 
 use anyhow::anyhow;
-use channel::{P2PCallbackResponse, P2PMessage, P2PRequest, P2PResponse};
+use channel::{P2PCallbackError, P2PCallbackResponse, P2PMessage, P2PRequest, P2PResponse};
 use delay_map::{HashMapDelay, HashSetDelay};
 use discv5::Enr;
 use libp2p::{
@@ -43,7 +43,9 @@ use ream_req_resp::{
         BeaconRequestMessage, BeaconResponseMessage,
         blob_sidecars::BlobSidecarsByRootV1Request,
         blocks::{BeaconBlocksByRangeV2Request, BeaconBlocksByRootV2Request},
-        data_column_sidecars::DataColumnSidecarsByRootV1Request,
+        data_column_sidecars::{
+            DataColumnSidecarsByRangeV1Request, DataColumnSidecarsByRootV1Request,
+        },
         meta_data::GetMetaDataV3,
         ping::Ping,
         status::Status,
@@ -52,6 +54,7 @@ use ream_req_resp::{
     handler::{ReqRespMessageError, ReqRespMessageReceived, RespMessage},
     messages::{RequestMessage, ResponseMessage},
 };
+use ssz_types::VariableList;
 use tokio::{
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     time::interval,
@@ -106,7 +109,7 @@ pub struct Network {
     peer_id: PeerId,
     swarm: Swarm<ReamBehaviour>,
     subscribed_topics: Arc<Mutex<HashSet<GossipTopic>>>,
-    callbacks: HashMapDelay<u64, mpsc::Sender<anyhow::Result<P2PCallbackResponse>>>,
+    callbacks: HashMapDelay<u64, mpsc::Sender<Result<P2PCallbackResponse, P2PCallbackError>>>,
     request_id: u64,
     network_state: Arc<NetworkState>,
     peers_to_ping: HashSetDelay<PeerId>,
@@ -359,6 +362,19 @@ impl Network {
                             },
                             P2PRequest::BlobIdentifiers { peer_id, blob_identifiers, callback } => {
                                 if let Some(request_id) = self.send_request(peer_id, BeaconRequestMessage::BlobSidecarsByRoot(BlobSidecarsByRootV1Request::new(blob_identifiers))) {
+                                    self.callbacks.insert(request_id, callback);
+                                } else if let Err(err) = callback.send(Ok(P2PCallbackResponse::Disconnected)).await {
+                                    warn!("Failed to send error response: {err:?}");
+                                }
+                            },
+                            P2PRequest::DataColumnRange { peer_id, start, count, columns, callback } => {
+                                let request = DataColumnSidecarsByRangeV1Request {
+                                    start_slot: start,
+                                    count,
+                                    columns: VariableList::new(columns)
+                                        .expect("Too many columns were requested"),
+                                };
+                                if let Some(request_id) = self.send_request(peer_id, BeaconRequestMessage::DataColumnSidecarsByRange(request)) {
                                     self.callbacks.insert(request_id, callback);
                                 } else if let Err(err) = callback.send(Ok(P2PCallbackResponse::Disconnected)).await {
                                     warn!("Failed to send error response: {err:?}");
@@ -671,9 +687,9 @@ impl Network {
         let message = match message {
             Ok(message) => message,
             Err(err) => {
-                if let ReqRespMessageError::Outbound { request_id, .. } = &err
-                    && let Some(callback) = self.callbacks.get(request_id)
-                    && let Err(err) = callback.send(Err(anyhow!("{err:?}"))).await
+                if let ReqRespMessageError::Outbound { request_id, err } = err
+                    && let Some(callback) = self.callbacks.remove(&request_id)
+                    && let Err(err) = callback.send(Err(P2PCallbackError::ReqResp(err))).await
                 {
                     warn!("Failed to send error response: {err:?}");
                 }
