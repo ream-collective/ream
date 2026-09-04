@@ -50,8 +50,8 @@ fn validate_proposer_duties_epoch(epoch: u64, current_epoch: u64) -> Result<(), 
 }
 
 /// Reads the current epoch so future requests can be rejected before epoch-to-slot conversion.
-fn current_epoch(db: &BeaconDB) -> Result<u64, ApiError> {
-    let slot = Store::new(db.clone(), Arc::new(OperationPool::default()), None)
+fn current_epoch(store: &Store) -> Result<u64, ApiError> {
+    let slot = store
         .get_current_slot()
         .map_err(|err| ApiError::InternalError(format!("Failed to get current slot: {err:?}")))?;
 
@@ -69,7 +69,8 @@ async fn proposer_duties(
     epoch: u64,
     dependent_root_kind: DependentRoot,
 ) -> Result<HttpResponse, ApiError> {
-    let current_epoch = current_epoch(db)?;
+    let store = Store::new(db.clone(), Arc::new(OperationPool::default()), None);
+    let current_epoch = current_epoch(&store)?;
     validate_proposer_duties_epoch(epoch, current_epoch)?;
 
     // Convert only after the guard because epoch-to-slot multiplication is unchecked.
@@ -81,9 +82,7 @@ async fn proposer_duties(
     };
     let start_slot = compute_start_slot_at_epoch(epoch);
     let (state, state_block_root) =
-        get_state_and_block_root_at_or_before_slot(db, start_slot).await?;
-    // Keep the duties and root on the same state branch. The global slot index can point to a
-    // discarded fork or omit blocks from before checkpoint sync.
+        get_canonical_state_and_block_root_at_or_before_slot(&store, start_slot).await?;
     let dependent_root = if state.slot <= decision_slot {
         state_block_root
     } else {
@@ -243,12 +242,45 @@ fn parse_validator_indices(
         .collect()
 }
 
+/// Resolves from fork-choice head so an overwritten slot index cannot select a side fork.
+async fn get_canonical_state_and_block_root_at_or_before_slot(
+    store: &Store,
+    slot: u64,
+) -> Result<(BeaconState, B256), ApiError> {
+    let head_root = store
+        .get_head()
+        .map_err(|err| ApiError::InternalError(format!("Failed to get head root: {err:?}")))?;
+    let block_root = get_block_root_at_or_before_slot_from_head(store, head_root, slot)?;
+
+    get_state_and_block_root(&store.db, block_root, slot).await
+}
+
+fn get_block_root_at_or_before_slot_from_head(
+    store: &Store,
+    head_root: B256,
+    slot: u64,
+) -> Result<B256, ApiError> {
+    store.get_ancestor(head_root, slot).map_err(|err| {
+        ApiError::InternalError(format!(
+            "Failed to find canonical block root at or before slot {slot}: {err:?}"
+        ))
+    })
+}
+
 /// Loads the state at `slot` and the root of the block it was built on.
 async fn get_state_and_block_root_at_or_before_slot(
     db: &BeaconDB,
     slot: u64,
 ) -> Result<(BeaconState, B256), ApiError> {
     let block_root = get_block_root_at_or_before_slot(db, slot)?;
+    get_state_and_block_root(db, block_root, slot).await
+}
+
+async fn get_state_and_block_root(
+    db: &BeaconDB,
+    block_root: B256,
+    slot: u64,
+) -> Result<(BeaconState, B256), ApiError> {
     let mut state = db
         .state_provider()
         .get(block_root)
@@ -296,7 +328,34 @@ fn get_block_root_at_or_before_slot(db: &BeaconDB, slot: u64) -> Result<B256, Ap
 
 #[cfg(test)]
 mod tests {
+    use ream_bls::BLSSignature;
+    use ream_consensus_beacon::electra::beacon_block::{BeaconBlock, SignedBeaconBlock};
+    use ream_storage::db::ReamDB;
+    use tempdir::TempDir;
+    use tree_hash::TreeHash;
+
     use super::*;
+
+    fn test_db() -> (BeaconDB, TempDir) {
+        let temp_dir = TempDir::new("ream_rpc_beacon_duties").expect("creates temp directory");
+        let db = ReamDB::new(temp_dir.path().to_path_buf())
+            .expect("creates database")
+            .init_beacon_db()
+            .expect("initializes beacon database");
+        (db, temp_dir)
+    }
+
+    fn block(slot: u64, parent_root: B256, state_root: B256) -> SignedBeaconBlock {
+        SignedBeaconBlock {
+            message: BeaconBlock {
+                slot,
+                parent_root,
+                state_root,
+                ..Default::default()
+            },
+            signature: BLSSignature::default(),
+        }
+    }
 
     #[test]
     fn proposer_decision_slot_preserves_the_fulu_boundary() {
@@ -335,5 +394,38 @@ mod tests {
             validate_proposer_duties_epoch(u64::MAX, 10),
             Err(ApiError::BadRequest(_))
         ));
+    }
+
+    #[test]
+    fn canonical_lookup_ignores_a_later_side_fork_at_the_same_slot() {
+        let (db, _temp_dir) = test_db();
+        let anchor = block(0, B256::ZERO, B256::repeat_byte(1));
+        let anchor_root = anchor.message.tree_hash_root();
+        let canonical = block(100, anchor_root, B256::repeat_byte(2));
+        let canonical_root = canonical.message.tree_hash_root();
+        let side_fork = block(100, anchor_root, B256::repeat_byte(3));
+        let side_fork_root = side_fork.message.tree_hash_root();
+
+        db.block_provider()
+            .insert(anchor_root, anchor)
+            .expect("stores anchor block");
+        db.block_provider()
+            .insert(canonical_root, canonical)
+            .expect("stores canonical block");
+        db.block_provider()
+            .insert(side_fork_root, side_fork)
+            .expect("stores side-fork block");
+
+        assert_eq!(
+            db.slot_index_provider().get(100).expect("reads slot index"),
+            Some(side_fork_root)
+        );
+
+        let store = Store::new(db, Arc::new(OperationPool::default()), None);
+        assert_eq!(
+            get_block_root_at_or_before_slot_from_head(&store, canonical_root, 100)
+                .expect("resolves canonical ancestor"),
+            canonical_root
+        );
     }
 }

@@ -59,5 +59,8 @@ ream-storage.workspace = true
 ream-sync-committee-pool.workspace = true
 ream-validator-beacon.workspace = true
 
+[dev-dependencies]
+tempdir.workspace = true
+
 [lints]
 workspace = true
