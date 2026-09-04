@@ -7057,10 +7057,12 @@ dependencies = [
  "serde",
  "serde_json",
  "ssz_types",
+ "tempdir",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
  "tree_hash",
+ "url",
 ]
 
 [[package]]

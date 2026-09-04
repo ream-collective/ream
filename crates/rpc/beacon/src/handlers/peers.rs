@@ -1,19 +1,17 @@
 use std::{str::FromStr, sync::Arc};
 
 use actix_web::{
-    HttpResponse, Responder, get,
-    web::{Data, Path, Query},
+    HttpRequest, HttpResponse, Responder, get,
+    web::{Data, Path},
 };
 use discv5::Enr;
 use libp2p::{Multiaddr, PeerId};
-use ream_api_types_beacon::{
-    query::{ConnectionStateQuery, DirectionQuery},
-    responses::{DataResponse, DataResponseWithMeta},
-};
+use ream_api_types_beacon::responses::{DataResponse, DataResponseWithMeta};
 use ream_api_types_common::error::ApiError;
 use ream_p2p::network::beacon::network_state::NetworkState;
 use ream_peer::{ConnectionState, Direction, PeerCount, PeersMetadata};
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
+use url::form_urlencoded;
 
 /// GET /eth/v1/node/peers/{peer_id}
 #[get("/node/peers/{peer_id}")]
@@ -58,27 +56,49 @@ pub async fn get_peer_count(
     Ok(HttpResponse::Ok().json(DataResponse::new(peer_count)))
 }
 
+/// Parses every occurrence of `name`, preserving `None` when the filter is absent.
+fn parse_repeated_query<T: DeserializeOwned>(
+    request: &HttpRequest,
+    name: &str,
+) -> Result<Option<Vec<T>>, ApiError> {
+    let values = form_urlencoded::parse(request.query_string().as_bytes())
+        .filter(|(key, _)| key == name)
+        .map(|(_, value)| {
+            serde_json::from_value::<T>(serde_json::Value::String(value.into_owned())).map_err(
+                |err| {
+                    ApiError::BadRequest(format!("Invalid value for query parameter {name}: {err}"))
+                },
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok((!values.is_empty()).then_some(values))
+}
+
 /// GET /eth/v1/node/peers
 #[get("/node/peers")]
 pub async fn get_peers(
     network_state: Data<Arc<NetworkState>>,
-    state: Query<ConnectionStateQuery>,
-    direction: Query<DirectionQuery>,
+    request: HttpRequest,
 ) -> Result<impl Responder, ApiError> {
+    // Actix's query extractor cannot deserialize repeated keys into `Vec<T>`, so parse them here.
+    let states = parse_repeated_query(&request, "state")?;
+    let directions = parse_repeated_query(&request, "direction")?;
+
     let peer_table = network_state.peer_table.read();
 
     let peers: Vec<Peer> = peer_table
         .values()
         .filter(|cached_peer| {
             // Filter by state if provided
-            if let Some(ref states) = state.state
+            if let Some(ref states) = states
                 && !states.contains(&cached_peer.state)
             {
                 return false;
             }
 
             // Filter by direction if provided
-            if let Some(ref directions) = direction.direction {
+            if let Some(ref directions) = directions {
                 // Unknown direction doesn't match any filter (not in spec)
                 if cached_peer.direction == Direction::Unknown {
                     return false;
@@ -122,4 +142,60 @@ pub struct Peer {
 
     /// Direction of the most recent connection (inbound/outbound)
     pub direction: Direction,
+}
+
+#[cfg(test)]
+mod tests {
+    use actix_web::{ResponseError, http::StatusCode, test::TestRequest};
+
+    use super::*;
+
+    #[test]
+    fn repeated_query_preserves_absent_filters() {
+        let request = TestRequest::with_uri("/node/peers?direction=inbound").to_http_request();
+
+        assert_eq!(
+            parse_repeated_query::<ConnectionState>(&request, "state")
+                .expect("absent state filter parses"),
+            None
+        );
+    }
+
+    #[test]
+    fn repeated_query_accepts_single_and_repeated_values() {
+        let request = TestRequest::with_uri("/node/peers?state=connected").to_http_request();
+        assert_eq!(
+            parse_repeated_query::<ConnectionState>(&request, "state")
+                .expect("single state filter parses"),
+            Some(vec![ConnectionState::Connected])
+        );
+
+        let request = TestRequest::with_uri(
+            "/node/peers?state=connected&state=disconnected&direction=inbound&direction=outbound",
+        )
+        .to_http_request();
+
+        assert_eq!(
+            parse_repeated_query::<ConnectionState>(&request, "state")
+                .expect("repeated state filters parse"),
+            Some(vec![
+                ConnectionState::Connected,
+                ConnectionState::Disconnected
+            ])
+        );
+        assert_eq!(
+            parse_repeated_query::<Direction>(&request, "direction")
+                .expect("repeated direction filters parse"),
+            Some(vec![Direction::Inbound, Direction::Outbound])
+        );
+    }
+
+    #[test]
+    fn repeated_query_rejects_invalid_values_with_bad_request() {
+        let request = TestRequest::with_uri("/node/peers?state=CONNECTED").to_http_request();
+        let error = parse_repeated_query::<ConnectionState>(&request, "state")
+            .expect_err("uppercase state is invalid");
+
+        assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
+    }
 }

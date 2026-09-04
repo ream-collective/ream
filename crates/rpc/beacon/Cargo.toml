@@ -33,6 +33,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tree_hash.workspace = true
+url.workspace = true
 
 #ream-dependencies
 ream-api-types-beacon.workspace = true
@@ -57,6 +58,9 @@ ream-rpc-common.workspace = true
 ream-storage.workspace = true
 ream-sync-committee-pool.workspace = true
 ream-validator-beacon.workspace = true
+
+[dev-dependencies]
+tempdir.workspace = true
 
 [lints]
 workspace = true

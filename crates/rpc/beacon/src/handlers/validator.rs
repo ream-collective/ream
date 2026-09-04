@@ -131,7 +131,7 @@ fn build_validator_balances(
         .collect()
 }
 
-#[get("/beacon/states/{state_id}/validator/{validator_id}")]
+#[get("/beacon/states/{state_id}/validators/{validator_id}")]
 pub async fn get_validator_from_state(
     db: Data<BeaconDB>,
     param: Path<(ID, ValidatorID)>,
