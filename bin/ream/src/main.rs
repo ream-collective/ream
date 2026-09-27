@@ -1041,7 +1041,7 @@ mod tests {
         validator::Validator,
     };
     use ream_executor::ReamExecutor;
-    use ream_fork_choice_beacon::store::get_forkchoice_store;
+    use ream_fork_choice_beacon::store::{Store, get_forkchoice_store};
     use ream_keystore::{
         decrypt::aes128_ctr,
         keystore::{
@@ -2763,6 +2763,16 @@ mod tests {
     #[test]
     #[serial]
     fn test_beacon_node_recovers_head_fork_via_range_sync() {
+        run_beacon_node_recovers_head_fork(true);
+    }
+
+    #[test]
+    #[serial]
+    fn test_beacon_node_recovers_head_fork_with_missing_parents() {
+        run_beacon_node_recovers_head_fork(false);
+    }
+
+    fn run_beacon_node_recovers_head_fork(hide_range_blocks: bool) {
         init_test_tracing();
 
         let port_offset = beacon_port_offset();
@@ -2889,15 +2899,30 @@ mod tests {
                 &fork_a_keystores,
                 &fork_a_password,
             );
-            let mut validator_b_config = validator_node_config_from_args(
+            let validator_b_config = validator_node_config_from_args(
                 node_b1_http_port,
                 &fork_b_keystores,
                 &fork_b_password,
             );
-            validator_b_config.suggested_fee_recipient =
-                "0x0000000000000000000000000000000000000002"
-                    .parse()
-                    .expect("alternate fee recipient should parse");
+            reqwest::Client::new()
+                .post(format!(
+                    "http://127.0.0.1:{node_b1_http_port}/eth/v1/validator/prepare_beacon_proposer"
+                ))
+                .json(
+                    &(0..BEACON_E2E_VALIDATOR_COUNT)
+                        .map(|index| {
+                            serde_json::json!({
+                                "validator_index": index.to_string(),
+                                "fee_recipient": "0x0000000000000000000000000000000000000002"
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .send()
+                .await
+                .expect("register B proposer fee recipients")
+                .error_for_status()
+                .expect("B proposer preparations should succeed");
             let validator_a_handle =
                 spawn_validator_test_node(validator_a_config, validator_a_executor_handle.clone());
             let validator_b_handle =
@@ -2911,9 +2936,13 @@ mod tests {
 
             shutdown_validator_test_node(&validator_a_executor_handle, validator_a_handle).await;
             let node_a_head = wait_for_head_slot_at_least(node_a_http_port, fork_slot).await;
+            let node_a_block_root =
+                beacon_block_root_at_slot(node_a_http_port, node_a_head.0).await;
             shutdown_beacon_test_node(&node_a_executor_handle, node_a_handle).await;
 
-            wait_for_head_slot_at_least(node_b1_http_port, node_a_head.0 + 4).await;
+            // Let every committee in a newer epoch attest to B, and include those votes.
+            let voted_b_target = (node_a_head.0 / SLOTS_PER_EPOCH + 2) * SLOTS_PER_EPOCH + 2;
+            wait_for_head_slot_at_least(node_b1_http_port, voted_b_target).await;
             shutdown_validator_test_node(&validator_b_executor_handle, validator_b_handle).await;
             let node_b_head = wait_for_matching_heads_all(&[
                 node_b1_http_port,
@@ -2922,10 +2951,12 @@ mod tests {
             ])
             .await;
 
+            let node_b_block_root =
+                beacon_block_root_at_slot(node_b1_http_port, node_b_head.0).await;
             let node_b_root_at_fork_slot =
                 beacon_block_root_at_slot(node_b1_http_port, node_a_head.0).await;
             assert_ne!(
-                node_a_head.1, node_b_root_at_fork_slot,
+                node_a_block_root, node_b_root_at_fork_slot,
                 "isolated validators should have produced different roots at slot {}",
                 node_a_head.0
             );
@@ -2998,12 +3029,14 @@ mod tests {
             .await;
             assert_eq!(node_b_head, restarted_peer_head);
 
-            for db in [
-                &node_b1_db_for_restart,
-                &node_b2_db_for_restart,
-                &node_b3_db_for_restart,
-            ] {
-                remove_beacon_slot_indexes(db, node_a_head.0 + 1, node_b_head.0);
+            if hide_range_blocks {
+                for db in [
+                    &node_b1_db_for_restart,
+                    &node_b2_db_for_restart,
+                    &node_b3_db_for_restart,
+                ] {
+                    remove_beacon_slot_indexes(db, node_a_head.0 + 1, node_b_head.0);
+                }
             }
 
             let bootnodes = [
@@ -3020,7 +3053,7 @@ mod tests {
             let node_a_restart_http_port = node_a_restart_config.http_port;
             let node_a_restart_handle = spawn_beacon_test_node(
                 node_a_restart_config,
-                node_a_db_for_restart,
+                node_a_db_for_restart.clone(),
                 node_a_restart_executor_handle.clone(),
             );
             wait_for_beacon_identity(node_a_restart_http_port).await;
@@ -3030,6 +3063,20 @@ mod tests {
             let recovered_head =
                 wait_for_beacon_json(node_a_restart_http_port, "/eth/v1/beacon/headers").await;
             let recovered_head = head_slot_and_root(&recovered_head);
+            let recovered_store = Store::new(
+                node_a_db_for_restart
+                    .init_beacon_db()
+                    .expect("open recovered DB"),
+                Arc::new(ream_operation_pool::OperationPool::default()),
+                None,
+            );
+            assert_eq!(
+                recovered_store.get_head().expect("read canonical head"),
+                node_b_block_root
+                    .parse::<B256>()
+                    .expect("valid target root"),
+                "recovery must switch canonical head, not just store a higher-slot block"
+            );
 
             shutdown_beacon_test_node(&node_a_restart_executor_handle, node_a_restart_handle).await;
             shutdown_beacon_test_node(&node_b3_restart_executor_handle, node_b3_restart_handle)

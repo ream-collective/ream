@@ -655,15 +655,9 @@ impl BlockCache {
             return DataToFetch::BlockRange(range);
         }
 
-        if has_retry_ranges
-            && !candidate_peers.is_empty()
-            && self.block_ranges_in_progress.is_empty()
-        {
-            return DataToFetch::Finished;
-        }
-
         let estimated_blocks_to_fetch = self.estimated_blocks_to_fetch();
-        if estimated_blocks_to_fetch > 0 && self.next_start_slot < target_slot {
+        if !has_retry_ranges && estimated_blocks_to_fetch > 0 && self.next_start_slot < target_slot
+        {
             let blocks_to_fill = estimated_blocks_to_fetch
                 .min(MAX_BLOCKS_PER_REQUEST.min(target_slot - self.next_start_slot));
             let start_slot = self.next_start_slot + 1;
@@ -707,6 +701,13 @@ impl BlockCache {
             return DataToFetch::MissingBlockRoots(block_roots_left_to_fetch);
         }
 
+        if missing_block_roots_len > 0
+            && self.block_roots_in_progress.is_empty()
+            && !candidate_peers.is_empty()
+        {
+            return DataToFetch::ParentsExhausted;
+        }
+
         if !blob_identifiers_left_to_fetch.is_empty() {
             return DataToFetch::MissingBlobIdentifiers(blob_identifiers_left_to_fetch);
         }
@@ -722,10 +723,17 @@ impl BlockCache {
             || missing_data_column_identifiers_len > 0
             || !self.block_ranges_in_progress.is_empty()
             || !self.column_ranges_in_progress.is_empty()
-            || !self.block_ranges_to_retry.is_empty()
             || !self.column_ranges_to_fetch.is_empty()
         {
             return DataToFetch::DownloadsInProgress;
+        }
+
+        if has_retry_ranges {
+            return if candidate_peers.is_empty() {
+                DataToFetch::DownloadsInProgress
+            } else {
+                DataToFetch::RangeExhausted
+            };
         }
 
         DataToFetch::Finished
@@ -929,6 +937,10 @@ pub enum DataToFetch {
     MissingBlobIdentifiers(Vec<BlobIdentifier>),
     MissingDataColumnIdentifiers(Vec<ColumnIdentifier>),
     DownloadsInProgress,
+    /// Cached blocks cannot be connected after trying all current candidates.
+    ParentsExhausted,
+    /// Forward requests stalled, but cached blocks have their required dependencies.
+    RangeExhausted,
     Finished,
 }
 
@@ -948,6 +960,8 @@ impl std::fmt::Display for DataToFetch {
             }
             DataToFetch::DownloadsInProgress => write!(f, "DownloadsInProgress"),
             DataToFetch::Finished => write!(f, "Finished"),
+            DataToFetch::ParentsExhausted => write!(f, "Parent candidates exhausted"),
+            DataToFetch::RangeExhausted => write!(f, "Range candidates exhausted"),
         }
     }
 }
@@ -999,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn data_to_fetch_finishes_after_all_candidates_exhaust_a_retry_range() {
+    fn data_to_fetch_reports_exhausted_range_separately_from_finished() {
         initialize_test_network_spec();
         let mut cache = BlockCache::new(B256::ZERO, 10);
         let range = Range::new(11, 4);
@@ -1014,7 +1028,7 @@ mod tests {
 
         assert_eq!(
             cache.data_to_fetch(14, 0, &HashSet::new(), &candidates, now, true),
-            DataToFetch::Finished
+            DataToFetch::RangeExhausted
         );
     }
 
@@ -1421,7 +1435,7 @@ mod tests {
     }
 
     #[test]
-    fn an_exhausted_backed_off_root_does_not_starve_other_tiers_or_cause_false_finished() {
+    fn exhausted_parent_candidates_end_the_round_without_reporting_finished() {
         initialize_test_network_spec();
         let parent_root = B256::repeat_byte(1);
         let mut block = SignedBeaconBlock {
@@ -1446,7 +1460,7 @@ mod tests {
 
         assert_eq!(
             cache.data_to_fetch(1, 0, &HashSet::new(), &[peer_a], now, false),
-            DataToFetch::DownloadsInProgress
+            DataToFetch::ParentsExhausted
         );
     }
 
@@ -1547,6 +1561,64 @@ mod tests {
             },
             signature: Default::default(),
         }
+    }
+
+    #[test]
+    fn exhausted_forward_range_still_fetches_cached_blocks_missing_parent() {
+        initialize_test_network_spec();
+        let peer = PeerId::random();
+        let local_root = B256::repeat_byte(1);
+        let common_ancestor = B256::repeat_byte(2);
+        let parent = child_block(common_ancestor, 130);
+        let parent_root = parent.message.tree_hash_root();
+        let mut cache = BlockCache::new(local_root, 130);
+        let mut root = parent_root;
+        for slot in 131..=140 {
+            let block = child_block(root, slot);
+            root = block.message.tree_hash_root();
+            cache.add_blocks(vec![block], true, peer).unwrap();
+        }
+        let range = Range::new(141, 1);
+        let now = Instant::now();
+        cache.push_retry_range(range);
+        cache.mark_attempted(RequestKey::BlockRange(range), peer, &[peer], now);
+        assert_eq!(
+            cache.data_to_fetch(141, 0, &HashSet::new(), &[peer], now, true),
+            DataToFetch::MissingBlockRoots(vec![parent_root])
+        );
+        cache.add_parent_blocks(vec![parent], peer).unwrap();
+        cache.mark_parent_root_known(common_ancestor);
+        assert_eq!(
+            cache.data_to_fetch(141, 0, &HashSet::new(), &[peer], now, true),
+            DataToFetch::RangeExhausted
+        );
+        assert_eq!(cache.get_blocks_and_blobs().unwrap().len(), 11);
+    }
+
+    #[test]
+    fn exhausted_forward_range_does_not_bypass_missing_data_columns() {
+        initialize_test_network_spec();
+        let epoch = beacon_network_spec().fulu_fork_epoch;
+        let slot = compute_start_slot_at_epoch(epoch);
+        let peer = PeerId::random();
+        let root = B256::repeat_byte(1);
+        let mut block = child_block(root, slot);
+        block
+            .message
+            .body
+            .blob_kzg_commitments
+            .push(KZGCommitment::empty_for_testing())
+            .unwrap();
+        let mut cache = BlockCache::new(root, slot);
+        cache.add_blocks(vec![block], true, peer).unwrap();
+        let range = Range::new(slot + 1, 1);
+        let now = Instant::now();
+        cache.push_retry_range(range);
+        cache.mark_attempted(RequestKey::BlockRange(range), peer, &[peer], now);
+        assert!(matches!(
+            cache.data_to_fetch(slot + 1, epoch, &HashSet::from([0]), &[peer], now, true),
+            DataToFetch::MissingDataColumnIdentifiers(_)
+        ));
     }
 
     #[test]
