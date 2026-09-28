@@ -382,7 +382,15 @@ struct CoverageDivergenceOutcome {
     non_connecting_peer: PeerId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportFailureKind {
+    MissingAncestry,
+    Processing,
+}
+
+#[derive(Debug)]
 struct ImportFailure {
+    kind: ImportFailureKind,
     imported_count: u64,
     error: anyhow::Error,
 }
@@ -696,6 +704,26 @@ impl BlockRangeSyncer {
     }
 
     async fn run_range_sync(&mut self) -> anyhow::Result<()> {
+        let mut task_handles = Vec::new();
+        let result = self.run_range_sync_inner(&mut task_handles).await;
+        self.cancel_downloads(task_handles).await;
+        result
+    }
+
+    async fn cancel_downloads(&mut self, tasks: Vec<DownloadTask>) {
+        for task in &tasks {
+            task.abort();
+        }
+        for mut task in tasks {
+            task.wait_stopped().await;
+            self.peer_manager.mark_peer_as_idle(&task.peer_id());
+        }
+    }
+
+    async fn run_range_sync_inner(
+        &mut self,
+        task_handles: &mut Vec<DownloadTask>,
+    ) -> anyhow::Result<()> {
         if let Some(not_before) = self.next_range_not_before.take()
             && let Some(remaining) = not_before.checked_duration_since(Instant::now())
         {
@@ -726,12 +754,10 @@ impl BlockRangeSyncer {
 
         // phase 1: download majority of blocks from ranges
         let mut block_cache = BlockCache::new(head_root, head_slot);
-        let mut task_handles = vec![];
 
         let mut phase = SyncPhase::Finalized;
         let mut active_target: Option<ActivePhaseTarget> = None;
         let mut saw_empty_range = false;
-        let mut saw_empty_range_in_completed_phase = false;
         let mut finalized_phase_settled = false;
         let mut finalized_target_was_ahead = false;
         let mut candidate_exhausted_since: Option<Instant> = None;
@@ -745,6 +771,7 @@ impl BlockRangeSyncer {
         let mut parent_lookup_started_at: Option<Instant> = None;
         let mut parent_lookup_requests = 0u64;
         let mut parent_lookup_peers = HashSet::new();
+        let mut last_observation = None;
 
         loop {
             self.peer_manager.update_peer_set();
@@ -768,7 +795,6 @@ impl BlockRangeSyncer {
             if active_target.is_none() {
                 if phase == SyncPhase::Finalized {
                     if finalized_target_reached(&selection, block_cache.next_start_slot()) {
-                        saw_empty_range_in_completed_phase |= saw_empty_range;
                         saw_empty_range = false;
                         phase = SyncPhase::Head;
                         continue;
@@ -841,6 +867,7 @@ impl BlockRangeSyncer {
                 scan_start_slot,
                 target_slot: target.slot,
             };
+            last_observation = Some(observation.clone());
             self.reconcile_not_ahead(&observation);
 
             let candidate_peers: Vec<PeerId> = self
@@ -857,7 +884,7 @@ impl BlockRangeSyncer {
                     head: &mut self.head_frontier,
                 };
                 poll_ready_tasks(
-                    &mut task_handles,
+                    task_handles,
                     &mut block_cache,
                     &mut self.peer_manager,
                     &mut frontiers,
@@ -1018,7 +1045,10 @@ impl BlockRangeSyncer {
             );
             if !matches!(
                 data_to_fetch,
-                DataToFetch::DownloadsInProgress | DataToFetch::Finished
+                DataToFetch::DownloadsInProgress
+                    | DataToFetch::Finished
+                    | DataToFetch::ParentsExhausted
+                    | DataToFetch::RangeExhausted
             ) {
                 recovery_window_open = false;
             }
@@ -1158,7 +1188,6 @@ impl BlockRangeSyncer {
                             parent_lookup_peers.clone(),
                             HashSet::new(),
                         );
-                        block_cache = BlockCache::new(head_root, head_slot);
                         break;
                     }
                     if block_roots.is_empty() {
@@ -1177,7 +1206,6 @@ impl BlockRangeSyncer {
                             parent_lookup_peers.clone(),
                             HashSet::new(),
                         );
-                        block_cache = BlockCache::new(head_root, head_slot);
                         break;
                     }
 
@@ -1350,11 +1378,22 @@ impl BlockRangeSyncer {
                     );
                     sleep(range_sync_delay(Duration::from_secs(10))).await;
                 }
-                DataToFetch::Finished => {
-                    if phase == SyncPhase::Finalized && block_cache.next_start_slot() >= target.slot
+                DataToFetch::ParentsExhausted => {
+                    pending_conclusions.observe(
+                        phase,
+                        observation.clone(),
+                        RemoteNoProgressReason::AncestorNotFound,
+                        parent_lookup_peers.clone(),
+                        HashSet::new(),
+                    );
+                    break;
+                }
+                DataToFetch::Finished | DataToFetch::RangeExhausted => {
+                    if matches!(data_to_fetch, DataToFetch::Finished)
+                        && phase == SyncPhase::Finalized
+                        && block_cache.next_start_slot() >= target.slot
                     {
                         finalized_target_was_ahead = target.slot > head_slot;
-                        saw_empty_range_in_completed_phase |= saw_empty_range;
                         saw_empty_range = false;
                         phase = SyncPhase::Head;
                         active_target = None;
@@ -1382,7 +1421,7 @@ impl BlockRangeSyncer {
         }
 
         info!(
-            "Block range sync completed a range successfully with {} blocks and {} blobs.",
+            "Block range download segment ended with {} blocks and {} blobs.",
             block_cache.block_count(),
             block_cache.downloaded_blob_count(),
         );
@@ -1401,20 +1440,18 @@ impl BlockRangeSyncer {
             ),
         }
 
-        if imported_count > 0 {
-            self.clear_tracker();
-        } else if import_result.is_ok() {
-            self.commit_pending_conclusions(pending_conclusions, range_exclusions);
-        }
+        self.record_import_outcome(
+            &import_result,
+            last_observation,
+            pending_conclusions,
+            range_exclusions,
+        );
 
         let target_was_ahead = finalized_target_was_ahead
             || active_target
                 .as_ref()
                 .is_some_and(|target| target.slot > head_slot);
-        if target_was_ahead
-            && (saw_empty_range_in_completed_phase || saw_empty_range)
-            && imported_count == 0
-        {
+        if target_was_ahead && imported_count == 0 {
             self.next_range_not_before =
                 Some(Instant::now() + range_sync_delay(ZERO_PROGRESS_BACKOFF));
         }
@@ -1422,33 +1459,86 @@ impl BlockRangeSyncer {
         import_result.map(|_| ()).map_err(|err| err.error)
     }
 
+    fn record_import_outcome(
+        &mut self,
+        result: &Result<u64, ImportFailure>,
+        observation: Option<FrontierObservation>,
+        mut pending: PendingConclusions,
+        exclusions: RangeExclusions,
+    ) {
+        let imported_count = match result {
+            Ok(count) => *count,
+            Err(err) => err.imported_count,
+        };
+        if imported_count > 0 {
+            // New block/state pairs are useful even before fork choice switches branches.
+            self.clear_tracker();
+            return;
+        }
+        if matches!(result, Err(err) if err.kind == ImportFailureKind::Processing) {
+            // EL, validation and local storage failures are not evidence of a missing fork.
+            return;
+        }
+        if let Some(observation) = observation
+            && observation.target_slot > observation.anchor_slot
+        {
+            let reason = if result.is_err() {
+                RemoteNoProgressReason::AncestorNotFound
+            } else {
+                RemoteNoProgressReason::NoNewDescendants
+            };
+            pending.observe(
+                observation.phase,
+                observation,
+                reason,
+                HashSet::new(),
+                HashSet::new(),
+            );
+        }
+        self.commit_pending_conclusions(pending, exclusions);
+    }
+
     async fn import_downloaded(&mut self, block_cache: BlockCache) -> Result<u64, ImportFailure> {
         let bundles = block_cache
             .get_blocks_and_blobs()
             .map_err(|err| ImportFailure {
+                kind: ImportFailureKind::MissingAncestry,
                 imported_count: 0,
                 error: err,
             })?;
         let mut imported_count = 0u64;
         for bundle in bundles {
-            if let Err(err) = self.import_one(bundle).await {
-                return Err(ImportFailure {
-                    imported_count,
-                    error: err,
-                });
+            match self.import_one(bundle).await {
+                Ok(true) => imported_count += 1,
+                Ok(false) => {}
+                Err(err) => {
+                    return Err(ImportFailure {
+                        kind: ImportFailureKind::Processing,
+                        imported_count,
+                        error: err,
+                    });
+                }
             }
-            imported_count += 1;
         }
         Ok(imported_count)
     }
 
-    async fn import_one(&mut self, bundle: BlockAndBlobBundle) -> anyhow::Result<()> {
+    async fn import_one(&mut self, bundle: BlockAndBlobBundle) -> anyhow::Result<bool> {
         let BlockAndBlobBundle {
             block,
             blobs,
             columns,
             source_peer,
         } = bundle;
+        let block_root = block.message.tree_hash_root();
+        {
+            let store = self.beacon_chain.store.lock().await;
+            if store.db.block_provider().get(block_root)?.is_some()
+                && store.db.state_provider().get(block_root)?.is_some()
+            {
+                return Ok(false);
+            }
+        }
         let fulu_fork_epoch = beacon_network_spec().fulu_fork_epoch;
         info!("Processing block with slot {}", block.message.slot);
 
@@ -1523,7 +1613,7 @@ impl BlockRangeSyncer {
             }
         }
         self.peer_manager.record_processed_blocks(&source_peer, 1);
-        Ok(())
+        Ok(true)
     }
 
     fn merge_confirmed_empty_coverage(&mut self, phase: SyncPhase, advance: &CoverageAdvance) {
@@ -1606,7 +1696,47 @@ pub enum DownloadTask {
     },
 }
 
+impl Drop for DownloadTask {
+    fn drop(&mut self) {
+        // Also cancel requests when the enclosing sync task is cancelled or unwinds.
+        self.abort();
+    }
+}
+
 impl DownloadTask {
+    fn peer_id(&self) -> PeerId {
+        match self {
+            Self::BlockRange { peer_id, .. }
+            | Self::DataColumnRange { peer_id, .. }
+            | Self::BlockRoots { peer_id, .. }
+            | Self::BlobIdentifiers { peer_id, .. }
+            | Self::DataColumnIdentifiers { peer_id, .. } => *peer_id,
+        }
+    }
+
+    fn abort(&self) {
+        match self {
+            Self::BlockRange { handle, .. } | Self::BlockRoots { handle, .. } => handle.abort(),
+            Self::DataColumnRange { handle, .. } | Self::DataColumnIdentifiers { handle, .. } => {
+                handle.abort()
+            }
+            Self::BlobIdentifiers { handle, .. } => handle.abort(),
+        }
+    }
+
+    async fn wait_stopped(&mut self) {
+        match self {
+            Self::BlockRange { handle, .. } | Self::BlockRoots { handle, .. } => {
+                let _ = handle.await;
+            }
+            Self::DataColumnRange { handle, .. } | Self::DataColumnIdentifiers { handle, .. } => {
+                let _ = handle.await;
+            }
+            Self::BlobIdentifiers { handle, .. } => {
+                let _ = handle.await;
+            }
+        }
+    }
     pub fn new_block_range(
         handle: JoinHandle<anyhow::Result<StreamOutcome<SignedBeaconBlock>>>,
         range: Range,
@@ -4086,5 +4216,502 @@ mod tests {
              candidate could stay excluded forever even after the peer cooldown reopens"
         );
         assert!(frontier.cooldown_until.is_none());
+    }
+
+    fn block(parent_root: B256, slot: u64) -> SignedBeaconBlock {
+        SignedBeaconBlock {
+            message: BeaconBlock {
+                parent_root,
+                slot,
+                ..Default::default()
+            },
+            signature: Default::default(),
+        }
+    }
+
+    fn observation(root: B256) -> FrontierObservation {
+        FrontierObservation {
+            anchor_root: root,
+            anchor_slot: 130,
+            scan_start_slot: 130,
+            phase: SyncPhase::Head,
+            target_slot: 150,
+        }
+    }
+
+    #[test]
+    fn missing_ancestry_counts_but_processing_errors_do_not() {
+        initialize_test_network_spec();
+        let (_dir, chain) = test_beacon_chain();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut syncer = BlockRangeSyncer::new(
+            Arc::new(chain),
+            sender,
+            test_network_state(),
+            ReamExecutor::new().unwrap(),
+        );
+        let root = B256::repeat_byte(1);
+        futures::executor::block_on(async {
+            for expected in 1..=3 {
+                let mut cache = BlockCache::new(root, 130);
+                cache
+                    .add_blocks(
+                        vec![block(B256::repeat_byte(2), 131)],
+                        true,
+                        PeerId::random(),
+                    )
+                    .unwrap();
+                let result = syncer.import_downloaded(cache).await;
+                assert_eq!(
+                    result.as_ref().unwrap_err().kind,
+                    ImportFailureKind::MissingAncestry
+                );
+                syncer.record_import_outcome(
+                    &result,
+                    Some(observation(root)),
+                    PendingConclusions::default(),
+                    RangeExclusions::default(),
+                );
+                assert_eq!(
+                    syncer
+                        .head_frontier
+                        .as_ref()
+                        .unwrap()
+                        .consecutive_no_progress,
+                    expected
+                );
+            }
+            assert!(
+                syncer
+                    .head_frontier
+                    .as_ref()
+                    .unwrap()
+                    .needs_recovery(&observation(root), 130)
+            );
+            let result = Err(ImportFailure {
+                kind: ImportFailureKind::Processing,
+                imported_count: 0,
+                error: anyhow!("execution engine unavailable"),
+            });
+            syncer.record_import_outcome(
+                &result,
+                Some(observation(root)),
+                PendingConclusions::default(),
+                RangeExclusions::default(),
+            );
+            assert_eq!(
+                syncer
+                    .head_frontier
+                    .as_ref()
+                    .unwrap()
+                    .consecutive_no_progress,
+                3
+            );
+        });
+    }
+
+    #[test]
+    fn already_stored_blocks_do_not_reset_recovery() {
+        initialize_test_network_spec();
+        let (_dir, chain) = test_beacon_chain();
+        let peer = PeerId::random();
+        let parent = B256::repeat_byte(1);
+        let known = block(parent, 131);
+        let root = known.message.tree_hash_root();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut syncer = BlockRangeSyncer::new(
+            Arc::new(chain),
+            sender,
+            test_network_state(),
+            ReamExecutor::new().unwrap(),
+        );
+        futures::executor::block_on(async {
+            {
+                let store = syncer.beacon_chain.store.lock().await;
+                store
+                    .db
+                    .block_provider()
+                    .insert(root, known.clone())
+                    .unwrap();
+                store
+                    .db
+                    .state_provider()
+                    .insert(root, test_beacon_state())
+                    .unwrap();
+            }
+            for expected in 1..=4 {
+                let mut cache = BlockCache::new(parent, 130);
+                cache.add_blocks(vec![known.clone()], true, peer).unwrap();
+                let result = syncer.import_downloaded(cache).await;
+                assert_eq!(*result.as_ref().unwrap(), 0);
+                syncer.record_import_outcome(
+                    &result,
+                    Some(observation(parent)),
+                    PendingConclusions::default(),
+                    RangeExclusions::default(),
+                );
+                assert_eq!(
+                    syncer
+                        .head_frontier
+                        .as_ref()
+                        .unwrap()
+                        .consecutive_no_progress,
+                    expected
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn failed_segment_cancels_downloads_and_releases_reserved_peers() {
+        initialize_test_network_spec();
+        let (_dir, chain) = test_beacon_chain();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let executor = ReamExecutor::new().unwrap();
+        let (peer_manager, peer) = test_peer_manager_with_one_peer();
+        let mut syncer = BlockRangeSyncer::new(
+            Arc::new(chain),
+            sender,
+            test_network_state(),
+            executor.clone(),
+        );
+        syncer.peer_manager = peer_manager;
+        assert!(syncer.peer_manager.fetch_idle_peer_from(&[peer]).is_some());
+        let handle = executor.spawn(std::future::pending::<StreamOutcome<SignedBeaconBlock>>());
+        let abort = handle.abort_handle();
+        let mut tasks = vec![DownloadTask::new_block_roots(
+            handle,
+            vec![B256::ZERO],
+            peer,
+        )];
+        executor.runtime().block_on(async {
+            // Empty DB makes the segment return through `?` before reaching its normal end.
+            assert!(syncer.run_range_sync_inner(&mut tasks).await.is_err());
+            syncer.cancel_downloads(tasks).await;
+            assert!(abort.is_finished());
+            assert!(syncer.peer_manager.fetch_idle_peer_from(&[peer]).is_some());
+        });
+    }
+
+    #[test]
+    fn dropping_download_task_aborts_its_request() {
+        let executor = ReamExecutor::new().unwrap();
+        let handle = executor.spawn(std::future::pending::<StreamOutcome<SignedBeaconBlock>>());
+        let abort = handle.abort_handle();
+        let task = DownloadTask::new_block_roots(handle, vec![B256::ZERO], PeerId::random());
+        drop(task);
+        executor.runtime().block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !abort.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "test-utils")]
+    fn stalled_segments_trigger_recovery_without_gossip() {
+        run_stalled_segments(false);
+    }
+
+    #[test]
+    #[cfg(feature = "test-utils")]
+    fn parent_lookup_budget_records_recovery_backoff() {
+        run_stalled_segments(true);
+    }
+
+    #[cfg(feature = "test-utils")]
+    fn run_stalled_segments(exhaust_budget: bool) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        initialize_test_network_spec();
+        let (_dir, chain) = test_beacon_chain();
+        let executor = ReamExecutor::new().unwrap();
+        let network = test_network_state();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let root_requests = Arc::new(AtomicUsize::new(0));
+        let probes = Arc::new(AtomicUsize::new(0));
+        let root_requests_task = root_requests.clone();
+        let probes_task = probes.clone();
+        let mut missing_parent = B256::repeat_byte(9);
+        let mut ancestors = HashMap::new();
+        if exhaust_budget {
+            for slot in 1..=130 {
+                let parent = block(missing_parent, slot);
+                missing_parent = parent.message.tree_hash_root();
+                ancestors.insert(missing_parent, parent);
+            }
+        }
+        let child = block(missing_parent, 131);
+        let child_root = child.message.tree_hash_root();
+        let responder = executor.spawn(async move {
+            while let Some(message) = receiver.recv().await {
+                let callback = match message {
+                    P2PMessage::Request(P2PRequest::BlockRange {
+                        start,
+                        count,
+                        callback,
+                        ..
+                    }) => {
+                        if count > MAX_BLOCKS_PER_REQUEST {
+                            probes_task.fetch_add(1, Ordering::SeqCst);
+                        }
+                        if start <= 131 && start + count > 131 {
+                            callback
+                                .send(Ok(P2PCallbackResponse::ResponseMessage(Arc::new(
+                                    BeaconResponseMessage::BeaconBlocksByRange(child.clone()),
+                                ))))
+                                .await
+                                .unwrap();
+                        }
+                        callback
+                    }
+                    P2PMessage::Request(P2PRequest::BlockRoots {
+                        roots, callback, ..
+                    }) => {
+                        if !exhaust_budget {
+                            assert_eq!(roots, vec![missing_parent]);
+                        }
+                        root_requests_task.fetch_add(roots.len(), Ordering::SeqCst);
+                        for root in roots {
+                            if let Some(parent) = ancestors.get(&root) {
+                                callback
+                                    .send(Ok(P2PCallbackResponse::ResponseMessage(Arc::new(
+                                        BeaconResponseMessage::BeaconBlocksByRoot(parent.clone()),
+                                    ))))
+                                    .await
+                                    .unwrap();
+                            }
+                        }
+                        callback
+                    }
+                    _ => panic!("unexpected request"),
+                };
+                callback
+                    .send(Ok(P2PCallbackResponse::EndOfStream))
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut syncer =
+            BlockRangeSyncer::new(Arc::new(chain), sender, network.clone(), executor.clone());
+        executor.runtime().block_on(async {
+            let genesis = block(B256::ZERO, 0);
+            let genesis_root = genesis.message.tree_hash_root();
+            let local = block(genesis_root, 130);
+            let local_root = local.message.tree_hash_root();
+            {
+                let store = syncer.beacon_chain.store.lock().await;
+                let checkpoint = Checkpoint {
+                    epoch: 0,
+                    root: genesis_root,
+                };
+                store
+                    .db
+                    .block_provider()
+                    .insert(genesis_root, genesis)
+                    .unwrap();
+                store.db.block_provider().insert(local_root, local).unwrap();
+                store
+                    .db
+                    .justified_checkpoint_provider()
+                    .insert(Checkpoint {
+                        epoch: 0,
+                        root: local_root,
+                    })
+                    .unwrap();
+                store
+                    .db
+                    .finalized_checkpoint_provider()
+                    .insert(checkpoint)
+                    .unwrap();
+                store
+                    .db
+                    .unrealized_justifications_provider()
+                    .insert(local_root, checkpoint)
+                    .unwrap();
+                store.db.genesis_time_provider().insert(0).unwrap();
+                store
+                    .db
+                    .time_provider()
+                    .insert(160 * beacon_network_spec().seconds_per_slot())
+                    .unwrap();
+            }
+            let add_peers = || {
+                for _ in 0..MIN_SYNC_PEERS {
+                    let id = PeerId::random();
+                    let mut peer = CachedPeer::new(
+                        id,
+                        None,
+                        ConnectionState::Connected,
+                        Direction::Outbound,
+                        None,
+                    );
+                    peer.status = Some(Status {
+                        head_slot: 150,
+                        head_root: child_root,
+                        ..Default::default()
+                    });
+                    network.peer_table.write().insert(id, peer);
+                }
+            };
+            add_peers();
+            if exhaust_budget {
+                tokio::time::timeout(Duration::from_secs(20), syncer.run_range_sync())
+                    .await
+                    .unwrap()
+                    .unwrap_err();
+                assert_eq!(
+                    root_requests.load(Ordering::SeqCst),
+                    MAX_TOTAL_ANCESTOR_REQUESTS_PER_ROUND as usize
+                );
+                let frontier = syncer
+                    .head_frontier
+                    .as_ref()
+                    .expect("budget failure must be recorded");
+                assert_eq!(frontier.consecutive_no_progress, 1);
+                assert!(frontier.recovery_round_not_before.is_some());
+                assert_eq!(
+                    syncer.beacon_chain.store.lock().await.get_head().unwrap(),
+                    local_root
+                );
+                return;
+            }
+            for expected in 1..=3 {
+                let error = tokio::time::timeout(Duration::from_secs(10), syncer.run_range_sync())
+                    .await
+                    .unwrap()
+                    .unwrap_err();
+                assert!(
+                    syncer.head_frontier.is_some(),
+                    "segment failed before recording ancestry: {error:#}"
+                );
+                assert_eq!(
+                    syncer
+                        .head_frontier
+                        .as_ref()
+                        .unwrap()
+                        .consecutive_no_progress,
+                    expected
+                );
+            }
+            assert!(root_requests.load(Ordering::SeqCst) >= 3 * MIN_SYNC_PEERS);
+            assert_eq!(probes.load(Ordering::SeqCst), 0);
+            // New peers become available while the old peers' failed attempts are cooling down.
+            add_peers();
+            tokio::time::timeout(Duration::from_secs(10), syncer.run_range_sync())
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                probes.load(Ordering::SeqCst) > 0,
+                "stalls should trigger a recovery probe"
+            );
+            assert_eq!(
+                syncer.beacon_chain.store.lock().await.get_head().unwrap(),
+                local_root
+            );
+        });
+        responder.abort();
+    }
+
+    #[test]
+    fn missing_parent_retry_uses_another_peer_and_keeps_downloaded_children() {
+        initialize_test_network_spec();
+        let executor = ReamExecutor::new().unwrap();
+        let network = test_network_state();
+        let peers = [PeerId::random(), PeerId::random()];
+        for id in peers {
+            network.peer_table.write().insert(
+                id,
+                CachedPeer::new(
+                    id,
+                    None,
+                    ConnectionState::Connected,
+                    Direction::Outbound,
+                    None,
+                ),
+            );
+        }
+        let mut manager = PeerManager::new(network);
+        manager.update_peer_set();
+        let anchor = B256::repeat_byte(1);
+        let parent = block(anchor, 130);
+        let parent_root = parent.message.tree_hash_root();
+        let mut cache = BlockCache::new(anchor, 131);
+        cache
+            .add_blocks(vec![block(parent_root, 131)], true, peers[0])
+            .unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let responder = executor.spawn(async move {
+            let mut requested_peers = Vec::new();
+            while requested_peers.len() < 2 {
+                let P2PMessage::Request(P2PRequest::BlockRoots {
+                    peer_id,
+                    roots,
+                    callback,
+                }) = receiver.recv().await.unwrap()
+                else {
+                    panic!("expected parent request");
+                };
+                assert_eq!(roots, vec![parent_root]);
+                requested_peers.push(peer_id);
+                if requested_peers.len() == 2 {
+                    callback
+                        .send(Ok(P2PCallbackResponse::ResponseMessage(Arc::new(
+                            BeaconResponseMessage::BeaconBlocksByRoot(parent.clone()),
+                        ))))
+                        .await
+                        .unwrap();
+                }
+                callback
+                    .send(Ok(P2PCallbackResponse::EndOfStream))
+                    .await
+                    .unwrap();
+            }
+            assert_ne!(requested_peers[0], requested_peers[1]);
+        });
+        let mut saw_empty = false;
+        for _ in 0..2 {
+            let excluded = cache.attempted_peers_for(RequestKey::BlockRoot(parent_root));
+            let peer = manager
+                .fetch_idle_peer_from_excluding(&peers, &excluded)
+                .unwrap();
+            cache.extend_block_roots_in_progress(&[parent_root]);
+            let handle = PeerRootsDownloader::start(
+                peer.peer_id,
+                sender.clone(),
+                executor.clone(),
+                vec![parent_root],
+            );
+            let mut tasks = vec![DownloadTask::new_block_roots(
+                handle,
+                vec![parent_root],
+                peer.peer_id,
+            )];
+            poll_until_done(
+                &mut tasks,
+                &mut cache,
+                &mut manager,
+                &HashSet::new(),
+                &mut saw_empty,
+                &peers,
+            );
+        }
+        futures::executor::block_on(responder).unwrap().unwrap();
+        assert_eq!(
+            cache
+                .get_blocks_and_blobs()
+                .unwrap()
+                .iter()
+                .map(|bundle| bundle.block.message.slot)
+                .collect::<Vec<_>>(),
+            vec![130, 131]
+        );
+        for peer in peers {
+            assert!(manager.fetch_idle_peer_from(&[peer]).is_some());
+        }
     }
 }
