@@ -11,7 +11,7 @@ use alloy_primitives::B256;
 use anyhow::anyhow;
 use futures::StreamExt;
 use ream_api_types_beacon::{
-    block::BroadcastValidation,
+    block::{BroadcastValidation, SignedBlockContents},
     id::ValidatorID,
     responses::{
         BeaconResponse, BeaconVersionedResponse, DataResponse, ETH_CONSENSUS_VERSION_HEADER,
@@ -23,7 +23,7 @@ use ream_chain_beacon::beacon_chain::{BeaconChain, BlockProcessingOutcome};
 use ream_consensus_beacon::{
     blob_sidecar::BlobIdentifier,
     data_column_sidecar::{
-        ColumnIdentifier, DataColumnSidecar, get_data_column_sidecars_from_block,
+        Cell, ColumnIdentifier, DataColumnSidecar, get_data_column_sidecars_from_block,
     },
     electra::{
         beacon_block::{BeaconBlock, SignedBeaconBlock},
@@ -34,8 +34,9 @@ use ream_consensus_beacon::{
     genesis::Genesis,
     matrix_entry::{compute_cells_and_kzg_proofs, das_context},
 };
-use ream_consensus_misc::constants::beacon::{
-    GENESIS_SLOT, WHISTLEBLOWER_REWARD_QUOTIENT, genesis_validators_root,
+use ream_consensus_misc::{
+    constants::beacon::{GENESIS_SLOT, WHISTLEBLOWER_REWARD_QUOTIENT, genesis_validators_root},
+    polynomial_commitments::kzg_proof::KZGProof,
 };
 use ream_fork_choice_beacon::store::Store;
 use ream_network_manager::p2p_sender::P2PSender;
@@ -556,20 +557,7 @@ async fn publish_and_process_block(
             ApiError::InternalError(format!("Failed to process current slot tick: {err}"))
         })?;
 
-    // Broadcast via P2P
-    let fork_digest = beacon_network_spec().fork_digest(
-        beacon_network_spec().current_epoch(),
-        genesis_validators_root(),
-    );
-    let topic = GossipTopic {
-        fork: fork_digest,
-        kind: GossipTopicKind::BeaconBlock,
-    };
-
-    p2p_sender.send_gossip(GossipMessage {
-        topic,
-        data: signed_block.as_ssz_bytes(),
-    });
+    gossip_block(&signed_block, p2p_sender.as_ref());
 
     broadcast_data_column_sidecars(
         signed_block.clone(),
@@ -578,8 +566,29 @@ async fn publish_and_process_block(
     )
     .await;
 
-    // Integrate into state (after broadcast)
-    let integration_success = match beacon_chain.process_block(signed_block.clone()).await {
+    import_published_block(signed_block, beacon_chain.as_ref()).await
+}
+
+fn gossip_block(signed_block: &SignedBeaconBlock, p2p_sender: &P2PSender) {
+    let fork_digest = beacon_network_spec().fork_digest(
+        beacon_network_spec().current_epoch(),
+        genesis_validators_root(),
+    );
+    p2p_sender.send_gossip(GossipMessage {
+        topic: GossipTopic {
+            fork: fork_digest,
+            kind: GossipTopicKind::BeaconBlock,
+        },
+        data: signed_block.as_ssz_bytes(),
+    });
+}
+
+/// Imports a block this node has already broadcast.
+async fn import_published_block(
+    signed_block: SignedBeaconBlock,
+    beacon_chain: &BeaconChain,
+) -> Result<HttpResponse, ApiError> {
+    let integration_success = match beacon_chain.process_block(signed_block).await {
         Ok(BlockProcessingOutcome::Imported { .. }) => true,
         Ok(BlockProcessingOutcome::PendingAvailability { block_root }) => {
             warn!("Published block {block_root} is pending data availability");
@@ -626,6 +635,22 @@ fn build_and_store_data_column_sidecars(
         )?);
     }
 
+    store_data_column_sidecars(
+        signed_block,
+        block_root,
+        cells_and_kzg_proofs,
+        column_sidecars_provider,
+    )
+}
+
+/// Builds this node's own data column sidecars from per-blob cells and cell proofs, and stores
+/// them so the block can be imported as available.
+fn store_data_column_sidecars(
+    signed_block: &SignedBeaconBlock,
+    block_root: B256,
+    cells_and_kzg_proofs: Vec<(Vec<Cell>, Vec<KZGProof>)>,
+    column_sidecars_provider: &ColumnSidecarsTable,
+) -> anyhow::Result<Vec<DataColumnSidecar>> {
     let sidecars = get_data_column_sidecars_from_block(signed_block, cells_and_kzg_proofs)
         .map_err(|err| {
             anyhow!("Failed to build data column sidecars for block {block_root:?}: {err}")
@@ -690,6 +715,10 @@ async fn broadcast_data_column_sidecars(
         }
     };
 
+    gossip_data_column_sidecars(sidecars, p2p_sender);
+}
+
+fn gossip_data_column_sidecars(sidecars: Vec<DataColumnSidecar>, p2p_sender: &P2PSender) {
     let fork_digest = beacon_network_spec().fork_digest(
         beacon_network_spec().current_epoch(),
         genesis_validators_root(),
@@ -721,6 +750,87 @@ fn current_unix_time_ceil_secs() -> Result<u64, String> {
     Ok(duration.as_secs() + u64::from(duration.subsec_nanos() > 0))
 }
 
+fn decode_block_contents(body: &[u8], version: &str) -> Result<SignedBlockContents, ApiError> {
+    if !matches!(version, "electra" | "fulu") {
+        return Err(ApiError::BadRequest(format!(
+            "Unsupported block contents version: {version}"
+        )));
+    }
+    let contents = SignedBlockContents::from_ssz_bytes(body).map_err(|err| {
+        ApiError::BadRequest(format!("Failed to decode SSZ block contents: {err:?}"))
+    })?;
+    let count = contents
+        .signed_block
+        .message
+        .body
+        .blob_kzg_commitments
+        .len();
+    let proofs_per_blob = if version == "fulu" { 128 } else { 1 };
+    if contents.blobs.len() != count || contents.kzg_proofs.len() != count * proofs_per_blob {
+        return Err(ApiError::BadRequest(
+            "Block contents blob/proof counts do not match commitments".into(),
+        ));
+    }
+    Ok(contents)
+}
+
+/// Blobs checked on publish, with the cells computed while checking them.
+struct PublishedBlobs {
+    cached: Vec<ream_execution_rpc_types::get_blobs::BlobAndProofV1>,
+    /// Per-blob cells and cell proofs (Fulu only), reused to build the data column sidecars so
+    /// the expensive extension runs once per blob.
+    cells_and_kzg_proofs: Vec<(Vec<Cell>, Vec<KZGProof>)>,
+}
+
+fn validate_contents_blobs(
+    contents: &SignedBlockContents,
+    fulu: bool,
+) -> anyhow::Result<PublishedBlobs> {
+    use ream_polynomial_commitments::handlers::{
+        compute_blob_kzg_proof, verify_blob_kzg_proof_batch,
+    };
+    let commitments = &contents.signed_block.message.body.blob_kzg_commitments;
+    let mut cached = Vec::with_capacity(contents.blobs.len());
+    let mut cells_and_kzg_proofs = Vec::new();
+    for (index, (blob, commitment)) in contents.blobs.iter().zip(commitments.iter()).enumerate() {
+        let proof = if fulu {
+            let computed = das_context()
+                .blob_to_kzg_commitment(&blob.to_fixed_bytes())
+                .map_err(|err| anyhow!("Failed to compute blob commitment: {err:?}"))?;
+            anyhow::ensure!(
+                computed == commitment.0,
+                "Blob {index} does not match commitment"
+            );
+            let (cells, proofs) = compute_cells_and_kzg_proofs(blob, das_context())?;
+            anyhow::ensure!(
+                proofs.as_slice() == &contents.kzg_proofs[index * 128..(index + 1) * 128],
+                "Invalid cell proofs for blob {index}"
+            );
+            cells_and_kzg_proofs.push((cells, proofs));
+            compute_blob_kzg_proof(blob, commitment)?
+        } else {
+            let proof = contents.kzg_proofs[index];
+            anyhow::ensure!(
+                verify_blob_kzg_proof_batch(
+                    std::slice::from_ref(blob),
+                    std::slice::from_ref(commitment),
+                    &[proof]
+                )?,
+                "Invalid blob proof {index}"
+            );
+            proof
+        };
+        cached.push(ream_execution_rpc_types::get_blobs::BlobAndProofV1 {
+            blob: blob.clone(),
+            proof,
+        });
+    }
+    Ok(PublishedBlobs {
+        cached,
+        cells_and_kzg_proofs,
+    })
+}
+
 /// POST /eth/v2/beacon/blocks
 /// Publishes a signed beacon block to the beacon network
 #[post("/beacon/blocks")]
@@ -736,8 +846,14 @@ pub async fn post_beacon_block(
 
     let body = read_ssz_payload(payload).await?;
 
-    let signed_block = SignedBeaconBlock::from_ssz_bytes(&body)
-        .map_err(|err| ApiError::BadRequest(format!("Failed to decode SSZ block: {err:?}")))?;
+    let version = http_request
+        .headers()
+        .get(ETH_CONSENSUS_VERSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .expect("validated version header");
+    let contents = decode_block_contents(&body, version)?;
+    let fulu = version == "fulu";
+    let signed_block = contents.signed_block.clone();
 
     // Validate based on broadcast_validation level
     validate_block_for_broadcast(
@@ -749,7 +865,61 @@ pub async fn post_beacon_block(
     .await
     .map_err(|err| ApiError::BadRequest(format!("Block validation failed: {err}")))?;
 
-    publish_and_process_block(signed_block, beacon_chain, p2p_sender).await
+    // Gossip the block before the blob work. Extending blobs into cells takes hundreds of
+    // milliseconds per blob, and a block that reaches peers after the attestation deadline is
+    // voted around. Peers need the block first anyway; columns follow once they are built.
+    gossip_block(&signed_block, p2p_sender.as_ref());
+
+    let published = tokio::task::spawn_blocking(move || validate_contents_blobs(&contents, fulu))
+        .await
+        .map_err(|err| {
+            ApiError::InternalError(format!("Block contents validation worker failed: {err}"))
+        })?
+        .map_err(|err| {
+            error!("Broadcast block has invalid blob contents: {err}");
+            ApiError::BadRequest(format!("Invalid block contents: {err}"))
+        })?;
+
+    let block_root = signed_block.message.tree_hash_root();
+    for (index, blob) in published.cached.into_iter().enumerate() {
+        beacon_chain
+            .db()
+            .blobs_and_proofs_provider()
+            .insert(BlobIdentifier::new(block_root, index as u64), blob)
+            .map_err(|err| {
+                ApiError::InternalError(format!("Failed to cache published blob: {err}"))
+            })?;
+    }
+
+    if fulu {
+        if !published.cells_and_kzg_proofs.is_empty() {
+            let column_sidecars_provider = beacon_chain.db().column_sidecars_provider();
+            let block = signed_block.clone();
+            let sidecars = tokio::task::spawn_blocking(move || {
+                store_data_column_sidecars(
+                    &block,
+                    block_root,
+                    published.cells_and_kzg_proofs,
+                    &column_sidecars_provider,
+                )
+            })
+            .await
+            .map_err(|err| {
+                ApiError::InternalError(format!("Data column sidecar worker failed: {err}"))
+            })?
+            .map_err(|err| ApiError::InternalError(err.to_string()))?;
+            gossip_data_column_sidecars(sidecars, p2p_sender.as_ref());
+        }
+    } else {
+        broadcast_data_column_sidecars(
+            signed_block.clone(),
+            beacon_chain.as_ref(),
+            p2p_sender.as_ref(),
+        )
+        .await;
+    }
+
+    import_published_block(signed_block, beacon_chain.as_ref()).await
 }
 
 /// POST /eth/v2/beacon/blinded_blocks
@@ -840,4 +1010,75 @@ pub async fn post_blinded_beacon_block(
     info!("Publishing assembled block from blinded block: slot={slot}, block_root={block_root:?}",);
 
     publish_and_process_block(signed_block, beacon_chain, p2p_sender).await
+}
+
+#[cfg(test)]
+mod publish_contents_tests {
+    use ream_consensus_misc::polynomial_commitments::kzg_commitment::KZGCommitment;
+    use ream_execution_rpc_types::get_blobs::Blob;
+
+    use super::*;
+
+    fn contents() -> SignedBlockContents {
+        SignedBlockContents {
+            signed_block: SignedBeaconBlock {
+                message: Default::default(),
+                signature: Default::default(),
+            },
+            kzg_proofs: vec![],
+            blobs: vec![],
+        }
+    }
+
+    #[test]
+    fn publish_decodes_three_field_envelope_instead_of_bare_block() {
+        let input = contents();
+        let block_bytes = input.signed_block.as_ssz_bytes();
+        // Independently assemble the three variable-field offsets sent by a VC.
+        let end = 12 + block_bytes.len() as u32;
+        let mut bytes = Vec::new();
+        for offset in [12u32, end, end] {
+            bytes.extend_from_slice(&offset.to_le_bytes());
+        }
+        bytes.extend_from_slice(&block_bytes);
+        assert!(SignedBeaconBlock::from_ssz_bytes(&bytes).is_err());
+        for version in ["electra", "fulu"] {
+            assert_eq!(
+                decode_block_contents(&bytes, version)
+                    .unwrap()
+                    .signed_block
+                    .as_ssz_bytes(),
+                block_bytes
+            );
+            assert!(decode_block_contents(&block_bytes, version).is_err());
+            assert!(decode_block_contents(&bytes[..11], version).is_err());
+        }
+    }
+
+    #[test]
+    fn fulu_publish_checks_blobs_proofs_and_commitments() {
+        let mut input = contents();
+        let blob = Blob::default();
+        let commitment = KZGCommitment(
+            das_context()
+                .blob_to_kzg_commitment(&blob.to_fixed_bytes())
+                .unwrap(),
+        );
+        let (_, proofs) = compute_cells_and_kzg_proofs(&blob, das_context()).unwrap();
+        input.signed_block.message.body.blob_kzg_commitments = vec![commitment].try_into().unwrap();
+        input.blobs.push(blob);
+        input.kzg_proofs = proofs;
+        let decoded = decode_block_contents(&input.as_ssz_bytes(), "fulu").unwrap();
+        let published = validate_contents_blobs(&decoded, true).unwrap();
+        assert_eq!(published.cached.len(), 1);
+        // The cells computed for the check are kept to build the column sidecars.
+        assert_eq!(published.cells_and_kzg_proofs.len(), 1);
+        assert_eq!(published.cells_and_kzg_proofs[0].1, decoded.kzg_proofs);
+        input.kzg_proofs[0] = Default::default();
+        assert!(validate_contents_blobs(&input, true).is_err());
+        input.kzg_proofs.clear();
+        assert!(decode_block_contents(&input.as_ssz_bytes(), "fulu").is_err());
+        input.blobs.clear();
+        assert!(decode_block_contents(&input.as_ssz_bytes(), "electra").is_err());
+    }
 }
