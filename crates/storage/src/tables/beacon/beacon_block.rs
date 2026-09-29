@@ -69,23 +69,12 @@ impl REDBTable for BeaconBlockTable {
     }
 
     fn insert(&self, key: Self::Key, value: Self::Value) -> Result<(), StoreError> {
-        // insert entry to slot_index table
         let block_root = value.message.tree_hash_root();
-        let slot_index_table = BeaconSlotIndexTable {
-            db: self.db.clone(),
-        };
-        slot_index_table.insert(value.message.slot, block_root)?;
-
-        // insert entry to state root index table
-        let state_root_index_table = BeaconStateRootIndexTable {
-            db: self.db.clone(),
-        };
-        state_root_index_table.insert(value.message.state_root, block_root)?;
-
-        let parent_root_index_table = ParentRootIndexMultimapTable {
-            db: self.db.clone(),
-        };
-        parent_root_index_table.insert(value.message.parent_root, block_root)?;
+        let (slot, state_root, parent_root) = (
+            value.message.slot,
+            value.message.state_root,
+            value.message.parent_root,
+        );
 
         if let Some(cache) = &self.cache
             && let Ok(mut cache_lock) = cache.blocks.lock()
@@ -93,12 +82,27 @@ impl REDBTable for BeaconBlockTable {
             cache_lock.put(key, value.clone());
         }
 
+        // Store the block before the indexes that lead to it. Readers do not hold the store lock,
+        // so a root found through an index must already resolve to a block.
         let mut write_txn = self.db.begin_write()?;
         write_txn.set_durability(Durability::Immediate)?;
         let mut table = write_txn.open_table(Self::TABLE_DEFINITION)?;
         table.insert(key, value)?;
         drop(table);
         write_txn.commit()?;
+
+        BeaconSlotIndexTable {
+            db: self.db.clone(),
+        }
+        .insert(slot, block_root)?;
+        BeaconStateRootIndexTable {
+            db: self.db.clone(),
+        }
+        .insert(state_root, block_root)?;
+        ParentRootIndexMultimapTable {
+            db: self.db.clone(),
+        }
+        .insert(parent_root, block_root)?;
         Ok(())
     }
 
