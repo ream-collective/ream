@@ -314,8 +314,11 @@ impl Decoder for OutboundSSZSnappyCodec {
             },
         };
         debug!(
-            "OutboundSSZSnappyCodec::decode: protocol: {:?}, response_code: {:?}, result: {:?}",
-            self.protocol.protocol, response_code, result
+            protocol = ?self.protocol.protocol,
+            response_code = ?response_code,
+            decoded = matches!(&result, Ok(Some(_))),
+            error = ?result.as_ref().err(),
+            "OutboundSSZSnappyCodec::decode"
         );
 
         if let Ok(Some(_)) = result {
