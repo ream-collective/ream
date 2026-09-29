@@ -1,7 +1,9 @@
 use std::{collections::HashSet, sync::Arc};
 
 use actix_web::{
-    HttpResponse, Responder, get, post,
+    HttpRequest, HttpResponse, Responder, get,
+    http::header::ACCEPT,
+    post,
     web::{Data, Json, Path, Query},
 };
 use alloy_primitives::{Address, B256, aliases::B32};
@@ -14,7 +16,7 @@ use ream_api_types_beacon::{
     responses::{BeaconResponse, DataResponse, DataVersionedResponse},
     validator::{ValidatorBalance, ValidatorData, ValidatorStatus},
 };
-use ream_api_types_common::{error::ApiError, id::ID};
+use ream_api_types_common::{content_type::SSZ_CONTENT_TYPE, error::ApiError, id::ID};
 use ream_bls::{BLSSignature, PublicKey, traits::Verifiable};
 use ream_consensus_beacon::{
     attestation::Attestation,
@@ -46,6 +48,7 @@ use ream_consensus_misc::{
     fork_name::ForkName,
     misc::{
         compute_domain, compute_epoch_at_slot, compute_signing_root, compute_start_slot_at_epoch,
+        get_committee_indices,
     },
     polynomial_commitments::{kzg_commitment::KZGCommitment, kzg_proof::KZGProof},
     validator::Validator,
@@ -60,11 +63,18 @@ use ream_execution_rpc_types::{
     get_payload::Payload,
 };
 use ream_fork_choice_beacon::store::Store;
-use ream_network_manager::gossipsub::validate::sync_committee_contribution_and_proof::get_sync_subcommittee_pubkeys;
-use ream_network_manager::p2p_sender::P2PSender;
+use ream_network_manager::{
+    gossipsub::validate::sync_committee_contribution_and_proof::{
+        get_contribution_participant_pubkeys, get_sync_subcommittee_pubkeys,
+    },
+    p2p_sender::P2PSender,
+};
 use ream_network_spec::networks::beacon_network_spec;
 use ream_operation_pool::OperationPool;
-use ream_p2p::gossipsub::beacon::topics::{GossipTopic, GossipTopicKind};
+use ream_p2p::{
+    gossipsub::beacon::topics::{GossipTopic, GossipTopicKind},
+    network::beacon::channel::GossipMessage,
+};
 use ream_storage::{
     db::beacon::BeaconDB,
     tables::table::{CustomTable, REDBTable},
@@ -72,7 +82,7 @@ use ream_storage::{
 use ream_sync_committee_pool::SyncCommitteePool;
 use ream_validator_beacon::{
     aggregate_and_proof::SignedAggregateAndProof,
-    attestation::{compute_on_chain_aggregate, compute_subnet_for_attestation},
+    attestation::compute_subnet_for_attestation,
     builder::{
         builder_bid::SignedBuilderBid, builder_client::BuilderClient,
         validator_registration::SignedValidatorRegistrationV1,
@@ -85,6 +95,7 @@ use ream_validator_beacon::{
     sync_committee::{SyncAggregatorSelectionData, is_sync_committee_aggregator},
 };
 use serde::Serialize;
+use ssz::Encode;
 use ssz_types::{
     VariableList,
     typenum::{U1, U8, U16},
@@ -675,10 +686,12 @@ pub async fn get_sync_committee_contribution(
 #[post("/validator/aggregate_and_proofs")]
 pub async fn post_aggregate_and_proofs_v2(
     db: Data<BeaconDB>,
+    operation_pool: Data<Arc<OperationPool>>,
+    p2p_sender: Data<Arc<P2PSender>>,
     aggregates: Json<Vec<SignedAggregateAndProof>>,
 ) -> Result<impl Responder, ApiError> {
     for signed_aggregate in aggregates.into_inner() {
-        let aggregate_and_proof = signed_aggregate.message;
+        let aggregate_and_proof = &signed_aggregate.message;
         let attestation = aggregate_and_proof.aggregate.clone();
         let slot = attestation.data.slot;
         let state = get_state_from_id(ID::Slot(slot), &db).await?;
@@ -690,8 +703,16 @@ pub async fn post_aggregate_and_proofs_v2(
             .get(aggregator_index)
             .ok_or_else(|| ApiError::NotFound("Aggregator not found".to_string()))?;
 
+        // Since Electra `data.index` is always 0; the committee comes from `committee_bits`.
+        let committee_indices = get_committee_indices(&attestation.committee_bits);
+        let [committee_index] = committee_indices[..] else {
+            return Err(ApiError::BadRequest(
+                "Aggregate must name exactly one committee".to_string(),
+            ));
+        };
+
         let committee = state
-            .get_beacon_committee(attestation.data.slot, attestation.data.index)
+            .get_beacon_committee(attestation.data.slot, committee_index)
             .map_err(|err| {
                 ApiError::InternalError(format!("Failed due to internal error: {err}"))
             })?;
@@ -776,6 +797,16 @@ pub async fn post_aggregate_and_proofs_v2(
                 "Aggregate proof verification failed".to_string(),
             ));
         }
+
+        // Accepting an aggregate means making it available for block packing and to peers.
+        operation_pool.insert_attestation(attestation, committee_index);
+        p2p_sender.send_gossip(GossipMessage {
+            topic: GossipTopic {
+                fork: gossip_fork_digest(&state),
+                kind: GossipTopicKind::AggregateAndProof,
+            },
+            data: signed_aggregate.as_ssz_bytes(),
+        });
     }
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
@@ -810,8 +841,24 @@ pub async fn post_beacon_committee_subscriptions(
 ) -> Result<impl Responder, ApiError> {
     let mut subnets: HashSet<(u64, B32)> = HashSet::new();
 
+    // Validator clients subscribe ahead of their duty slot, which has no state yet. The latest
+    // state already fixes the shuffling for its own epoch and the next one.
+    let highest_slot = db
+        .slot_index_provider()
+        .get_highest_slot()
+        .map_err(|err| ApiError::InternalError(format!("Failed to get highest slot: {err:?}")))?
+        .ok_or_else(|| ApiError::NotFound("Failed to find highest slot".to_string()))?;
+    let state = get_state_from_id(ID::Slot(highest_slot), &db).await?;
+    let current_epoch = state.get_current_epoch();
+
     for sub in subscriptions.into_inner() {
-        let state = get_state_from_id(ID::Slot(sub.slot), &db).await?;
+        let duty_epoch = compute_epoch_at_slot(sub.slot);
+        if duty_epoch + 1 < current_epoch || duty_epoch > current_epoch + 1 {
+            return Err(ApiError::BadRequest(format!(
+                "Subscription slot {} is outside the previous, current and next epochs",
+                sub.slot
+            )));
+        }
 
         if sub.committees_at_slot > MAX_COMMITTEES_PER_SLOT {
             return Err(ApiError::BadRequest(
@@ -1112,12 +1159,11 @@ fn validate_signed_contribution_and_proof(
         return Err("The selection proof is not a valid signature".to_string());
     }
 
+    let participant_pubkeys = get_contribution_participant_pubkeys(state, contribution);
     let sync_committee_valid = contribution
         .signature
         .fast_aggregate_verify(
-            sync_committee_validators
-                .iter()
-                .collect::<Vec<&PublicKey>>(),
+            participant_pubkeys.iter().collect::<Vec<&PublicKey>>(),
             compute_signing_root(
                 contribution.beacon_block_root,
                 state.get_domain(DOMAIN_SYNC_COMMITTEE, Some(epoch)),
@@ -1440,8 +1486,50 @@ fn execution_checkpoint_hash(db: &BeaconDB, root: B256) -> Result<B256, ApiError
         .ok_or_else(|| ApiError::InternalError(format!("Missing checkpoint block {root}")))
 }
 
+/// Whether the caller asked for SSZ. Validator clients prefer it for block production and decode
+/// the body as SSZ without checking the content type, so JSON must not be sent in its place.
+fn accepts_ssz(http_request: &HttpRequest) -> bool {
+    http_request
+        .headers()
+        .get(ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|accept| accept.contains(SSZ_CONTENT_TYPE))
+}
+
+/// Sends a produced block as SSZ or JSON, carrying the metadata headers either way.
+fn produce_block_response(
+    response: ProduceBlockResponse,
+    ssz: bool,
+) -> Result<HttpResponse, ApiError> {
+    let mut builder = HttpResponse::Ok();
+    builder
+        .insert_header(("Eth-Consensus-Version", response.version.clone()))
+        .insert_header((
+            "Eth-Execution-Payload-Blinded",
+            response.execution_payload_blinded.to_string(),
+        ))
+        .insert_header((
+            "Eth-Execution-Payload-Value",
+            response.execution_payload_value.to_string(),
+        ))
+        .insert_header((
+            "Eth-Consensus-Block-Value",
+            response.consensus_block_value.to_string(),
+        ));
+    if !ssz {
+        return Ok(builder.json(response));
+    }
+    let body = match &response.data {
+        ProduceBlockData::Full(contents) => contents.as_ssz_bytes(),
+        ProduceBlockData::Blinded(block) => block.as_ssz_bytes(),
+    };
+    Ok(builder.content_type(SSZ_CONTENT_TYPE).body(body))
+}
+
 #[get("/validator/blocks/{slot}")]
+#[allow(clippy::too_many_arguments)]
 pub async fn get_blocks_v3(
+    http_request: HttpRequest,
     path: Path<u64>,
     query: Query<BlockQuery>,
     db: Data<BeaconDB>,
@@ -1640,18 +1728,7 @@ pub async fn get_blocks_v3(
             data: ProduceBlockData::Blinded(blinded_block),
         };
 
-        return Ok(HttpResponse::Ok()
-            .insert_header(("Eth-Consensus-Version", fork_name.to_string()))
-            .insert_header(("Eth-Execution-Payload-Blinded", "true"))
-            .insert_header((
-                "Eth-Execution-Payload-Value",
-                response.execution_payload_value.to_string(),
-            ))
-            .insert_header((
-                "Eth-Consensus-Block-Value",
-                consensus_block_value.to_string(),
-            ))
-            .json(response));
+        return produce_block_response(response, accepts_ssz(&http_request));
     }
 
     let execution_payload = local_payload.to_execution_payload();
@@ -1710,7 +1787,7 @@ pub async fn get_blocks_v3(
             kzg_proofs[index]
         } else {
             let blob = blob.clone();
-            let commitment = commitment.clone();
+            let commitment = *commitment;
             tokio::task::spawn_blocking(move || {
                 ream_polynomial_commitments::handlers::compute_blob_kzg_proof(&blob, &commitment)
             })
@@ -1745,18 +1822,7 @@ pub async fn get_blocks_v3(
         }),
     };
 
-    Ok(HttpResponse::Ok()
-        .insert_header(("Eth-Consensus-Version", fork_name.to_string()))
-        .insert_header(("Eth-Execution-Payload-Blinded", "false"))
-        .insert_header((
-            "Eth-Execution-Payload-Value",
-            local_execution_value.to_string(),
-        ))
-        .insert_header((
-            "Eth-Consensus-Block-Value",
-            consensus_block_value.to_string(),
-        ))
-        .json(response))
+    produce_block_response(response, accepts_ssz(&http_request))
 }
 
 #[get("/validator/aggregate_attestation")]
@@ -1764,31 +1830,90 @@ pub async fn get_aggregate_attestation(
     opertation_pool: Data<Arc<OperationPool>>,
     attestation_query: Query<AttestationQuery>,
 ) -> Result<impl Responder, ApiError> {
-    let attestations = opertation_pool.get_attestations(
-        attestation_query.slot,
-        attestation_query.committee_index,
+    let (Some(attestation_data_root), Some(committee_index)) = (
         attestation_query.attestation_data_root,
-    );
-    if attestations.is_empty() {
-        return Err(ApiError::NotFound(String::from("No attestations found")));
-    }
+        attestation_query.committee_index,
+    ) else {
+        return Err(ApiError::BadRequest(String::from(
+            "attestation_data_root and committee_index are required",
+        )));
+    };
 
-    let aggregated_attestation = compute_on_chain_aggregate(attestations).map_err(|err| {
-        ApiError::InternalError(format!("Failed to compute attestation aggregate {err}"))
-    })?;
+    // Aggregators combine votes within a single committee: OR its members' bits, never
+    // concatenate committees as block packing does.
+    let aggregated_attestation = opertation_pool
+        .get_aggregate_attestation(
+            attestation_query.slot,
+            attestation_data_root,
+            committee_index,
+        )
+        .ok_or_else(|| ApiError::NotFound(String::from("No attestations found")))?;
 
     Ok(HttpResponse::Ok().json(DataVersionedResponse::new(aggregated_attestation)))
 }
 
 #[cfg(test)]
 mod validator_api_tests {
-    use super::*;
     use actix_web::{App, test};
     use ream_execution_rpc_types::{
         get_blobs::Blob,
         get_payload::{BlobsBundle, BlobsBundleV1, BlobsBundleV2},
     };
     use ream_storage::db::ReamDB;
+
+    use super::*;
+
+    #[actix_web::test]
+    async fn produced_block_is_ssz_when_the_client_asks_for_it() {
+        // Lighthouse's validator client sends this and decodes the body as SSZ.
+        let request = test::TestRequest::default()
+            .insert_header((
+                ACCEPT,
+                "application/octet-stream;q=1.0,application/json;q=0.9",
+            ))
+            .to_http_request();
+        assert!(accepts_ssz(&request));
+        assert!(!accepts_ssz(
+            &test::TestRequest::default()
+                .insert_header((ACCEPT, "application/json"))
+                .to_http_request()
+        ));
+
+        let contents = FullBlockData {
+            block: Default::default(),
+            kzg_proofs: vec![],
+            blobs: vec![],
+        };
+        let response = ProduceBlockResponse {
+            version: "fulu".to_string(),
+            execution_payload_blinded: false,
+            execution_payload_value: 7,
+            consensus_block_value: 9,
+            data: ProduceBlockData::Full(contents.clone()),
+        };
+        let response = produce_block_response(response, true).unwrap();
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            SSZ_CONTENT_TYPE
+        );
+        assert_eq!(
+            response.headers().get("Eth-Consensus-Version").unwrap(),
+            "fulu"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("Eth-Execution-Payload-Value")
+                .unwrap(),
+            "7"
+        );
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        assert_eq!(body, contents.as_ssz_bytes());
+        let decoded = <FullBlockData as ssz::Decode>::from_ssz_bytes(&body).unwrap();
+        assert_eq!(decoded.block, contents.block);
+    }
 
     #[actix_web::test]
     async fn subscription_route_extracts_registered_p2p_sender() {
