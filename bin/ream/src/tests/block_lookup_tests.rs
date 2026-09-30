@@ -1781,3 +1781,183 @@ async fn test_head_apis_ignore_partially_imported_block() {
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
     }
 }
+
+#[actix_web::test]
+#[serial]
+async fn test_subscription_uses_clock_epoch_and_canonical_head() {
+    use actix_web::{App, http::StatusCode, test, web::Data};
+    use ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH;
+    use ream_rpc_beacon::handlers::validator::post_beacon_committee_subscriptions;
+    initialize_beacon_e2e_network_spec(beacon_e2e_dev_spec());
+    let (mut state, mut block) = build_dev_genesis(&beacon_e2e_public_keys());
+    state.process_slots(SLOTS_PER_EPOCH - 1).unwrap();
+    state.genesis_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - SLOTS_PER_EPOCH * beacon_e2e_dev_spec().seconds_per_slot();
+    block.message.slot = state.slot;
+    block.message.state_root = state.tree_hash_root();
+    let ream_db = create_beacon_test_node_db("subscription_canonical", 1);
+    super::seed_beacon_test_db(&ream_db, state.clone(), &block);
+    let db = ream_db.init_beacon_db().unwrap();
+    let chain = Arc::new(BeaconChain::new(
+        db.clone(),
+        Arc::new(OperationPool::default()),
+        Arc::new(SyncCommitteePool::default()),
+        None,
+        None,
+    ));
+    // A later indexed side-fork state must not select the epoch or committee for this request.
+    let mut unrelated_state = state.clone();
+    unrelated_state.slot = 4 * SLOTS_PER_EPOCH;
+    let unrelated_root = B256::repeat_byte(0xee);
+    db.state_provider()
+        .insert(unrelated_root, unrelated_state)
+        .unwrap();
+    db.slot_index_provider()
+        .insert(4 * SLOTS_PER_EPOCH, unrelated_root)
+        .unwrap();
+    let mut duty_state = state;
+    let duty_slot = 2 * SLOTS_PER_EPOCH;
+    duty_state.process_slots(duty_slot).unwrap();
+    let (duty_slot, validator_index) = (duty_slot..duty_slot + SLOTS_PER_EPOCH)
+        .find_map(|slot| {
+            duty_state
+                .get_beacon_committee(slot, 0)
+                .unwrap()
+                .first()
+                .copied()
+                .map(|index| (slot, index))
+        })
+        .expect("at least one committee in the next epoch");
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(message) = rx.recv().await {
+            if let P2PMessage::Subscribe { response, .. } = message {
+                let _ = response.send(true);
+            }
+        }
+    });
+    let app = test::init_service(
+        App::new()
+            .app_data(Data::new(chain))
+            .app_data(Data::new(Arc::new(P2PSender(tx))))
+            .service(post_beacon_committee_subscriptions),
+    )
+    .await;
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/validator/beacon_committee_subscriptions")
+            .set_json(serde_json::json!([{
+                "validator_index": validator_index.to_string(), "committee_index": "0",
+                "committees_at_slot": duty_state.get_committee_count_per_slot(2).to_string(),
+                "slot": duty_slot.to_string(), "is_aggregator": true
+            }]))
+            .to_request(),
+    )
+    .await;
+    let status = response.status();
+    let body = test::read_body(response).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "clock is epoch 1, head is slot 31, subscription is for next epoch 2: {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+#[actix_web::test]
+#[serial]
+async fn test_invalid_published_contents_are_not_gossiped() {
+    use actix_web::{App, http::StatusCode, test, web::Data};
+    use ream_api_types_beacon::block::SignedBlockContents;
+    use ream_rpc_beacon::handlers::block::post_beacon_block;
+    let (mut harness, state, parent) = GossipLookupHarness::new("invalid_published_contents").await;
+    let fixture = build_blob_block(&state, &parent, 1, None, 7).await;
+    harness.wait_for_slot(1).await;
+    let (valid_blob, _) = sample_blob_and_commitment(7).unwrap();
+    let app = test::init_service(
+        App::new()
+            .app_data(Data::new(harness.beacon_chain.clone()))
+            .app_data(Data::new(Arc::new(harness.p2p_sender.clone())))
+            .app_data(Data::new(harness.cached_db.clone()))
+            .service(post_beacon_block),
+    )
+    .await;
+    for blob in [Default::default(), valid_blob.clone()] {
+        let contents = SignedBlockContents {
+            signed_block: fixture.signed_block.clone(),
+            kzg_proofs: vec![Default::default(); 128],
+            blobs: vec![blob],
+        };
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/beacon/blocks?broadcast_validation=gossip")
+                .insert_header(("Eth-Consensus-Version", "fulu"))
+                .insert_header(("Content-Type", "application/octet-stream"))
+                .set_payload(contents.as_ssz_bytes())
+                .to_request(),
+        )
+        .await;
+        let status = response.status();
+        let body = test::read_body(response).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains("Invalid block contents"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let mut broadcasts = 0;
+        while let Ok(message) = harness.p2p_receiver.try_recv() {
+            if let P2PMessage::Gossip(message) = message
+                && matches!(message.topic.kind, GossipTopicKind::BeaconBlock)
+            {
+                broadcasts += 1;
+            }
+        }
+        assert_eq!(
+            broadcasts, 0,
+            "invalid contents returned 400 after broadcasting the signed block"
+        );
+    }
+    // The rejected requests must not prevent the same signed block from being published
+    // once the validator supplies matching contents.
+    let (_, proofs) = compute_cells_and_kzg_proofs(&valid_blob, das_context()).unwrap();
+    let contents = SignedBlockContents {
+        signed_block: fixture.signed_block,
+        kzg_proofs: proofs,
+        blobs: vec![valid_blob],
+    };
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/beacon/blocks?broadcast_validation=gossip")
+            .insert_header(("Eth-Consensus-Version", "fulu"))
+            .insert_header(("Content-Type", "application/octet-stream"))
+            .set_payload(contents.as_ssz_bytes())
+            .to_request(),
+    )
+    .await;
+    assert!(response.status().is_success());
+    let mut block_broadcasts = 0;
+    let mut column_broadcasts = 0;
+    while let Ok(message) = harness.p2p_receiver.try_recv() {
+        if let P2PMessage::Gossip(message) = message {
+            match message.topic.kind {
+                GossipTopicKind::BeaconBlock => block_broadcasts += 1,
+                GossipTopicKind::DataColumnSidecar(_) => column_broadcasts += 1,
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(block_broadcasts, 1);
+    assert_eq!(column_broadcasts, 128);
+}

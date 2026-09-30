@@ -66,7 +66,7 @@ fn validate_proposer_duties_epoch(epoch: u64, current_epoch: u64) -> Result<(), 
 ///
 /// Uses the wall clock with gossip clock disparity rather than the store's tick time: validator
 /// clients ask for the next epoch's duties right at the boundary, before the store has ticked.
-fn current_epoch(db: &BeaconDB) -> Result<u64, ApiError> {
+pub(super) fn current_epoch(db: &BeaconDB) -> Result<u64, ApiError> {
     let genesis_time = db
         .genesis_time_provider()
         .get()
