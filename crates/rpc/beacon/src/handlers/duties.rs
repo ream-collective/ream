@@ -13,14 +13,14 @@ use ream_api_types_beacon::{
     responses::DutiesResponse,
 };
 use ream_api_types_common::error::ApiError;
+use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::electra::beacon_state::BeaconState;
 use ream_consensus_misc::{
     constants::beacon::{MIN_SEED_LOOKAHEAD, SLOTS_PER_EPOCH},
     misc::{compute_epoch_at_slot, compute_start_slot_at_epoch},
 };
-use ream_fork_choice_beacon::store::Store;
+use ream_fork_choice_beacon::store::get_ancestor_from_db;
 use ream_network_spec::networks::beacon_network_spec;
-use ream_operation_pool::OperationPool;
 use ream_storage::{
     db::beacon::BeaconDB,
     tables::{field::REDBField, table::REDBTable},
@@ -66,11 +66,11 @@ fn validate_proposer_duties_epoch(epoch: u64, current_epoch: u64) -> Result<(), 
 ///
 /// Uses the wall clock with gossip clock disparity rather than the store's tick time: validator
 /// clients ask for the next epoch's duties right at the boundary, before the store has ticked.
-fn current_epoch(store: &Store) -> Result<u64, ApiError> {
-    let genesis_time =
-        store.db.genesis_time_provider().get().map_err(|err| {
-            ApiError::InternalError(format!("Failed to get genesis time: {err:?}"))
-        })?;
+fn current_epoch(db: &BeaconDB) -> Result<u64, ApiError> {
+    let genesis_time = db
+        .genesis_time_provider()
+        .get()
+        .map_err(|err| ApiError::InternalError(format!("Failed to get genesis time: {err:?}")))?;
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|err| ApiError::InternalError(format!("System time before Unix epoch: {err}")))?
@@ -96,12 +96,12 @@ enum DependentRoot {
 }
 
 async fn proposer_duties(
-    db: &BeaconDB,
+    beacon_chain: &BeaconChain,
     epoch: u64,
     dependent_root_kind: DependentRoot,
 ) -> Result<HttpResponse, ApiError> {
-    let store = Store::new(db.clone(), Arc::new(OperationPool::default()), None);
-    let current_epoch = current_epoch(&store)?;
+    let db = beacon_chain.db();
+    let current_epoch = current_epoch(db)?;
     validate_proposer_duties_epoch(epoch, current_epoch)?;
 
     // Convert only after the guard because epoch-to-slot multiplication is unchecked.
@@ -112,8 +112,9 @@ async fn proposer_duties(
         }
     };
     let start_slot = compute_start_slot_at_epoch(epoch);
+    let head_root = canonical_head_root(beacon_chain)?;
     let (state, state_block_root) =
-        get_canonical_state_and_block_root_at_or_before_slot(&store, start_slot).await?;
+        get_canonical_state_and_block_root_at_or_before_slot(db, head_root, start_slot).await?;
     let dependent_root = if state.slot <= decision_slot {
         state_block_root
     } else {
@@ -144,34 +145,41 @@ async fn proposer_duties(
 /// Serves v1 proposer duties with the legacy end-of-`N - 1` dependent root.
 #[get("/validator/duties/proposer/{epoch}")]
 pub async fn get_proposer_duties(
-    db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<BeaconChain>>,
     epoch: Path<u64>,
 ) -> Result<impl Responder, ApiError> {
     let epoch = epoch.into_inner();
-    proposer_duties(&db, epoch, DependentRoot::Legacy).await
+    proposer_duties(&beacon_chain, epoch, DependentRoot::Legacy).await
 }
 
 /// Serves v2 proposer duties with the fork-aware dependent root.
 #[get("/validator/duties/proposer/{epoch}")]
 pub async fn get_proposer_duties_v2(
-    db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<BeaconChain>>,
     epoch: Path<u64>,
 ) -> Result<impl Responder, ApiError> {
     let epoch = epoch.into_inner();
-    proposer_duties(&db, epoch, DependentRoot::ForkAware).await
+    proposer_duties(&beacon_chain, epoch, DependentRoot::ForkAware).await
 }
 
 #[post("/validator/duties/attester/{epoch}")]
 pub async fn get_attester_duties(
-    db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<BeaconChain>>,
     epoch: Path<u64>,
     validator_indices: Json<Vec<ValidatorIndexRequest>>,
 ) -> Result<impl Responder, ApiError> {
     let epoch = epoch.into_inner();
+    let db = beacon_chain.db();
     let start_slot = compute_start_slot_at_epoch(epoch);
-    let state = get_state_at_or_before_slot(&db, start_slot).await?;
-    let dependent_root =
-        get_block_root_at_or_before_slot(&db, attester_shuffling_decision_slot(epoch))?;
+    // Resolve the state and the dependent root from one head so both describe the same chain.
+    let head_root = canonical_head_root(&beacon_chain)?;
+    let (state, _) =
+        get_canonical_state_and_block_root_at_or_before_slot(db, head_root, start_slot).await?;
+    let dependent_root = get_canonical_block_root_at_or_before_slot(
+        db,
+        head_root,
+        attester_shuffling_decision_slot(epoch),
+    )?;
     let validator_indices = parse_validator_indices(validator_indices.into_inner())?;
     let committees_at_slot = state.get_committee_count_per_slot(epoch);
     let mut duties = vec![];
@@ -214,13 +222,24 @@ pub async fn get_attester_duties(
 
 #[post("/validator/duties/sync/{epoch}")]
 pub async fn get_sync_committee_duties(
-    db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<BeaconChain>>,
     epoch: Path<u64>,
     validator_indices: Json<Vec<ValidatorIndexRequest>>,
 ) -> Result<impl Responder, ApiError> {
     let epoch = epoch.into_inner();
-    let state = get_state_at_or_before_slot(&db, compute_start_slot_at_epoch(epoch)).await?;
+    let head_root = canonical_head_root(&beacon_chain)?;
+    let (state, _) = get_canonical_state_and_block_root_at_or_before_slot(
+        beacon_chain.db(),
+        head_root,
+        compute_start_slot_at_epoch(epoch),
+    )
+    .await?;
     let validator_indices = parse_validator_indices(validator_indices.into_inner())?;
+    let sync_committee_indices = state
+        .get_sync_committee_indices(&state.current_sync_committee)
+        .map_err(|err| {
+            ApiError::BadRequest(format!("Failed to get sync committee indices {err:?}"))
+        })?;
 
     let mut duties = vec![];
     for validator_index in validator_indices {
@@ -229,12 +248,6 @@ pub async fn get_sync_committee_duties(
                 "Validator with index {validator_index} not found in state at epoch {epoch}"
             )));
         };
-
-        let sync_committee_indices = state
-            .get_sync_committee_indices(&state.current_sync_committee)
-            .map_err(|err| {
-                ApiError::BadRequest(format!("Failed to get sync committee indices {err:?}"))
-            })?;
 
         let validator_sync_committee_indices = sync_committee_indices
             .iter()
@@ -271,37 +284,36 @@ fn parse_validator_indices(
         .collect()
 }
 
-/// Resolves from fork-choice head so an overwritten slot index cannot select a side fork.
-async fn get_canonical_state_and_block_root_at_or_before_slot(
-    store: &Store,
-    slot: u64,
-) -> Result<(BeaconState, B256), ApiError> {
-    let head_root = store
-        .get_head()
-        .map_err(|err| ApiError::InternalError(format!("Failed to get head root: {err:?}")))?;
-    let block_root = get_block_root_at_or_before_slot_from_head(store, head_root, slot)?;
-
-    get_state_and_block_root(&store.db, block_root, slot).await
+/// Root of the fork-choice head from the published snapshot. Reading it does not take the store
+/// lock and does not recompute LMD-GHOST from the database.
+fn canonical_head_root(beacon_chain: &BeaconChain) -> Result<B256, ApiError> {
+    beacon_chain
+        .head()
+        .map(|head| head.head_root)
+        .map_err(|err| ApiError::InternalError(format!("Failed to get head snapshot: {err:?}")))
 }
 
-fn get_block_root_at_or_before_slot_from_head(
-    store: &Store,
+/// Root of the canonical block at or before `slot`, found by walking parents from `head_root`.
+/// The slot index is never consulted: a later side-fork block at the same slot overwrites it.
+fn get_canonical_block_root_at_or_before_slot(
+    db: &BeaconDB,
     head_root: B256,
     slot: u64,
 ) -> Result<B256, ApiError> {
-    store.get_ancestor(head_root, slot).map_err(|err| {
+    get_ancestor_from_db(db, head_root, slot).map_err(|err| {
         ApiError::InternalError(format!(
             "Failed to find canonical block root at or before slot {slot}: {err:?}"
         ))
     })
 }
 
-/// Loads the state at `slot` and the root of the block it was built on.
-async fn get_state_and_block_root_at_or_before_slot(
+/// Loads the canonical state at `slot` and the root of the block it was built on.
+async fn get_canonical_state_and_block_root_at_or_before_slot(
     db: &BeaconDB,
+    head_root: B256,
     slot: u64,
 ) -> Result<(BeaconState, B256), ApiError> {
-    let block_root = get_block_root_at_or_before_slot(db, slot)?;
+    let block_root = get_canonical_block_root_at_or_before_slot(db, head_root, slot)?;
     get_state_and_block_root(db, block_root, slot).await
 }
 
@@ -327,32 +339,6 @@ async fn get_state_and_block_root(
             .map_err(|err| ApiError::BadRequest(err.to_string()))?;
     }
     Ok((state, block_root))
-}
-
-async fn get_state_at_or_before_slot(db: &BeaconDB, slot: u64) -> Result<BeaconState, ApiError> {
-    Ok(get_state_and_block_root_at_or_before_slot(db, slot)
-        .await?
-        .0)
-}
-
-fn get_block_root_at_or_before_slot(db: &BeaconDB, slot: u64) -> Result<B256, ApiError> {
-    for candidate_slot in (0..=slot).rev() {
-        match db
-            .slot_index_provider()
-            .get(candidate_slot)
-            .map_err(|err| {
-                ApiError::InternalError(format!(
-                    "Failed to get block root for slot {candidate_slot}, error: {err:?}"
-                ))
-            })? {
-            Some(block_root) => return Ok(block_root),
-            None => continue,
-        }
-    }
-
-    Err(ApiError::NotFound(format!(
-        "Failed to find block root at or before slot {slot}"
-    )))
 }
 
 #[cfg(test)]
@@ -486,11 +472,23 @@ mod tests {
             Some(side_fork_root)
         );
 
-        let store = Store::new(db, Arc::new(OperationPool::default()), None);
+        // Attester duties, sync duties and the attester dependent root all resolve through this
+        // helper, so none of them can select the side fork.
         assert_eq!(
-            get_block_root_at_or_before_slot_from_head(&store, canonical_root, 100)
+            get_canonical_block_root_at_or_before_slot(&db, canonical_root, 100)
                 .expect("resolves canonical ancestor"),
             canonical_root
+        );
+        // A skipped slot resolves to the canonical block before it, not to the side fork.
+        assert_eq!(
+            get_canonical_block_root_at_or_before_slot(&db, canonical_root, 101)
+                .expect("resolves canonical ancestor"),
+            canonical_root
+        );
+        assert_eq!(
+            get_canonical_block_root_at_or_before_slot(&db, canonical_root, 99)
+                .expect("resolves canonical ancestor"),
+            anchor_root
         );
     }
 }
