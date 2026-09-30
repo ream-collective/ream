@@ -865,6 +865,11 @@ pub async fn post_beacon_block(
     .await
     .map_err(|err| ApiError::BadRequest(format!("Block validation failed: {err}")))?;
 
+    // Gossip the block before the blob work. Extending blobs into cells takes hundreds of
+    // milliseconds per blob, and a block that reaches peers after the attestation deadline is
+    // voted around. Peers need the block first anyway; columns follow once they are built.
+    gossip_block(&signed_block, p2p_sender.as_ref());
+
     let published = tokio::task::spawn_blocking(move || validate_contents_blobs(&contents, fulu))
         .await
         .map_err(|err| {
@@ -874,10 +879,6 @@ pub async fn post_beacon_block(
             error!("Broadcast block has invalid blob contents: {err}");
             ApiError::BadRequest(format!("Invalid block contents: {err}"))
         })?;
-
-    // Rejected contents must not escape onto gossip. Reuse the cells computed during
-    // verification below, so checking Fulu contents does not repeat the extension work.
-    gossip_block(&signed_block, p2p_sender.as_ref());
 
     let block_root = signed_block.message.tree_hash_root();
     for (index, blob) in published.cached.into_iter().enumerate() {
