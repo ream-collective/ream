@@ -182,7 +182,10 @@ impl NetworkBehaviour for ReqResp {
         &mut self,
         _cx: &mut Context<'_>,
     ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
-        debug!("REQRESP: Polling events {:?}", self.events);
+        debug!(
+            pending_events = self.events.len(),
+            "REQRESP: Polling events"
+        );
         if !self.events.is_empty() {
             return Poll::Ready(self.events.remove(0));
         }

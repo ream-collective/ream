@@ -192,6 +192,22 @@ impl OperationPool {
             .collect()
     }
 
+    /// Aggregates the pooled attestations for one committee's vote on `attestation_data_root`,
+    /// as served by `GET /eth/v2/validator/aggregate_attestation`.
+    pub fn get_aggregate_attestation(
+        &self,
+        slot: u64,
+        attestation_data_root: B256,
+        committee_index: u64,
+    ) -> Option<Attestation> {
+        let key = AttestationKey {
+            slot,
+            attestation_data_root,
+            committee_index,
+        };
+        aggregate_attestation_group(self.attestations.read().get(&key)?, &HashSet::default())
+    }
+
     pub fn insert_attestation(&self, attestation: Attestation, committee_index: u64) {
         let key = AttestationKey {
             slot: attestation.data.slot,
@@ -624,5 +640,41 @@ mod tests {
         // Should be expired at epoch 103
         operation_pool.clean_proposer_preparations(103);
         assert_eq!(operation_pool.get_proposer_preparation(1), None);
+    }
+
+    #[test]
+    fn get_aggregate_attestation_merges_one_committee_vote() {
+        let operation_pool = OperationPool::default();
+        let first = make_attestation(5, 1, 0, 128, &[3]);
+        let second = make_attestation(5, 1, 0, 128, &[40]);
+        let other_committee = make_attestation(5, 2, 0, 128, &[7]);
+        let data_root = first.data.tree_hash_root();
+        operation_pool.insert_attestation(first.clone(), 1);
+        operation_pool.insert_attestation(second, 1);
+        operation_pool.insert_attestation(other_committee, 2);
+
+        let aggregate = operation_pool
+            .get_aggregate_attestation(5, data_root, 1)
+            .expect("committee 1 has pooled votes");
+
+        // Bits are ORed within the committee's bitfield, not appended.
+        assert_eq!(aggregate.aggregation_bits.len(), 128);
+        let set: Vec<usize> = (0..128)
+            .filter(|&index| aggregate.aggregation_bits.get(index).unwrap())
+            .collect();
+        assert_eq!(set, vec![3, 40]);
+        assert_eq!(aggregate.committee_bits, first.committee_bits);
+        assert_eq!(aggregate.data, first.data);
+
+        assert!(
+            operation_pool
+                .get_aggregate_attestation(5, data_root, 3)
+                .is_none()
+        );
+        assert!(
+            operation_pool
+                .get_aggregate_attestation(5, B256::repeat_byte(0x01), 1)
+                .is_none()
+        );
     }
 }

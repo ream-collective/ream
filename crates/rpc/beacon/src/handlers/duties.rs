@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use actix_web::{
     HttpResponse, Responder, get, post,
@@ -18,7 +21,10 @@ use ream_consensus_misc::{
 use ream_fork_choice_beacon::store::Store;
 use ream_network_spec::networks::beacon_network_spec;
 use ream_operation_pool::OperationPool;
-use ream_storage::{db::beacon::BeaconDB, tables::table::REDBTable};
+use ream_storage::{
+    db::beacon::BeaconDB,
+    tables::{field::REDBField, table::REDBTable},
+};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -39,6 +45,13 @@ fn proposer_shuffling_decision_slot(epoch: u64, fulu_fork_epoch: u64) -> u64 {
     }
 }
 
+/// Returns the slot whose block root fixes the attester shuffling for `epoch`: the last slot of
+/// `epoch - 2`, or genesis for the first two epochs. Using the end of `epoch - 1` instead makes the
+/// root of next-epoch duties follow the head, so validator clients refetch duties every slot.
+fn attester_shuffling_decision_slot(epoch: u64) -> u64 {
+    compute_start_slot_at_epoch(epoch.saturating_sub(1)).saturating_sub(1)
+}
+
 fn validate_proposer_duties_epoch(epoch: u64, current_epoch: u64) -> Result<(), ApiError> {
     if epoch > current_epoch.saturating_add(1) {
         return Err(ApiError::BadRequest(format!(
@@ -50,12 +63,30 @@ fn validate_proposer_duties_epoch(epoch: u64, current_epoch: u64) -> Result<(), 
 }
 
 /// Reads the current epoch so future requests can be rejected before epoch-to-slot conversion.
+///
+/// Uses the wall clock with gossip clock disparity rather than the store's tick time: validator
+/// clients ask for the next epoch's duties right at the boundary, before the store has ticked.
 fn current_epoch(store: &Store) -> Result<u64, ApiError> {
-    let slot = store
-        .get_current_slot()
-        .map_err(|err| ApiError::InternalError(format!("Failed to get current slot: {err:?}")))?;
+    let genesis_time =
+        store.db.genesis_time_provider().get().map_err(|err| {
+            ApiError::InternalError(format!("Failed to get genesis time: {err:?}"))
+        })?;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| ApiError::InternalError(format!("System time before Unix epoch: {err}")))?
+        .as_millis() as u64;
+    let spec = beacon_network_spec();
 
-    Ok(compute_epoch_at_slot(slot))
+    Ok(epoch_at_time(
+        genesis_time,
+        now_ms.saturating_add(spec.maximum_gossip_clock_disparity),
+        spec.slot_duration_ms,
+    ))
+}
+
+fn epoch_at_time(genesis_time: u64, time_ms: u64, slot_duration_ms: u64) -> u64 {
+    let slot = time_ms.saturating_sub(genesis_time.saturating_mul(1000)) / slot_duration_ms;
+    compute_epoch_at_slot(slot)
 }
 
 /// Selects the dependent-root semantics returned by v1 and v2.
@@ -139,11 +170,8 @@ pub async fn get_attester_duties(
     let epoch = epoch.into_inner();
     let start_slot = compute_start_slot_at_epoch(epoch);
     let state = get_state_at_or_before_slot(&db, start_slot).await?;
-    let dependent_root = if epoch == 0 {
-        get_block_root_at_or_before_slot(&db, 0)?
-    } else {
-        get_block_root_at_or_before_slot(&db, start_slot - 1)?
-    };
+    let dependent_root =
+        get_block_root_at_or_before_slot(&db, attester_shuffling_decision_slot(epoch))?;
     let validator_indices = parse_validator_indices(validator_indices.into_inner())?;
     let committees_at_slot = state.get_committee_count_per_slot(epoch);
     let mut duties = vec![];
@@ -174,6 +202,7 @@ pub async fn get_attester_duties(
                 public_key: validator.public_key.clone(),
                 validator_index,
                 committee_index,
+                committee_length: committee.len() as u64,
                 committees_at_slot,
                 validator_committee_index: validator_committee_index as u64,
                 slot,
@@ -336,6 +365,21 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn attester_duty_includes_quoted_committee_length() {
+        let duty = AttesterDuty {
+            public_key: Default::default(),
+            validator_index: 7,
+            committee_index: 0,
+            committee_length: 3,
+            committees_at_slot: 1,
+            validator_committee_index: 2,
+            slot: 5,
+        };
+        let json = serde_json::to_value(duty).unwrap();
+        assert_eq!(json["committee_length"], "3");
+    }
+
     fn test_db() -> (BeaconDB, TempDir) {
         let temp_dir = TempDir::new("ream_rpc_beacon_duties").expect("creates temp directory");
         let db = ReamDB::new(temp_dir.path().to_path_buf())
@@ -380,6 +424,27 @@ mod tests {
         assert_eq!(proposer_shuffling_decision_slot(0, 0), 0);
         assert_eq!(proposer_shuffling_decision_slot(1, 0), 0);
         assert_eq!(proposer_shuffling_decision_slot(2, 0), SLOTS_PER_EPOCH - 1);
+    }
+
+    #[test]
+    fn attester_dependent_root_is_fixed_two_epochs_ahead() {
+        assert_eq!(attester_shuffling_decision_slot(0), 0);
+        assert_eq!(attester_shuffling_decision_slot(1), 0);
+        assert_eq!(attester_shuffling_decision_slot(2), SLOTS_PER_EPOCH - 1);
+        // Duties for epoch 5 depend on the end of epoch 3, which is final once epoch 4 starts.
+        assert_eq!(attester_shuffling_decision_slot(5), 4 * SLOTS_PER_EPOCH - 1);
+    }
+
+    #[test]
+    fn epoch_at_time_counts_the_boundary_as_the_new_epoch() {
+        let genesis = 1_000;
+        let epoch_ms = 12_000 * SLOTS_PER_EPOCH;
+        let boundary_ms = genesis * 1000 + 2 * epoch_ms;
+        assert_eq!(epoch_at_time(genesis, boundary_ms - 1, 12_000), 1);
+        assert_eq!(epoch_at_time(genesis, boundary_ms, 12_000), 2);
+        // A request 400 ms early, within the 500 ms disparity, already sees the next epoch.
+        assert_eq!(epoch_at_time(genesis, boundary_ms - 400 + 500, 12_000), 2);
+        assert_eq!(epoch_at_time(genesis, 0, 12_000), 0);
     }
 
     #[test]

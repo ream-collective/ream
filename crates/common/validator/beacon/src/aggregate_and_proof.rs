@@ -13,6 +13,7 @@ use crate::attestation::get_slot_signature;
 
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, Encode, Decode, TreeHash)]
 pub struct AggregateAndProof {
+    #[serde(with = "serde_utils::quoted_u64")]
     pub aggregator_index: u64,
     pub aggregate: Attestation,
     pub selection_proof: BLSSignature,
@@ -64,4 +65,41 @@ pub fn sign_aggregate_and_proof(
     );
     let signing_root = compute_signing_root(aggregate_and_proof, domain);
     Ok(private_key.sign(signing_root.as_ref())?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aggregator_index_uses_the_beacon_api_quoted_form() {
+        let root = format!("0x{}", "00".repeat(32));
+        let signature = format!("0xc0{}", "00".repeat(95));
+        // Shape of the body a validator client posts to `/eth/v2/validator/aggregate_and_proofs`.
+        let request = serde_json::json!([{
+            "message": {
+                "aggregator_index": "56",
+                "aggregate": {
+                    "aggregation_bits": "0x03",
+                    "data": {
+                        "slot": "2",
+                        "index": "0",
+                        "beacon_block_root": root,
+                        "source": {"epoch": "0", "root": root},
+                        "target": {"epoch": "0", "root": root}
+                    },
+                    "signature": signature,
+                    "committee_bits": "0x0100000000000000"
+                },
+                "selection_proof": signature
+            },
+            "signature": signature
+        }]);
+
+        // A bare-number decoder rejected every aggregate with HTTP 400.
+        let aggregates: Vec<SignedAggregateAndProof> =
+            serde_json::from_value(request.clone()).unwrap();
+        assert_eq!(aggregates[0].message.aggregator_index, 56);
+        assert_eq!(serde_json::to_value(&aggregates).unwrap(), request);
+    }
 }
