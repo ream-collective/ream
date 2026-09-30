@@ -1870,7 +1870,7 @@ async fn test_subscription_uses_clock_epoch_and_canonical_head() {
 
 #[actix_web::test]
 #[serial]
-async fn test_invalid_published_contents_are_not_gossiped() {
+async fn test_invalid_published_contents_do_not_publish_columns_or_import() {
     use actix_web::{App, http::StatusCode, test, web::Data};
     use ream_api_types_beacon::block::SignedBlockContents;
     use ream_rpc_beacon::handlers::block::post_beacon_block;
@@ -1915,17 +1915,34 @@ async fn test_invalid_published_contents_are_not_gossiped() {
             "{}",
             String::from_utf8_lossy(&body)
         );
-        let mut broadcasts = 0;
+        let mut block_broadcasts = 0;
+        let mut column_broadcasts = 0;
         while let Ok(message) = harness.p2p_receiver.try_recv() {
-            if let P2PMessage::Gossip(message) = message
-                && matches!(message.topic.kind, GossipTopicKind::BeaconBlock)
-            {
-                broadcasts += 1;
+            if let P2PMessage::Gossip(message) = message {
+                match message.topic.kind {
+                    GossipTopicKind::BeaconBlock => block_broadcasts += 1,
+                    GossipTopicKind::DataColumnSidecar(_) => column_broadcasts += 1,
+                    _ => {}
+                }
             }
         }
         assert_eq!(
-            broadcasts, 0,
-            "invalid contents returned 400 after broadcasting the signed block"
+            block_broadcasts, 1,
+            "gossip-valid blocks are published early"
+        );
+        assert_eq!(
+            column_broadcasts, 0,
+            "invalid contents must not publish columns"
+        );
+        assert!(
+            harness
+                .beacon_chain
+                .db()
+                .block_provider()
+                .get(fixture.signed_block.message.tree_hash_root())
+                .unwrap()
+                .is_none(),
+            "invalid contents must not import the block"
         );
     }
     // The rejected requests must not prevent the same signed block from being published
