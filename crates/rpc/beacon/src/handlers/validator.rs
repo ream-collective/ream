@@ -2,7 +2,7 @@ use std::{collections::HashSet, sync::Arc};
 
 use actix_web::{
     HttpRequest, HttpResponse, Responder, get,
-    http::header::ACCEPT,
+    http::header::{ACCEPT, Accept, Header, Quality},
     post,
     web::{Data, Json, Path, Query},
 };
@@ -835,25 +835,25 @@ impl SubscriptionAction {
 
 #[post("/validator/beacon_committee_subscriptions")]
 pub async fn post_beacon_committee_subscriptions(
-    db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<ream_chain_beacon::beacon_chain::BeaconChain>>,
     subscriptions: Json<Vec<BeaconCommitteeSubscription>>,
     network: Data<Arc<P2PSender>>,
 ) -> Result<impl Responder, ApiError> {
     let mut subnets: HashSet<(u64, B32)> = HashSet::new();
 
-    // Validator clients subscribe ahead of their duty slot, which has no state yet. The latest
-    // state already fixes the shuffling for its own epoch and the next one.
-    let highest_slot = db
-        .slot_index_provider()
-        .get_highest_slot()
-        .map_err(|err| ApiError::InternalError(format!("Failed to get highest slot: {err:?}")))?
-        .ok_or_else(|| ApiError::NotFound("Failed to find highest slot".to_string()))?;
-    let state = get_state_from_id(ID::Slot(highest_slot), &db).await?;
-    let current_epoch = state.get_current_epoch();
+    let head = beacon_chain
+        .head()
+        .map_err(|err| ApiError::InternalError(format!("Failed to read head: {err}")))?;
+    let current_epoch = super::duties::current_epoch(beacon_chain.db())?;
 
-    for sub in subscriptions.into_inner() {
+    let mut subscriptions = subscriptions.into_inner();
+    subscriptions.sort_unstable_by_key(|sub| sub.slot);
+    let mut state = (*head.state).clone();
+    for sub in subscriptions {
         let duty_epoch = compute_epoch_at_slot(sub.slot);
-        if duty_epoch + 1 < current_epoch || duty_epoch > current_epoch + 1 {
+        if duty_epoch < current_epoch.saturating_sub(1)
+            || duty_epoch > current_epoch.saturating_add(1)
+        {
             return Err(ApiError::BadRequest(format!(
                 "Subscription slot {} is outside the previous, current and next epochs",
                 sub.slot
@@ -872,6 +872,13 @@ pub async fn post_beacon_committee_subscriptions(
             ));
         }
 
+        // Future duty slots need epoch processing, but all subscriptions must use the
+        // same canonical branch, not whichever block last overwrote the slot index.
+        if state.slot < sub.slot {
+            state.process_slots(sub.slot).map_err(|err| {
+                ApiError::InternalError(format!("Failed to advance subscription state: {err}"))
+            })?;
+        }
         let committee_members = state
             .get_beacon_committee(sub.slot, sub.committee_index)
             .map_err(|err| ApiError::InternalError(format!("Failed to get committee: {err}")))?;
@@ -1486,14 +1493,46 @@ fn execution_checkpoint_hash(db: &BeaconDB, root: B256) -> Result<B256, ApiError
         .ok_or_else(|| ApiError::InternalError(format!("Missing checkpoint block {root}")))
 }
 
-/// Whether the caller asked for SSZ. Validator clients prefer it for block production and decode
-/// the body as SSZ without checking the content type, so JSON must not be sent in its place.
-fn accepts_ssz(http_request: &HttpRequest) -> bool {
-    http_request
-        .headers()
-        .get(ACCEPT)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|accept| accept.contains(SSZ_CONTENT_TYPE))
+/// Chooses between the two block representations, applying the most specific matching
+/// media range before comparing quality values. Explicit SSZ wins ties; wildcards default to JSON.
+fn accepts_ssz(http_request: &HttpRequest) -> Result<bool, ApiError> {
+    if !http_request.headers().contains_key(ACCEPT) {
+        return Ok(false);
+    }
+    let accept = Accept::parse(http_request)
+        .map_err(|err| ApiError::BadRequest(format!("Invalid Accept header: {err}")))?;
+    if accept.is_empty() {
+        return Ok(false);
+    }
+    let preference = |subtype: &str| {
+        accept
+            .iter()
+            .filter_map(|range| {
+                let media_type = &range.item;
+                // Neither representation has media-type parameters.
+                if media_type.params().next().is_some() {
+                    return None;
+                }
+                let specificity = match (media_type.type_().as_str(), media_type.subtype().as_str())
+                {
+                    ("application", value) if value == subtype => 2,
+                    ("application", "*") => 1,
+                    ("*", "*") => 0,
+                    _ => return None,
+                };
+                Some((specificity, range.quality))
+            })
+            .max()
+            .unwrap_or((0, Quality::ZERO))
+    };
+    let (ssz_specificity, ssz_quality) = preference("octet-stream");
+    let (_, json_quality) = preference("json");
+    if ssz_quality == Quality::ZERO && json_quality == Quality::ZERO {
+        return Err(ApiError::NotAcceptable(
+            "Supported representations are application/json and application/octet-stream".into(),
+        ));
+    }
+    Ok(ssz_quality > json_quality || (ssz_quality == json_quality && ssz_specificity == 2))
 }
 
 /// Sends a produced block as SSZ or JSON, carrying the metadata headers either way.
@@ -1538,6 +1577,7 @@ pub async fn get_blocks_v3(
     execution_engine: Data<Option<ExecutionEngine>>,
     builder_client: Data<Option<Arc<BuilderClient>>>,
 ) -> Result<impl Responder, ApiError> {
+    let ssz = accepts_ssz(&http_request)?;
     let slot = path.into_inner();
     let query_params = query.into_inner();
     let randao_reveal = query_params.randao_reveal;
@@ -1728,7 +1768,7 @@ pub async fn get_blocks_v3(
             data: ProduceBlockData::Blinded(blinded_block),
         };
 
-        return produce_block_response(response, accepts_ssz(&http_request));
+        return produce_block_response(response, ssz);
     }
 
     let execution_payload = local_payload.to_execution_payload();
@@ -1822,7 +1862,7 @@ pub async fn get_blocks_v3(
         }),
     };
 
-    produce_block_response(response, accepts_ssz(&http_request))
+    produce_block_response(response, ssz)
 }
 
 #[get("/validator/aggregate_attestation")]
@@ -1872,12 +1912,15 @@ mod validator_api_tests {
                 "application/octet-stream;q=1.0,application/json;q=0.9",
             ))
             .to_http_request();
-        assert!(accepts_ssz(&request));
-        assert!(!accepts_ssz(
-            &test::TestRequest::default()
-                .insert_header((ACCEPT, "application/json"))
-                .to_http_request()
-        ));
+        assert!(accepts_ssz(&request).unwrap());
+        assert!(
+            !accepts_ssz(
+                &test::TestRequest::default()
+                    .insert_header((ACCEPT, "application/json"))
+                    .to_http_request()
+            )
+            .unwrap()
+        );
 
         let contents = FullBlockData {
             block: Default::default(),
@@ -2006,5 +2049,54 @@ mod validator_api_tests {
             validate_proposal_blob_bundle(&BlobsBundle::V1(bundle)).unwrap(),
             1
         );
+    }
+
+    #[actix_web::test]
+    async fn block_representation_respects_quality_and_specificity() {
+        for (accept, ssz) in [
+            ("application/octet-stream", true),
+            ("application/json", false),
+            ("application/octet-stream;q=0,application/json;q=1", false),
+            (
+                "application/octet-stream;q=0.5,application/json;q=0.9",
+                false,
+            ),
+            ("application/octet-stream;q=1,application/json;q=0.9", true),
+            ("application/octet-stream;q=0,*/*;q=1", false),
+            ("application/json;q=0,application/*;q=1", true),
+            ("application/octet-stream;q=0.2,application/*;q=0.8", false),
+            (
+                "application/octet-stream;q=0.9,application/json;q=0.9",
+                true,
+            ),
+            ("application/*", false),
+            ("*/*", false),
+            ("text/html,application/json;q=0.5", false),
+        ] {
+            let request = test::TestRequest::default()
+                .insert_header((ACCEPT, accept))
+                .to_http_request();
+            assert_eq!(accepts_ssz(&request).unwrap(), ssz, "{accept}");
+        }
+        assert!(!accepts_ssz(&test::TestRequest::default().to_http_request()).unwrap());
+        let request = test::TestRequest::default()
+            .append_header((ACCEPT, "application/octet-stream;q=0.5"))
+            .append_header((ACCEPT, "application/json;q=0.9"))
+            .to_http_request();
+        assert!(!accepts_ssz(&request).unwrap());
+        for accept in [
+            "text/html",
+            "application/octet-stream;q=0,application/json;q=0",
+            "*/*;q=0",
+        ] {
+            let request = test::TestRequest::default()
+                .insert_header((ACCEPT, accept))
+                .to_http_request();
+            let err = accepts_ssz(&request).unwrap_err();
+            assert_eq!(
+                actix_web::ResponseError::status_code(&err),
+                actix_web::http::StatusCode::NOT_ACCEPTABLE
+            );
+        }
     }
 }

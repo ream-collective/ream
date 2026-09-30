@@ -12,6 +12,9 @@ pub enum ApiError {
     #[error("Bad Request: {0}")]
     BadRequest(String),
 
+    #[error("Not Acceptable: {0}")]
+    NotAcceptable(String),
+
     #[error("Internal Server Error: {0}")]
     InternalError(String),
 
@@ -39,6 +42,7 @@ impl ResponseError for ApiError {
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ApiError::NotAcceptable(_) => StatusCode::NOT_ACCEPTABLE,
             ApiError::InvalidParameter(_) => StatusCode::BAD_REQUEST,
             ApiError::ValidatorNotFound(_) => StatusCode::NOT_FOUND,
             ApiError::TooManyValidatorsIds => StatusCode::URI_TOO_LONG,
