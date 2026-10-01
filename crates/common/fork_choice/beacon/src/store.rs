@@ -3,7 +3,6 @@ use std::{cmp::Ordering, sync::Arc};
 use alloy_primitives::{B256, map::HashSet};
 use anyhow::{anyhow, bail, ensure};
 use hashbrown::HashMap;
-use ream_bls::BLSSignature;
 use ream_consensus_beacon::{
     attestation::Attestation,
     data_column_sidecar::ColumnIdentifier,
@@ -864,11 +863,11 @@ impl Store {
 
 pub fn get_forkchoice_store(
     anchor_state: BeaconState,
-    anchor_block: BeaconBlock,
+    anchor_block: SignedBeaconBlock,
     db: BeaconDB,
 ) -> anyhow::Result<Store> {
-    ensure!(anchor_block.state_root == anchor_state.tree_hash_root());
-    let anchor_root = anchor_block.tree_hash_root();
+    ensure!(anchor_block.message.state_root == anchor_state.tree_hash_root());
+    let anchor_root = anchor_block.message.tree_hash_root();
     let anchor_epoch = anchor_state.get_current_epoch();
     let justified_checkpoint = Checkpoint {
         epoch: anchor_epoch,
@@ -879,12 +878,6 @@ pub fn get_forkchoice_store(
         root: anchor_root,
     };
     let proposer_boost_root = B256::ZERO;
-    let signature = BLSSignature::default();
-
-    let signed_anchor_block = SignedBeaconBlock {
-        message: anchor_block,
-        signature,
-    };
 
     let previous_justified_checkpoint = Checkpoint {
         epoch: anchor_epoch,
@@ -911,8 +904,7 @@ pub fn get_forkchoice_store(
     // the moment any validator has a latest message (i.e. once attestations reach fork choice).
     db.equivocating_indices_provider()
         .insert(HashSet::default())?;
-    db.block_provider()
-        .insert(anchor_root, signed_anchor_block)?;
+    db.block_provider().insert(anchor_root, anchor_block)?;
     db.state_provider()
         .insert(anchor_root, anchor_state.clone())?;
     db.state_root_index_provider()

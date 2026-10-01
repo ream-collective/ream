@@ -6217,6 +6217,7 @@ dependencies = [
  "ethereum_ssz",
  "hashbrown 0.17.1",
  "leansig",
+ "libp2p",
  "libp2p-identity",
  "prometheus_exporter",
  "rand 0.10.2",
