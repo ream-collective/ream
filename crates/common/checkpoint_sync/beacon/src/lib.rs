@@ -107,7 +107,7 @@ pub async fn initialize_db_from_checkpoint(
     ensure!(block.message.slot == state.slot, "Slot mismatch");
 
     ensure!(block.message.state_root == state.state_root());
-    let mut store = get_forkchoice_store(state.clone(), block.message, db)?;
+    let mut store = get_forkchoice_store(state.clone(), block, db)?;
 
     let time = beacon_network_spec().min_genesis_time
         + beacon_network_spec().seconds_per_slot() * (slot + 1);
@@ -165,7 +165,12 @@ pub fn initialize_db_from_genesis_state(
         genesis_state.genesis_time, genesis_state.genesis_validators_root
     );
 
-    let mut store = get_forkchoice_store(genesis_state.clone(), genesis_block, db)?;
+    // Genesis has no proposer signature.
+    let signed_genesis_block = SignedBeaconBlock {
+        message: genesis_block,
+        signature: Default::default(),
+    };
+    let mut store = get_forkchoice_store(genesis_state.clone(), signed_genesis_block, db)?;
 
     let time = genesis_state.genesis_time
         + beacon_network_spec().seconds_per_slot() * (genesis_state.slot + 1);

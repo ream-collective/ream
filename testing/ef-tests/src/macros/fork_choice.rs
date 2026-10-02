@@ -137,7 +137,12 @@ macro_rules! test_fork_choice {
 
                         let ream_db = ReamDB::new(ream_directory).expect("unable to init Ream Database");
                         let beacon_db = ream_db.init_beacon_db().expect("count not find reabdb");
-                        let mut store = get_forkchoice_store(anchor_state, anchor_block, beacon_db)
+                        // Spec fixtures provide an unsigned anchor block.
+                        let signed_anchor_block = SignedBeaconBlock {
+                            message: anchor_block,
+                            signature: BLSSignature::default(),
+                        };
+                        let mut store = get_forkchoice_store(anchor_state, signed_anchor_block, beacon_db)
                             .expect("get_forkchoice_store failed");
 
                         for step in steps {

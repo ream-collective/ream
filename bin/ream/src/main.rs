@@ -995,6 +995,7 @@ pub async fn countdown_for_genesis() {
 #[cfg(test)]
 mod tests {
     mod block_lookup_tests;
+    mod checkpoint_bootstrap_tests;
 
     use std::{
         env::temp_dir,
@@ -1401,7 +1402,7 @@ mod tests {
             .init_beacon_db()
             .expect("unable to init Ream Beacon Database");
 
-        let _store = get_forkchoice_store(genesis_state, genesis_block.message.clone(), beacon_db)
+        let _store = get_forkchoice_store(genesis_state, genesis_block.clone(), beacon_db)
             .expect("Failed to seed Beacon DB from fixture");
 
         genesis_validators_root
