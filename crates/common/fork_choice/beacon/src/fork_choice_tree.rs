@@ -61,6 +61,7 @@ pub struct ForkChoiceTree {
     balances_checkpoint: Option<Checkpoint>,
     proposer_score: u64,
     votes: HashMap<u64, AppliedVote>,
+    pending_weight: HashMap<B256, u64>,
     equivocating: HashSet<u64>,
     boost: Option<(B256, u64)>,
 }
@@ -90,6 +91,7 @@ impl ForkChoiceTree {
             balances_checkpoint: None,
             proposer_score: 0,
             votes: HashMap::default(),
+            pending_weight: HashMap::default(),
             equivocating: HashSet::default(),
             boost: None,
         };
@@ -178,12 +180,9 @@ impl ForkChoiceTree {
         self.update_node(block.root);
         self.update_ancestors(block.parent_root);
 
-        let carried_weight: u64 = self
-            .votes
-            .values()
-            .filter(|vote| vote.root == block.root)
-            .map(|vote| vote.balance)
-            .sum();
+        // Votes that arrived before this block were parked in `pending_weight`; hand over only
+        // this root's share.
+        let carried_weight = self.pending_weight.remove(&block.root).unwrap_or(0);
         if carried_weight > 0 {
             self.apply_weight_delta(block.root, i128::from(carried_weight));
         }
@@ -331,6 +330,7 @@ impl ForkChoiceTree {
         }
         self.nodes = retained;
         self.root = new_root;
+        self.rebuild_pending_weight();
         if self
             .boost
             .is_some_and(|(root, _)| !self.nodes.contains_key(&root))
@@ -341,9 +341,41 @@ impl ForkChoiceTree {
         Ok(())
     }
 
+    /// Applies per-root vote weight changes. A root that is in the tree gets the weight on its
+    /// subtree chain; a root that is not is tracked in `pending_weight` until its block arrives.
     fn apply_deltas(&mut self, deltas: HashMap<B256, i128>) {
         for (root, delta) in deltas {
-            self.apply_weight_delta(root, delta);
+            if self.nodes.contains_key(&root) {
+                self.apply_weight_delta(root, delta);
+            } else {
+                self.adjust_pending_weight(root, delta);
+            }
+        }
+    }
+
+    fn adjust_pending_weight(&mut self, root: B256, delta: i128) {
+        if delta == 0 {
+            return;
+        }
+        let current = self.pending_weight.get(&root).copied().unwrap_or(0);
+        match apply_signed(current, delta) {
+            0 => {
+                self.pending_weight.remove(&root);
+            }
+            updated => {
+                self.pending_weight.insert(root, updated);
+            }
+        }
+    }
+
+    /// Recomputes `pending_weight` from `votes`. Needed after `prune`, which removes nodes whose
+    /// votes were previously counted in the tree.
+    fn rebuild_pending_weight(&mut self) {
+        self.pending_weight.clear();
+        for vote in self.votes.values() {
+            if vote.balance > 0 && !self.nodes.contains_key(&vote.root) {
+                *self.pending_weight.entry(vote.root).or_default() += vote.balance;
+            }
         }
     }
 
@@ -486,6 +518,17 @@ mod tests {
         }
     }
 
+    /// `pending_weight` must equal the per-root sum of vote balances for roots outside the tree.
+    fn assert_pending_invariant(tree: &ForkChoiceTree) {
+        let mut expected: HashMap<B256, u64> = HashMap::default();
+        for vote in tree.votes.values() {
+            if vote.balance > 0 && !tree.nodes.contains_key(&vote.root) {
+                *expected.entry(vote.root).or_default() += vote.balance;
+            }
+        }
+        assert_eq!(tree.pending_weight, expected);
+    }
+
     fn tree_with_balances(validators: usize) -> ForkChoiceTree {
         let mut tree = ForkChoiceTree::new(block(1, 0, 0), genesis_context());
         tree.set_balances(checkpoint(0, 1), vec![32; validators], 0);
@@ -550,6 +593,59 @@ mod tests {
         assert_eq!(tree.weight(&root(3)), Some(32));
         // Tie on weight (32 vs 32) between root(2) and root(3) breaks towards the higher root.
         assert_eq!(tree.head(), root(3));
+    }
+
+    #[test]
+    fn pending_weight_is_indexed_per_unknown_root_and_moves_with_votes() {
+        let mut tree = tree_with_balances(4);
+
+        tree.process_votes([(0, root(2)), (1, root(2)), (2, root(3))]);
+        assert_eq!(tree.pending_weight.get(&root(2)), Some(&64));
+        assert_eq!(tree.pending_weight.get(&root(3)), Some(&32));
+        assert_pending_invariant(&tree);
+
+        // A vote moving between unknown roots leaves the old root's share behind.
+        tree.process_votes([(1, root(3))]);
+        assert_eq!(tree.pending_weight.get(&root(2)), Some(&32));
+        assert_eq!(tree.pending_weight.get(&root(3)), Some(&64));
+        assert_pending_invariant(&tree);
+
+        // Equivocation and balance changes adjust the parked weight.
+        tree.mark_equivocating([2]);
+        assert_eq!(tree.pending_weight.get(&root(3)), Some(&32));
+        tree.set_balances(checkpoint(0, 1), vec![10; 4], 0);
+        assert_eq!(tree.pending_weight.get(&root(2)), Some(&10));
+        assert_eq!(tree.pending_weight.get(&root(3)), Some(&10));
+        assert_pending_invariant(&tree);
+
+        // Inserting a block takes only its own root's weight and clears that entry.
+        tree.insert(block(2, 1, 1)).unwrap();
+        assert_eq!(tree.weight(&root(2)), Some(10));
+        assert!(!tree.pending_weight.contains_key(&root(2)));
+        assert_eq!(tree.pending_weight.get(&root(3)), Some(&10));
+        assert_pending_invariant(&tree);
+
+        tree.insert(block(3, 1, 1)).unwrap();
+        assert_eq!(tree.weight(&root(3)), Some(10));
+        assert!(tree.pending_weight.is_empty());
+    }
+
+    #[test]
+    fn prune_keeps_pending_weight_consistent_for_removed_roots() {
+        let mut tree = tree_with_balances(3);
+        tree.insert(block(2, 1, 1)).unwrap();
+        tree.insert(block(3, 1, 1)).unwrap();
+
+        // Validator 0 votes for block 3, which is then pruned away by finalizing block 2.
+        tree.process_votes([(0, root(3))]);
+        tree.prune(root(2)).unwrap();
+        assert_pending_invariant(&tree);
+
+        // A later vote for the pruned root and a move away from it must not corrupt the index.
+        tree.process_votes([(1, root(3))]);
+        tree.process_votes([(0, root(2))]);
+        assert_pending_invariant(&tree);
+        assert_eq!(tree.pending_weight.get(&root(3)), Some(&32));
     }
 
     #[test]
@@ -911,6 +1007,7 @@ mod tests {
                     context.justified_checkpoint.root,
                 );
                 assert_eq!(tree.head(), expected, "seed {seed}, step {step}");
+                assert_pending_invariant(&tree);
             }
         }
     }
