@@ -1,4 +1,9 @@
-use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
+use std::{
+    cmp::Ordering,
+    collections::VecDeque,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use alloy_primitives::{B256, map::HashSet};
 use anyhow::{anyhow, bail, ensure};
@@ -57,12 +62,47 @@ pub struct BlockWithEpochInfo {
 }
 
 #[derive(Debug)]
+struct RetryBackoff {
+    next_attempt: Option<Instant>,
+    delay: Duration,
+}
+
+impl RetryBackoff {
+    const INITIAL_DELAY: Duration = Duration::from_secs(1);
+    const MAX_DELAY: Duration = Duration::from_secs(12);
+
+    fn new() -> Self {
+        Self {
+            next_attempt: None,
+            delay: Self::INITIAL_DELAY,
+        }
+    }
+
+    fn is_due(&self, now: Instant) -> bool {
+        self.next_attempt.is_none_or(|next| now >= next)
+    }
+
+    /// Schedules the next attempt and returns how long it will wait.
+    fn record_failure(&mut self, now: Instant) -> Duration {
+        let wait = self.delay;
+        self.next_attempt = Some(now + wait);
+        self.delay = (wait * 2).min(Self::MAX_DELAY);
+        wait
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+}
+
+#[derive(Debug)]
 pub struct Store {
     pub db: BeaconDB,
     pub data_availability_checker: DataAvailabilityChecker,
     pub operation_pool: Arc<OperationPool>,
     pub sync_committee_pool: Arc<SyncCommitteePool>,
     fork_choice: Option<ForkChoiceTree>,
+    fork_choice_retry: RetryBackoff,
 }
 
 impl Store {
@@ -79,6 +119,7 @@ impl Store {
             operation_pool,
             sync_committee_pool,
             fork_choice: None,
+            fork_choice_retry: RetryBackoff::new(),
         }
     }
 
@@ -229,8 +270,10 @@ impl Store {
 
     pub fn get_head(&self) -> anyhow::Result<B256> {
         match &self.fork_choice {
-            Some(tree) => Ok(tree.head()),
-            None => self.get_head_from_db(),
+            Some(tree) if tree.contains(&tree.context().justified_checkpoint.root) => {
+                Ok(tree.head())
+            }
+            _ => self.get_head_from_db(),
         }
     }
 
@@ -327,6 +370,7 @@ impl Store {
         );
 
         self.fork_choice = Some(tree);
+        self.fork_choice_retry.reset();
         Ok(())
     }
 
@@ -340,8 +384,13 @@ impl Store {
     /// proposer boost.
     pub fn refresh_fork_choice(&mut self) {
         let Some(mut tree) = self.fork_choice.take() else {
+            let now = Instant::now();
+            if !self.fork_choice_retry.is_due(now) {
+                return;
+            }
             if let Err(err) = self.enable_fork_choice_tree() {
-                warn!("unable to re-enable the fork choice tree: {err:#}");
+                let wait = self.fork_choice_retry.record_failure(now);
+                warn!("unable to re-enable the fork choice tree, retrying in {wait:?}: {err:#}");
             }
             return;
         };
@@ -399,6 +448,7 @@ impl Store {
                 "Failed to rebuild the fork choice tree, computing the head from the database: {err:#}"
             );
             self.fork_choice = None;
+            self.fork_choice_retry.record_failure(Instant::now());
         }
     }
 
@@ -1291,6 +1341,34 @@ mod tests {
             .init_beacon_db()
             .unwrap();
         (db, temp_dir)
+    }
+
+    #[test]
+    fn retry_backoff_doubles_up_to_the_cap_and_resets() {
+        let start = Instant::now();
+        let mut backoff = RetryBackoff::new();
+        assert!(backoff.is_due(start));
+
+        backoff.record_failure(start);
+        assert!(!backoff.is_due(start + Duration::from_millis(999)));
+        assert!(backoff.is_due(start + Duration::from_secs(1)));
+
+        let second = start + Duration::from_secs(1);
+        backoff.record_failure(second);
+        assert!(!backoff.is_due(second + Duration::from_millis(1999)));
+        assert!(backoff.is_due(second + Duration::from_secs(2)));
+
+        let mut now = second;
+        for _ in 0..10 {
+            now += RetryBackoff::MAX_DELAY;
+            backoff.record_failure(now);
+        }
+        assert_eq!(backoff.delay, RetryBackoff::MAX_DELAY);
+        assert!(!backoff.is_due(now + RetryBackoff::MAX_DELAY - Duration::from_millis(1)));
+
+        backoff.reset();
+        assert!(backoff.is_due(now));
+        assert_eq!(backoff.delay, RetryBackoff::INITIAL_DELAY);
     }
 
     fn signed_block(slot: u64) -> SignedBeaconBlock {
