@@ -8,10 +8,8 @@ use std::{
 
 use alloy_rlp::Encodable;
 use anyhow::{Result, anyhow};
-use discv5::{
-    Discv5, Enr, Event,
-    enr::{CombinedKey, NodeId, k256::ecdsa::SigningKey},
-};
+use discv5::{Discv5, Enr, Event};
+use enr::{CombinedKey, NodeId, k256::ecdsa::SigningKey};
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use libp2p::{
     Multiaddr, PeerId,

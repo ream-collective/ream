@@ -1,6 +1,6 @@
 use alloy_primitives::U256;
 use anyhow::{Ok, Result, anyhow, ensure};
-use discv5::enr::NodeId;
+use enr::NodeId;
 use ream_consensus_misc::constants::beacon::NUM_CUSTODY_GROUPS;
 use ream_network_spec::networks::beacon::{BeaconNetworkSpec, beacon_network_spec};
 use sha2::{Digest, Sha256};
@@ -215,7 +215,7 @@ fn compute_columns_for_custody_groups(custody_groups: &[u64]) -> Result<Vec<u64>
 #[cfg(test)]
 mod tests {
     use alloy_primitives::U256;
-    use discv5::enr::NodeId;
+    use enr::NodeId;
     use ream_network_spec::networks::beacon::{BeaconNetworkSpec, DEV, HOODI, MAINNET, SEPOLIA};
 
     use super::{
