@@ -1,4 +1,9 @@
-use std::{cmp::Ordering, sync::Arc};
+use std::{
+    cmp::Ordering,
+    collections::VecDeque,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use alloy_primitives::{B256, map::HashSet};
 use anyhow::{anyhow, bail, ensure};
@@ -27,6 +32,7 @@ use ream_network_spec::networks::beacon_network_spec;
 use ream_operation_pool::OperationPool;
 use ream_storage::{
     db::beacon::BeaconDB,
+    errors::StoreError,
     tables::{
         field::{CustomField, REDBField},
         multimap_table::MultimapTable,
@@ -34,12 +40,15 @@ use ream_storage::{
     },
 };
 use ream_sync_committee_pool::SyncCommitteePool;
-use tracing::debug;
+use tracing::{debug, warn};
 use tree_hash::TreeHash;
 
-use crate::constants::{
-    PROPOSER_SCORE_BOOST, REORG_HEAD_WEIGHT_THRESHOLD, REORG_MAX_EPOCHS_SINCE_FINALIZATION,
-    REORG_PARENT_WEIGHT_THRESHOLD,
+use crate::{
+    constants::{
+        PROPOSER_SCORE_BOOST, REORG_HEAD_WEIGHT_THRESHOLD, REORG_MAX_EPOCHS_SINCE_FINALIZATION,
+        REORG_PARENT_WEIGHT_THRESHOLD,
+    },
+    fork_choice_tree::{ForkChoiceBlock, ForkChoiceTree, ViabilityContext},
 };
 
 const VALIDATOR_API_SYNC_TOLERANCE_EPOCHS: u64 = 2;
@@ -52,11 +61,47 @@ pub struct BlockWithEpochInfo {
 }
 
 #[derive(Debug)]
+struct RetryBackoff {
+    next_attempt: Option<Instant>,
+    delay: Duration,
+}
+
+impl RetryBackoff {
+    const INITIAL_DELAY: Duration = Duration::from_secs(1);
+    const MAX_DELAY: Duration = Duration::from_secs(12);
+
+    fn new() -> Self {
+        Self {
+            next_attempt: None,
+            delay: Self::INITIAL_DELAY,
+        }
+    }
+
+    fn is_due(&self, now: Instant) -> bool {
+        self.next_attempt.is_none_or(|next| now >= next)
+    }
+
+    /// Schedules the next attempt and returns how long it will wait.
+    fn record_failure(&mut self, now: Instant) -> Duration {
+        let wait = self.delay;
+        self.next_attempt = Some(now + wait);
+        self.delay = (wait * 2).min(Self::MAX_DELAY);
+        wait
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+}
+
+#[derive(Debug)]
 pub struct Store {
     pub db: BeaconDB,
     pub data_availability_checker: DataAvailabilityChecker,
     pub operation_pool: Arc<OperationPool>,
     pub sync_committee_pool: Arc<SyncCommitteePool>,
+    fork_choice: Option<ForkChoiceTree>,
+    fork_choice_retry: RetryBackoff,
 }
 
 impl Store {
@@ -72,6 +117,8 @@ impl Store {
             data_availability_checker: DataAvailabilityChecker::supernode(),
             operation_pool,
             sync_committee_pool,
+            fork_choice: None,
+            fork_choice_retry: RetryBackoff::new(),
         }
     }
 
@@ -221,6 +268,15 @@ impl Store {
     }
 
     pub fn get_head(&self) -> anyhow::Result<B256> {
+        match &self.fork_choice {
+            Some(tree) if tree.contains(&tree.context().justified_checkpoint.root) => {
+                Ok(tree.head())
+            }
+            _ => self.get_head_from_db(),
+        }
+    }
+
+    pub fn get_head_from_db(&self) -> anyhow::Result<B256> {
         // Get filtered block tree that only includes viable branches
         let blocks = self.get_filtered_block_tree()?;
         // Execute the LMD-GHOST fork choice
@@ -263,6 +319,234 @@ impl Store {
 
             head = *best_child;
         }
+    }
+
+    /// Builds the in-memory fork choice tree from the database and starts maintaining it.
+    pub fn enable_fork_choice_tree(&mut self) -> anyhow::Result<()> {
+        self.fork_choice = None;
+
+        let finalized_checkpoint = self.db.finalized_checkpoint_provider().get()?;
+        let justified_checkpoint = self.db.justified_checkpoint_provider().get()?;
+        let current_epoch = self.get_current_store_epoch()?;
+
+        let anchor = self.fork_choice_block_from_db(finalized_checkpoint.root, current_epoch)?;
+        let mut tree = ForkChoiceTree::new(
+            anchor,
+            ViabilityContext {
+                justified_checkpoint,
+                finalized_checkpoint,
+                current_epoch,
+            },
+        );
+
+        // Breadth-first so every parent is inserted before its children.
+        let mut queue = VecDeque::from([finalized_checkpoint.root]);
+        while let Some(parent_root) = queue.pop_front() {
+            let children = self
+                .db
+                .parent_root_index_multimap_provider()
+                .get(parent_root)?
+                .unwrap_or_default();
+            for child_root in children {
+                tree.insert(self.fork_choice_block_from_db(child_root, current_epoch)?)?;
+                queue.push_back(child_root);
+            }
+        }
+
+        // Balances must be loaded before votes so they are counted with the right weight.
+        self.reconcile_fork_choice_tree(&mut tree)?;
+        match self.db.equivocating_indices_provider().get() {
+            Ok(indices) => tree.mark_equivocating(indices),
+            Err(StoreError::FieldNotInitilized) => {}
+            Err(err) => return Err(err.into()),
+        }
+        tree.process_votes(
+            self.db
+                .latest_messages_provider()
+                .get_all()?
+                .into_iter()
+                .map(|(validator_index, message)| (validator_index, message.root)),
+        );
+
+        self.fork_choice = Some(tree);
+        self.fork_choice_retry.reset();
+        Ok(())
+    }
+
+    pub fn is_fork_choice_tree_enabled(&self) -> bool {
+        self.fork_choice.is_some()
+    }
+
+    /// Brings the fork choice tree in line with the checkpoints, time and proposer boost stored in
+    /// the database: prunes at a new finalized root, refreshes viability on justified/finalized/
+    /// epoch changes, reloads balances when the justified checkpoint changed and applies the
+    /// proposer boost.
+    pub fn refresh_fork_choice(&mut self) {
+        let Some(mut tree) = self.fork_choice.take() else {
+            let now = Instant::now();
+            if !self.fork_choice_retry.is_due(now) {
+                return;
+            }
+            if let Err(err) = self.enable_fork_choice_tree() {
+                let wait = self.fork_choice_retry.record_failure(now);
+                warn!("unable to re-enable the fork choice tree, retrying in {wait:?}: {err:#}");
+            }
+            return;
+        };
+        match self.reconcile_fork_choice_tree(&mut tree) {
+            Ok(()) => self.fork_choice = Some(tree),
+            Err(err) => self.recover_fork_choice(err),
+        }
+    }
+
+    /// Adds a freshly imported block to the fork choice tree. Must run after the block, its state
+    /// and its unrealized justification are in the database.
+    pub fn fork_choice_insert_block(
+        &mut self,
+        block_root: B256,
+        parent_root: B256,
+        slot: u64,
+        justified_checkpoint: Checkpoint,
+    ) {
+        if self.fork_choice.is_none() {
+            return;
+        }
+        let unrealized_justified_checkpoint = self
+            .db
+            .unrealized_justifications_provider()
+            .get(block_root)
+            .ok()
+            .flatten()
+            .unwrap_or(justified_checkpoint);
+        let result = match self.fork_choice.as_mut() {
+            Some(tree) => tree.insert(ForkChoiceBlock {
+                root: block_root,
+                parent_root,
+                slot,
+                justified_checkpoint,
+                unrealized_justified_checkpoint,
+            }),
+            None => return,
+        };
+        if let Err(err) = result {
+            self.recover_fork_choice(err);
+        }
+    }
+
+    /// Removes the fork choice influence of validators found equivocating.
+    pub fn fork_choice_mark_equivocating(&mut self, indices: impl IntoIterator<Item = u64>) {
+        if let Some(tree) = self.fork_choice.as_mut() {
+            tree.mark_equivocating(indices);
+        }
+    }
+
+    fn recover_fork_choice(&mut self, err: anyhow::Error) {
+        warn!("Fork choice tree is out of sync ({err:#}), rebuilding it from the database");
+        if let Err(err) = self.enable_fork_choice_tree() {
+            warn!(
+                "Failed to rebuild the fork choice tree, computing the head from the database: {err:#}"
+            );
+            self.fork_choice = None;
+            self.fork_choice_retry.record_failure(Instant::now());
+        }
+    }
+
+    fn reconcile_fork_choice_tree(&mut self, tree: &mut ForkChoiceTree) -> anyhow::Result<()> {
+        let finalized_checkpoint = self.db.finalized_checkpoint_provider().get()?;
+        let justified_checkpoint = self.db.justified_checkpoint_provider().get()?;
+
+        if tree.root() != finalized_checkpoint.root {
+            tree.prune(finalized_checkpoint.root)?;
+        }
+        tree.update_context(ViabilityContext {
+            justified_checkpoint,
+            finalized_checkpoint,
+            current_epoch: self.get_current_store_epoch()?,
+        });
+
+        if tree.balances_checkpoint() != Some(justified_checkpoint) {
+            self.load_fork_choice_balances(tree, justified_checkpoint)?;
+        }
+
+        let proposer_boost_root = self.db.proposer_boost_root_provider().get()?;
+        tree.set_proposer_boost_root(
+            (proposer_boost_root != B256::ZERO).then_some(proposer_boost_root),
+        );
+        Ok(())
+    }
+
+    /// Loads validator balances from the justified checkpoint state, exactly as `get_weight`
+    /// derives them: active, unslashed validators' effective balances.
+    fn load_fork_choice_balances(
+        &mut self,
+        tree: &mut ForkChoiceTree,
+        justified_checkpoint: Checkpoint,
+    ) -> anyhow::Result<()> {
+        let mut justified_state = self
+            .db
+            .checkpoint_states_provider()
+            .get(justified_checkpoint)?;
+        if justified_state.is_none() {
+            // A newly justified checkpoint's state is normally stored when an attestation targeting
+            // it is processed, which can come after the block that justified it.
+            self.store_target_checkpoint_state(justified_checkpoint)?;
+            justified_state = self
+                .db
+                .checkpoint_states_provider()
+                .get(justified_checkpoint)?;
+        }
+        let Some(state) = justified_state else {
+            // Keep the previous balances; `balances_checkpoint` stays behind so the next refresh
+            // retries.
+            debug!("Justified checkpoint state is not available yet, keeping previous balances");
+            return Ok(());
+        };
+
+        let mut balances = vec![0; state.validators.len()];
+        for index in state.get_active_validator_indices(state.get_current_epoch()) {
+            let validator = &state.validators[index as usize];
+            if !validator.slashed {
+                balances[index as usize] = validator.effective_balance;
+            }
+        }
+        // Same derivation as `get_proposer_score`.
+        let proposer_score =
+            (get_total_active_balance(&state) / SLOTS_PER_EPOCH * PROPOSER_SCORE_BOOST) / 100;
+
+        tree.set_balances(justified_checkpoint, balances, proposer_score);
+        Ok(())
+    }
+
+    fn fork_choice_block_from_db(
+        &self,
+        root: B256,
+        current_epoch: u64,
+    ) -> anyhow::Result<ForkChoiceBlock> {
+        let block = self
+            .db
+            .block_provider()
+            .get(root)?
+            .ok_or_else(|| anyhow!("block {root} not found"))?
+            .message;
+        let unrealized = self.db.unrealized_justifications_provider().get(root)?;
+        let realized = if compute_epoch_at_slot(block.slot) >= current_epoch {
+            self.db
+                .state_provider()
+                .get(root)?
+                .map(|state| state.current_justified_checkpoint)
+        } else {
+            None
+        };
+        let justified_checkpoint = realized
+            .or(unrealized)
+            .ok_or_else(|| anyhow!("no voting source available for block {root}"))?;
+        Ok(ForkChoiceBlock {
+            root,
+            parent_root: block.parent_root,
+            slot: block.slot,
+            justified_checkpoint,
+            unrealized_justified_checkpoint: unrealized.unwrap_or(justified_checkpoint),
+        })
     }
 
     /// Update checkpoints in store if necessary
@@ -506,6 +790,17 @@ impl Store {
         }
     }
 
+    fn weight(&self, root: B256) -> anyhow::Result<u64> {
+        match self
+            .fork_choice
+            .as_ref()
+            .and_then(|tree| tree.weight(&root))
+        {
+            Some(weight) => Ok(weight),
+            None => self.get_weight(root),
+        }
+    }
+
     pub fn is_head_weak(&self, head_root: B256) -> anyhow::Result<bool> {
         let justified_state = self
             .db
@@ -515,7 +810,7 @@ impl Store {
 
         let reorg_threshold =
             calculate_committee_fraction(&justified_state, REORG_HEAD_WEIGHT_THRESHOLD);
-        let head_weight = self.get_weight(head_root)?;
+        let head_weight = self.weight(head_root)?;
 
         Ok(head_weight < reorg_threshold)
     }
@@ -529,7 +824,7 @@ impl Store {
 
         let parent_threshold =
             calculate_committee_fraction(&justified_state, REORG_PARENT_WEIGHT_THRESHOLD);
-        let parent_weight = self.get_weight(parent_root)?;
+        let parent_weight = self.weight(parent_root)?;
 
         Ok(parent_weight > parent_threshold)
     }
@@ -629,7 +924,14 @@ impl Store {
             }
         }
         if !updates.is_empty() {
+            let votes = updates
+                .iter()
+                .map(|(index, message)| (*index, message.root))
+                .collect::<Vec<_>>();
             latest_messages.insert_batch(updates)?;
+            if let Some(tree) = self.fork_choice.as_mut() {
+                tree.process_votes(votes);
+            }
         }
 
         Ok(())
@@ -701,6 +1003,8 @@ impl Store {
                 previous_justified,
             )?;
         }
+
+        self.refresh_fork_choice();
 
         Ok(())
     }
@@ -920,7 +1224,43 @@ pub fn get_forkchoice_store(
 
     let operation_pool = Arc::new(OperationPool::default());
 
-    Ok(Store::new(db, operation_pool, None))
+    let mut store = Store::new(db, operation_pool, None);
+    store.enable_fork_choice_tree()?;
+
+    Ok(store)
+}
+
+pub fn get_slots_since_genesis_from_db(db: &BeaconDB) -> anyhow::Result<u64> {
+    Ok(db
+        .time_provider()
+        .get()?
+        .saturating_sub(db.genesis_time_provider().get()?)
+        / beacon_network_spec().seconds_per_slot())
+}
+
+pub fn get_current_slot_from_db(db: &BeaconDB) -> anyhow::Result<u64> {
+    Ok(GENESIS_SLOT + get_slots_since_genesis_from_db(db)?)
+}
+
+/// Finds the ancestor of `root` at or before `slot` using only database reads, so callers that do
+/// not hold the [`Store`] can walk ancestry.
+pub fn get_ancestor_from_db(db: &BeaconDB, mut root: B256, slot: u64) -> anyhow::Result<B256> {
+    loop {
+        let block = db
+            .block_provider()
+            .get(root)?
+            .ok_or(anyhow!("Failed to find beacon_block_provider()"))?
+            .message;
+        if block.slot > slot {
+            root = block.parent_root;
+        } else {
+            return Ok(root);
+        }
+    }
+}
+
+pub fn get_checkpoint_block_from_db(db: &BeaconDB, root: B256, epoch: u64) -> anyhow::Result<B256> {
+    get_ancestor_from_db(db, root, compute_start_slot_at_epoch(epoch))
 }
 
 pub fn compute_slots_since_epoch_start(slot: u64) -> u64 {
@@ -993,6 +1333,34 @@ mod tests {
             .init_beacon_db()
             .unwrap();
         (db, temp_dir)
+    }
+
+    #[test]
+    fn retry_backoff_doubles_up_to_the_cap_and_resets() {
+        let start = Instant::now();
+        let mut backoff = RetryBackoff::new();
+        assert!(backoff.is_due(start));
+
+        backoff.record_failure(start);
+        assert!(!backoff.is_due(start + Duration::from_millis(999)));
+        assert!(backoff.is_due(start + Duration::from_secs(1)));
+
+        let second = start + Duration::from_secs(1);
+        backoff.record_failure(second);
+        assert!(!backoff.is_due(second + Duration::from_millis(1999)));
+        assert!(backoff.is_due(second + Duration::from_secs(2)));
+
+        let mut now = second;
+        for _ in 0..10 {
+            now += RetryBackoff::MAX_DELAY;
+            backoff.record_failure(now);
+        }
+        assert_eq!(backoff.delay, RetryBackoff::MAX_DELAY);
+        assert!(!backoff.is_due(now + RetryBackoff::MAX_DELAY - Duration::from_millis(1)));
+
+        backoff.reset();
+        assert!(backoff.is_due(now));
+        assert_eq!(backoff.delay, RetryBackoff::INITIAL_DELAY);
     }
 
     fn signed_block(slot: u64) -> SignedBeaconBlock {
