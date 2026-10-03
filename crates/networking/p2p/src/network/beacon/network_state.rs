@@ -8,7 +8,11 @@ use ream_peer::{ConnectionState, Direction};
 use ream_req_resp::beacon::messages::{meta_data::GetMetaDataV3, status::Status};
 use ssz::Encode;
 
-use super::{peer::CachedPeer, utils::META_DATA_FILE_NAME};
+use super::{
+    peer::CachedPeer,
+    peer_custody::{ColumnCoverage, PeerCustody},
+    utils::META_DATA_FILE_NAME,
+};
 
 pub struct NetworkState {
     pub local_enr: RwLock<Enr>,
@@ -37,7 +41,7 @@ impl NetworkState {
                 cached_peer.state = state;
                 cached_peer.direction = direction;
                 if let Some(enr_ref) = &enr {
-                    cached_peer.enr = Some(enr_ref.clone());
+                    cached_peer.update_enr(enr_ref.clone());
                 }
             })
             .or_insert(CachedPeer::new(peer_id, address, state, direction, enr));
@@ -50,6 +54,44 @@ impl NetworkState {
             .and_modify(|cached_peer| {
                 cached_peer.state = state;
             });
+    }
+
+    /// Stores MetaData received from `peer_id` and refreshes its custody. Returns `false` when
+    /// the peer is unknown or the MetaData is older than the cached one.
+    pub fn update_peer_meta_data(&self, peer_id: PeerId, meta_data: GetMetaDataV3) -> bool {
+        self.peer_table
+            .write()
+            .get_mut(&peer_id)
+            .is_some_and(|cached_peer| cached_peer.update_meta_data(meta_data))
+    }
+
+    /// Marks the peer disconnected and drops the MetaData of the closed connection.
+    pub fn peer_disconnected(&self, peer_id: PeerId) {
+        if let Some(cached_peer) = self.peer_table.write().get_mut(&peer_id) {
+            cached_peer.state = ConnectionState::Disconnected;
+            cached_peer.clear_meta_data();
+        }
+    }
+
+    /// Returns the custody derived for `peer_id`, if the peer is in the peer table.
+    pub fn peer_custody(&self, peer_id: &PeerId) -> Option<PeerCustody> {
+        self.peer_table
+            .read()
+            .get(peer_id)
+            .map(|cached_peer| cached_peer.custody().clone())
+    }
+
+    /// Reports which connected peers are expected to serve each of `columns` and which columns
+    /// none of them covers. Peers without a valid custody advertisement cover nothing.
+    pub fn column_coverage(&self, columns: &[u64]) -> ColumnCoverage {
+        let peer_table = self.peer_table.read();
+        ColumnCoverage::compute(
+            peer_table
+                .values()
+                .filter(|peer| peer.state == ConnectionState::Connected)
+                .map(|peer| (peer.peer_id, peer.custody())),
+            columns,
+        )
     }
 
     pub fn write_meta_data_to_disk(&self) -> anyhow::Result<()> {
