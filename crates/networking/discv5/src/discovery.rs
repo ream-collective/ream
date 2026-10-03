@@ -62,6 +62,7 @@ pub enum QueryType {
     Peers,
     AttestationSubnetPeers(Vec<u64>),
     SyncCommitteeSubnetPeers(Vec<u64>),
+    CustodyGroupPeers(Vec<u64>),
 }
 
 struct QueryResult {
@@ -74,6 +75,9 @@ pub struct Discovery {
     event_stream: EventStream,
     discovery_queries: FuturesUnordered<Pin<Box<dyn Future<Output = QueryResult> + Send>>>,
     find_peer_active: bool,
+    /// Whether a custody query is running. Custody queries run one at a time, and a running
+    /// general peer query does not block them.
+    find_custody_peer_active: bool,
     pub started: bool,
     /// Current attestation subnets this node is subscribed to
     current_attestation_subnets: AttestationSubnets,
@@ -157,6 +161,7 @@ impl Discovery {
             event_stream,
             discovery_queries: FuturesUnordered::new(),
             find_peer_active: false,
+            find_custody_peer_active: false,
             started: !config.disable_discovery,
             current_attestation_subnets: config.attestation_subnets.clone(),
             subscription_epoch,
@@ -229,9 +234,44 @@ impl Discovery {
         if !self.started || self.find_peer_active {
             return;
         }
+        if matches!(query, QueryType::CustodyGroupPeers(_)) {
+            warn!("Custody group queries must start through discover_custody_peers");
+            return;
+        }
         self.find_peer_active = true;
 
         self.start_query(query, target_peers);
+    }
+
+    /// Queries for up to `target_peers` peers that custody at least one of `custody_groups`.
+    /// The caller supplies `predicate` because the custody helpers live outside this crate.
+    /// Returns `false` without starting a query while discovery is disabled or another custody
+    /// query is running.
+    pub fn discover_custody_peers(
+        &mut self,
+        custody_groups: Vec<u64>,
+        predicate: Box<dyn Fn(&Enr) -> bool + Send>,
+        target_peers: usize,
+    ) -> bool {
+        if !self.started || self.find_custody_peer_active || custody_groups.is_empty() {
+            return false;
+        }
+        self.find_custody_peer_active = true;
+
+        let query = QueryType::CustodyGroupPeers(custody_groups);
+        let query_future = self
+            .discv5
+            .find_node_predicate(NodeId::random(), predicate, target_peers)
+            .map(move |result| QueryResult {
+                query_type: query,
+                result,
+            });
+        self.discovery_queries.push(Box::pin(query_future));
+        true
+    }
+
+    pub fn custody_query_active(&self) -> bool {
+        self.find_custody_peer_active
     }
 
     fn start_query(&mut self, query: QueryType, target_peers: usize) {
@@ -265,6 +305,8 @@ impl Discovery {
                     QueryType::SyncCommitteeSubnetPeers(subnet_ids) => {
                         Box::new(sync_committee_subnet_predicate(subnet_ids))
                     }
+                    // Rejected by `discover_peers`, which is the only caller.
+                    QueryType::CustodyGroupPeers(_) => return,
                 },
                 target_peers,
             )
@@ -339,6 +381,23 @@ impl Discovery {
                         }
                         Err(err) => {
                             warn!("Failed to find sync committee subnet peers: {err:?}");
+                            None
+                        }
+                    }
+                }
+                QueryType::CustodyGroupPeers(custody_groups) => {
+                    self.find_custody_peer_active = false;
+                    match query.result {
+                        // discv5 already applied the custody predicate to these results.
+                        Ok(peers) => {
+                            info!(
+                                "Found {} peers for custody groups {custody_groups:?}",
+                                peers.len()
+                            );
+                            Some(peers.into_iter().map(|peer| (peer, None)).collect())
+                        }
+                        Err(err) => {
+                            warn!("Failed to find custody group peers: {err:?}");
                             None
                         }
                     }
@@ -742,6 +801,66 @@ mod tests {
             discovery.current_attestation_subnets()
         );
 
+        Ok(())
+    }
+
+    async fn disabled_discovery() -> anyhow::Result<Discovery> {
+        let _ = GENESIS_VALIDATORS_ROOT.set(B256::ZERO);
+        initialize_test_network_spec();
+        let config = DiscoveryConfig {
+            disable_discovery: true,
+            ..DiscoveryConfig::default()
+        };
+        Discovery::new(Keypair::generate_secp256k1(), &config, 0).await
+    }
+
+    #[tokio::test]
+    async fn custody_queries_are_bounded_to_one_in_flight() -> anyhow::Result<()> {
+        let mut discovery = disabled_discovery().await?;
+        assert!(!discovery.discover_custody_peers(vec![1], Box::new(empty_predicate()), 4));
+        assert!(!discovery.custody_query_active());
+
+        // The discv5 service is not running, so the query resolves with an error once polled.
+        discovery.started = true;
+        assert!(!discovery.discover_custody_peers(vec![], Box::new(empty_predicate()), 4));
+        assert!(discovery.discover_custody_peers(vec![1], Box::new(empty_predicate()), 4));
+        assert!(discovery.custody_query_active());
+        assert!(!discovery.discover_custody_peers(vec![2], Box::new(empty_predicate()), 4));
+
+        // A general peer query does not wait for the custody query.
+        discovery.discover_peers(QueryType::Peers, 4);
+        assert!(discovery.find_peer_active);
+
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(discovery.poll(&mut cx).is_pending());
+        assert!(!discovery.custody_query_active());
+        assert!(discovery.discover_custody_peers(vec![2], Box::new(empty_predicate()), 4));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn custody_query_results_are_reported_as_discovered_peers() -> anyhow::Result<()> {
+        let mut discovery = disabled_discovery().await?;
+        let peer_enr = disabled_discovery().await?.local_enr();
+        discovery.started = true;
+        discovery.find_custody_peer_active = true;
+        let query_result = QueryResult {
+            query_type: QueryType::CustodyGroupPeers(vec![3]),
+            result: Ok(vec![peer_enr.clone()]),
+        };
+        discovery
+            .discovery_queries
+            .push(Box::pin(async move { query_result }));
+
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let Poll::Ready(ToSwarm::GenerateEvent(DiscoveryOutEvent::DiscoveredPeers { peers })) =
+            discovery.poll(&mut cx)
+        else {
+            panic!("expected custody peers to be reported");
+        };
+        assert_eq!(peers.len(), 1);
+        assert!(peers.contains_key(&peer_enr));
+        assert!(!discovery.custody_query_active());
         Ok(())
     }
 }

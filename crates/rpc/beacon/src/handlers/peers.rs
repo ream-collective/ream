@@ -33,10 +33,10 @@ pub async fn get_peer(
 
     Ok(HttpResponse::Ok().json(DataResponse::new(&Peer {
         peer_id: cached_peer.peer_id,
+        enr: cached_peer.enr().cloned(),
         last_seen_p2p_address: cached_peer.last_seen_p2p_address,
         state: cached_peer.state,
         direction: cached_peer.direction,
-        enr: cached_peer.enr,
     })))
 }
 
@@ -112,7 +112,7 @@ pub async fn get_peers(
         })
         .map(|cached_peer| Peer {
             peer_id: cached_peer.peer_id,
-            enr: cached_peer.enr.clone(),
+            enr: cached_peer.enr().cloned(),
             last_seen_p2p_address: cached_peer.last_seen_p2p_address.clone(),
             state: cached_peer.state,
             direction: cached_peer.direction,

@@ -15,7 +15,9 @@ use alloy_primitives::B256;
 use anyhow::ensure;
 use libp2p::PeerId;
 use ream_chain_beacon::beacon_chain::BeaconChain;
-use ream_consensus_beacon::data_column_sidecar::DataColumnSidecar;
+use ream_consensus_beacon::{
+    custody_group::PeerCustodyGroups, data_column_sidecar::DataColumnSidecar,
+};
 use ream_p2p::network::beacon::channel::{P2PCallbackResponse, P2PMessage, P2PRequest};
 use ream_polynomial_commitments::handlers::verify_data_column_sidecar_kzg_proofs;
 use ream_req_resp::beacon::messages::{
@@ -229,7 +231,17 @@ impl ColumnFetchTracker {
     }
 }
 
-/// Requests the columns `block_root` still needs, then validates and imports each one.
+/// Keeps the missing columns `peer_custody` covers. Peers are only expected to serve columns in
+/// their advertised custody groups, so requesting others wastes the response budget.
+fn columns_to_request(missing: Vec<u64>, peer_custody: &PeerCustodyGroups) -> Vec<u64> {
+    missing
+        .into_iter()
+        .filter(|column| peer_custody.custodies_column(*column))
+        .collect()
+}
+
+/// Requests the columns `block_root` still needs that `peer_id` custodies, then validates and
+/// imports each one.
 ///
 /// A response is accepted only when it carries the requested root and a column this node actually
 /// custodies, so a peer cannot use the reply to push unrelated data.
@@ -238,6 +250,7 @@ pub async fn fetch_missing_columns(
     p2p_sender: &P2PSender,
     block_root: B256,
     peer_id: PeerId,
+    peer_custody: &PeerCustodyGroups,
 ) -> ColumnFetchOutcome {
     // Re-read on every attempt: gossip or an earlier peer may have completed part of the set.
     let Some((missing, expected_header)) = ({
@@ -256,6 +269,10 @@ pub async fn fetch_missing_columns(
     };
     if missing.is_empty() {
         return ColumnFetchOutcome::Complete;
+    }
+    let missing = columns_to_request(missing, peer_custody);
+    if missing.is_empty() {
+        return ColumnFetchOutcome::Incomplete;
     }
 
     let sidecars = match request_columns_by_root(p2p_sender, peer_id, block_root, &missing).await {
@@ -485,6 +502,27 @@ mod tests {
             signed_block_header: SignedBeaconBlockHeader::default(),
             kzg_commitments_inclusion_proof: Default::default(),
         }
+    }
+
+    #[test]
+    fn requests_only_the_missing_columns_the_peer_custodies() {
+        let node_id = discv5::enr::NodeId::new(&[4; 32]);
+        let partial = PeerCustodyGroups::from_advertised(node_id, 4).expect("valid count");
+        let full = PeerCustodyGroups::from_advertised(node_id, 128).expect("valid count");
+        let none = PeerCustodyGroups::from_advertised(node_id, 0).expect("valid count");
+        let missing = (0..128).collect::<Vec<_>>();
+
+        assert_eq!(
+            columns_to_request(missing.clone(), &partial),
+            partial.custody_columns
+        );
+        assert_eq!(columns_to_request(missing.clone(), &full), missing);
+        assert!(columns_to_request(missing, &none).is_empty());
+
+        let outside = (0..128)
+            .find(|column| !partial.custodies_column(*column))
+            .expect("4 groups leave columns out");
+        assert!(columns_to_request(vec![outside], &partial).is_empty());
     }
 
     #[test]

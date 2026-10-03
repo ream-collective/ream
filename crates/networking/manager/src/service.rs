@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -126,20 +127,29 @@ fn spawn_queued_column_fetches(
     network_state: &NetworkState,
     done_sender: &mpsc::UnboundedSender<(B256, PeerId, ColumnFetchOutcome)>,
 ) {
-    let connected_peers = network_state
+    // Only peers with a valid custody advertisement are expected to serve any column.
+    let custody_peers = network_state
         .connected_peers()
         .into_iter()
-        .map(|peer| peer.peer_id)
-        .collect::<Vec<_>>();
+        .filter_map(|peer| {
+            let custody = peer.custody().groups()?.clone();
+            Some((peer.peer_id, custody))
+        })
+        .collect::<HashMap<_, _>>();
+    let connected_peers = custody_peers.keys().copied().collect::<Vec<_>>();
     while let Some((block_root, peer)) =
         tracker.next_fetch(&connected_peers, std::time::Instant::now())
     {
+        // `next_fetch` only returns peers from `connected_peers`, the keys of `custody_peers`.
+        let peer_custody = custody_peers[&peer].clone();
         let beacon_chain = beacon_chain.clone();
         let p2p_sender = p2p_sender.clone();
         let done_sender = done_sender.clone();
         tokio::spawn(async move {
             let started_at = std::time::Instant::now();
-            let outcome = fetch_missing_columns(&beacon_chain, &p2p_sender, block_root, peer).await;
+            let outcome =
+                fetch_missing_columns(&beacon_chain, &p2p_sender, block_root, peer, &peer_custody)
+                    .await;
             observe_histogram(
                 &BEACON_DATA_COLUMN_FETCH_DURATION_SECONDS,
                 started_at.elapsed().as_secs_f64(),
