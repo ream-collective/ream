@@ -84,7 +84,7 @@ impl CachedHead {
 /// BeaconChain is the main struct which manages the nodes local beacon chain.
 pub struct BeaconChain {
     pub store: Mutex<Store>,
-    pub cached_head: RwLock<Option<CachedHead>>,
+    cached_head: RwLock<Option<CachedHead>>,
     db: BeaconDB,
     operation_pool: Arc<OperationPool>,
     pub execution_engine: Option<ExecutionEngine>,
