@@ -434,7 +434,8 @@ impl PeerManager {
 mod tests {
     use std::path::PathBuf;
 
-    use discv5::{Enr, enr::CombinedKey};
+    use discv5::Enr;
+    use enr::CombinedKey;
     use parking_lot::RwLock;
     use ream_peer::{ConnectionState, Direction};
     use ream_req_resp::beacon::messages::{meta_data::GetMetaDataV3, status::Status};

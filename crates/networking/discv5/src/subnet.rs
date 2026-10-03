@@ -1,7 +1,8 @@
 use alloy_primitives::{B256, aliases::B32};
 use alloy_rlp::{BufMut, Decodable, Encodable, bytes::Bytes};
 use anyhow::{anyhow, ensure};
-use discv5::{Enr, enr::NodeId};
+use discv5::Enr;
+use enr::NodeId;
 use ream_consensus_misc::{
     constants::beacon::{FAR_FUTURE_EPOCH, genesis_validators_root},
     misc::compute_shuffled_index,
@@ -345,10 +346,8 @@ pub fn sync_committee_subnet_predicate(subnets: Vec<u64>) -> impl Fn(&Enr) -> bo
 mod tests {
     use std::str::FromStr;
 
-    use discv5::{
-        Enr,
-        enr::{CombinedKey, k256::ecdsa::SigningKey},
-    };
+    use discv5::Enr;
+    use enr::CombinedKey;
 
     use super::*;
 
@@ -398,8 +397,7 @@ mod tests {
 
     #[test]
     fn test_encode_decode_subnet_fields() {
-        let secret_key = SigningKey::random(&mut rand::thread_rng());
-        let combined_key = CombinedKey::from(secret_key);
+        let combined_key = CombinedKey::generate_secp256k1();
 
         let mut attestation_subnets = AttestationSubnets::new();
         attestation_subnets.enable_attestation_subnet(1).unwrap();
@@ -472,8 +470,7 @@ mod tests {
 
     #[test]
     fn test_new_subnet_types() {
-        let secret_key = SigningKey::random(&mut rand::thread_rng());
-        let combined_key = CombinedKey::from(secret_key);
+        let combined_key = CombinedKey::generate_secp256k1();
 
         let mut attestation_subnets = AttestationSubnets::new();
         attestation_subnets.enable_attestation_subnet(3).unwrap();
@@ -570,8 +567,7 @@ mod tests {
 
     #[test]
     fn test_subnet_predicates() {
-        let secret_key = SigningKey::random(&mut rand::thread_rng());
-        let combined_key = CombinedKey::from(secret_key);
+        let combined_key = CombinedKey::generate_secp256k1();
 
         let mut attestation_subnets = AttestationSubnets::new();
         attestation_subnets.enable_attestation_subnet(5).unwrap();

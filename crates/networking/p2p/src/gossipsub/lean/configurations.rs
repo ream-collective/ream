@@ -26,7 +26,7 @@ impl Default for LeanGossipsubConfig {
             .gossip_lazy(6)
             .history_length(6)
             .history_gossip(3)
-            .max_messages_per_rpc(Some(500))
+            .max_publish_messages(500)
             .duplicate_cache_time(Duration::from_secs(
                 lean_network_spec().justification_lookback_slots
                     * lean_network_spec().seconds_per_slot

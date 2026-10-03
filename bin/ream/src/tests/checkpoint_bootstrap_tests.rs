@@ -130,7 +130,7 @@ async fn checkpoint_bootstrap_preserves_anchor_signature() {
     );
 
     let enr = discv5::Enr::builder()
-        .build(&discv5::enr::CombinedKey::generate_secp256k1())
+        .build(&enr::CombinedKey::generate_secp256k1())
         .unwrap();
     let network_state = Arc::new(NetworkState {
         local_enr: enr.into(),

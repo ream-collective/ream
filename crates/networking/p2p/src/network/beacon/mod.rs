@@ -961,7 +961,7 @@ mod tests {
     use std::net::IpAddr;
 
     use alloy_primitives::aliases::B32;
-    use discv5::enr::CombinedKey;
+    use enr::CombinedKey;
     use k256::ecdsa::SigningKey;
     use libp2p_identity::{Keypair, PeerId};
     use ream_consensus_misc::constants::beacon::NUM_CUSTODY_GROUPS;

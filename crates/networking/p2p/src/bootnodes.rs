@@ -1,8 +1,8 @@
 use std::str::FromStr;
 
 use anyhow::anyhow;
-use discv5::{Enr, multiaddr::Protocol};
-use libp2p::Multiaddr;
+use discv5::Enr;
+use libp2p::{Multiaddr, multiaddr::Protocol};
 use ream_network_spec::networks::Network;
 
 use crate::{network::misc::peer_id_from_enr, utils::quic_from_enr};

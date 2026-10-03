@@ -2480,7 +2480,8 @@ fn poll_ready_tasks(
 mod tests {
     use std::{collections::HashMap, path::PathBuf};
 
-    use discv5::{Enr, enr::CombinedKey};
+    use discv5::Enr;
+    use enr::CombinedKey;
     use kzg::{G1, eip_4844::compute_blob_kzg_proof_raw};
     use parking_lot::RwLock;
     use ream_consensus_beacon::{
