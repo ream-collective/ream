@@ -7316,7 +7316,6 @@ dependencies = [
  "anyhow",
  "asynchronous-codec",
  "delay_map",
- "discv5",
  "enr",
  "ethereum_serde_utils",
  "ethereum_ssz",
