@@ -16,7 +16,7 @@ use anyhow::anyhow;
 use channel::{P2PCallbackError, P2PCallbackResponse, P2PMessage, P2PRequest, P2PResponse};
 use delay_map::{HashMapDelay, HashSetDelay};
 use discv5::Enr;
-use identity::load_or_create_network_key;
+use identity::{ENR_FILE_NAME, load_or_create_network_key};
 use libp2p::{
     Multiaddr, PeerId, Swarm, SwarmBuilder,
     connection_limits::{self, ConnectionLimits},
@@ -145,10 +145,11 @@ impl Network {
         let local_key = load_or_create_network_key(&config.data_dir)?;
 
         let discovery = {
-            let mut discovery = Discovery::new(
+            let mut discovery = Discovery::with_persisted_enr(
                 Keypair::from(local_key.clone()),
                 &config.discv5_config,
                 status.head_slot,
+                config.data_dir.join(ENR_FILE_NAME),
             )
             .await?;
             discovery.discover_peers(QueryType::Peers, 16);
@@ -969,7 +970,10 @@ mod tests {
     use ream_consensus_misc::constants::beacon::NUM_CUSTODY_GROUPS;
     use ream_discv5::{
         config::DiscoveryConfig,
-        subnet::{AttestationSubnets, CustodyGroupCount, SyncCommitteeSubnets},
+        subnet::{
+            AttestationSubnets, CustodyGroupCount, EPOCHS_PER_SUBNET_SUBSCRIPTION,
+            SyncCommitteeSubnets,
+        },
     };
     use ream_executor::ReamExecutor;
     use ream_network_spec::networks::beacon::initialize_test_network_spec;
@@ -1407,6 +1411,43 @@ mod tests {
         assert_eq!(network.peer_id(), first_peer_id);
         assert_eq!(network.enr().node_id(), first_node_id);
         assert_eq!(peer_id_from_enr(&network.enr()), Some(first_peer_id));
+    }
+
+    #[test]
+    fn enr_seq_never_regresses_across_restarts() {
+        initialize_test_network_spec();
+
+        let runtime = Runtime::new().unwrap();
+        let data_dir = TestDataDir::new();
+
+        let first = create_local_network(&runtime, data_dir.path())
+            .unwrap()
+            .enr();
+        let unchanged = create_local_network(&runtime, data_dir.path())
+            .unwrap()
+            .enr();
+        assert_eq!(unchanged, first);
+
+        let updated = {
+            let mut network = create_local_network(&runtime, data_dir.path()).unwrap();
+            let discovery = &mut network.swarm.behaviour_mut().discovery;
+            let mut slot = 0;
+            loop {
+                slot += EPOCHS_PER_SUBNET_SUBSCRIPTION * SLOTS_PER_EPOCH;
+                if discovery.update_attestation_subnets(slot).unwrap() {
+                    break;
+                }
+            }
+            discovery.local_enr()
+        };
+        assert!(updated.seq() > first.seq());
+
+        let restarted = create_local_network(&runtime, data_dir.path())
+            .unwrap()
+            .enr();
+        assert_eq!(restarted.node_id(), first.node_id());
+        assert!(restarted.seq() > updated.seq());
+        assert!(data_dir.path().join(ENR_FILE_NAME).is_file());
     }
 
     #[test]

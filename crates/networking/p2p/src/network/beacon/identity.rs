@@ -3,7 +3,7 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use alloy_primitives::hex;
@@ -13,6 +13,13 @@ use tracing::{info, warn};
 
 /// Hex secp256k1 secret key shared by discv5 (NodeId) and libp2p (PeerId).
 pub const NETWORK_KEY_FILE_NAME: &str = "beacon_network_key";
+
+/// Last published local ENR, so its sequence number keeps increasing across restarts.
+pub const ENR_FILE_NAME: &str = "beacon_enr";
+
+const MAX_TEMP_FILE_ATTEMPTS: usize = 64;
+
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Loads the beacon network key, creating it only if the key file is missing.
 ///
@@ -83,49 +90,41 @@ fn read_network_key(key_path: &Path) -> anyhow::Result<Option<secp256k1::Keypair
 /// Writes the key to a private temp file, then hard links it into place so an existing key is
 /// never overwritten. Returns `Ok(false)` if a key already exists.
 fn persist_new_network_key(key_path: &Path, keypair: &secp256k1::Keypair) -> anyhow::Result<bool> {
-    let temp_path = temp_key_path(key_path);
-    let result = write_temp_key(&temp_path, keypair).and_then(|()| {
-        match fs::hard_link(&temp_path, key_path) {
+    let context = || {
+        format!(
+            "Failed to persist beacon network key {}",
+            key_path.display()
+        )
+    };
+    let (temp_path, mut temp_file) = create_temp_key_file(key_path).with_context(context)?;
+
+    let result = temp_file
+        .write_all(hex::encode(keypair.secret().to_bytes()).as_bytes())
+        .and_then(|()| temp_file.sync_all())
+        .and_then(|()| match fs::hard_link(&temp_path, key_path) {
             Ok(()) => Ok(true),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(false),
             Err(err) => Err(err),
-        }
-    });
+        });
+    drop(temp_file);
 
-    if let Err(err) = fs::remove_file(&temp_path)
-        && err.kind() != io::ErrorKind::NotFound
-    {
+    if let Err(err) = fs::remove_file(&temp_path) {
         warn!(
             "Failed to remove temporary beacon network key {}: {err}",
             temp_path.display()
         );
     }
 
-    let created = result.with_context(|| {
-        format!(
-            "Failed to persist beacon network key {}",
-            key_path.display()
-        )
-    })?;
-
+    let created = result.with_context(context)?;
     if created {
         sync_parent_dir(key_path)?;
     }
-
     Ok(created)
 }
 
-fn temp_key_path(key_path: &Path) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let mut file_name = key_path.file_name().unwrap_or_default().to_os_string();
-    file_name.push(format!(".tmp.{}.{nanos}", process::id()));
-    key_path.with_file_name(file_name)
-}
-
-fn write_temp_key(temp_path: &Path, keypair: &secp256k1::Keypair) -> io::Result<()> {
+/// Creates an owner-only temp file that belongs to this call, so cleanup never removes a file
+/// created by a concurrent caller.
+fn create_temp_key_file(key_path: &Path) -> io::Result<(PathBuf, File)> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -134,9 +133,24 @@ fn write_temp_key(temp_path: &Path, keypair: &secp256k1::Keypair) -> io::Result<
         options.mode(0o600);
     }
 
-    let mut file = options.open(temp_path)?;
-    file.write_all(hex::encode(keypair.secret().to_bytes()).as_bytes())?;
-    file.sync_all()
+    for _ in 0..MAX_TEMP_FILE_ATTEMPTS {
+        let temp_path = temp_key_path(key_path, TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed));
+        match options.open(&temp_path) {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no unused temporary file name",
+    ))
+}
+
+fn temp_key_path(key_path: &Path, id: u64) -> PathBuf {
+    let mut file_name = key_path.file_name().unwrap_or_default().to_os_string();
+    file_name.push(format!(".tmp.{}.{id}", process::id()));
+    key_path.with_file_name(file_name)
 }
 
 #[cfg(unix)]
@@ -183,7 +197,6 @@ pub(crate) mod test_utils {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    /// A unique data directory under the system temp dir, removed when dropped.
     pub(crate) struct TestDataDir(PathBuf);
 
     impl TestDataDir {
@@ -216,6 +229,8 @@ pub(crate) mod test_utils {
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::Barrier, thread};
+
     use libp2p_identity::{Keypair, PeerId};
 
     use super::{test_utils::TestDataDir, *};
@@ -239,7 +254,6 @@ mod tests {
         assert_eq!(peer_id(&created), peer_id(&reloaded));
         assert_eq!(fs::read(&key_path).unwrap(), contents);
 
-        // Temporary files are cleaned up.
         let entries: Vec<_> = fs::read_dir(data_dir.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
@@ -333,6 +347,53 @@ mod tests {
             peer_id(&load_or_create_network_key(data_dir.path()).unwrap()),
             peer_id(&existing)
         );
+    }
+
+    #[test]
+    fn concurrent_creators_share_one_key() {
+        let data_dir = TestDataDir::new();
+        let barrier = Barrier::new(16);
+
+        let peer_ids: Vec<_> = thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        peer_id(&load_or_create_network_key(data_dir.path()).unwrap())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+
+        assert!(peer_ids.iter().all(|peer_id| *peer_id == peer_ids[0]));
+        let entries: Vec<_> = fs::read_dir(data_dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![NETWORK_KEY_FILE_NAME]);
+    }
+
+    #[test]
+    fn temp_files_of_other_creators_are_left_untouched() {
+        let data_dir = TestDataDir::new();
+        let key_path = data_dir.path().join(NETWORK_KEY_FILE_NAME);
+        let next_id = TEMP_FILE_COUNTER.load(Ordering::Relaxed);
+        let foreign_paths: Vec<_> = (next_id..next_id + 32)
+            .map(|id| temp_key_path(&key_path, id))
+            .collect();
+        for path in &foreign_paths {
+            fs::write(path, "foreign").unwrap();
+        }
+
+        load_or_create_network_key(data_dir.path()).unwrap();
+
+        for path in &foreign_paths {
+            assert_eq!(fs::read_to_string(path).unwrap(), "foreign");
+        }
     }
 
     #[cfg(unix)]
