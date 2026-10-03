@@ -107,8 +107,11 @@ pub struct CustodyConfig {
 }
 
 impl CustodyConfig {
-    /// Rejects configurations the custody helpers and gossip subnet mapping, which are built
-    /// against compile-time constants, cannot honour.
+    /// Used for every node, whatever its custody group count. Returns an error if the network
+    /// config sets the network-wide totals `NUMBER_OF_CUSTODY_GROUPS` or
+    /// `DATA_COLUMN_SIDECAR_SUBNET_COUNT` to anything other than 128. The custody helpers and
+    /// gossip subnet mapping are hardcoded to 128, so other values would silently produce wrong
+    /// assignments.
     pub fn from_network_spec(spec: &BeaconNetworkSpec) -> Result<Self> {
         ensure!(
             spec.number_of_custody_groups == NUM_CUSTODY_GROUPS,
@@ -160,8 +163,9 @@ pub struct CustodyAssignment {
 }
 
 impl CustodyAssignment {
-    /// Unlike `get_custody_group_indices`, which accepts any count up to
-    /// `NUMBER_OF_CUSTODY_GROUPS`, a node must advertise at least `CUSTODY_REQUIREMENT`.
+    /// `custody_group_count` must be between `CUSTODY_REQUIREMENT` and
+    /// `NUMBER_OF_CUSTODY_GROUPS`, because an honest node custodies at least
+    /// `CUSTODY_REQUIREMENT` groups.
     pub fn new(node_id: NodeId, custody_group_count: u64, config: &CustodyConfig) -> Result<Self> {
         ensure!(
             custody_group_count >= config.custody_requirement,
