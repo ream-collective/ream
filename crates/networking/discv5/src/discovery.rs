@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     future::Future,
+    path::PathBuf,
     pin::Pin,
     task::{Context, Poll},
     time::Instant,
@@ -31,6 +32,7 @@ use tracing::{error, info, trace, warn};
 use crate::{
     config::DiscoveryConfig,
     eth2::{ENR_ETH2_KEY, EnrForkId},
+    persisted_enr::{continue_enr_seq, load_enr, save_enr},
     subnet::{
         ATTESTATION_BITFIELD_ENR_KEY, AttestationSubnets, CUSTODY_GROUP_COUNT_ENR_KEY,
         EPOCHS_PER_SUBNET_SUBSCRIPTION, NEXT_FORK_DIGEST_ENR_KEY, SYNC_COMMITTEE_BITFIELD_ENR_KEY,
@@ -81,6 +83,8 @@ pub struct Discovery {
     subscription_epoch: u64,
     /// Last slot we checked for subnet rotation
     last_checked_slot: u64,
+    /// Saved after every local ENR change when set
+    enr_path: Option<PathBuf>,
 }
 
 impl Discovery {
@@ -88,6 +92,26 @@ impl Discovery {
         local_key: Keypair,
         config: &DiscoveryConfig,
         current_slot: u64,
+    ) -> anyhow::Result<Self> {
+        Self::init(local_key, config, current_slot, None).await
+    }
+
+    /// Like [`Discovery::new`], but keeps the local ENR at `enr_path` so its sequence number
+    /// keeps increasing across restarts.
+    pub async fn with_persisted_enr(
+        local_key: Keypair,
+        config: &DiscoveryConfig,
+        current_slot: u64,
+        enr_path: PathBuf,
+    ) -> anyhow::Result<Self> {
+        Self::init(local_key, config, current_slot, Some(enr_path)).await
+    }
+
+    async fn init(
+        local_key: Keypair,
+        config: &DiscoveryConfig,
+        current_slot: u64,
+        enr_path: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
         let enr_local =
             convert_to_enr(local_key).map_err(|err| anyhow!("Failed to convert key: {err:?}"))?;
@@ -98,7 +122,7 @@ impl Discovery {
         enr_builder.tcp4(config.socket_port);
         enr_builder.udp4(config.discovery_port);
 
-        let enr = enr_builder
+        let mut enr = enr_builder
             .add_value(
                 ENR_ETH2_KEY,
                 &EnrForkId::current(genesis_validators_root(), current_epoch),
@@ -112,6 +136,13 @@ impl Discovery {
             .add_value(NEXT_FORK_DIGEST_ENR_KEY, &next_fork_digest(current_epoch))
             .build(&enr_local)
             .map_err(|err| anyhow!("Failed to build ENR: {err}"))?;
+
+        if let Some(enr_path) = &enr_path {
+            if let Some(previous) = load_enr(enr_path)? {
+                continue_enr_seq(&mut enr, &previous, &enr_local)?;
+            }
+            save_enr(enr_path, &enr)?;
+        }
 
         let node_local_id = enr.node_id();
 
@@ -161,7 +192,16 @@ impl Discovery {
             current_attestation_subnets: config.attestation_subnets.clone(),
             subscription_epoch,
             last_checked_slot: current_slot,
+            enr_path,
         })
+    }
+
+    fn persist_local_enr(&self) {
+        if let Some(enr_path) = &self.enr_path
+            && let Err(err) = save_enr(enr_path, &self.discv5.local_enr())
+        {
+            warn!("Failed to persist local ENR: {err:?}");
+        }
     }
 
     /// Update attestation subnet subscriptions based on the current slot
@@ -206,6 +246,7 @@ impl Discovery {
                 );
                 self.current_attestation_subnets = new_attestation_subnets;
                 self.subscription_epoch = current_epoch;
+                self.persist_local_enr();
                 Ok(true)
             }
             Err(err) => {
@@ -434,6 +475,7 @@ impl NetworkBehaviour for Discovery {
             EventStream::Present(receiver) => match receiver.try_recv() {
                 Ok(event) => {
                     if let Event::SocketUpdated(_) = event {
+                        self.persist_local_enr();
                         return Poll::Ready(ToSwarm::GenerateEvent(
                             DiscoveryOutEvent::UpdatedEnr {
                                 enr: self.local_enr(),
@@ -477,7 +519,11 @@ mod tests {
     use super::*;
     use crate::{
         config::DiscoveryConfig,
-        subnet::{AttestationSubnets, EPOCHS_PER_SUBNET_SUBSCRIPTION, SyncCommitteeSubnets},
+        persisted_enr::test_utils::TestDir,
+        subnet::{
+            AttestationSubnets, CustodyGroupCount, EPOCHS_PER_SUBNET_SUBSCRIPTION,
+            SyncCommitteeSubnets,
+        },
     };
 
     #[tokio::test]
@@ -742,6 +788,81 @@ mod tests {
             discovery.current_attestation_subnets()
         );
 
+        Ok(())
+    }
+
+    fn rotate_attestation_subnets(discovery: &mut Discovery) -> anyhow::Result<u64> {
+        let mut slot = 0;
+        loop {
+            slot += EPOCHS_PER_SUBNET_SUBSCRIPTION * 32;
+            if discovery.update_attestation_subnets(slot)? {
+                return Ok(slot);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn persisted_enr_seq_survives_runtime_updates_and_restarts() -> anyhow::Result<()> {
+        let _ = GENESIS_VALIDATORS_ROOT.set(B256::ZERO);
+        initialize_test_network_spec();
+        let dir = TestDir::new();
+        let enr_path = dir.path().join("enr");
+        let key = Keypair::generate_secp256k1();
+        let config = DiscoveryConfig {
+            disable_discovery: true,
+            ..DiscoveryConfig::default()
+        };
+
+        let mut discovery =
+            Discovery::with_persisted_enr(key.clone(), &config, 0, enr_path.clone()).await?;
+        let slot = rotate_attestation_subnets(&mut discovery)?;
+        let updated = discovery.local_enr();
+        assert_eq!(updated.seq(), 2);
+        assert_eq!(load_enr(&enr_path)?, Some(updated.clone()));
+        drop(discovery);
+
+        // The rebuilt record differs from the runtime one, so it needs a higher seq.
+        let restarted = Discovery::with_persisted_enr(key.clone(), &config, slot, enr_path.clone())
+            .await?
+            .local_enr();
+        assert_eq!(restarted.node_id(), updated.node_id());
+        assert!(restarted.seq() > updated.seq());
+
+        let unchanged = Discovery::with_persisted_enr(key, &config, slot, enr_path)
+            .await?
+            .local_enr();
+        assert_eq!(unchanged, restarted);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn changed_enr_on_restart_increments_seq() -> anyhow::Result<()> {
+        let _ = GENESIS_VALIDATORS_ROOT.set(B256::ZERO);
+        initialize_test_network_spec();
+        let dir = TestDir::new();
+        let enr_path = dir.path().join("enr");
+        let key = Keypair::generate_secp256k1();
+        let mut config = DiscoveryConfig {
+            disable_discovery: true,
+            custody_group_count: CustodyGroupCount(128),
+            ..DiscoveryConfig::default()
+        };
+
+        let first = Discovery::with_persisted_enr(key.clone(), &config, 0, enr_path.clone())
+            .await?
+            .local_enr();
+        config.custody_group_count = CustodyGroupCount(4);
+        let restarted = Discovery::with_persisted_enr(key, &config, 0, enr_path.clone())
+            .await?
+            .local_enr();
+
+        assert_eq!(restarted.node_id(), first.node_id());
+        assert_eq!(restarted.seq(), first.seq() + 1);
+        assert_eq!(
+            restarted.get_decodable::<CustodyGroupCount>(CUSTODY_GROUP_COUNT_ENR_KEY),
+            Some(Ok(CustodyGroupCount(4)))
+        );
+        assert_eq!(load_enr(&enr_path)?, Some(restarted));
         Ok(())
     }
 }
