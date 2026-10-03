@@ -129,7 +129,7 @@ pub struct Network {
 
 impl Network {
     /// Initializes the network by:
-    /// - Loading the persisted local keypair from the data directory, or creating it if absent
+    /// - Loading or creating the local keypair in the data directory
     /// - Setting up the discovery, req_resp and gossipsub behaviours
     /// - Starting P2P listening and discovery
     /// - Connecting to the configured bootnodes
@@ -1430,7 +1430,7 @@ mod tests {
 
         let runtime = Runtime::new().unwrap();
         let data_dir = TestDataDir::new();
-        // Simulate a data directory created before network identity was persisted.
+        // A data directory from before the key was persisted.
         fs::write(
             data_dir.path().join(utils::META_DATA_FILE_NAME),
             GetMetaDataV3::default().as_ssz_bytes(),
@@ -1457,8 +1457,7 @@ mod tests {
         let key_path = data_dir.path().join(NETWORK_KEY_FILE_NAME);
         fs::write(&key_path, "malformed").unwrap();
 
-        // Drive this future without tokio: `create_network` owns a tokio runtime, and dropping it
-        // inside a tokio `block_on` when init fails panics.
+        // `create_network` owns a tokio runtime; dropping it inside tokio's `block_on` panics.
         let err = futures::executor::block_on(create_network(
             "127.0.0.1".parse().unwrap(),
             0,

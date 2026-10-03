@@ -11,15 +11,12 @@ use anyhow::{Context, anyhow};
 use libp2p_identity::secp256k1;
 use tracing::{info, warn};
 
-/// File inside the beacon data directory holding the hex encoded secp256k1 secret key used for
-/// both the discv5 NodeId and the libp2p PeerId.
+/// Hex secp256k1 secret key shared by discv5 (NodeId) and libp2p (PeerId).
 pub const NETWORK_KEY_FILE_NAME: &str = "beacon_network_key";
 
-/// Loads the beacon network key from `data_dir`, generating and persisting a new one only if no
-/// key file exists yet.
+/// Loads the beacon network key, creating it only if the key file is missing.
 ///
-/// An existing key file that cannot be read or decoded is reported as an error and is never
-/// replaced, so a node can't silently change its identity.
+/// A key file that can't be read or decoded is an error and is never replaced.
 pub fn load_or_create_network_key(data_dir: &Path) -> anyhow::Result<secp256k1::Keypair> {
     let key_path = data_dir.join(NETWORK_KEY_FILE_NAME);
 
@@ -41,7 +38,7 @@ pub fn load_or_create_network_key(data_dir: &Path) -> anyhow::Result<secp256k1::
         return Ok(keypair);
     }
 
-    // Another process created the key between our read and write, so use theirs.
+    // Another process created the key first; use it.
     read_network_key(&key_path)?.ok_or_else(|| {
         anyhow!(
             "Beacon network key {} exists but could not be opened",
@@ -64,26 +61,27 @@ fn read_network_key(key_path: &Path) -> anyhow::Result<Option<secp256k1::Keypair
 
     warn_if_permissive(key_path);
 
-    // Decoding errors are not propagated so that no part of the key file ends up in logs.
-    let secret_key_bytes = hex::decode(contents.trim()).map_err(|_| {
-        anyhow!(
+    // Drop decode errors so no part of the key reaches the logs.
+    let secret_key_bytes = hex::decode(contents.trim()).ok().with_context(|| {
+        format!(
             "Beacon network key {} is not valid hex; refusing to replace it",
             key_path.display()
         )
     })?;
-    let secret_key = secp256k1::SecretKey::try_from_bytes(secret_key_bytes).map_err(|_| {
-        anyhow!(
-            "Beacon network key {} is not a valid secp256k1 secret key; refusing to replace it",
-            key_path.display()
-        )
-    })?;
+    let secret_key = secp256k1::SecretKey::try_from_bytes(secret_key_bytes)
+        .ok()
+        .with_context(|| {
+            format!(
+                "Beacon network key {} is not a valid secp256k1 secret key; refusing to replace it",
+                key_path.display()
+            )
+        })?;
 
     Ok(Some(secp256k1::Keypair::from(secret_key)))
 }
 
-/// Atomically publishes `keypair` at `key_path`. The key is fully written to a private temporary
-/// file first and then hard linked into place, which fails rather than overwrites if a key
-/// already exists. Returns `Ok(false)` if another key was already present.
+/// Writes the key to a private temp file, then hard links it into place so an existing key is
+/// never overwritten. Returns `Ok(false)` if a key already exists.
 fn persist_new_network_key(key_path: &Path, keypair: &secp256k1::Keypair) -> anyhow::Result<bool> {
     let temp_path = temp_key_path(key_path);
     let result = write_temp_key(&temp_path, keypair).and_then(|()| {
@@ -241,7 +239,7 @@ mod tests {
         assert_eq!(peer_id(&created), peer_id(&reloaded));
         assert_eq!(fs::read(&key_path).unwrap(), contents);
 
-        // Only the key file remains; temporary files are cleaned up.
+        // Temporary files are cleaned up.
         let entries: Vec<_> = fs::read_dir(data_dir.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
@@ -274,7 +272,7 @@ mod tests {
     fn loads_existing_hex_key() {
         let data_dir = TestDataDir::new();
         let keypair = secp256k1::Keypair::generate();
-        // Same format as `ream generate_private_key`, plus surrounding whitespace.
+        // `ream generate_private_key` format, with a trailing newline.
         fs::write(
             data_dir.path().join(NETWORK_KEY_FILE_NAME),
             format!("{}\n", hex::encode(keypair.secret().to_bytes())),
