@@ -1,4 +1,5 @@
 pub mod channel;
+pub mod identity;
 pub mod network_state;
 pub mod peer;
 pub mod utils;
@@ -15,6 +16,7 @@ use anyhow::anyhow;
 use channel::{P2PCallbackError, P2PCallbackResponse, P2PMessage, P2PRequest, P2PResponse};
 use delay_map::{HashMapDelay, HashSetDelay};
 use discv5::Enr;
+use identity::load_or_create_network_key;
 use libp2p::{
     Multiaddr, PeerId, Swarm, SwarmBuilder,
     connection_limits::{self, ConnectionLimits},
@@ -27,7 +29,7 @@ use libp2p::{
     multiaddr::Protocol,
     swarm::{self, ConnectionId, NetworkBehaviour, SwarmEvent},
 };
-use libp2p_identity::{Keypair, PublicKey, secp256k1};
+use libp2p_identity::{Keypair, PublicKey};
 use network_state::NetworkState;
 use parking_lot::{Mutex, RwLock};
 use peer::CachedPeer;
@@ -127,7 +129,7 @@ pub struct Network {
 
 impl Network {
     /// Initializes the network by:
-    /// - Creating a local keypair
+    /// - Loading the persisted local keypair from the data directory, or creating it if absent
     /// - Setting up the discovery, req_resp and gossipsub behaviours
     /// - Starting P2P listening and discovery
     /// - Connecting to the configured bootnodes
@@ -140,7 +142,7 @@ impl Network {
         config: &NetworkConfig,
         status: Status,
     ) -> anyhow::Result<Self> {
-        let local_key = secp256k1::Keypair::generate();
+        let local_key = load_or_create_network_key(&config.data_dir)?;
 
         let discovery = {
             let mut discovery = Discovery::new(
@@ -958,7 +960,7 @@ impl Network {
 
 #[cfg(test)]
 mod tests {
-    use std::net::IpAddr;
+    use std::{fs, net::IpAddr, path::Path};
 
     use alloy_primitives::aliases::B32;
     use discv5::enr::CombinedKey;
@@ -971,12 +973,14 @@ mod tests {
     };
     use ream_executor::ReamExecutor;
     use ream_network_spec::networks::beacon::initialize_test_network_spec;
+    use ssz::Encode;
     use tokio::{runtime::Runtime, time::sleep};
 
     use super::*;
     use crate::{
         config::NetworkConfig,
         gossipsub::beacon::{configurations::GossipsubConfig, topics::GossipTopicKind},
+        network::beacon::identity::{NETWORK_KEY_FILE_NAME, test_utils::TestDataDir},
     };
 
     #[test]
@@ -1022,6 +1026,7 @@ mod tests {
         bootnodes: Vec<Enr>,
         disable_discovery: bool,
         topics: Vec<GossipTopic>,
+        data_dir: &Path,
     ) -> anyhow::Result<Network> {
         let executor = ReamExecutor::new().unwrap();
 
@@ -1047,7 +1052,7 @@ mod tests {
                 topics,
                 ..Default::default()
             },
-            data_dir: std::env::temp_dir().join("ream_network_test"),
+            data_dir: data_dir.to_path_buf(),
         };
 
         std::fs::create_dir_all(&config.data_dir)?;
@@ -1092,10 +1097,19 @@ mod tests {
 
         let tokio_runtime = Runtime::new().unwrap();
 
+        let data_dir = TestDataDir::new();
         let network = tokio_runtime.block_on(async {
-            create_network("127.0.0.1".parse().unwrap(), 0, 0, vec![], true, vec![])
-                .await
-                .unwrap()
+            create_network(
+                "127.0.0.1".parse().unwrap(),
+                0,
+                0,
+                vec![],
+                true,
+                vec![],
+                data_dir.path(),
+            )
+            .await
+            .unwrap()
         });
 
         let peer_id = PeerId::random();
@@ -1124,10 +1138,19 @@ mod tests {
 
         let tokio_runtime = Runtime::new().unwrap();
 
+        let data_dir = TestDataDir::new();
         let network = tokio_runtime.block_on(async {
-            create_network("127.0.0.1".parse().unwrap(), 0, 0, vec![], true, vec![])
-                .await
-                .unwrap()
+            create_network(
+                "127.0.0.1".parse().unwrap(),
+                0,
+                0,
+                vec![],
+                true,
+                vec![],
+                data_dir.path(),
+            )
+            .await
+            .unwrap()
         });
 
         let peer_id = PeerId::random();
@@ -1160,10 +1183,19 @@ mod tests {
 
         let tokio_runtime = Runtime::new().unwrap();
 
+        let data_dir = TestDataDir::new();
         let network = tokio_runtime.block_on(async {
-            create_network("127.0.0.1".parse().unwrap(), 0, 0, vec![], true, vec![])
-                .await
-                .unwrap()
+            create_network(
+                "127.0.0.1".parse().unwrap(),
+                0,
+                0,
+                vec![],
+                true,
+                vec![],
+                data_dir.path(),
+            )
+            .await
+            .unwrap()
         });
 
         let peer_id = PeerId::random();
@@ -1182,6 +1214,9 @@ mod tests {
             kind: GossipTopicKind::BeaconBlock,
         }];
 
+        let data_dir_1 = TestDataDir::new();
+        let data_dir_2 = TestDataDir::new();
+
         let mut network_1 = runtime
             .block_on(create_network(
                 "127.0.0.1".parse::<IpAddr>().unwrap(),
@@ -1190,6 +1225,7 @@ mod tests {
                 vec![],
                 true,
                 gossip_topics.clone(),
+                data_dir_1.path(),
             ))
             .unwrap();
         let network_1_enr = network_1.enr();
@@ -1201,6 +1237,7 @@ mod tests {
                 vec![network_1_enr],
                 false,
                 gossip_topics.clone(),
+                data_dir_2.path(),
             ))
             .unwrap();
 
@@ -1246,6 +1283,9 @@ mod tests {
 
         let tokio_runtime = Runtime::new().unwrap();
 
+        let data_dir_1 = TestDataDir::new();
+        let data_dir_2 = TestDataDir::new();
+
         let mut network_1 = tokio_runtime
             .block_on(create_network(
                 "127.0.0.1".parse().unwrap(),
@@ -1254,6 +1294,7 @@ mod tests {
                 vec![],
                 true,
                 vec![],
+                data_dir_1.path(),
             ))
             .unwrap();
 
@@ -1265,6 +1306,7 @@ mod tests {
                 vec![],
                 true,
                 vec![],
+                data_dir_2.path(),
             ))
             .unwrap();
 
@@ -1331,5 +1373,105 @@ mod tests {
         assert_eq!(peer_from_network_2.direction, Direction::Outbound);
         assert_eq!(ream_metrics::BEACON_PEER_COUNT.get(), 1);
         assert_eq!(ream_metrics::LIBP2P_PEERS.get(), 1);
+    }
+
+    fn create_local_network(runtime: &Runtime, data_dir: &Path) -> anyhow::Result<Network> {
+        runtime.block_on(create_network(
+            "127.0.0.1".parse().unwrap(),
+            0,
+            0,
+            vec![],
+            true,
+            vec![],
+            data_dir,
+        ))
+    }
+
+    #[test]
+    fn network_identity_persists_across_restarts() {
+        initialize_test_network_spec();
+
+        let runtime = Runtime::new().unwrap();
+        let data_dir = TestDataDir::new();
+
+        let (first_peer_id, first_node_id) = {
+            let network = create_local_network(&runtime, data_dir.path()).unwrap();
+            let enr = network.enr();
+            // discv5 and libp2p share the same key.
+            assert_eq!(peer_id_from_enr(&enr), Some(network.peer_id()));
+            (network.peer_id(), enr.node_id())
+        };
+        assert!(data_dir.path().join(NETWORK_KEY_FILE_NAME).is_file());
+
+        let network = create_local_network(&runtime, data_dir.path()).unwrap();
+        assert_eq!(network.peer_id(), first_peer_id);
+        assert_eq!(network.enr().node_id(), first_node_id);
+        assert_eq!(peer_id_from_enr(&network.enr()), Some(first_peer_id));
+    }
+
+    #[test]
+    fn independent_data_directories_have_distinct_identities() {
+        initialize_test_network_spec();
+
+        let runtime = Runtime::new().unwrap();
+        let data_dir_1 = TestDataDir::new();
+        let data_dir_2 = TestDataDir::new();
+
+        let network_1 = create_local_network(&runtime, data_dir_1.path()).unwrap();
+        let network_2 = create_local_network(&runtime, data_dir_2.path()).unwrap();
+
+        assert_ne!(network_1.peer_id(), network_2.peer_id());
+        assert_ne!(network_1.enr().node_id(), network_2.enr().node_id());
+    }
+
+    #[test]
+    fn existing_data_directory_without_key_gets_new_identity() {
+        initialize_test_network_spec();
+
+        let runtime = Runtime::new().unwrap();
+        let data_dir = TestDataDir::new();
+        // Simulate a data directory created before network identity was persisted.
+        fs::write(
+            data_dir.path().join(utils::META_DATA_FILE_NAME),
+            GetMetaDataV3::default().as_ssz_bytes(),
+        )
+        .unwrap();
+
+        let peer_id = create_local_network(&runtime, data_dir.path())
+            .unwrap()
+            .peer_id();
+
+        assert_eq!(
+            create_local_network(&runtime, data_dir.path())
+                .unwrap()
+                .peer_id(),
+            peer_id
+        );
+    }
+
+    #[test]
+    fn malformed_network_key_fails_init_without_replacement() {
+        initialize_test_network_spec();
+
+        let data_dir = TestDataDir::new();
+        let key_path = data_dir.path().join(NETWORK_KEY_FILE_NAME);
+        fs::write(&key_path, "malformed").unwrap();
+
+        // Drive this future without tokio: `create_network` owns a tokio runtime, and dropping it
+        // inside a tokio `block_on` when init fails panics.
+        let err = futures::executor::block_on(create_network(
+            "127.0.0.1".parse().unwrap(),
+            0,
+            0,
+            vec![],
+            true,
+            vec![],
+            data_dir.path(),
+        ))
+        .err()
+        .expect("init should fail with a malformed key");
+
+        assert!(err.to_string().contains(NETWORK_KEY_FILE_NAME));
+        assert_eq!(fs::read_to_string(&key_path).unwrap(), "malformed");
     }
 }
