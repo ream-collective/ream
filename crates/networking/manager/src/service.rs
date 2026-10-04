@@ -234,6 +234,7 @@ impl NetworkManagerService {
             socket_port: config.socket_port,
             discovery_port: config.discovery_port,
             disable_discovery: config.disable_discovery,
+            // `Network::init` sets both from the gossip topics below.
             attestation_subnets: AttestationSubnets::new(),
             sync_committee_subnets: SyncCommitteeSubnets::new(),
             // Must match the count advertised in our MetaData: peers cross-check the ENR

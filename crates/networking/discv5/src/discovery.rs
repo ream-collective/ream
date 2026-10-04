@@ -865,7 +865,10 @@ mod tests {
 
         let mut discovery = Discovery::new(Keypair::generate_secp256k1(), &config, 0).await?;
         let initial = discovery.local_enr();
-        assert_eq!(enr_attestation_subnets(&initial)?, config.attestation_subnets);
+        assert_eq!(
+            enr_attestation_subnets(&initial)?,
+            config.attestation_subnets
+        );
 
         for period in 1..=4 {
             let slot = period * EPOCHS_PER_SUBNET_SUBSCRIPTION * 32;

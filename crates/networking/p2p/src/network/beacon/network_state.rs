@@ -52,6 +52,26 @@ impl NetworkState {
             });
     }
 
+    /// Applies `update` to `MetaData`. If a field changed, increments `seq_number` and saves the
+    /// result, as peers only refetch `MetaData` when `seq_number` grows.
+    pub fn update_meta_data(
+        &self,
+        update: impl FnOnce(&mut GetMetaDataV3),
+    ) -> anyhow::Result<bool> {
+        let mut meta_data = self.meta_data.write();
+        let mut updated = meta_data.clone();
+        update(&mut updated);
+        updated.seq_number = meta_data.seq_number;
+        if updated == *meta_data {
+            return Ok(false);
+        }
+        updated.seq_number = updated.seq_number.saturating_add(1);
+        *meta_data = updated;
+        drop(meta_data);
+        self.write_meta_data_to_disk()?;
+        Ok(true)
+    }
+
     pub fn write_meta_data_to_disk(&self) -> anyhow::Result<()> {
         let meta_data_path = self.data_dir.join(META_DATA_FILE_NAME);
         fs::write(meta_data_path, self.meta_data.read().as_ssz_bytes())
