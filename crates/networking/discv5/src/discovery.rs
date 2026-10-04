@@ -7,7 +7,6 @@ use std::{
     time::Instant,
 };
 
-use alloy_rlp::Encodable;
 use anyhow::{Result, anyhow};
 use discv5::{
     Discv5, Enr, Event,
@@ -77,7 +76,9 @@ pub struct Discovery {
     discovery_queries: FuturesUnordered<Pin<Box<dyn Future<Output = QueryResult> + Send>>>,
     find_peer_active: bool,
     pub started: bool,
-    /// Current attestation subnets this node is subscribed to
+    /// Subnets the node joins regardless of the backbone assignment
+    long_lived_attestation_subnets: AttestationSubnets,
+    /// Attestation subnets advertised in the local ENR
     current_attestation_subnets: AttestationSubnets,
     /// The epoch at which the current subnet subscriptions were computed
     subscription_epoch: u64,
@@ -116,6 +117,11 @@ impl Discovery {
         let enr_local =
             convert_to_enr(local_key).map_err(|err| anyhow!("Failed to convert key: {err:?}"))?;
         let current_epoch = compute_epoch_at_slot(current_slot);
+        let attestation_subnets = advertised_attestation_subnets(
+            &config.attestation_subnets,
+            NodeId::from(enr_local.public()),
+            current_epoch,
+        )?;
 
         // A saved ENR from another node, e.g. after a key change, is not reused.
         let previous_enr = match &enr_path {
@@ -135,7 +141,7 @@ impl Discovery {
                 ENR_ETH2_KEY,
                 &EnrForkId::current(genesis_validators_root(), current_epoch),
             )
-            .add_value(ATTESTATION_BITFIELD_ENR_KEY, &config.attestation_subnets)
+            .add_value(ATTESTATION_BITFIELD_ENR_KEY, &attestation_subnets)
             .add_value(
                 SYNC_COMMITTEE_BITFIELD_ENR_KEY,
                 &config.sync_committee_subnets,
@@ -168,16 +174,6 @@ impl Discovery {
             }
         }
 
-        // Compute and set attestation subnets
-        let subnets = compute_subscribed_subnets(enr.node_id(), current_epoch)?;
-        let mut config = config.clone();
-        config.attestation_subnets = AttestationSubnets::new();
-        for subnet_id in subnets {
-            config
-                .attestation_subnets
-                .enable_attestation_subnet(subnet_id)?;
-        }
-
         let subscription_epoch = current_epoch;
 
         let event_stream = if !config.disable_discovery {
@@ -197,7 +193,8 @@ impl Discovery {
             discovery_queries: FuturesUnordered::new(),
             find_peer_active: false,
             started: !config.disable_discovery,
-            current_attestation_subnets: config.attestation_subnets.clone(),
+            long_lived_attestation_subnets: config.attestation_subnets.clone(),
+            current_attestation_subnets: attestation_subnets,
             subscription_epoch,
             last_checked_slot: current_slot,
             enr_path,
@@ -227,25 +224,21 @@ impl Discovery {
             return Ok(false);
         }
 
-        let node_id = self.discv5.local_enr().node_id();
-        let new_subnets = compute_subscribed_subnets(node_id, current_epoch)?;
-
-        let mut new_attestation_subnets = AttestationSubnets::new();
-        for subnet_id in new_subnets {
-            new_attestation_subnets.enable_attestation_subnet(subnet_id)?;
-        }
+        let new_attestation_subnets = advertised_attestation_subnets(
+            &self.long_lived_attestation_subnets,
+            self.discv5.local_enr().node_id(),
+            current_epoch,
+        )?;
 
         if new_attestation_subnets == self.current_attestation_subnets {
             self.subscription_epoch = current_epoch;
             return Ok(false);
         }
 
-        let mut rlp_buffer = Vec::new();
-        new_attestation_subnets.encode(&mut rlp_buffer);
-
+        // `enr_insert` RLP-encodes the value itself.
         match self
             .discv5
-            .enr_insert(ATTESTATION_BITFIELD_ENR_KEY, &rlp_buffer)
+            .enr_insert(ATTESTATION_BITFIELD_ENR_KEY, &new_attestation_subnets)
         {
             Ok(_) => {
                 info!(
@@ -264,6 +257,8 @@ impl Discovery {
         }
     }
 
+    /// Returns the attestation subnets advertised in the local ENR. The caller must stay subscribed
+    /// to all of them.
     pub fn current_attestation_subnets(&self) -> &AttestationSubnets {
         &self.current_attestation_subnets
     }
@@ -502,6 +497,19 @@ impl NetworkBehaviour for Discovery {
     }
 }
 
+/// Returns the long-lived subnets plus the backbone subnets assigned to `node_id` for `epoch`.
+fn advertised_attestation_subnets(
+    long_lived: &AttestationSubnets,
+    node_id: NodeId,
+    epoch: u64,
+) -> Result<AttestationSubnets> {
+    let mut subnets = long_lived.clone();
+    for subnet_id in compute_subscribed_subnets(node_id, epoch)? {
+        subnets.enable_attestation_subnet(subnet_id)?;
+    }
+    Ok(subnets)
+}
+
 pub fn empty_predicate() -> impl Fn(&Enr) -> bool + Send + Sync {
     move |_enr: &Enr| true
 }
@@ -523,14 +531,15 @@ mod tests {
     use libp2p::identity::Keypair;
     use ream_consensus_misc::constants::beacon::GENESIS_VALIDATORS_ROOT;
     use ream_network_spec::networks::initialize_test_network_spec;
+    use ssz::Encode;
 
     use super::*;
     use crate::{
         config::DiscoveryConfig,
         persisted_enr::test_utils::TestDir,
         subnet::{
-            AttestationSubnets, CustodyGroupCount, EPOCHS_PER_SUBNET_SUBSCRIPTION,
-            SyncCommitteeSubnets,
+            ATTESTATION_SUBNET_COUNT, AttestationSubnets, CustodyGroupCount,
+            EPOCHS_PER_SUBNET_SUBSCRIPTION, SyncCommitteeSubnets,
         },
     };
 
@@ -543,19 +552,18 @@ mod tests {
             disable_discovery: true,
             ..DiscoveryConfig::default()
         };
-        config.attestation_subnets.enable_attestation_subnet(0)?; // Set subnet 0
-        config.attestation_subnets.disable_attestation_subnet(1)?; // Set subnet 1
+        config.attestation_subnets = AttestationSubnets::new();
+        config.attestation_subnets.enable_attestation_subnet(5)?;
 
         let discovery = Discovery::new(key, &config, 0).await.unwrap();
-        // Check ENR reflects config.subnets
-        let enr_subnets = discovery
-            .discv5
-            .local_enr()
-            .get_decodable::<AttestationSubnets>(ATTESTATION_BITFIELD_ENR_KEY)
-            .ok_or("ATTESTATION_BITFIELD_ENR_KEY not found")
-            .map_err(|err| anyhow!("ATTESTATION_BITFIELD_ENR_KEY decoding failed: {err:?}"))??;
-        assert!(enr_subnets.is_attestation_subnet_enabled(0)?);
-        assert!(!enr_subnets.is_attestation_subnet_enabled(1)?);
+        let enr_subnets = enr_attestation_subnets(&discovery.local_enr())?;
+
+        let mut expected = config.attestation_subnets.clone();
+        for subnet_id in compute_subscribed_subnets(discovery.local_enr().node_id(), 0)? {
+            expected.enable_attestation_subnet(subnet_id)?;
+        }
+        assert_eq!(enr_subnets, expected);
+        assert_eq!(discovery.current_attestation_subnets(), &expected);
         Ok(())
     }
 
@@ -575,8 +583,16 @@ mod tests {
         let predicate = attestation_subnet_predicate(vec![0]);
         assert!(predicate(&local_enr));
 
-        // Predicate for subnet 1 should not match
-        let predicate = attestation_subnet_predicate(vec![1]);
+        // The backbone adds two subnets, so some subnet is not advertised.
+        let unadvertised = (0..ATTESTATION_SUBNET_COUNT as u64)
+            .find(|subnet_id| {
+                !discovery
+                    .current_attestation_subnets()
+                    .is_attestation_subnet_enabled(*subnet_id)
+                    .unwrap()
+            })
+            .unwrap();
+        let predicate = attestation_subnet_predicate(vec![unadvertised]);
         assert!(!predicate(&local_enr));
         Ok(())
     }
@@ -799,6 +815,66 @@ mod tests {
         Ok(())
     }
 
+    fn enr_attestation_subnets(enr: &Enr) -> anyhow::Result<AttestationSubnets> {
+        enr.get_decodable::<AttestationSubnets>(ATTESTATION_BITFIELD_ENR_KEY)
+            .ok_or_else(|| anyhow!("Missing attestation subnet field"))?
+            .map_err(|err| anyhow!("Failed to decode attestation subnets: {err:?}"))
+    }
+
+    #[tokio::test]
+    async fn rotated_attnets_are_a_single_ssz_byte_string() -> anyhow::Result<()> {
+        let _ = GENESIS_VALIDATORS_ROOT.set(B256::ZERO);
+        initialize_test_network_spec();
+        let config = DiscoveryConfig {
+            disable_discovery: true,
+            attestation_subnets: AttestationSubnets::new(),
+            ..DiscoveryConfig::default()
+        };
+        let mut discovery = Discovery::new(Keypair::generate_secp256k1(), &config, 0).await?;
+        let seq = discovery.local_enr().seq();
+
+        rotate_attestation_subnets(&mut discovery)?;
+        let enr = discovery.local_enr();
+        let current = discovery.current_attestation_subnets();
+
+        // RLP string of the 8 byte SSZ bitvector, as other clients decode it.
+        let mut expected_rlp = vec![0x88];
+        expected_rlp.extend_from_slice(&current.0.as_ssz_bytes());
+        assert_eq!(
+            enr.get_raw_rlp(ATTESTATION_BITFIELD_ENR_KEY),
+            Some(expected_rlp.as_slice())
+        );
+        assert_eq!(&enr_attestation_subnets(&enr)?, current);
+        assert_eq!(enr.seq(), seq + 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn all_long_lived_subnets_keep_enr_stable_across_rotations() -> anyhow::Result<()> {
+        let _ = GENESIS_VALIDATORS_ROOT.set(B256::ZERO);
+        initialize_test_network_spec();
+        let mut config = DiscoveryConfig {
+            disable_discovery: true,
+            ..DiscoveryConfig::default()
+        };
+        for subnet_id in 0..ATTESTATION_SUBNET_COUNT as u64 {
+            config
+                .attestation_subnets
+                .enable_attestation_subnet(subnet_id)?;
+        }
+
+        let mut discovery = Discovery::new(Keypair::generate_secp256k1(), &config, 0).await?;
+        let initial = discovery.local_enr();
+        assert_eq!(enr_attestation_subnets(&initial)?, config.attestation_subnets);
+
+        for period in 1..=4 {
+            let slot = period * EPOCHS_PER_SUBNET_SUBSCRIPTION * 32;
+            assert!(!discovery.update_attestation_subnets(slot)?);
+        }
+        assert_eq!(discovery.local_enr(), initial);
+        Ok(())
+    }
+
     fn rotate_attestation_subnets(discovery: &mut Discovery) -> anyhow::Result<u64> {
         let mut slot = 0;
         loop {
@@ -829,17 +905,21 @@ mod tests {
         assert_eq!(load_enr(&enr_path)?, Some(updated.clone()));
         drop(discovery);
 
-        // The rebuilt record differs from the runtime one, so it needs a higher seq.
+        // Restarting in the same epoch rebuilds the runtime record, so the seq is kept.
         let restarted = Discovery::with_persisted_enr(key.clone(), &config, slot, enr_path.clone())
             .await?
             .local_enr();
-        assert_eq!(restarted.node_id(), updated.node_id());
-        assert!(restarted.seq() > updated.seq());
+        assert_eq!(restarted, updated);
 
-        let unchanged = Discovery::with_persisted_enr(key, &config, slot, enr_path)
+        // A restart in another subscription period advertises other subnets and needs a higher seq.
+        let later = Discovery::with_persisted_enr(key, &config, 0, enr_path)
             .await?
             .local_enr();
-        assert_eq!(unchanged, restarted);
+        assert_ne!(
+            enr_attestation_subnets(&later)?,
+            enr_attestation_subnets(&updated)?
+        );
+        assert_eq!(later.seq(), updated.seq() + 1);
         Ok(())
     }
 
