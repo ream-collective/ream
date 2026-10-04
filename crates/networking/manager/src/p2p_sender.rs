@@ -127,8 +127,9 @@ impl P2PSender {
 
 #[cfg(test)]
 mod subscription_tests {
-    use super::*;
     use ream_p2p::gossipsub::beacon::topics::{GossipTopic, GossipTopicKind};
+
+    use super::*;
 
     #[tokio::test]
     async fn subscription_waits_for_network_ack_and_reports_failure() {

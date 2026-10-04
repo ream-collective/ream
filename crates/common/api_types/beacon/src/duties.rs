@@ -36,5 +36,6 @@ pub struct SyncCommitteeDuty {
     pub public_key: PublicKey,
     #[serde(with = "serde_utils::quoted_u64")]
     pub validator_index: u64,
+    #[serde(with = "serde_utils::quoted_u64_vec")]
     pub validator_sync_committee_indices: Vec<u64>,
 }

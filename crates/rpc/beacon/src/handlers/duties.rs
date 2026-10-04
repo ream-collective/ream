@@ -10,14 +10,14 @@ use actix_web::{
 use alloy_primitives::B256;
 use ream_api_types_beacon::{
     duties::{AttesterDuty, ProposerDuty, SyncCommitteeDuty},
-    responses::DutiesResponse,
+    responses::{DutiesResponse, SyncCommitteeDutiesResponse},
 };
 use ream_api_types_common::error::ApiError;
 use ream_chain_beacon::beacon_chain::BeaconChain;
-use ream_consensus_beacon::electra::beacon_state::BeaconState;
+use ream_consensus_beacon::{electra::beacon_state::BeaconState, sync_committee::SyncCommittee};
 use ream_consensus_misc::{
-    constants::beacon::{MIN_SEED_LOOKAHEAD, SLOTS_PER_EPOCH},
-    misc::{compute_epoch_at_slot, compute_start_slot_at_epoch},
+    constants::beacon::{EPOCHS_PER_SYNC_COMMITTEE_PERIOD, MIN_SEED_LOOKAHEAD, SLOTS_PER_EPOCH},
+    misc::{compute_epoch_at_slot, compute_start_slot_at_epoch, compute_sync_committee_period},
 };
 use ream_fork_choice_beacon::store::get_ancestor_from_db;
 use ream_network_spec::networks::beacon_network_spec;
@@ -52,7 +52,8 @@ fn attester_shuffling_decision_slot(epoch: u64) -> u64 {
     compute_start_slot_at_epoch(epoch.saturating_sub(1)).saturating_sub(1)
 }
 
-fn validate_proposer_duties_epoch(epoch: u64, current_epoch: u64) -> Result<(), ApiError> {
+/// Proposer and attester duties are known at most one epoch ahead.
+fn validate_duties_epoch(epoch: u64, current_epoch: u64) -> Result<(), ApiError> {
     if epoch > current_epoch.saturating_add(1) {
         return Err(ApiError::BadRequest(format!(
             "Request epoch {epoch} is more than one epoch past the current epoch {current_epoch}"
@@ -102,7 +103,7 @@ async fn proposer_duties(
 ) -> Result<HttpResponse, ApiError> {
     let db = beacon_chain.db();
     let current_epoch = current_epoch(db)?;
-    validate_proposer_duties_epoch(epoch, current_epoch)?;
+    validate_duties_epoch(epoch, current_epoch)?;
 
     // Convert only after the guard because epoch-to-slot multiplication is unchecked.
     let decision_slot = match dependent_root_kind {
@@ -170,6 +171,7 @@ pub async fn get_attester_duties(
 ) -> Result<impl Responder, ApiError> {
     let epoch = epoch.into_inner();
     let db = beacon_chain.db();
+    validate_duties_epoch(epoch, current_epoch(db)?)?;
     let start_slot = compute_start_slot_at_epoch(epoch);
     // Resolve the state and the dependent root from one head so both describe the same chain.
     let head_root = canonical_head_root(&beacon_chain)?;
@@ -220,46 +222,59 @@ pub async fn get_attester_duties(
     Ok(HttpResponse::Ok().json(DutiesResponse::new(Some(dependent_root), duties)))
 }
 
-#[post("/validator/duties/sync/{epoch}")]
-pub async fn get_sync_committee_duties(
-    beacon_chain: Data<Arc<BeaconChain>>,
-    epoch: Path<u64>,
-    validator_indices: Json<Vec<ValidatorIndexRequest>>,
-) -> Result<impl Responder, ApiError> {
-    let epoch = epoch.into_inner();
-    let head_root = canonical_head_root(&beacon_chain)?;
-    let (state, _) = get_canonical_state_and_block_root_at_or_before_slot(
-        beacon_chain.db(),
-        head_root,
-        compute_start_slot_at_epoch(epoch),
-    )
-    .await?;
-    let validator_indices = parse_validator_indices(validator_indices.into_inner())?;
-    let sync_committee_indices = state
-        .get_sync_committee_indices(&state.current_sync_committee)
-        .map_err(|err| {
-            ApiError::BadRequest(format!("Failed to get sync committee indices {err:?}"))
-        })?;
+/// Sync committee duties are known for the current and the next sync committee period.
+fn validate_sync_duties_epoch(epoch: u64, current_epoch: u64) -> Result<(), ApiError> {
+    let max_period = compute_sync_committee_period(current_epoch).saturating_add(1);
+    if compute_sync_committee_period(epoch) > max_period {
+        return Err(ApiError::BadRequest(format!(
+            "Request epoch {epoch} is beyond the next sync committee period of current epoch \
+             {current_epoch}"
+        )));
+    }
 
+    Ok(())
+}
+
+/// The committee `state` holds for `epoch`: its current committee for its own period and its next
+/// committee for the period after. Any other period is unknown to this state.
+fn sync_committee_for_epoch(state: &BeaconState, epoch: u64) -> Option<&SyncCommittee> {
+    let state_period = compute_sync_committee_period(state.get_current_epoch());
+    let period = compute_sync_committee_period(epoch);
+    if period == state_period {
+        Some(&state.current_sync_committee)
+    } else if period == state_period.saturating_add(1) {
+        Some(&state.next_sync_committee)
+    } else {
+        None
+    }
+}
+
+/// Sync committee positions held by each requested validator. Validators outside the committee
+/// get no duty, because validator clients treat every returned duty as membership and sign sync
+/// committee messages for it.
+fn sync_committee_duties(
+    state: &BeaconState,
+    sync_committee_indices: &[usize],
+    validator_indices: &[u64],
+    epoch: u64,
+) -> Result<Vec<SyncCommitteeDuty>, ApiError> {
     let mut duties = vec![];
-    for validator_index in validator_indices {
+    for &validator_index in validator_indices {
         let Some(validator) = state.validators.get(validator_index as usize) else {
             return Err(ApiError::ValidatorNotFound(format!(
                 "Validator with index {validator_index} not found in state at epoch {epoch}"
             )));
         };
 
-        let validator_sync_committee_indices = sync_committee_indices
+        let validator_sync_committee_indices: Vec<u64> = sync_committee_indices
             .iter()
             .enumerate()
-            .filter_map(|(index, &committee_index)| {
-                if validator_index == committee_index as u64 {
-                    Some(index as u64)
-                } else {
-                    None
-                }
-            })
+            .filter(|(_, member)| **member as u64 == validator_index)
+            .map(|(position, _)| position as u64)
             .collect();
+        if validator_sync_committee_indices.is_empty() {
+            continue;
+        }
 
         duties.push(SyncCommitteeDuty {
             public_key: validator.public_key.clone(),
@@ -267,7 +282,58 @@ pub async fn get_sync_committee_duties(
             validator_sync_committee_indices,
         });
     }
-    Ok(HttpResponse::Ok().json(DutiesResponse::new(None, duties)))
+    Ok(duties)
+}
+
+#[post("/validator/duties/sync/{epoch}")]
+pub async fn get_sync_committee_duties(
+    beacon_chain: Data<Arc<BeaconChain>>,
+    epoch: Path<u64>,
+    validator_indices: Json<Vec<ValidatorIndexRequest>>,
+) -> Result<impl Responder, ApiError> {
+    let epoch = epoch.into_inner();
+    let db = beacon_chain.db();
+    validate_sync_duties_epoch(epoch, current_epoch(db)?)?;
+    let validator_indices = parse_validator_indices(validator_indices.into_inner())?;
+
+    // The head state holds the committees for its own and the next period, which covers what
+    // validator clients ask for. Advancing a state to a future epoch instead would replay up to a
+    // whole period of epoch transitions.
+    let head = beacon_chain
+        .head()
+        .map_err(|err| ApiError::InternalError(format!("Failed to get head snapshot: {err:?}")))?;
+    let state = if sync_committee_for_epoch(&head.state, epoch).is_some() {
+        head.state
+    } else {
+        // An older period is read from a canonical state inside it. A head more than one period
+        // behind is advanced to the period before the request, whose next committee is the one
+        // requested.
+        let period = compute_sync_committee_period(epoch);
+        let load_epoch = if period < compute_sync_committee_period(head.state.get_current_epoch()) {
+            epoch
+        } else {
+            (period - 1) * EPOCHS_PER_SYNC_COMMITTEE_PERIOD
+        };
+        let (state, _) = get_canonical_state_and_block_root_at_or_before_slot(
+            db,
+            head.head_root,
+            compute_start_slot_at_epoch(load_epoch),
+        )
+        .await?;
+        Arc::new(state)
+    };
+    let sync_committee = sync_committee_for_epoch(&state, epoch).ok_or_else(|| {
+        ApiError::InternalError(format!("No sync committee known for epoch {epoch}"))
+    })?;
+    let sync_committee_indices =
+        state
+            .get_sync_committee_indices(sync_committee)
+            .map_err(|err| {
+                ApiError::InternalError(format!("Failed to get sync committee indices {err:?}"))
+            })?;
+
+    let duties = sync_committee_duties(&state, &sync_committee_indices, &validator_indices, epoch)?;
+    Ok(HttpResponse::Ok().json(SyncCommitteeDutiesResponse::new(duties)))
 }
 
 fn parse_validator_indices(
@@ -433,16 +499,102 @@ mod tests {
         assert_eq!(epoch_at_time(genesis, 0, 12_000), 0);
     }
 
+    /// A real Sepolia state, so its sync committees resolve to validators in the registry.
+    fn sepolia_state() -> BeaconState {
+        use ssz::Decode;
+
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../../testing/gossip-validation/tests/assets/sepolia/states/grandparent_state_9552074.ssz_snappy",
+        );
+        let compressed = std::fs::read(path).expect("test beacon state should be readable");
+        let bytes = snap::raw::Decoder::new()
+            .decompress_vec(&compressed)
+            .expect("test beacon state should decompress");
+        BeaconState::from_ssz_bytes(&bytes).expect("test beacon state should decode")
+    }
+
     #[test]
-    fn proposer_duties_reject_epochs_beyond_the_lookahead() {
-        assert!(validate_proposer_duties_epoch(10, 10).is_ok());
-        assert!(validate_proposer_duties_epoch(11, 10).is_ok());
+    fn sync_duties_reject_epochs_beyond_the_next_period() {
+        let period = EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
+        assert!(validate_sync_duties_epoch(0, 3).is_ok());
+        assert!(validate_sync_duties_epoch(2 * period - 1, 3).is_ok());
+        for epoch in [2 * period, u64::MAX] {
+            assert!(matches!(
+                validate_sync_duties_epoch(epoch, 3),
+                Err(ApiError::BadRequest(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn sync_committee_is_chosen_by_the_state_period() {
+        let state = sepolia_state();
+        let period_start = compute_sync_committee_period(state.get_current_epoch())
+            * EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
+        let period = EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
+
+        assert_eq!(
+            sync_committee_for_epoch(&state, period_start),
+            Some(&*state.current_sync_committee)
+        );
+        // Validator clients fetch next-period duties at the first epoch of that period.
+        assert_eq!(
+            sync_committee_for_epoch(&state, period_start + period),
+            Some(&*state.next_sync_committee)
+        );
+        assert_eq!(
+            sync_committee_for_epoch(&state, period_start + 2 * period),
+            None
+        );
+        assert_eq!(sync_committee_for_epoch(&state, period_start - 1), None);
+    }
+
+    #[test]
+    fn sync_duties_list_only_committee_members() {
+        let state = sepolia_state();
+        let epoch = state.get_current_epoch();
+        let committee_indices = state
+            .get_sync_committee_indices(&state.current_sync_committee)
+            .expect("committee members are registered validators");
+        let member = committee_indices[0] as u64;
+        let member_positions: Vec<u64> = committee_indices
+            .iter()
+            .enumerate()
+            .filter(|(_, index)| **index as u64 == member)
+            .map(|(position, _)| position as u64)
+            .collect();
+        let non_member = (0..state.validators.len() as u64)
+            .find(|index| !committee_indices.contains(&(*index as usize)))
+            .expect("the registry is larger than the committee");
+
+        let duties =
+            sync_committee_duties(&state, &committee_indices, &[non_member, member], epoch)
+                .expect("both validators exist");
+
+        assert_eq!(duties.len(), 1);
+        assert_eq!(duties[0].validator_index, member);
+        assert_eq!(duties[0].validator_sync_committee_indices, member_positions);
+        let json = serde_json::to_value(&duties[0]).unwrap();
+        assert_eq!(
+            json["validator_sync_committee_indices"][0],
+            member_positions[0].to_string()
+        );
         assert!(matches!(
-            validate_proposer_duties_epoch(12, 10),
+            sync_committee_duties(&state, &committee_indices, &[u64::MAX], epoch),
+            Err(ApiError::ValidatorNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn duties_reject_epochs_beyond_the_lookahead() {
+        assert!(validate_duties_epoch(10, 10).is_ok());
+        assert!(validate_duties_epoch(11, 10).is_ok());
+        assert!(matches!(
+            validate_duties_epoch(12, 10),
             Err(ApiError::BadRequest(_))
         ));
         assert!(matches!(
-            validate_proposer_duties_epoch(u64::MAX, 10),
+            validate_duties_epoch(u64::MAX, 10),
             Err(ApiError::BadRequest(_))
         ));
     }

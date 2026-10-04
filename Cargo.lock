@@ -7061,6 +7061,7 @@ dependencies = [
  "ream-validator-beacon",
  "serde",
  "serde_json",
+ "snap",
  "ssz_types",
  "tempdir",
  "thiserror 2.0.19",
