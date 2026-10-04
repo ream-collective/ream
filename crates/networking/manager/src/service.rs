@@ -249,6 +249,7 @@ impl NetworkManagerService {
             discv5_config,
             gossipsub_config,
             data_dir: ream_directory,
+            genesis_time: ream_db.genesis_time_provider().get()?,
         };
 
         let (manager_sender, manager_receiver) = mpsc::unbounded_channel();
