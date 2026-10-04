@@ -572,7 +572,7 @@ mod tests {
                 discovery_port: 9101,
                 ..DiscoveryConfig::default()
             };
-            let enr = Discovery::new(Keypair::generate_secp256k1(), &config, 0)
+            let enr = Discovery::new(Keypair::generate_secp256k1(), &config, 0, 0)
                 .await?
                 .local_enr();
 
