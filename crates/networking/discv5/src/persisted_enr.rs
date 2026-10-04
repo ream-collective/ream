@@ -1,6 +1,7 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
+    net::IpAddr,
     path::{Path, PathBuf},
     process,
     str::FromStr,
@@ -33,6 +34,21 @@ pub fn load_enr(path: &Path) -> anyhow::Result<Option<Enr>> {
         )
     })?;
     Ok(Some(enr))
+}
+
+/// Returns the IP for the local ENR. With an unspecified listen address, the IP learned from peers
+/// in a previous run is reused so a restart doesn't drop it or change the record.
+pub fn advertised_ip(configured: IpAddr, previous: Option<&Enr>) -> IpAddr {
+    if !configured.is_unspecified() {
+        return configured;
+    }
+    let learned = match configured {
+        IpAddr::V4(_) => previous.and_then(Enr::ip4).map(IpAddr::V4),
+        IpAddr::V6(_) => previous.and_then(Enr::ip6).map(IpAddr::V6),
+    };
+    learned
+        .filter(|ip| !ip.is_unspecified())
+        .unwrap_or(configured)
 }
 
 /// Continues the sequence of `previous` in a freshly built `enr` for the same node.
@@ -168,6 +184,31 @@ mod tests {
 
     fn enr(key: &CombinedKey, tcp_port: u16) -> Enr {
         Enr::builder().tcp4(tcp_port).build(key).unwrap()
+    }
+
+    #[test]
+    fn advertised_ip_reuses_learned_ip_only_for_unspecified_address() {
+        let key = key();
+        let learned: IpAddr = "203.0.113.7".parse().unwrap();
+        let previous = Enr::builder().ip(learned).build(&key).unwrap();
+        let unspecified: IpAddr = "0.0.0.0".parse().unwrap();
+        let configured: IpAddr = "198.51.100.1".parse().unwrap();
+
+        assert_eq!(advertised_ip(unspecified, Some(&previous)), learned);
+        assert_eq!(advertised_ip(configured, Some(&previous)), configured);
+        assert_eq!(advertised_ip(unspecified, None), unspecified);
+
+        let never_learned = Enr::builder().ip(unspecified).build(&key).unwrap();
+        assert_eq!(
+            advertised_ip(unspecified, Some(&never_learned)),
+            unspecified
+        );
+
+        let ipv6_unspecified: IpAddr = "::".parse().unwrap();
+        assert_eq!(
+            advertised_ip(ipv6_unspecified, Some(&previous)),
+            ipv6_unspecified
+        );
     }
 
     #[test]
