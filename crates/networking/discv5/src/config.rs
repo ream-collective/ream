@@ -12,8 +12,7 @@ pub struct DiscoveryConfig {
     pub socket_port: u16,
     pub discovery_port: u16,
     pub disable_discovery: bool,
-    /// Attestation subnets the node stays subscribed to. The ENR also advertises the backbone
-    /// subnets assigned to the node ID.
+    /// Subnets the node stays subscribed to. The ENR adds the node's backbone subnets.
     pub attestation_subnets: AttestationSubnets,
     pub sync_committee_subnets: SyncCommitteeSubnets,
     pub custody_group_count: CustodyGroupCount,

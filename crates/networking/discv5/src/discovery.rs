@@ -76,7 +76,6 @@ pub struct Discovery {
     discovery_queries: FuturesUnordered<Pin<Box<dyn Future<Output = QueryResult> + Send>>>,
     find_peer_active: bool,
     pub started: bool,
-    /// Subnets the node joins regardless of the backbone assignment
     long_lived_attestation_subnets: AttestationSubnets,
     /// Attestation subnets advertised in the local ENR
     current_attestation_subnets: AttestationSubnets,
@@ -257,8 +256,7 @@ impl Discovery {
         }
     }
 
-    /// Returns the attestation subnets advertised in the local ENR. The caller must stay subscribed
-    /// to all of them.
+    /// Subnets advertised in the local ENR. The caller must stay subscribed to all of them.
     pub fn current_attestation_subnets(&self) -> &AttestationSubnets {
         &self.current_attestation_subnets
     }
@@ -497,7 +495,6 @@ impl NetworkBehaviour for Discovery {
     }
 }
 
-/// Returns the long-lived subnets plus the backbone subnets assigned to `node_id` for `epoch`.
 fn advertised_attestation_subnets(
     long_lived: &AttestationSubnets,
     node_id: NodeId,
@@ -583,7 +580,6 @@ mod tests {
         let predicate = attestation_subnet_predicate(vec![0]);
         assert!(predicate(&local_enr));
 
-        // The backbone adds two subnets, so some subnet is not advertised.
         let unadvertised = (0..ATTESTATION_SUBNET_COUNT as u64)
             .find(|subnet_id| {
                 !discovery
@@ -837,7 +833,7 @@ mod tests {
         let enr = discovery.local_enr();
         let current = discovery.current_attestation_subnets();
 
-        // RLP string of the 8 byte SSZ bitvector, as other clients decode it.
+        // 0x88 is the RLP string header for the 8 byte SSZ bitvector.
         let mut expected_rlp = vec![0x88];
         expected_rlp.extend_from_slice(&current.0.as_ssz_bytes());
         assert_eq!(
@@ -846,35 +842,6 @@ mod tests {
         );
         assert_eq!(&enr_attestation_subnets(&enr)?, current);
         assert_eq!(enr.seq(), seq + 1);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn all_long_lived_subnets_keep_enr_stable_across_rotations() -> anyhow::Result<()> {
-        let _ = GENESIS_VALIDATORS_ROOT.set(B256::ZERO);
-        initialize_test_network_spec();
-        let mut config = DiscoveryConfig {
-            disable_discovery: true,
-            ..DiscoveryConfig::default()
-        };
-        for subnet_id in 0..ATTESTATION_SUBNET_COUNT as u64 {
-            config
-                .attestation_subnets
-                .enable_attestation_subnet(subnet_id)?;
-        }
-
-        let mut discovery = Discovery::new(Keypair::generate_secp256k1(), &config, 0).await?;
-        let initial = discovery.local_enr();
-        assert_eq!(
-            enr_attestation_subnets(&initial)?,
-            config.attestation_subnets
-        );
-
-        for period in 1..=4 {
-            let slot = period * EPOCHS_PER_SUBNET_SUBSCRIPTION * 32;
-            assert!(!discovery.update_attestation_subnets(slot)?);
-        }
-        assert_eq!(discovery.local_enr(), initial);
         Ok(())
     }
 
@@ -908,13 +875,13 @@ mod tests {
         assert_eq!(load_enr(&enr_path)?, Some(updated.clone()));
         drop(discovery);
 
-        // Restarting in the same epoch rebuilds the runtime record, so the seq is kept.
+        // Same epoch: same record and seq.
         let restarted = Discovery::with_persisted_enr(key.clone(), &config, slot, enr_path.clone())
             .await?
             .local_enr();
         assert_eq!(restarted, updated);
 
-        // A restart in another subscription period advertises other subnets and needs a higher seq.
+        // Other subscription period: other subnets, higher seq.
         let later = Discovery::with_persisted_enr(key, &config, 0, enr_path)
             .await?
             .local_enr();

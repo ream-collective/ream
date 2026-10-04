@@ -85,8 +85,7 @@ use crate::{
     network::misc::{Executor, build_transport, peer_id_from_enr},
 };
 
-/// Returns the discovery config with the subnet bitfields set to the subnets joined through
-/// `topics`, so the ENR only advertises subnets this node is subscribed to.
+/// The ENR advertises only the subnets joined through `topics`.
 fn discovery_config_for_topics(
     config: &DiscoveryConfig,
     topics: &[GossipTopic],
@@ -112,7 +111,7 @@ fn discovery_config_for_topics(
     Ok(config)
 }
 
-/// Decodes the ENR subnet bitfields, which `MetaData` must mirror.
+/// `MetaData` must mirror these ENR bitfields.
 fn enr_subnet_bitfields(enr: &Enr) -> anyhow::Result<(BitVector<U64>, BitVector<U4>)> {
     let attestation_subnets = enr
         .get_decodable::<AttestationSubnets>(ATTESTATION_BITFIELD_ENR_KEY)
@@ -310,7 +309,7 @@ impl Network {
         };
 
         network.start_network_worker(config).await?;
-        // Join the backbone subnets the ENR advertises on top of the configured topics.
+        // Join backbone subnets missing from the configured topics.
         network.update_attestation_subnet_topics(&discv5_config.attestation_subnets)?;
 
         Ok(network)
@@ -1014,8 +1013,7 @@ impl Network {
         self.swarm.behaviour_mut().gossipsub.unsubscribe(&topic)
     }
 
-    /// Rotates the backbone attestation subnets. When the ENR changes, the topics, the cached ENR
-    /// and `MetaData` follow it.
+    /// On an ENR change, topics, the cached ENR and `MetaData` follow it.
     fn rotate_attestation_subnets(&mut self, current_slot: u64) -> anyhow::Result<()> {
         let previous = self
             .swarm
@@ -1043,8 +1041,7 @@ impl Network {
         Ok(())
     }
 
-    /// Joins the attestation subnets the ENR advertises beyond `previous` and leaves the ones it
-    /// no longer advertises.
+    /// Joins subnets added since `previous` and leaves removed ones.
     fn update_attestation_subnet_topics(
         &mut self,
         previous: &AttestationSubnets,
@@ -1523,7 +1520,7 @@ mod tests {
         ))
     }
 
-    /// Every attestation and sync committee subnet topic, as the manager configures them.
+    /// All subnet topics, as the manager configures them.
     fn all_subnet_topics() -> Vec<GossipTopic> {
         let fork = beacon_network_spec().fork_digest(
             beacon_network_spec().current_epoch(),
@@ -1536,8 +1533,7 @@ mod tests {
             .collect()
     }
 
-    /// Asserts that gossipsub subscriptions, the ENR, its cached copy and the saved `MetaData`
-    /// all describe the same subnets.
+    /// Topics, ENR, cached ENR and saved `MetaData` must agree.
     fn assert_subnets_consistent(network: &Network, data_dir: &Path) {
         let enr = network.swarm.behaviour().discovery.local_enr();
         assert_eq!(network.enr(), enr);
@@ -1589,7 +1585,7 @@ mod tests {
             assert_eq!(syncnets.num_set_bits(), 4);
             assert_subnets_consistent(&network, data_dir.path());
 
-            // The backbone is a subset of all subnets, so rotation changes nothing.
+            // The backbone is already included.
             let (enr, seq) = (network.enr(), meta_data_seq(&network));
             for period in 1..=4 {
                 network
@@ -1619,7 +1615,7 @@ mod tests {
         let data_dir = TestDataDir::new();
 
         let mut network = create_local_network(&runtime, data_dir.path()).unwrap();
-        // Without subnet topics configured, the node joins only its backbone subnets.
+        // No subnet topics: only the backbone is joined.
         let initial = network
             .swarm
             .behaviour()
@@ -1646,7 +1642,7 @@ mod tests {
         assert_subnets_consistent(&network, data_dir.path());
         drop(network);
 
-        // The restart is at slot 0, so the epoch 0 backbone comes back.
+        // Restarting at slot 0 restores the epoch 0 backbone.
         let network = create_local_network(&runtime, data_dir.path()).unwrap();
         assert_eq!(meta_data_seq(&network), seq + 2);
         assert_subnets_consistent(&network, data_dir.path());

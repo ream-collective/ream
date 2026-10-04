@@ -52,8 +52,8 @@ impl NetworkState {
             });
     }
 
-    /// Applies `update` to `MetaData`. If a field changed, increments `seq_number` and saves the
-    /// result, as peers only refetch `MetaData` when `seq_number` grows.
+    /// Applies `update`. On change, bumps `seq_number` and saves, since peers refetch `MetaData`
+    /// only when it grows.
     pub fn update_meta_data(
         &self,
         update: impl FnOnce(&mut GetMetaDataV3),
