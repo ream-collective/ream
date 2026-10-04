@@ -961,7 +961,11 @@ impl Network {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, net::IpAddr, path::Path};
+    use std::{
+        fs,
+        net::{IpAddr, Ipv4Addr, Ipv6Addr},
+        path::Path,
+    };
 
     use alloy_primitives::aliases::B32;
     use discv5::enr::CombinedKey;
@@ -1513,5 +1517,77 @@ mod tests {
 
         assert!(err.to_string().contains(NETWORK_KEY_FILE_NAME));
         assert_eq!(fs::read_to_string(&key_path).unwrap(), "malformed");
+    }
+
+    /// Restarts a node listening on `address`, then dials it from its ENR as discovery does.
+    fn dial_restarted_node_from_enr(address: IpAddr, ports: [u16; 2]) {
+        initialize_test_network_spec();
+
+        let runtime = Runtime::new().unwrap();
+        let data_dir_1 = TestDataDir::new();
+        let data_dir_2 = TestDataDir::new();
+        let start = |data_dir: &Path, socket_port| {
+            runtime
+                .block_on(create_network(
+                    address,
+                    socket_port,
+                    0,
+                    vec![],
+                    true,
+                    vec![],
+                    data_dir,
+                ))
+                .unwrap()
+        };
+
+        let first_enr = start(data_dir_1.path(), ports[0]).enr();
+        let mut network_1 = start(data_dir_1.path(), ports[0]);
+        let mut network_2 = start(data_dir_2.path(), ports[1]);
+        assert_eq!(network_1.enr(), first_enr);
+
+        let peer_id_1 = network_1.peer_id();
+        let mut expected_address = Multiaddr::from(address);
+        expected_address.push(Protocol::Tcp(ports[0]));
+        expected_address.push(Protocol::P2p(peer_id_1));
+
+        network_2.handle_discovered_peers(HashMap::from([(network_1.enr(), None)]));
+        let dialed = network_2
+            .cached_peer(&peer_id_1)
+            .expect("ENR should yield a dialable address");
+        assert_eq!(dialed.last_seen_p2p_address, Some(expected_address));
+
+        let connected = runtime.block_on(async {
+            let network_1_task = async {
+                loop {
+                    network_1.swarm.next().await;
+                }
+            };
+            let network_2_task = async {
+                while let Some(event) = network_2.swarm.next().await {
+                    if let SwarmEvent::ConnectionEstablished { peer_id, .. } = event
+                        && peer_id == peer_id_1
+                    {
+                        return true;
+                    }
+                }
+                false
+            };
+            tokio::select! {
+                _ = network_1_task => false,
+                connected = network_2_task => connected,
+                _ = sleep(Duration::from_secs(10)) => false,
+            }
+        });
+        assert!(connected, "failed to connect to {address}");
+    }
+
+    #[test]
+    fn ipv4_enr_is_dialable_after_restart() {
+        dial_restarted_node_from_enr(Ipv4Addr::LOCALHOST.into(), [9320, 9321]);
+    }
+
+    #[test]
+    fn ipv6_enr_is_dialable_after_restart() {
+        dial_restarted_node_from_enr(Ipv6Addr::LOCALHOST.into(), [9322, 9323]);
     }
 }

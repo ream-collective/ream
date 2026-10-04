@@ -76,3 +76,11 @@ The libp2p swarm provides:
 - Unified interface for all network behaviors
 - Connection management and multiplexing
 - Transport layer abstraction
+
+## Advertised Endpoints
+
+The beacon node advertises its P2P endpoints in its ENR:
+- The IP version of `--socket-address` decides the fields: an IPv4 address sets `ip`, `tcp` and `udp`, and an IPv6 address sets `ip6`, `tcp6` and `udp6`.
+- At startup, the TCP port is `--socket-port` and the UDP port is `--discovery-port`. Ream has no separate external port setting, so a node behind NAT should forward the same port numbers.
+- At runtime, discv5 may replace the IP and UDP port with the external socket reported by peers. It never changes the TCP port.
+- After a restart, the ports are reset to the configured values. A learned IP is kept only when `--socket-address` is unspecified (`0.0.0.0` or `::`).
