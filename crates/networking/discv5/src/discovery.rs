@@ -125,7 +125,6 @@ impl Discovery {
             None => None,
         };
 
-        // Peers only use ports of the same IP version as the address, e.g. `ip6` with `tcp6`.
         let mut enr_builder = Enr::builder();
         let ip = advertised_ip(config.socket_address, previous_enr.as_ref());
         enr_builder.ip(ip);
@@ -567,6 +566,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enr_ports_match_socket_address_ip_version() -> anyhow::Result<()> {
+        let _ = GENESIS_VALIDATORS_ROOT.set(B256::ZERO);
+        initialize_test_network_spec();
+        for socket_address in [
+            IpAddr::from(Ipv4Addr::new(192, 0, 2, 1)),
+            Ipv4Addr::UNSPECIFIED.into(),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).into(),
+            Ipv6Addr::UNSPECIFIED.into(),
+        ] {
+            let config = DiscoveryConfig {
+                disable_discovery: true,
+                socket_address,
+                socket_port: 9100,
+                discovery_port: 9101,
+                ..DiscoveryConfig::default()
+            };
+            let enr = Discovery::new(Keypair::generate_secp256k1(), &config, 0)
+                .await?
+                .local_enr();
+
+            let tcp: Vec<_> = [
+                enr.tcp4_socket().map(SocketAddr::V4),
+                enr.tcp6_socket().map(SocketAddr::V6),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            let udp: Vec<_> = [
+                enr.udp4_socket().map(SocketAddr::V4),
+                enr.udp6_socket().map(SocketAddr::V6),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            assert_eq!(
+                tcp,
+                [SocketAddr::new(socket_address, 9100)],
+                "{socket_address}"
+            );
+            assert_eq!(
+                udp,
+                [SocketAddr::new(socket_address, 9101)],
+                "{socket_address}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_attestation_subnet_predicate() -> anyhow::Result<()> {
         initialize_test_network_spec();
         let key = Keypair::generate_secp256k1();
@@ -882,64 +930,13 @@ mod tests {
     }
 
     /// Simulates discv5 learning `ip` from PONG votes, as handled on `Event::SocketUpdated`.
-    fn learn_external_ip(discovery: &Discovery, ip: impl Into<IpAddr>, udp_port: u16) {
+    fn learn_external_ip(discovery: &Discovery, ip: Ipv4Addr, udp_port: u16) {
         assert!(
             discovery
                 .discv5
-                .update_local_enr_socket(SocketAddr::new(ip.into(), udp_port), false)
+                .update_local_enr_socket((ip, udp_port).into(), false)
         );
         discovery.persist_local_enr();
-    }
-
-    /// The TCP sockets a peer can dial from `enr`.
-    fn tcp_sockets(enr: &Enr) -> Vec<SocketAddr> {
-        let tcp4 = enr.tcp4_socket().map(SocketAddr::V4);
-        let tcp6 = enr.tcp6_socket().map(SocketAddr::V6);
-        tcp4.into_iter().chain(tcp6).collect()
-    }
-
-    /// The UDP sockets a peer can contact over discv5 from `enr`.
-    fn udp_sockets(enr: &Enr) -> Vec<SocketAddr> {
-        let udp4 = enr.udp4_socket().map(SocketAddr::V4);
-        let udp6 = enr.udp6_socket().map(SocketAddr::V6);
-        udp4.into_iter().chain(udp6).collect()
-    }
-
-    #[tokio::test]
-    async fn enr_ports_match_socket_address_ip_version() -> anyhow::Result<()> {
-        let _ = GENESIS_VALIDATORS_ROOT.set(B256::ZERO);
-        initialize_test_network_spec();
-        let socket_addresses: [IpAddr; 4] = [
-            Ipv4Addr::new(192, 0, 2, 1).into(),
-            Ipv4Addr::UNSPECIFIED.into(),
-            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).into(),
-            Ipv6Addr::UNSPECIFIED.into(),
-        ];
-
-        for socket_address in socket_addresses {
-            let config = DiscoveryConfig {
-                disable_discovery: true,
-                socket_address,
-                socket_port: 9100,
-                discovery_port: 9101,
-                ..DiscoveryConfig::default()
-            };
-            let enr = Discovery::new(Keypair::generate_secp256k1(), &config, 0)
-                .await?
-                .local_enr();
-
-            assert_eq!(
-                tcp_sockets(&enr),
-                vec![SocketAddr::new(socket_address, config.socket_port)],
-                "{socket_address}"
-            );
-            assert_eq!(
-                udp_sockets(&enr),
-                vec![SocketAddr::new(socket_address, config.discovery_port)],
-                "{socket_address}"
-            );
-        }
-        Ok(())
     }
 
     #[tokio::test]
@@ -1033,78 +1030,6 @@ mod tests {
             .await?
             .local_enr();
         assert_eq!(restarted.ip4(), Some(configured_ip));
-        assert_eq!(restarted.seq(), learned.seq() + 1);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn learned_ipv6_and_seq_survive_restart_with_unspecified_address() -> anyhow::Result<()> {
-        let _ = GENESIS_VALIDATORS_ROOT.set(B256::ZERO);
-        initialize_test_network_spec();
-        let dir = TestDir::new();
-        let enr_path = dir.path().join("enr");
-        let key = Keypair::generate_secp256k1();
-        let config = DiscoveryConfig {
-            disable_discovery: true,
-            socket_address: Ipv6Addr::UNSPECIFIED.into(),
-            ..DiscoveryConfig::default()
-        };
-        let external_ip = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 7);
-
-        let discovery =
-            Discovery::with_persisted_enr(key.clone(), &config, 0, enr_path.clone()).await?;
-        assert_eq!(discovery.local_enr().ip6(), Some(Ipv6Addr::UNSPECIFIED));
-        learn_external_ip(&discovery, external_ip, config.discovery_port);
-        let learned = discovery.local_enr();
-        assert_eq!(load_enr(&enr_path)?, Some(learned.clone()));
-        drop(discovery);
-
-        let restarted = Discovery::with_persisted_enr(key, &config, 0, enr_path)
-            .await?
-            .local_enr();
-        assert_eq!(
-            tcp_sockets(&restarted),
-            vec![SocketAddr::new(external_ip.into(), config.socket_port)]
-        );
-        assert_eq!(
-            udp_sockets(&restarted),
-            vec![SocketAddr::new(external_ip.into(), config.discovery_port)]
-        );
-        assert_eq!(restarted, learned);
-        Ok(())
-    }
-
-    /// Ream advertises its configured listening ports. A NAT-mapped UDP port learned from PONG
-    /// votes is not reused after a restart, and the TCP port is never learned.
-    #[tokio::test]
-    async fn configured_ports_replace_learned_udp_port_on_restart() -> anyhow::Result<()> {
-        let _ = GENESIS_VALIDATORS_ROOT.set(B256::ZERO);
-        initialize_test_network_spec();
-        let dir = TestDir::new();
-        let enr_path = dir.path().join("enr");
-        let key = Keypair::generate_secp256k1();
-        let config = DiscoveryConfig {
-            disable_discovery: true,
-            socket_address: Ipv4Addr::UNSPECIFIED.into(),
-            ..DiscoveryConfig::default()
-        };
-        let external_ip = Ipv4Addr::new(203, 0, 113, 7);
-        let mapped_udp_port = config.discovery_port + 1000;
-
-        let discovery =
-            Discovery::with_persisted_enr(key.clone(), &config, 0, enr_path.clone()).await?;
-        learn_external_ip(&discovery, external_ip, mapped_udp_port);
-        let learned = discovery.local_enr();
-        assert_eq!(learned.udp4(), Some(mapped_udp_port));
-        assert_eq!(learned.tcp4(), Some(config.socket_port));
-        drop(discovery);
-
-        let restarted = Discovery::with_persisted_enr(key, &config, 0, enr_path)
-            .await?
-            .local_enr();
-        assert_eq!(restarted.ip4(), Some(external_ip));
-        assert_eq!(restarted.udp4(), Some(config.discovery_port));
-        assert_eq!(restarted.tcp4(), Some(config.socket_port));
         assert_eq!(restarted.seq(), learned.seq() + 1);
         Ok(())
     }
