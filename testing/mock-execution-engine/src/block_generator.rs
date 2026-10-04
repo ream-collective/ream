@@ -3,9 +3,7 @@ use std::{collections::HashMap, sync::OnceLock};
 use alloy_primitives::{Address, B64, B256, Bytes, U64, U256};
 use alloy_rlp::Encodable;
 use anyhow::{anyhow, bail, ensure};
-use ream_consensus_misc::polynomial_commitments::{
-    kzg_commitment::KZGCommitment, kzg_proof::KZGProof,
-};
+use ream_consensus_misc::polynomial_commitments::kzg_commitment::KZGCommitment;
 use ream_execution_rpc_types::{
     electra::execution_payload::ExecutionPayload,
     execution_payload::ExecutionPayloadV3,
@@ -15,6 +13,7 @@ use ream_execution_rpc_types::{
     payload_status::{PayloadStatus, PayloadStatusV1},
     transaction::{AccessList, BlobTransaction, ToAddress},
 };
+use ream_polynomial_commitments::handlers::compute_blob_kzg_proof;
 use rust_eth_kzg::{DASContext, TrustedSetup, UsePrecomp};
 use ssz_types::{FixedVector, VariableList};
 
@@ -93,7 +92,7 @@ pub struct ExecutionBlockGenerator {
     head_block_hash: B256,
     blobs_per_payload: usize,
     pending_blobs: HashMap<B256, Vec<(Blob, KZGCommitment)>>,
-    blobs_by_versioned_hash: HashMap<B256, Blob>,
+    blobs_by_versioned_hash: HashMap<B256, BlobAndProofV1>,
     next_blob_seed: u8,
 }
 
@@ -129,12 +128,7 @@ impl ExecutionBlockGenerator {
     }
 
     pub fn get_blob_and_proof(&self, versioned_hash: B256) -> Option<BlobAndProofV1> {
-        self.blobs_by_versioned_hash
-            .get(&versioned_hash)
-            .map(|blob| BlobAndProofV1 {
-                blob: blob.clone(),
-                proof: KZGProof::default(),
-            })
+        self.blobs_by_versioned_hash.get(&versioned_hash).cloned()
     }
 
     fn generate_blobs(&mut self) -> anyhow::Result<Vec<(Blob, KZGCommitment)>> {
@@ -245,12 +239,20 @@ impl ExecutionBlockGenerator {
             .pending_blobs
             .remove(&payload.block_hash)
             .unwrap_or_default();
+        // Real proofs, because beacon nodes verify the blobs a validator client publishes.
+        let mut proofs = Vec::with_capacity(blobs_and_commitments.len());
         for (blob, commitment) in &blobs_and_commitments {
-            self.blobs_by_versioned_hash
-                .insert(commitment.calculate_versioned_hash(), blob.clone());
+            let proof = compute_blob_kzg_proof(blob, commitment)?;
+            self.blobs_by_versioned_hash.insert(
+                commitment.calculate_versioned_hash(),
+                BlobAndProofV1 {
+                    blob: blob.clone(),
+                    proof,
+                },
+            );
+            proofs.push(proof);
         }
         let (blobs, commitments): (Vec<_>, Vec<_>) = blobs_and_commitments.into_iter().unzip();
-        let proofs = vec![KZGProof::default(); blobs.len()];
         let blobs_bundle = BlobsBundleV1 {
             blobs: VariableList::new(blobs)
                 .map_err(|err| anyhow!("too many sample blobs: {err:?}"))?,
@@ -356,6 +358,7 @@ mod tests {
     use ream_execution_rpc_types::{
         execution_payload::WithdrawalV1, forkchoice_update::ForkchoiceStateV1,
     };
+    use ream_polynomial_commitments::handlers::verify_blob_kzg_proof_batch;
 
     use super::*;
 
@@ -525,7 +528,25 @@ mod tests {
                 .get_blob_and_proof(versioned_hash)
                 .expect("blob should be retrievable by its versioned hash");
             assert_eq!(&blob_and_proof.blob, blob);
+            assert!(
+                verify_blob_kzg_proof_batch(
+                    std::slice::from_ref(blob),
+                    std::slice::from_ref(commitment),
+                    &[blob_and_proof.proof]
+                )
+                .unwrap(),
+                "the cached proof must verify"
+            );
         }
+        assert!(
+            verify_blob_kzg_proof_batch(
+                &payload.blobs_bundle.blobs,
+                &payload.blobs_bundle.commitments,
+                &payload.blobs_bundle.proofs
+            )
+            .unwrap(),
+            "bundle proofs must verify"
+        );
 
         assert!(
             generator

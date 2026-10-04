@@ -26,6 +26,7 @@ url.workspace = true
 # ream dependencies
 ream-consensus-misc.workspace = true
 ream-execution-rpc-types.workspace = true
+ream-polynomial-commitments.workspace = true
 
 [dev-dependencies]
 reqwest.workspace = true

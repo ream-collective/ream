@@ -6776,6 +6776,7 @@ dependencies = [
  "ream-consensus-misc",
  "ream-execution-engine",
  "ream-execution-rpc-types",
+ "ream-polynomial-commitments",
  "reqwest",
  "rust_eth_kzg",
  "serde",
