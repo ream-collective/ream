@@ -140,9 +140,15 @@ impl Discovery {
         };
 
         let mut enr_builder = Enr::builder();
-        enr_builder.ip(advertised_ip(config.socket_address, previous_enr.as_ref()));
-        enr_builder.tcp4(config.socket_port);
-        enr_builder.udp4(config.discovery_port);
+        let ip = advertised_ip(config.socket_address, previous_enr.as_ref());
+        enr_builder.ip(ip);
+        if ip.is_ipv4() {
+            enr_builder.tcp4(config.socket_port);
+            enr_builder.udp4(config.discovery_port);
+        } else {
+            enr_builder.tcp6(config.socket_port);
+            enr_builder.udp6(config.discovery_port);
+        }
 
         let mut enr = enr_builder
             .add_value(
@@ -508,7 +514,7 @@ fn convert_to_enr(key: Keypair) -> anyhow::Result<CombinedKey> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     use alloy_primitives::B256;
     use libp2p::identity::Keypair;
@@ -546,6 +552,55 @@ mod tests {
         }
         assert_eq!(enr_subnets, expected);
         assert_eq!(discovery.current_attestation_subnets(), &expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enr_ports_match_socket_address_ip_version() -> anyhow::Result<()> {
+        let _ = GENESIS_VALIDATORS_ROOT.set(B256::ZERO);
+        initialize_test_network_spec();
+        for socket_address in [
+            IpAddr::from(Ipv4Addr::new(192, 0, 2, 1)),
+            Ipv4Addr::UNSPECIFIED.into(),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).into(),
+            Ipv6Addr::UNSPECIFIED.into(),
+        ] {
+            let config = DiscoveryConfig {
+                disable_discovery: true,
+                socket_address,
+                socket_port: 9100,
+                discovery_port: 9101,
+                ..DiscoveryConfig::default()
+            };
+            let enr = Discovery::new(Keypair::generate_secp256k1(), &config, 0)
+                .await?
+                .local_enr();
+
+            let tcp: Vec<_> = [
+                enr.tcp4_socket().map(SocketAddr::V4),
+                enr.tcp6_socket().map(SocketAddr::V6),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            let udp: Vec<_> = [
+                enr.udp4_socket().map(SocketAddr::V4),
+                enr.udp6_socket().map(SocketAddr::V6),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            assert_eq!(
+                tcp,
+                [SocketAddr::new(socket_address, 9100)],
+                "{socket_address}"
+            );
+            assert_eq!(
+                udp,
+                [SocketAddr::new(socket_address, 9101)],
+                "{socket_address}"
+            );
+        }
         Ok(())
     }
 
