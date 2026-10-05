@@ -9,10 +9,10 @@ use std::{
     fmt::Debug,
     num::{NonZeroU8, NonZeroUsize},
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::anyhow;
+use anyhow::{anyhow, ensure};
 use channel::{P2PCallbackError, P2PCallbackResponse, P2PMessage, P2PRequest, P2PResponse};
 use delay_map::{HashMapDelay, HashSetDelay};
 use discv5::Enr;
@@ -33,8 +33,18 @@ use libp2p_identity::{Keypair, PublicKey};
 use network_state::NetworkState;
 use parking_lot::{Mutex, RwLock};
 use peer::CachedPeer;
-use ream_consensus_misc::constants::beacon::{SLOTS_PER_EPOCH, genesis_validators_root};
-use ream_discv5::discovery::{Discovery, DiscoveryOutEvent, QueryType};
+use ream_consensus_misc::{
+    constants::beacon::{SLOTS_PER_EPOCH, genesis_validators_root},
+    misc::compute_epoch_at_slot,
+};
+use ream_discv5::{
+    config::DiscoveryConfig,
+    discovery::{Discovery, DiscoveryOutEvent, QueryType},
+    subnet::{
+        ATTESTATION_BITFIELD_ENR_KEY, ATTESTATION_SUBNET_COUNT, AttestationSubnets,
+        SYNC_COMMITTEE_BITFIELD_ENR_KEY, SyncCommitteeSubnets,
+    },
+};
 use ream_executor::ReamExecutor;
 use ream_metrics::set_peer_count;
 use ream_network_spec::networks::beacon_network_spec;
@@ -56,7 +66,10 @@ use ream_req_resp::{
     handler::{ReqRespMessageError, ReqRespMessageReceived, RespMessage},
     messages::{RequestMessage, ResponseMessage},
 };
-use ssz_types::VariableList;
+use ssz_types::{
+    BitVector, VariableList,
+    typenum::{U4, U64},
+};
 use tokio::{
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     time::interval,
@@ -67,9 +80,61 @@ use utils::read_meta_data_from_disk;
 use crate::{
     config::NetworkConfig,
     constants::{PING_INTERVAL_DURATION, TARGET_PEER_COUNT},
-    gossipsub::{GossipsubBehaviour, beacon::topics::GossipTopic, snappy::SnappyTransform},
+    gossipsub::{
+        GossipsubBehaviour,
+        beacon::topics::{GossipTopic, GossipTopicKind},
+        snappy::SnappyTransform,
+    },
     network::misc::{Executor, build_transport, peer_id_from_enr},
 };
+
+/// The ENR advertises only the subnets joined through `topics`.
+fn discovery_config_for_topics(
+    config: &DiscoveryConfig,
+    topics: &[GossipTopic],
+) -> anyhow::Result<DiscoveryConfig> {
+    let mut config = config.clone();
+    config.attestation_subnets = AttestationSubnets::new();
+    config.sync_committee_subnets = SyncCommitteeSubnets::new();
+    for topic in topics {
+        match topic.kind {
+            GossipTopicKind::BeaconAttestation(subnet_id) => {
+                config
+                    .attestation_subnets
+                    .enable_attestation_subnet(subnet_id)?;
+            }
+            GossipTopicKind::SyncCommittee(subnet_id) => {
+                config
+                    .sync_committee_subnets
+                    .enable_sync_committee_subnet(subnet_id)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(config)
+}
+
+/// `MetaData` must mirror these ENR bitfields.
+fn enr_subnet_bitfields(enr: &Enr) -> anyhow::Result<(BitVector<U64>, BitVector<U4>)> {
+    let attestation_subnets = enr
+        .get_decodable::<AttestationSubnets>(ATTESTATION_BITFIELD_ENR_KEY)
+        .ok_or_else(|| anyhow!("Local ENR has no attnets field"))?
+        .map_err(|err| anyhow!("Failed to decode local ENR attnets: {err:?}"))?;
+    let sync_committee_subnets = enr
+        .get_decodable::<SyncCommitteeSubnets>(SYNC_COMMITTEE_BITFIELD_ENR_KEY)
+        .ok_or_else(|| anyhow!("Local ENR has no syncnets field"))?
+        .map_err(|err| anyhow!("Failed to decode local ENR syncnets: {err:?}"))?;
+    Ok((attestation_subnets.0, sync_committee_subnets.0))
+}
+
+/// Epoch at `now` for a chain that started at `genesis_time`, counted like the fork choice store.
+/// Before genesis this is epoch 0, so the mesh for the first backbone subnets forms early.
+fn epoch_at(genesis_time: u64, now: SystemTime) -> u64 {
+    let now = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    compute_epoch_at_slot(
+        now.saturating_sub(genesis_time) / beacon_network_spec().seconds_per_slot(),
+    )
+}
 
 fn status_is_plausible(status: &Status, current_epoch: u64) -> bool {
     status.earliest_available_slot <= status.head_slot
@@ -125,6 +190,9 @@ pub struct Network {
     network_state: Arc<NetworkState>,
     peers_to_ping: HashSetDelay<PeerId>,
     bootnodes: Vec<Enr>,
+    genesis_time: u64,
+    /// Backbone subnet topics joined by `sync_attestation_subnets`, which only leaves these
+    backbone_topics: HashMap<u64, GossipTopic>,
 }
 
 impl Network {
@@ -143,12 +211,15 @@ impl Network {
         status: Status,
     ) -> anyhow::Result<Self> {
         let local_key = load_or_create_network_key(&config.data_dir)?;
+        let discv5_config =
+            discovery_config_for_topics(&config.discv5_config, &config.gossipsub_config.topics)?;
 
         let discovery = {
             let mut discovery = Discovery::with_persisted_enr(
                 Keypair::from(local_key.clone()),
-                &config.discv5_config,
+                &discv5_config,
                 status.head_slot,
+                epoch_at(config.genesis_time, SystemTime::now()),
                 config.data_dir.join(ENR_FILE_NAME),
             )
             .await?;
@@ -222,17 +293,12 @@ impl Network {
                 .build()
         };
 
-        let mut meta_data =
-            read_meta_data_from_disk(config.data_dir.clone()).unwrap_or_else(|err| {
-                error!("Failed to read meta data from disk: {err:?}");
-                GetMetaDataV3::default()
-            });
+        let meta_data = read_meta_data_from_disk(config.data_dir.clone()).unwrap_or_else(|err| {
+            error!("Failed to read meta data from disk: {err:?}");
+            GetMetaDataV3::default()
+        });
         let custody_group_count = config.discv5_config.custody_group_count.0;
-        let meta_data_changed = meta_data.custody_group_count != custody_group_count;
-        if meta_data_changed {
-            meta_data.seq_number = meta_data.seq_number.saturating_add(1);
-            meta_data.custody_group_count = custody_group_count;
-        }
+        let (attnets, syncnets) = enr_subnet_bitfields(&local_enr)?;
 
         let network_state = Arc::new(NetworkState {
             local_enr: RwLock::new(local_enr),
@@ -241,9 +307,11 @@ impl Network {
             status: RwLock::new(status),
             data_dir: config.data_dir.clone(),
         });
-        if meta_data_changed {
-            network_state.write_meta_data_to_disk()?;
-        }
+        network_state.update_meta_data(|meta_data| {
+            meta_data.attnets = attnets;
+            meta_data.syncnets = syncnets;
+            meta_data.custody_group_count = custody_group_count;
+        })?;
 
         let mut network = Network {
             peer_id: PeerId::from_public_key(&PublicKey::from(local_key.public().clone())),
@@ -254,9 +322,14 @@ impl Network {
             network_state,
             peers_to_ping: HashSetDelay::new(PING_INTERVAL_DURATION),
             bootnodes: config.discv5_config.bootnodes.clone(),
+            genesis_time: config.genesis_time,
+            backbone_topics: HashMap::new(),
         };
 
         network.start_network_worker(config).await?;
+        if let Err(err) = network.sync_attestation_subnets(SystemTime::now()) {
+            warn!("Failed to sync attestation subnets, retrying on the next tick: {err:?}");
+        }
 
         Ok(network)
     }
@@ -478,11 +551,10 @@ impl Network {
                     let seq_number = self.network_state.meta_data.read().seq_number;
 
                     info!("Peer statuses: {counts:?}, Peers with Status {status_is_some_count}, Peers with MetaData {meta_data_some_count}, Peers to ping: {peers_to_ping_count}, MetaData seq_number: {seq_number}");
+                    drop(peer_table);
 
-                    // Update attestation subnet subscriptions based on current slot
-                    let current_slot = self.network_state.status.read().head_slot;
-                    if let Err(err) = self.swarm.behaviour_mut().discovery.update_attestation_subnets(current_slot) {
-                        warn!("Failed to update attestation subnet subscriptions: {err:?}");
+                    if let Err(err) = self.sync_attestation_subnets(SystemTime::now()) {
+                        warn!("Failed to sync attestation subnets: {err:?}");
                     }
 
                     if active_peer_count < TARGET_PEER_COUNT {
@@ -938,16 +1010,23 @@ impl Network {
         }
     }
 
+    /// Returns true if the node is subscribed afterwards, including when it already was.
     pub fn subscribe_to_topic(&mut self, topic: GossipTopic) -> bool {
-        self.subscribed_topics.lock().insert(topic);
-
-        let topic: Topic = topic.into();
-
-        self.swarm
+        match self
+            .swarm
             .behaviour_mut()
             .gossipsub
-            .subscribe(&topic)
-            .is_ok()
+            .subscribe(&topic.into())
+        {
+            Ok(_) => {
+                self.subscribed_topics.lock().insert(topic);
+                true
+            }
+            Err(err) => {
+                warn!("Gossipsub rejected subscription to {topic}: {err:?}");
+                false
+            }
+        }
     }
 
     pub fn unsubscribe_from_topic(&mut self, topic: GossipTopic) -> bool {
@@ -956,6 +1035,78 @@ impl Network {
         let topic: Topic = topic.into();
 
         self.swarm.behaviour_mut().gossipsub.unsubscribe(&topic)
+    }
+
+    /// Advertises the subnets assigned for the epoch at `now`. Order: join new subnets, advertise
+    /// only joined ones in the ENR and `MetaData`, then leave dropped backbone subnets. Every
+    /// step compares against the target state, so a failed step is retried on the next call.
+    ///
+    /// The ENR is served before it is saved, so a crash in between can reuse its seq on restart.
+    fn sync_attestation_subnets(&mut self, now: SystemTime) -> anyhow::Result<()> {
+        let epoch = epoch_at(self.genesis_time, now);
+        let desired = self
+            .swarm
+            .behaviour()
+            .discovery
+            .attestation_subnets_at(epoch)?;
+        let fork_digest = beacon_network_spec().fork_digest(
+            beacon_network_spec().current_epoch(),
+            genesis_validators_root(),
+        );
+
+        let mut joined = AttestationSubnets::new();
+        for topic in self.subscribed_topics.lock().iter() {
+            if let GossipTopicKind::BeaconAttestation(subnet_id) = topic.kind {
+                joined.enable_attestation_subnet(subnet_id)?;
+            }
+        }
+        let mut failed = vec![];
+        for subnet_id in 0..ATTESTATION_SUBNET_COUNT as u64 {
+            if !desired.is_attestation_subnet_enabled(subnet_id)?
+                || joined.is_attestation_subnet_enabled(subnet_id)?
+            {
+                continue;
+            }
+            let topic = GossipTopic {
+                fork: fork_digest,
+                kind: GossipTopicKind::BeaconAttestation(subnet_id),
+            };
+            if self.subscribe_to_topic(topic) {
+                joined.enable_attestation_subnet(subnet_id)?;
+                self.backbone_topics.insert(subnet_id, topic);
+            } else {
+                failed.push(subnet_id);
+            }
+        }
+
+        let advertised = AttestationSubnets(desired.0.intersection(&joined.0));
+        let discovery = &mut self.swarm.behaviour_mut().discovery;
+        discovery.set_attestation_subnets(advertised)?;
+        let local_enr = discovery.local_enr();
+        let (attnets, syncnets) = enr_subnet_bitfields(&local_enr)?;
+        *self.network_state.local_enr.write() = local_enr;
+        self.network_state.update_meta_data(|meta_data| {
+            meta_data.attnets = attnets;
+            meta_data.syncnets = syncnets;
+        })?;
+
+        let dropped: Vec<u64> = self
+            .backbone_topics
+            .keys()
+            .copied()
+            .filter(|subnet_id| !desired.0.get(*subnet_id as usize).unwrap_or(false))
+            .collect();
+        for subnet_id in dropped {
+            if let Some(topic) = self.backbone_topics.remove(&subnet_id) {
+                self.unsubscribe_from_topic(topic);
+            }
+        }
+
+        ensure!(
+            failed.is_empty(),
+            "Failed to join attestation subnets {failed:?}"
+        );
+        Ok(())
     }
 }
 
@@ -970,6 +1121,7 @@ mod tests {
     use ream_consensus_misc::constants::beacon::NUM_CUSTODY_GROUPS;
     use ream_discv5::{
         config::DiscoveryConfig,
+        persisted_enr::load_enr,
         subnet::{
             AttestationSubnets, CustodyGroupCount, EPOCHS_PER_SUBNET_SUBSCRIPTION,
             SyncCommitteeSubnets,
@@ -1057,6 +1209,7 @@ mod tests {
                 ..Default::default()
             },
             data_dir: data_dir.to_path_buf(),
+            genesis_time: beacon_network_spec().min_genesis_time,
         };
 
         std::fs::create_dir_all(&config.data_dir)?;
@@ -1380,15 +1533,260 @@ mod tests {
     }
 
     fn create_local_network(runtime: &Runtime, data_dir: &Path) -> anyhow::Result<Network> {
+        create_local_network_with_topics(runtime, data_dir, vec![])
+    }
+
+    fn create_local_network_with_topics(
+        runtime: &Runtime,
+        data_dir: &Path,
+        topics: Vec<GossipTopic>,
+    ) -> anyhow::Result<Network> {
         runtime.block_on(create_network(
             "127.0.0.1".parse().unwrap(),
             0,
             0,
             vec![],
             true,
-            vec![],
+            topics,
             data_dir,
         ))
+    }
+
+    /// All subnet topics, as the manager configures them.
+    fn all_subnet_topics() -> Vec<GossipTopic> {
+        let fork = beacon_network_spec().fork_digest(
+            beacon_network_spec().current_epoch(),
+            genesis_validators_root(),
+        );
+        (0..ATTESTATION_SUBNET_COUNT as u64)
+            .map(GossipTopicKind::BeaconAttestation)
+            .chain((0..4).map(GossipTopicKind::SyncCommittee))
+            .map(|kind| GossipTopic { fork, kind })
+            .collect()
+    }
+
+    /// Attestation and sync committee subnets gossipsub is subscribed to.
+    fn subscribed_subnets(network: &Network) -> (BitVector<U64>, BitVector<U4>) {
+        let mut subscribed_attnets = BitVector::<U64>::new();
+        let mut subscribed_syncnets = BitVector::<U4>::new();
+        for topic_hash in network.swarm.behaviour().gossipsub.topics() {
+            match GossipTopic::from_topic_hash(topic_hash).unwrap().kind {
+                GossipTopicKind::BeaconAttestation(subnet_id) => {
+                    subscribed_attnets.set(subnet_id as usize, true).unwrap()
+                }
+                GossipTopicKind::SyncCommittee(subnet_id) => {
+                    subscribed_syncnets.set(subnet_id as usize, true).unwrap()
+                }
+                _ => {}
+            }
+        }
+        (subscribed_attnets, subscribed_syncnets)
+    }
+
+    /// Topics, ENR, cached ENR and saved `MetaData` must agree.
+    fn assert_subnets_consistent(network: &Network, data_dir: &Path) {
+        let enr = network.swarm.behaviour().discovery.local_enr();
+        assert_eq!(network.enr(), enr);
+
+        let (subscribed_attnets, subscribed_syncnets) = subscribed_subnets(network);
+        let (attnets, syncnets) = enr_subnet_bitfields(&enr).unwrap();
+        assert_eq!(attnets, subscribed_attnets);
+        assert_eq!(syncnets, subscribed_syncnets);
+
+        let meta_data = network.network_state.meta_data.read().clone();
+        assert_eq!(meta_data.attnets, attnets);
+        assert_eq!(meta_data.syncnets, syncnets);
+        assert_eq!(
+            read_meta_data_from_disk(data_dir.to_path_buf()).unwrap(),
+            meta_data
+        );
+    }
+
+    fn meta_data_seq(network: &Network) -> u64 {
+        network.network_state.meta_data.read().seq_number
+    }
+
+    fn epoch_start(epoch: u64) -> SystemTime {
+        let spec = beacon_network_spec();
+        UNIX_EPOCH
+            + Duration::from_secs(
+                spec.min_genesis_time + epoch * SLOTS_PER_EPOCH * spec.seconds_per_slot(),
+            )
+    }
+
+    fn advertised(network: &Network) -> AttestationSubnets {
+        network
+            .swarm
+            .behaviour()
+            .discovery
+            .current_attestation_subnets()
+            .clone()
+    }
+
+    /// Returns the first epoch after `epoch` with a different backbone assignment.
+    fn next_assignment_change(network: &Network, epoch: u64) -> u64 {
+        let discovery = &network.swarm.behaviour().discovery;
+        let assignment = discovery.attestation_subnets_at(epoch).unwrap();
+        (epoch + 1..)
+            .find(|epoch| discovery.attestation_subnets_at(*epoch).unwrap() != assignment)
+            .unwrap()
+    }
+
+    #[test]
+    fn subscribing_to_all_subnets_advertises_all_subnets() {
+        initialize_test_network_spec();
+
+        let runtime = Runtime::new().unwrap();
+        let data_dir = TestDataDir::new();
+
+        let (enr, seq) = {
+            let mut network =
+                create_local_network_with_topics(&runtime, data_dir.path(), all_subnet_topics())
+                    .unwrap();
+            let (attnets, syncnets) = enr_subnet_bitfields(&network.enr()).unwrap();
+            assert_eq!(attnets.num_set_bits(), ATTESTATION_SUBNET_COUNT);
+            assert_eq!(syncnets.num_set_bits(), 4);
+            assert_subnets_consistent(&network, data_dir.path());
+
+            // The backbone is already included.
+            let (enr, seq) = (network.enr(), meta_data_seq(&network));
+            for period in 0..4 {
+                network
+                    .sync_attestation_subnets(epoch_start(period * EPOCHS_PER_SUBNET_SUBSCRIPTION))
+                    .unwrap();
+            }
+            assert_eq!(network.enr(), enr);
+            assert_eq!(meta_data_seq(&network), seq);
+            (enr, seq)
+        };
+
+        let network =
+            create_local_network_with_topics(&runtime, data_dir.path(), all_subnet_topics())
+                .unwrap();
+        assert_eq!(network.enr(), enr);
+        assert_eq!(meta_data_seq(&network), seq);
+        assert_subnets_consistent(&network, data_dir.path());
+    }
+
+    #[test]
+    fn backbone_rotation_updates_topics_enr_and_meta_data() {
+        initialize_test_network_spec();
+
+        let runtime = Runtime::new().unwrap();
+        let data_dir = TestDataDir::new();
+
+        let mut network = create_local_network(&runtime, data_dir.path()).unwrap();
+        // No subnet topics: only the backbone is joined.
+        assert_eq!(advertised(&network).0.num_set_bits(), 2);
+        assert_subnets_consistent(&network, data_dir.path());
+
+        // Assignments change where (epoch + node_id % 256) % 256 == 0.
+        let node_offset = network.enr().node_id().raw()[31] as u64;
+        let boundary = next_assignment_change(&network, 0);
+        assert_eq!((boundary + node_offset) % EPOCHS_PER_SUBNET_SUBSCRIPTION, 0);
+        let assignment_at = |network: &Network, epoch| {
+            network
+                .swarm
+                .behaviour()
+                .discovery
+                .attestation_subnets_at(epoch)
+                .unwrap()
+        };
+
+        network
+            .sync_attestation_subnets(epoch_start(boundary - 1))
+            .unwrap();
+        assert_eq!(advertised(&network), assignment_at(&network, boundary - 1));
+        assert_subnets_consistent(&network, data_dir.path());
+        let (enr_seq, seq) = (network.enr().seq(), meta_data_seq(&network));
+        network
+            .sync_attestation_subnets(epoch_start(boundary - 1) + Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(
+            (network.enr().seq(), meta_data_seq(&network)),
+            (enr_seq, seq)
+        );
+
+        // One epoch later the boundary rotates the subnets.
+        network
+            .sync_attestation_subnets(epoch_start(boundary))
+            .unwrap();
+        assert_eq!(advertised(&network), assignment_at(&network, boundary));
+        assert_eq!(network.enr().seq(), enr_seq + 1);
+        assert_eq!(meta_data_seq(&network), seq + 1);
+        assert_subnets_consistent(&network, data_dir.path());
+
+        // A late tick skips boundaries, and before genesis epoch 0 applies.
+        let late = boundary + 3 * EPOCHS_PER_SUBNET_SUBSCRIPTION + 7;
+        for (now, epoch) in [
+            (epoch_start(late), late),
+            (epoch_start(0) - Duration::from_secs(100), 0),
+        ] {
+            network.sync_attestation_subnets(now).unwrap();
+            assert_eq!(advertised(&network), assignment_at(&network, epoch));
+            assert_subnets_consistent(&network, data_dir.path());
+        }
+        drop(network);
+
+        let restarted_seq = {
+            let network = create_local_network(&runtime, data_dir.path()).unwrap();
+            assert_subnets_consistent(&network, data_dir.path());
+            meta_data_seq(&network)
+        };
+        let network = create_local_network(&runtime, data_dir.path()).unwrap();
+        assert_eq!(meta_data_seq(&network), restarted_seq);
+        assert_subnets_consistent(&network, data_dir.path());
+    }
+
+    #[test]
+    fn failed_subnet_sync_is_retried_on_the_next_tick() {
+        initialize_test_network_spec();
+
+        let runtime = Runtime::new().unwrap();
+        let data_dir = TestDataDir::new();
+        let mut network = create_local_network(&runtime, data_dir.path()).unwrap();
+        let mut epoch = next_assignment_change(&network, 0) - 1;
+        network
+            .sync_attestation_subnets(epoch_start(epoch))
+            .unwrap();
+
+        // Each phase blocks one save with a directory in place of its file, during a rotation.
+        for (file, enr_published) in [(ENR_FILE_NAME, false), (utils::META_DATA_FILE_NAME, true)] {
+            let published = network.swarm.behaviour().discovery.local_enr();
+            let meta_data = network.network_state.meta_data.read().clone();
+            let old_subnets = advertised(&network);
+            epoch = next_assignment_change(&network, epoch);
+            let path = data_dir.path().join(file);
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+
+            assert!(
+                network
+                    .sync_attestation_subnets(epoch_start(epoch))
+                    .is_err()
+            );
+            // The ENR changes only once saved. `MetaData` and the old backbone topics stay until
+            // `MetaData` is saved.
+            assert_eq!(
+                network.swarm.behaviour().discovery.local_enr() != published,
+                enr_published
+            );
+            assert_eq!(*network.network_state.meta_data.read(), meta_data);
+            let (subscribed, _) = subscribed_subnets(&network);
+            assert_eq!(old_subnets.0.intersection(&subscribed), old_subnets.0);
+
+            // The assignment is unchanged, but the next tick finishes the update.
+            fs::remove_dir(&path).unwrap();
+            network
+                .sync_attestation_subnets(epoch_start(epoch))
+                .unwrap();
+            assert_eq!(meta_data_seq(&network), meta_data.seq_number + 1);
+            assert_subnets_consistent(&network, data_dir.path());
+            assert_eq!(
+                load_enr(&data_dir.path().join(ENR_FILE_NAME)).unwrap(),
+                Some(network.enr())
+            );
+        }
     }
 
     #[test]
@@ -1430,15 +1828,12 @@ mod tests {
 
         let updated = {
             let mut network = create_local_network(&runtime, data_dir.path()).unwrap();
-            let discovery = &mut network.swarm.behaviour_mut().discovery;
-            let mut slot = 0;
-            loop {
-                slot += EPOCHS_PER_SUBNET_SUBSCRIPTION * SLOTS_PER_EPOCH;
-                if discovery.update_attestation_subnets(slot).unwrap() {
-                    break;
-                }
-            }
-            discovery.local_enr()
+            let epoch = next_assignment_change(&network, 0);
+            network.sync_attestation_subnets(epoch_start(0)).unwrap();
+            network
+                .sync_attestation_subnets(epoch_start(epoch))
+                .unwrap();
+            network.enr()
         };
         assert!(updated.seq() > first.seq());
 
@@ -1446,7 +1841,7 @@ mod tests {
             .unwrap()
             .enr();
         assert_eq!(restarted.node_id(), first.node_id());
-        assert!(restarted.seq() > updated.seq());
+        assert!(restarted.seq() > updated.seq() || restarted == updated);
         assert!(data_dir.path().join(ENR_FILE_NAME).is_file());
     }
 
