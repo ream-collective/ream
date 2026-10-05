@@ -8,7 +8,10 @@ use eventsource_client::{Client, ClientBuilder, SSE};
 use futures::{Stream, StreamExt};
 use http_client::ClientWithBaseUrl;
 use ream_api_types_beacon::{
-    block::{BroadcastValidation, FullBlockData, ProduceBlockData, ProduceBlockResponse},
+    block::{
+        BroadcastValidation, FullBlockData, ProduceBlockData, ProduceBlockResponse,
+        SignedBlockContents,
+    },
     committee::BeaconCommitteeSubscription,
     duties::{AttesterDuty, ProposerDuty, SyncCommitteeDuty},
     error::ValidatorError,
@@ -25,10 +28,7 @@ use ream_api_types_common::{content_type::ContentType, id::ID};
 use ream_bls::BLSSignature;
 use ream_consensus_beacon::{
     attestation::Attestation,
-    electra::{
-        beacon_block::SignedBeaconBlock,
-        blinded_beacon_block::{BlindedBeaconBlock, SignedBlindedBeaconBlock},
-    },
+    electra::blinded_beacon_block::{BlindedBeaconBlock, SignedBlindedBeaconBlock},
     genesis::Genesis,
     single_attestation::SingleAttestation,
     voluntary_exit::SignedVoluntaryExit,
@@ -655,10 +655,14 @@ impl BeaconApiClient {
         }
     }
 
+    /// Publishes a signed block with its blobs and proofs. Since Deneb the endpoint takes the
+    /// block contents rather than a bare block, and `version` must name the block's fork because
+    /// the beacon node decodes the body by it.
     pub async fn publish_block(
         &self,
         broadcast_validation: BroadcastValidation,
-        signed_beacon_block: SignedBeaconBlock,
+        version: &str,
+        signed_block_contents: SignedBlockContents,
     ) -> anyhow::Result<(), ValidatorError> {
         let broadcast_validation = broadcast_validation_value(broadcast_validation);
         let response = self
@@ -667,8 +671,8 @@ impl BeaconApiClient {
                 self.http_client
                     .post("/eth/v2/beacon/blocks".to_string(), ContentType::Ssz)?
                     .query(&[(BROADCAST_VALIDATION_QUERY_PARAM, broadcast_validation)])
-                    .header(ETH_CONSENSUS_VERSION_HEADER, VERSION)
-                    .body(signed_beacon_block.as_ssz_bytes())
+                    .header(ETH_CONSENSUS_VERSION_HEADER, version)
+                    .body(signed_block_contents.as_ssz_bytes())
                     .build()?,
             )
             .await?;

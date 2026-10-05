@@ -6,7 +6,9 @@ use ream_consensus_misc::{
     constants::beacon::{DOMAIN_SYNC_COMMITTEE, SYNC_COMMITTEE_SIZE},
     misc::{compute_epoch_at_slot, compute_signing_root, compute_sync_committee_period},
 };
-use ream_events_beacon::contribution_and_proof::SignedContributionAndProof;
+use ream_events_beacon::contribution_and_proof::{
+    SignedContributionAndProof, SyncCommitteeContribution,
+};
 use ream_storage::cache::{BeaconCacheDB, CacheSyncCommitteeContribution, SyncCommitteeKey};
 use ream_validator_beacon::{
     constants::{
@@ -156,13 +158,10 @@ pub async fn validate_sync_committee_contribution_and_proof(
     // [REJECT] if aggregate signature is not valid for the message beacon_block_root and aggregate
     // pubkey
 
-    let sync_committee_validators =
-        get_sync_subcommittee_pubkeys(state, contribution.subcommittee_index);
+    let participant_pubkeys = get_contribution_participant_pubkeys(state, contribution);
 
     let is_sync_committee_valid = contribution.signature.fast_aggregate_verify(
-        sync_committee_validators
-            .iter()
-            .collect::<Vec<&PublicKey>>(),
+        participant_pubkeys.iter().collect::<Vec<&PublicKey>>(),
         compute_signing_root(
             contribution.beacon_block_root,
             state.get_domain(DOMAIN_SYNC_COMMITTEE, Some(current_epoch)),
@@ -215,4 +214,53 @@ pub fn get_sync_subcommittee_pubkeys(
 
     let end = start + sync_subcommittee_size as usize;
     sync_committee.public_keys[start..end].to_vec()
+}
+
+/// Public keys of the subcommittee members whose bits are set in `aggregation_bits`, i.e. the
+/// keys the contribution's aggregate signature must verify against.
+pub fn get_contribution_participant_pubkeys(
+    state: &BeaconState,
+    contribution: &SyncCommitteeContribution,
+) -> Vec<PublicKey> {
+    select_participant_pubkeys(
+        get_sync_subcommittee_pubkeys(state, contribution.subcommittee_index),
+        contribution.aggregation_bits.iter(),
+    )
+}
+
+fn select_participant_pubkeys(
+    subcommittee_pubkeys: Vec<PublicKey>,
+    aggregation_bits: impl IntoIterator<Item = bool>,
+) -> Vec<PublicKey> {
+    subcommittee_pubkeys
+        .into_iter()
+        .zip(aggregation_bits)
+        .filter_map(|(pubkey, participated)| participated.then_some(pubkey))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn participant_pubkeys_follow_aggregation_bits() {
+        let subcommittee_pubkeys: Vec<PublicKey> = (0..128u8)
+            .map(|index| {
+                let mut pubkey = PublicKey::default();
+                pubkey.inner[0] = index;
+                pubkey
+            })
+            .collect();
+        let aggregation_bits = (0..128).map(|index| index == 3 || index == 100);
+
+        // Only signers count: verifying against all 128 keys rejects every partial contribution.
+        assert_eq!(
+            select_participant_pubkeys(subcommittee_pubkeys.clone(), aggregation_bits),
+            vec![
+                subcommittee_pubkeys[3].clone(),
+                subcommittee_pubkeys[100].clone()
+            ]
+        );
+    }
 }

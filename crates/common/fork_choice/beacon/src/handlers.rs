@@ -128,14 +128,15 @@ pub fn process_available_block(store: &mut Store, pending: PendingBlock) -> anyh
 
     BEACON_PROCESSED_DEPOSITS_TOTAL.set(state.eth1_deposit_index as i64);
 
-    // Add new block to the store
-    store.db.block_provider().insert(block_root, signed_block)?;
-
-    // Add new state for this block to the store
+    // Store the post-state before the block. RPC handlers read the database without the store
+    // lock; once the block is indexed it can become the head, and a head without its state fails
+    // `node/syncing` and `states/head/*`. A state keyed by an unknown root is never looked up.
     store
         .db
         .state_provider()
         .insert(block_root, state.clone())?;
+
+    store.db.block_provider().insert(block_root, signed_block)?;
 
     // Add block timeliness to the store
     let time_into_slot = (store.db.time_provider().get()?

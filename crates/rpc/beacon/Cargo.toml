@@ -53,6 +53,7 @@ ream-node.workspace = true
 ream-operation-pool.workspace = true
 ream-p2p.workspace = true
 ream-peer.workspace = true
+ream-polynomial-commitments.workspace = true
 ream-req-resp.workspace = true
 ream-rpc-common.workspace = true
 ream-storage.workspace = true
@@ -60,6 +61,7 @@ ream-sync-committee-pool.workspace = true
 ream-validator-beacon.workspace = true
 
 [dev-dependencies]
+snap.workspace = true
 tempdir.workspace = true
 
 [lints]

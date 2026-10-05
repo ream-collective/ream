@@ -10,7 +10,7 @@ use alloy_primitives::Address;
 use anyhow::anyhow;
 use futures::future::try_join_all;
 use ream_api_types_beacon::{
-    block::{BroadcastValidation, ProduceBlockData},
+    block::{BroadcastValidation, ProduceBlockData, SignedBlockContents},
     duties::{AttesterDuty, ProposerDuty, SyncCommitteeDuty},
     id::ValidatorID,
     request::SyncCommitteeRequestItem,
@@ -463,11 +463,18 @@ impl ValidatorService {
 
         match block_response.data {
             ProduceBlockData::Full(full_block) => {
-                let signed_beacon_block =
-                    sign_beacon_block(full_block.block, &keystore.private_key)?;
+                let signed_block_contents = SignedBlockContents {
+                    signed_block: sign_beacon_block(full_block.block, &keystore.private_key)?,
+                    kzg_proofs: full_block.kzg_proofs,
+                    blobs: full_block.blobs,
+                };
 
                 self.beacon_api_client
-                    .publish_block(BroadcastValidation::Gossip, signed_beacon_block)
+                    .publish_block(
+                        BroadcastValidation::Gossip,
+                        &block_response.version,
+                        signed_block_contents,
+                    )
                     .await?;
             }
             ProduceBlockData::Blinded(blinded_block) => {
