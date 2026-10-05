@@ -3,14 +3,13 @@ use std::{
     future::Future,
     path::PathBuf,
     pin::Pin,
-    sync::atomic::{AtomicBool, Ordering},
     task::{Context, Poll},
     time::Instant,
 };
 
 use anyhow::{Result, anyhow};
 use discv5::{
-    Discv5, Enr, Event,
+    Discv5, Enr,
     enr::{CombinedKey, EnrKey, NodeId, k256::ecdsa::SigningKey},
 };
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
@@ -81,8 +80,12 @@ pub struct Discovery {
     current_attestation_subnets: AttestationSubnets,
     /// Saved after every local ENR change when set
     enr_path: Option<PathBuf>,
-    /// The last save failed and is retried by [`Discovery::set_attestation_subnets`]
-    enr_save_pending: AtomicBool,
+    /// The last save failed and is retried by [`Discovery::persist_local_enr`]
+    enr_save_pending: bool,
+    /// Local ENR seq at the last [`Discovery::persist_local_enr`]
+    persisted_seq: u64,
+    /// Signs the ENR updates made by [`Discovery::set_attestation_subnets`]
+    enr_key: CombinedKey,
 }
 
 impl Discovery {
@@ -122,6 +125,8 @@ impl Discovery {
         subnet_epoch: u64,
         enr_path: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
+        let enr_key = convert_to_enr(local_key.clone())
+            .map_err(|err| anyhow!("Failed to convert key: {err:?}"))?;
         let enr_local =
             convert_to_enr(local_key).map_err(|err| anyhow!("Failed to convert key: {err:?}"))?;
         let current_epoch = compute_epoch_at_slot(current_slot);
@@ -208,19 +213,29 @@ impl Discovery {
             long_lived_attestation_subnets: config.attestation_subnets.clone(),
             current_attestation_subnets: attestation_subnets,
             enr_path,
-            enr_save_pending: AtomicBool::new(false),
+            enr_save_pending: false,
+            persisted_seq: enr.seq(),
+            enr_key,
         })
     }
 
-    fn persist_local_enr(&self) {
-        if let Some(enr_path) = &self.enr_path {
-            let result = save_enr(enr_path, &self.discv5.local_enr());
-            self.enr_save_pending
-                .store(result.is_err(), Ordering::Relaxed);
+    /// Saves the local ENR if its seq changed or the last save failed. Returns whether the seq
+    /// changed since the last call. discv5 changes the ENR itself (learned or dropped UDP
+    /// sockets) and serves the change before this can save it.
+    fn persist_local_enr(&mut self) -> bool {
+        let enr = self.discv5.local_enr();
+        let changed = enr.seq() != self.persisted_seq;
+        self.persisted_seq = enr.seq();
+        if let Some(enr_path) = &self.enr_path
+            && (changed || self.enr_save_pending)
+        {
+            let result = save_enr(enr_path, &enr);
+            self.enr_save_pending = result.is_err();
             if let Err(err) = result {
                 warn!("Failed to persist local ENR: {err:?}");
             }
         }
+        changed
     }
 
     /// Returns the configured subnets plus the backbone subnets assigned for `epoch`.
@@ -232,23 +247,33 @@ impl Discovery {
         )
     }
 
-    /// Advertises `subnets` in the local ENR. Returns whether the ENR changed. Also retries a
-    /// failed ENR save.
+    /// Advertises `subnets` in the local ENR. Returns whether the ENR changed.
+    ///
+    /// The new record is saved while holding the lock discv5 serves the ENR from, so it is never
+    /// served before it is on disk, and a failed save or seq overflow publishes nothing.
     pub fn set_attestation_subnets(&mut self, subnets: AttestationSubnets) -> Result<bool> {
         if subnets == self.current_attestation_subnets {
-            if self.enr_save_pending.load(Ordering::Relaxed) {
-                self.persist_local_enr();
-            }
+            self.persist_local_enr();
             return Ok(false);
         }
 
-        // `enr_insert` RLP-encodes the value itself.
-        self.discv5
-            .enr_insert(ATTESTATION_BITFIELD_ENR_KEY, &subnets)
+        let shared_enr = self.discv5.external_enr();
+        let mut local_enr = shared_enr.write();
+        let mut candidate = local_enr.clone();
+        // `insert` RLP-encodes the value itself.
+        candidate
+            .insert(ATTESTATION_BITFIELD_ENR_KEY, &subnets, &self.enr_key)
             .map_err(|err| anyhow!("Failed to update local ENR attnets: {err:?}"))?;
+        if let Some(enr_path) = &self.enr_path {
+            save_enr(enr_path, &candidate)?;
+        }
+        self.persisted_seq = candidate.seq();
+        self.enr_save_pending = false;
+        *local_enr = candidate;
+        drop(local_enr);
+
         info!("Advertising attestation subnets {subnets:?}");
         self.current_attestation_subnets = subnets;
-        self.persist_local_enr();
         Ok(true)
     }
 
@@ -465,23 +490,25 @@ impl NetworkBehaviour for Discovery {
                     }
                 }
             }
-            EventStream::Present(receiver) => match receiver.try_recv() {
-                Ok(event) => {
-                    if let Event::SocketUpdated(_) = event {
-                        self.persist_local_enr();
-                        return Poll::Ready(ToSwarm::GenerateEvent(
-                            DiscoveryOutEvent::UpdatedEnr {
-                                enr: self.local_enr(),
-                            },
-                        ));
+            EventStream::Present(receiver) => loop {
+                // discv5 also changes the ENR without an event, so the seq is compared below.
+                match receiver.poll_recv(cx) {
+                    Poll::Ready(Some(_)) => {}
+                    Poll::Ready(None) => {
+                        warn!("Discovery event stream closed");
+                        self.event_stream = EventStream::Inactive;
+                        break;
                     }
-                }
-                Err(err) => {
-                    warn!("No discovery event found: {err:?}");
-                    self.event_stream = EventStream::Inactive;
+                    Poll::Pending => break,
                 }
             },
         };
+
+        if self.persist_local_enr() {
+            return Poll::Ready(ToSwarm::GenerateEvent(DiscoveryOutEvent::UpdatedEnr {
+                enr: self.local_enr(),
+            }));
+        }
 
         Poll::Pending
     }
@@ -514,7 +541,10 @@ fn convert_to_enr(key: Keypair) -> anyhow::Result<CombinedKey> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::{
+        fs,
+        net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    };
 
     use alloy_primitives::B256;
     use libp2p::identity::Keypair;
@@ -811,6 +841,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attnets_update_is_published_only_after_it_is_saved() -> anyhow::Result<()> {
+        let _ = GENESIS_VALIDATORS_ROOT.set(B256::ZERO);
+        initialize_test_network_spec();
+        let dir = TestDir::new();
+        let enr_path = dir.path().join("enr");
+        let config = DiscoveryConfig {
+            disable_discovery: true,
+            ..DiscoveryConfig::default()
+        };
+        let mut discovery = Discovery::with_persisted_enr(
+            Keypair::generate_secp256k1(),
+            &config,
+            0,
+            0,
+            enr_path.clone(),
+        )
+        .await?;
+        let published = discovery.local_enr();
+
+        // A failed save leaves the served ENR unchanged, so a crash cannot lose a served seq.
+        fs::remove_file(&enr_path)?;
+        fs::create_dir(&enr_path)?;
+        assert!(rotate_attestation_subnets(&mut discovery).is_err());
+        assert_eq!(discovery.local_enr(), published);
+        fs::remove_dir(&enr_path)?;
+
+        rotate_attestation_subnets(&mut discovery)?;
+        assert_eq!(load_enr(&enr_path)?, Some(discovery.local_enr()));
+
+        // A seq that would overflow is rejected instead of wrapping.
+        let at_max = {
+            let mut enr = discovery.local_enr();
+            enr.set_seq(u64::MAX, &discovery.enr_key)?;
+            enr
+        };
+        *discovery.discv5.external_enr().write() = at_max.clone();
+        discovery.current_attestation_subnets = AttestationSubnets::new();
+        assert!(
+            discovery
+                .set_attestation_subnets(discovery.attestation_subnets_at(0)?)
+                .is_err()
+        );
+        assert_eq!(discovery.local_enr(), at_max);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn changed_enr_on_restart_increments_seq() -> anyhow::Result<()> {
         let _ = GENESIS_VALIDATORS_ROOT.set(B256::ZERO);
         initialize_test_network_spec();
@@ -842,7 +919,7 @@ mod tests {
     }
 
     /// Simulates discv5 learning `ip` from PONG votes, as handled on `Event::SocketUpdated`.
-    fn learn_external_ip(discovery: &Discovery, ip: Ipv4Addr, udp_port: u16) {
+    fn learn_external_ip(discovery: &mut Discovery, ip: Ipv4Addr, udp_port: u16) {
         assert!(
             discovery
                 .discv5
@@ -865,10 +942,10 @@ mod tests {
         };
         let external_ip = Ipv4Addr::new(203, 0, 113, 7);
 
-        let discovery =
+        let mut discovery =
             Discovery::with_persisted_enr(key.clone(), &config, 0, 0, enr_path.clone()).await?;
         assert_eq!(discovery.local_enr().ip4(), Some(Ipv4Addr::UNSPECIFIED));
-        learn_external_ip(&discovery, external_ip, config.discovery_port);
+        learn_external_ip(&mut discovery, external_ip, config.discovery_port);
         let learned = discovery.local_enr();
         assert_eq!(load_enr(&enr_path)?, Some(learned.clone()));
         drop(discovery);
@@ -897,9 +974,9 @@ mod tests {
         };
         let external_ip = Ipv4Addr::new(203, 0, 113, 7);
 
-        let discovery =
+        let mut discovery =
             Discovery::with_persisted_enr(key.clone(), &config, 0, 0, enr_path.clone()).await?;
-        learn_external_ip(&discovery, external_ip, config.discovery_port);
+        learn_external_ip(&mut discovery, external_ip, config.discovery_port);
         let learned = discovery.local_enr();
         drop(discovery);
 
@@ -926,10 +1003,10 @@ mod tests {
             ..DiscoveryConfig::default()
         };
 
-        let discovery =
+        let mut discovery =
             Discovery::with_persisted_enr(key.clone(), &config, 0, 0, enr_path.clone()).await?;
         learn_external_ip(
-            &discovery,
+            &mut discovery,
             Ipv4Addr::new(203, 0, 113, 7),
             config.discovery_port,
         );

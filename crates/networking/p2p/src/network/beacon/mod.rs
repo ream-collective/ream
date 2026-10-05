@@ -1565,11 +1565,8 @@ mod tests {
             .collect()
     }
 
-    /// Topics, ENR, cached ENR and saved `MetaData` must agree.
-    fn assert_subnets_consistent(network: &Network, data_dir: &Path) {
-        let enr = network.swarm.behaviour().discovery.local_enr();
-        assert_eq!(network.enr(), enr);
-
+    /// Attestation and sync committee subnets gossipsub is subscribed to.
+    fn subscribed_subnets(network: &Network) -> (BitVector<U64>, BitVector<U4>) {
         let mut subscribed_attnets = BitVector::<U64>::new();
         let mut subscribed_syncnets = BitVector::<U4>::new();
         for topic_hash in network.swarm.behaviour().gossipsub.topics() {
@@ -1583,7 +1580,15 @@ mod tests {
                 _ => {}
             }
         }
+        (subscribed_attnets, subscribed_syncnets)
+    }
 
+    /// Topics, ENR, cached ENR and saved `MetaData` must agree.
+    fn assert_subnets_consistent(network: &Network, data_dir: &Path) {
+        let enr = network.swarm.behaviour().discovery.local_enr();
+        assert_eq!(network.enr(), enr);
+
+        let (subscribed_attnets, subscribed_syncnets) = subscribed_subnets(network);
         let (attnets, syncnets) = enr_subnet_bitfields(&enr).unwrap();
         assert_eq!(attnets, subscribed_attnets);
         assert_eq!(syncnets, subscribed_syncnets);
@@ -1740,44 +1745,48 @@ mod tests {
         let runtime = Runtime::new().unwrap();
         let data_dir = TestDataDir::new();
         let mut network = create_local_network(&runtime, data_dir.path()).unwrap();
-        let boundary = next_assignment_change(&network, 0);
+        let mut epoch = next_assignment_change(&network, 0) - 1;
         network
-            .sync_attestation_subnets(epoch_start(boundary - 1))
+            .sync_attestation_subnets(epoch_start(epoch))
             .unwrap();
-        let (meta_data, seq) = (
-            network.network_state.meta_data.read().clone(),
-            meta_data_seq(&network),
-        );
 
-        // Directories in place of the files make both saves fail.
-        let blocked = [
-            data_dir.path().join(utils::META_DATA_FILE_NAME),
-            data_dir.path().join(ENR_FILE_NAME),
-        ];
-        for path in &blocked {
-            fs::remove_file(path).unwrap();
-            fs::create_dir(path).unwrap();
-        }
-        assert!(
+        // Each phase blocks one save with a directory in place of its file, during a rotation.
+        for (file, enr_published) in [(ENR_FILE_NAME, false), (utils::META_DATA_FILE_NAME, true)] {
+            let published = network.swarm.behaviour().discovery.local_enr();
+            let meta_data = network.network_state.meta_data.read().clone();
+            let old_subnets = advertised(&network);
+            epoch = next_assignment_change(&network, epoch);
+            let path = data_dir.path().join(file);
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+
+            assert!(
+                network
+                    .sync_attestation_subnets(epoch_start(epoch))
+                    .is_err()
+            );
+            // The ENR changes only once saved. `MetaData` and the old backbone topics stay until
+            // `MetaData` is saved.
+            assert_eq!(
+                network.swarm.behaviour().discovery.local_enr() != published,
+                enr_published
+            );
+            assert_eq!(*network.network_state.meta_data.read(), meta_data);
+            let (subscribed, _) = subscribed_subnets(&network);
+            assert_eq!(old_subnets.0.intersection(&subscribed), old_subnets.0);
+
+            // The assignment is unchanged, but the next tick finishes the update.
+            fs::remove_dir(&path).unwrap();
             network
-                .sync_attestation_subnets(epoch_start(boundary))
-                .is_err()
-        );
-        assert_eq!(*network.network_state.meta_data.read(), meta_data);
-
-        // The assignment is unchanged, but the next tick finishes the update.
-        for path in &blocked {
-            fs::remove_dir(path).unwrap();
+                .sync_attestation_subnets(epoch_start(epoch))
+                .unwrap();
+            assert_eq!(meta_data_seq(&network), meta_data.seq_number + 1);
+            assert_subnets_consistent(&network, data_dir.path());
+            assert_eq!(
+                load_enr(&data_dir.path().join(ENR_FILE_NAME)).unwrap(),
+                Some(network.enr())
+            );
         }
-        network
-            .sync_attestation_subnets(epoch_start(boundary))
-            .unwrap();
-        assert_eq!(meta_data_seq(&network), seq + 1);
-        assert_subnets_consistent(&network, data_dir.path());
-        assert_eq!(
-            load_enr(&data_dir.path().join(ENR_FILE_NAME)).unwrap(),
-            Some(network.enr())
-        );
     }
 
     #[test]
