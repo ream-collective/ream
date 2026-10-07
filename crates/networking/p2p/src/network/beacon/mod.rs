@@ -8,6 +8,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::Debug,
     num::{NonZeroU8, NonZeroUsize},
+    pin::Pin,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -16,6 +17,7 @@ use anyhow::{anyhow, ensure};
 use channel::{P2PCallbackError, P2PCallbackResponse, P2PMessage, P2PRequest, P2PResponse};
 use delay_map::{HashMapDelay, HashSetDelay};
 use discv5::Enr;
+use futures::future::OptionFuture;
 use identity::{ENR_FILE_NAME, load_or_create_network_key};
 use libp2p::{
     Multiaddr, PeerId, Swarm, SwarmBuilder,
@@ -35,7 +37,7 @@ use parking_lot::{Mutex, RwLock};
 use peer::CachedPeer;
 use ream_consensus_misc::{
     constants::beacon::{SLOTS_PER_EPOCH, genesis_validators_root},
-    misc::compute_epoch_at_slot,
+    misc::{compute_epoch_at_slot, compute_start_slot_at_epoch},
 };
 use ream_discv5::{
     config::DiscoveryConfig,
@@ -72,7 +74,7 @@ use ssz_types::{
 };
 use tokio::{
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
-    time::interval,
+    time::{interval, sleep},
 };
 use tracing::{error, info, trace, warn};
 use utils::read_meta_data_from_disk;
@@ -134,6 +136,18 @@ fn epoch_at(genesis_time: u64, now: SystemTime) -> u64 {
     compute_epoch_at_slot(
         now.saturating_sub(genesis_time) / beacon_network_spec().seconds_per_slot(),
     )
+}
+
+/// Time from `now` until `epoch` starts on the clock of [`epoch_at`], so once it has elapsed
+/// `epoch_at` returns at least `epoch`.
+fn duration_to_epoch(genesis_time: u64, epoch: u64, now: SystemTime) -> Duration {
+    let start_secs = compute_start_slot_at_epoch(epoch)
+        .saturating_mul(beacon_network_spec().seconds_per_slot())
+        .saturating_add(genesis_time);
+    UNIX_EPOCH
+        .checked_add(Duration::from_secs(start_secs))
+        .and_then(|start| start.duration_since(now).ok())
+        .unwrap_or_default()
 }
 
 fn status_is_plausible(status: &Status, current_epoch: u64) -> bool {
@@ -218,7 +232,6 @@ impl Network {
             let mut discovery = Discovery::with_persisted_enr(
                 Keypair::from(local_key.clone()),
                 &discv5_config,
-                status.head_slot,
                 epoch_at(config.genesis_time, SystemTime::now()),
                 config.data_dir.join(ENR_FILE_NAME),
             )
@@ -412,8 +425,13 @@ impl Network {
     ) {
         let mut bootnode_redial_interval = interval(Duration::from_secs(20));
         let mut status_interval = interval(Duration::from_secs(30));
+        let mut next_fork_update: Pin<Box<OptionFuture<_>>> =
+            Box::pin(self.update_fork_enr(SystemTime::now()).map(sleep).into());
         loop {
             tokio::select! {
+                Some(()) = &mut next_fork_update => {
+                    next_fork_update.set(self.update_fork_enr(SystemTime::now()).map(sleep).into());
+                }
                 _ = bootnode_redial_interval.tick() => {
                     let bootnodes = self
                         .bootnodes
@@ -556,6 +574,8 @@ impl Network {
                     if let Err(err) = self.sync_attestation_subnets(SystemTime::now()) {
                         warn!("Failed to sync attestation subnets: {err:?}");
                     }
+                    // Retries a failed fork update and catches a boundary the timer slept past.
+                    next_fork_update.set(self.update_fork_enr(SystemTime::now()).map(sleep).into());
 
                     if active_peer_count < TARGET_PEER_COUNT {
                         info!("Active peer count is below target: {active_peer_count}, discovering more peers");
@@ -567,6 +587,21 @@ impl Network {
                 }
             }
         }
+    }
+
+    /// Advertises the fork of the epoch at `now` and returns the time until the next fork or BPO
+    /// boundary, if one is scheduled.
+    fn update_fork_enr(&mut self, now: SystemTime) -> Option<Duration> {
+        let epoch = epoch_at(self.genesis_time, now);
+        let discovery = &mut self.swarm.behaviour_mut().discovery;
+        match discovery.update_fork_enr(epoch) {
+            Ok(true) => *self.network_state.local_enr.write() = discovery.local_enr(),
+            Ok(false) => {}
+            Err(err) => warn!("Failed to update ENR fork entries: {err:?}"),
+        }
+        beacon_network_spec()
+            .next_fork_epoch(epoch)
+            .map(|next_fork_epoch| duration_to_epoch(self.genesis_time, next_fork_epoch, now))
     }
 
     fn send_request(&mut self, peer_id: PeerId, message: BeaconRequestMessage) -> Option<u64> {
@@ -1121,10 +1156,11 @@ mod tests {
     use ream_consensus_misc::constants::beacon::NUM_CUSTODY_GROUPS;
     use ream_discv5::{
         config::DiscoveryConfig,
+        eth2::{ENR_ETH2_KEY, EnrForkId},
         persisted_enr::load_enr,
         subnet::{
             AttestationSubnets, CustodyGroupCount, EPOCHS_PER_SUBNET_SUBSCRIPTION,
-            SyncCommitteeSubnets,
+            NEXT_FORK_DIGEST_ENR_KEY, NextForkDigest, SyncCommitteeSubnets,
         },
     };
     use ream_executor::ReamExecutor;
@@ -1843,6 +1879,96 @@ mod tests {
         assert_eq!(restarted.node_id(), first.node_id());
         assert!(restarted.seq() > updated.seq() || restarted == updated);
         assert!(data_dir.path().join(ENR_FILE_NAME).is_file());
+    }
+
+    fn fork_entries(enr: &Enr) -> (EnrForkId, NextForkDigest) {
+        (
+            enr.get_decodable(ENR_ETH2_KEY).unwrap().unwrap(),
+            enr.get_decodable(NEXT_FORK_DIGEST_ENR_KEY)
+                .unwrap()
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn fork_enr_follows_the_wall_clock_and_keeps_cached_enr_in_sync() {
+        initialize_test_network_spec();
+        let spec = beacon_network_spec();
+        let gvr = genesis_validators_root();
+        let epoch_duration = Duration::from_secs(SLOTS_PER_EPOCH * spec.seconds_per_slot());
+        let runtime = Runtime::new().unwrap();
+        let data_dir = TestDataDir::new();
+        let mut network = create_local_network(&runtime, data_dir.path()).unwrap();
+        let assert_cache_in_sync = |network: &Network| {
+            assert_eq!(
+                network.enr(),
+                network.swarm.behaviour().discovery.local_enr()
+            );
+        };
+
+        // The Status head is at slot 0, but the ENR follows the wall clock.
+        let now = SystemTime::now();
+        assert_eq!(
+            fork_entries(&network.enr()).0,
+            EnrForkId::current(gvr, epoch_at(network.genesis_time, now))
+        );
+
+        let before_genesis = epoch_start(0) - Duration::from_secs(100);
+        assert_eq!(
+            network.update_fork_enr(before_genesis),
+            Some(Duration::from_secs(100) + epoch_duration * spec.altair_fork_epoch as u32)
+        );
+        assert_eq!(
+            fork_entries(&network.enr()).0.fork_digest,
+            spec.fork_digest(0, gvr)
+        );
+        assert_cache_in_sync(&network);
+
+        let before_fulu = epoch_start(spec.fulu_fork_epoch - 1);
+        assert_eq!(network.update_fork_enr(before_fulu), Some(epoch_duration));
+        let electra = network.enr();
+        assert_cache_in_sync(&network);
+        assert_eq!(
+            fork_entries(&electra),
+            (
+                EnrForkId::current(gvr, spec.fulu_fork_epoch - 1),
+                NextForkDigest(spec.fork_digest(spec.fulu_fork_epoch, gvr))
+            )
+        );
+
+        let later = before_fulu + Duration::from_secs(10);
+        assert_eq!(
+            network.update_fork_enr(later),
+            Some(epoch_duration - Duration::from_secs(10))
+        );
+        assert_eq!(network.enr(), electra);
+
+        // A late wake-up lands well after the Fulu boundary.
+        assert_eq!(
+            network.update_fork_enr(epoch_start(spec.fulu_fork_epoch + 5)),
+            None
+        );
+        let fulu = network.enr();
+        assert_cache_in_sync(&network);
+        assert!(fulu.seq() > electra.seq());
+        assert_eq!(
+            fork_entries(&fulu),
+            (
+                EnrForkId::current(gvr, spec.fulu_fork_epoch),
+                NextForkDigest::default()
+            )
+        );
+        assert_eq!(
+            load_enr(&data_dir.path().join(ENR_FILE_NAME)).unwrap(),
+            Some(fulu.clone())
+        );
+        drop(network);
+
+        // The real wall clock is also past Fulu, so a restart rebuilds the same record.
+        let restarted = create_local_network(&runtime, data_dir.path())
+            .unwrap()
+            .enr();
+        assert_eq!(restarted, fulu);
     }
 
     #[test]
