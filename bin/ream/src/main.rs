@@ -84,7 +84,6 @@ use ream_storage::{
     cache::{BeaconCacheDB, LeanCacheDB},
     db::{ReamDB, reset_db},
     dir::setup_data_dir,
-    tables::table::REDBTable,
 };
 use ream_sync::rwlock::Writer;
 use ream_sync_committee_pool::SyncCommitteePool;
@@ -565,17 +564,9 @@ async fn run_beacon_node_inner(
 
     info!("Database Initialization completed");
 
-    let oldest_root = beacon_db
-        .slot_index_provider()
-        .get_oldest_root()
-        .expect("Failed to access slot index provider")
-        .expect("No oldest root found");
-    let genesis_validators_root = beacon_db
-        .state_provider()
-        .get(oldest_root)
-        .expect("Failed to access beacon state provider")
-        .expect("No beacon state found")
-        .genesis_validators_root;
+    let genesis_validators_root =
+        ream_checkpoint_sync_beacon::load_genesis_validators_root(&beacon_db)
+            .expect("Unable to load genesis validators root");
     if initialize_globals {
         set_genesis_validator_root(genesis_validators_root);
     }

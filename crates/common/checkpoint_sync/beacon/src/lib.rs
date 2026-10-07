@@ -1,31 +1,41 @@
+mod anchor_data;
 pub mod checkpoint;
 pub mod weak_subjectivity;
 
-use std::{fs, path::Path};
+use std::{fs, path::Path, sync::Arc};
 
 use alloy_primitives::B256;
 use anyhow::{anyhow, ensure};
 use checkpoint::get_checkpoint_sync_sources;
 use ream_consensus_beacon::{
-    blob_sidecar::{BlobIdentifier, BlobSidecar},
+    blob_sidecar::BlobIdentifier,
     electra::{
         beacon_block::{BeaconBlock, SignedBeaconBlock},
         beacon_state::BeaconState,
     },
 };
-use ream_consensus_misc::{checkpoint::Checkpoint, misc::compute_epoch_at_slot};
+use ream_consensus_misc::checkpoint::Checkpoint;
 use ream_execution_rpc_types::get_blobs::BlobAndProofV1;
-use ream_fork_choice_beacon::{handlers::on_tick, store::get_forkchoice_store};
+use ream_fork_choice_beacon::{
+    handlers::on_tick,
+    store::{Store, get_forkchoice_store},
+};
 use ream_network_spec::networks::beacon_network_spec;
+use ream_operation_pool::OperationPool;
 use ream_storage::{
     db::beacon::BeaconDB,
-    tables::table::{CustomTable, REDBTable},
+    tables::{
+        beacon::backfill::{
+            BackfillMeta, BackfillMode, BlockBackfillState, BlockCoverage, Frontier, Origin,
+            SidecarCoverage,
+        },
+        table::{CustomTable, REDBTable},
+    },
 };
 use reqwest::{
     Url,
     header::{ACCEPT, HeaderValue},
 };
-use serde::{Deserialize, Serialize};
 use ssz::Decode;
 use tracing::{info, warn};
 use tree_hash::TreeHash;
@@ -37,19 +47,16 @@ pub async fn initialize_db_from_checkpoint(
     checkpoint_sync_url: Option<Url>,
     weak_subjectivity_checkpoint: Option<Checkpoint>,
 ) -> anyhow::Result<WeakSubjectivityState> {
+    if db.recover_interrupted_bootstrap()? {
+        warn!("Recovered interrupted bootstrap; retrying initialization");
+    }
     if db.is_initialized() {
+        log_backfill_mode(&db)?;
         warn!("DB is already initialized. Skipping checkpoint sync.");
 
-        let highest_root = db
-            .slot_index_provider()
-            .get_highest_root()?
-            .expect("No highest root found");
-        let state = db
-            .state_provider()
-            .get(highest_root)?
-            .ok_or_else(|| anyhow!("Unable to fetch state"))?;
-
         if let Some(weak_subjectivity_checkpoint) = &weak_subjectivity_checkpoint {
+            let state = canonical_head_state(&db)?;
+            db.cache_genesis_validators_root(state.genesis_validators_root)?;
             if !verify_state_from_weak_subjectivity_checkpoint(
                 &state,
                 weak_subjectivity_checkpoint,
@@ -70,48 +77,64 @@ pub async fn initialize_db_from_checkpoint(
          default checkpoint sync sources (mainnet, sepolia, hoodi).",
         beacon_network_spec().network
     );
-    let checkpoint_sync_url = sources.into_iter().next().expect("checked non-empty above");
     info!("Initiating checkpoint sync");
-
-    info!("Fetching finalized block...");
-    let block = fetch_finalized_block(&checkpoint_sync_url).await?;
-    info!(
-        "Downloaded block: {} with root: {}. Slot: {}",
-        block.message.body.execution_payload.block_number,
-        block.message.block_root(),
-        block.message.slot
-    );
+    let (block, state) = fetch_checkpoint_from_sources(&sources).await?;
     let slot = block.message.slot;
-
-    // blob_sidecars only serves pre-Fulu blobs; post-Fulu data comes as data column sidecars.
-    if compute_epoch_at_slot(slot) < beacon_network_spec().fulu_fork_epoch {
-        info!("Fetching blobs...");
-        initialize_blobs_in_db(&checkpoint_sync_url, db.clone(), block.message.block_root())
-            .await?;
-        info!(
-            "Downloaded blobs for block: {}",
-            block.message.body.execution_payload.block_number
-        );
-    } else {
-        info!("Skipping legacy blob_sidecars fetch for post-Fulu checkpoint block");
+    let (anchor_data, sidecar_frontier) = match anchor_data::fetch_anchor_data_from_sources(
+        &sources,
+        &block,
+        state.genesis_time,
+    )
+    .await
+    {
+        Ok(data) => (data, Some(slot)),
+        Err(err)
+            if ream_consensus_misc::misc::compute_epoch_at_slot(slot)
+                >= beacon_network_spec().fulu_fork_epoch =>
+        {
+            warn!(%err, "Anchor columns unavailable from checkpoint providers; scheduling peer recovery after startup");
+            (anchor_data::AnchorData::default(), None)
+        }
+        Err(err) => return Err(err),
+    };
+    let root = block.message.block_root();
+    let meta = BackfillMeta {
+        revision: 0,
+        origin: Origin {
+            slot,
+            root,
+            state_root: block.message.state_root,
+        },
+        blocks: BlockCoverage {
+            frontier: Frontier {
+                oldest_block_slot: slot,
+                oldest_block_root: root,
+                oldest_block_parent: block.message.parent_root,
+            },
+            state: BlockBackfillState::InProgress,
+        },
+        sidecars: SidecarCoverage {
+            frontier: sidecar_frontier,
+        },
+    };
+    db.begin_bootstrap()?;
+    for blob in anchor_data.blobs {
+        db.blobs_and_proofs_provider().insert(
+            BlobIdentifier::new(root, blob.index),
+            BlobAndProofV1 {
+                blob: blob.blob,
+                proof: blob.kzg_proof,
+            },
+        )?;
     }
-
-    info!("Fetching initial state...");
-    let state = get_state(&checkpoint_sync_url, slot).await?;
-    info!(
-        "Downloaded state with root: {}. Slot: {}",
-        state.state_root(),
-        slot
-    );
-
-    ensure!(block.message.slot == state.slot, "Slot mismatch");
-
-    ensure!(block.message.state_root == state.state_root());
-    let mut store = get_forkchoice_store(state.clone(), block, db)?;
+    db.column_sidecars_provider()
+        .insert_batch(anchor_data.columns)?;
+    let mut store = get_forkchoice_store(state.clone(), block, db.clone())?;
 
     let time = beacon_network_spec().min_genesis_time
         + beacon_network_spec().seconds_per_slot() * (slot + 1);
     on_tick(&mut store, time)?;
+    db.finish_bootstrap(state.genesis_validators_root, Some(&meta))?;
     info!("Initial sync complete");
 
     if let Some(weak_subjectivity_checkpoint) = &weak_subjectivity_checkpoint {
@@ -130,7 +153,11 @@ pub fn initialize_db_from_genesis_state(
     db: BeaconDB,
     genesis_state_path: &Path,
 ) -> anyhow::Result<()> {
+    if db.recover_interrupted_bootstrap()? {
+        warn!("Recovered interrupted bootstrap; retrying initialization");
+    }
     if db.is_initialized() {
+        log_backfill_mode(&db)?;
         warn!("DB is already initialized. Skipping genesis bootstrap.");
         return Ok(());
     }
@@ -170,24 +197,64 @@ pub fn initialize_db_from_genesis_state(
         message: genesis_block,
         signature: Default::default(),
     };
-    let mut store = get_forkchoice_store(genesis_state.clone(), signed_genesis_block, db)?;
+    ensure!(
+        genesis_state.slot == 0,
+        "Genesis bootstrap requires a slot-zero state"
+    );
+    db.begin_bootstrap()?;
+    let mut store = get_forkchoice_store(genesis_state.clone(), signed_genesis_block, db.clone())?;
 
     let time = genesis_state.genesis_time
         + beacon_network_spec().seconds_per_slot() * (genesis_state.slot + 1);
     on_tick(&mut store, time)?;
 
+    db.finish_bootstrap(genesis_state.genesis_validators_root, None)?;
     info!("Genesis bootstrap complete");
     Ok(())
 }
 
+async fn fetch_checkpoint_from_sources(
+    sources: &[Url],
+) -> anyhow::Result<(SignedBeaconBlock, BeaconState)> {
+    let mut failures = Vec::new();
+    for source in sources {
+        let result = async {
+            let block = fetch_finalized_block(source).await?;
+            let state = get_state(source, block.message.slot).await?;
+            ensure!(block.message.slot == state.slot, "Checkpoint slot mismatch");
+            ensure!(
+                block.message.state_root == state.state_root(),
+                "Checkpoint state root mismatch"
+            );
+            Ok::<_, anyhow::Error>((block, state))
+        }
+        .await;
+        match result {
+            Ok(pair) => return Ok(pair),
+            Err(err) => {
+                warn!(%source, %err, "Checkpoint source failed; trying next source");
+                failures.push(format!("{source}: {err:#}"));
+            }
+        }
+    }
+    anyhow::bail!(
+        "No checkpoint source returned a matching block/state: {}",
+        failures.join("; ")
+    )
+}
+
 /// Fetch initial state from trusted RPC
 async fn get_state(rpc: &Url, slot: u64) -> anyhow::Result<BeaconState> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(std::time::Duration::from_secs(120))
+        .build()?;
     let state = client
         .get(format!("{rpc}eth/v2/debug/beacon/states/{slot}"))
         .header(ACCEPT, HeaderValue::from_static("application/octet-stream"))
         .send()
         .await?
+        .error_for_status()?
         .bytes()
         .await?;
 
@@ -197,12 +264,16 @@ async fn get_state(rpc: &Url, slot: u64) -> anyhow::Result<BeaconState> {
 
 /// Fetch initial block from trusted RPC
 async fn fetch_finalized_block(rpc: &Url) -> anyhow::Result<SignedBeaconBlock> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(std::time::Duration::from_secs(120))
+        .build()?;
     let raw_bytes = client
         .get(format!("{rpc}eth/v2/beacon/blocks/finalized"))
         .header(ACCEPT, HeaderValue::from_static("application/octet-stream"))
         .send()
         .await?
+        .error_for_status()?
         .bytes()
         .await?;
 
@@ -210,32 +281,30 @@ async fn fetch_finalized_block(rpc: &Url) -> anyhow::Result<SignedBeaconBlock> {
         .map_err(|err| anyhow!("Unable to decode block from ssz bytes: {err:?}"))
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct BlobSidercars {
-    pub data: Vec<BlobSidecar>,
-}
-
-// Fetch and initialize blobs in the DB from trusted RPC
-async fn initialize_blobs_in_db(
-    rpc: &Url,
-    store: BeaconDB,
-    beacon_block_root: B256,
-) -> anyhow::Result<()> {
-    let blob_sidecar = reqwest::get(&format!(
-        "{rpc}eth/v1/beacon/blob_sidecars/{beacon_block_root}"
-    ))
-    .await?
-    .json::<BlobSidercars>()
-    .await?;
-
-    for blob_sidecar in blob_sidecar.data {
-        store.blobs_and_proofs_provider().insert(
-            BlobIdentifier::new(beacon_block_root, blob_sidecar.index),
-            BlobAndProofV1 {
-                blob: blob_sidecar.blob,
-                proof: blob_sidecar.kzg_proof,
-            },
-        )?;
+fn log_backfill_mode(db: &BeaconDB) -> anyhow::Result<()> {
+    match db.backfill_mode()? {
+        BackfillMode::Legacy => warn!(
+            "Legacy database: backfill disabled and historical coverage unverified. Use --purge-db to bootstrap with backfill metadata"
+        ),
+        mode => info!(?mode, "Loaded bootstrap mode"),
     }
     Ok(())
+}
+
+/// Used for legacy databases that predate the independent genesis validators root field.
+pub fn canonical_head_state(db: &BeaconDB) -> anyhow::Result<BeaconState> {
+    let store = Store::new(db.clone(), Arc::new(OperationPool::default()), None);
+    let root = store.get_head()?;
+    db.state_provider()
+        .get(root)?
+        .ok_or_else(|| anyhow!("Missing canonical head state for {root}"))
+}
+
+pub fn load_genesis_validators_root(db: &BeaconDB) -> anyhow::Result<B256> {
+    if let Some(root) = db.genesis_validators_root()? {
+        return Ok(root);
+    }
+    let root = canonical_head_state(db)?.genesis_validators_root;
+    db.cache_genesis_validators_root(root)?;
+    Ok(root)
 }

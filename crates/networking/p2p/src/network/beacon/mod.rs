@@ -70,7 +70,8 @@ use crate::{
 };
 
 fn status_is_plausible(status: &Status, current_epoch: u64) -> bool {
-    status.earliest_available_slot <= status.head_slot
+    // A checkpoint node may not have recovered its anchor columns yet.
+    status.earliest_available_slot <= status.head_slot.saturating_add(1)
         && status.finalized_epoch <= current_epoch.saturating_add(1)
         && status.head_slot
             <= current_epoch
@@ -991,10 +992,18 @@ mod tests {
             },
             current_epoch
         ));
-        assert!(!status_is_plausible(
+        assert!(status_is_plausible(
             &Status {
                 head_slot: 10,
                 earliest_available_slot: 11,
+                ..Default::default()
+            },
+            current_epoch
+        ));
+        assert!(!status_is_plausible(
+            &Status {
+                head_slot: 10,
+                earliest_available_slot: 12,
                 ..Default::default()
             },
             current_epoch

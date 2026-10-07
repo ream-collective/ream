@@ -6,7 +6,7 @@ use parking_lot::RwLock;
 use ream_consensus_beacon::{
     attestation::Attestation,
     attester_slashing::AttesterSlashing,
-    data_column_sidecar::{ColumnIdentifier, DataColumnSidecar},
+    data_column_sidecar::DataColumnSidecar,
     electra::{beacon_block::SignedBeaconBlock, beacon_state::BeaconState},
 };
 use ream_consensus_misc::{
@@ -32,10 +32,7 @@ use ream_operation_pool::OperationPool;
 use ream_req_resp::beacon::messages::status::Status;
 use ream_storage::{
     db::beacon::BeaconDB,
-    tables::{
-        field::REDBField,
-        table::{CustomTable, REDBTable},
-    },
+    tables::{field::REDBField, table::REDBTable},
 };
 use ream_sync_committee_pool::SyncCommitteePool;
 use tokio::sync::{Mutex, broadcast};
@@ -242,36 +239,63 @@ impl BeaconChain {
         Ok(())
     }
 
-    /// Stores and processes a validated column under the same Store guard as a caller-supplied
-    /// release check. Coupling these operations prevents mutable finality/ancestry facts from
-    /// changing between release validation and completion of a pending block.
+    /// Validate eligibility before staging and again before updating fork choice.
     pub async fn import_data_column_sidecar_if<F>(
         &self,
         sidecar: DataColumnSidecar,
         validate_release: F,
     ) -> anyhow::Result<()>
     where
-        F: FnOnce(&Store) -> anyhow::Result<()> + Send,
+        F: Fn(&Store) -> anyhow::Result<()> + Send,
     {
-        let block_root = sidecar.signed_block_header.message.tree_hash_root();
-        let column_index = sidecar.index;
-        let slot = sidecar.signed_block_header.message.slot;
+        self.import_data_column_sidecars_if(vec![sidecar], validate_release)
+            .await
+    }
+
+    pub async fn import_data_column_sidecars_if<F>(
+        &self,
+        columns: Vec<DataColumnSidecar>,
+        validate_release: F,
+    ) -> anyhow::Result<()>
+    where
+        F: Fn(&Store) -> anyhow::Result<()> + Send,
+    {
+        if columns.is_empty() {
+            return Ok(());
+        }
+        {
+            let store = self.store.lock().await;
+            validate_release(&store)?;
+        }
+        let identifiers = columns
+            .iter()
+            .map(|column| {
+                (
+                    column.signed_block_header.message.tree_hash_root(),
+                    column.index,
+                    column.signed_block_header.message.slot,
+                )
+            })
+            .collect::<Vec<_>>();
+        let provider = self.db.column_sidecars_provider();
+        // This task owns staging, publication, flush and rollback even if the caller is cancelled.
+        tokio::task::spawn_blocking(move || provider.insert_batch(columns)).await??;
         let mut store = self.store.lock().await;
         validate_release(&store)?;
-        store
-            .db
-            .column_sidecars_provider()
-            .insert(ColumnIdentifier::new(block_root, column_index), sidecar)?;
-        let imported_block =
-            self.process_data_column_sidecar_locked(&mut store, block_root, column_index, slot)?;
+        let mut imported = Vec::new();
+        for (root, index, slot) in identifiers {
+            if let Some(block) =
+                self.process_data_column_sidecar_locked(&mut store, root, index, slot)?
+            {
+                imported.push(block);
+            }
+        }
         drop(store);
-
-        if let Some((imported_block_root, block_event)) = imported_block {
-            self.notify_block_imported(imported_block_root);
-            self.publish_block_event(block_event);
+        for (root, event) in imported {
+            self.notify_block_imported(root);
+            self.publish_block_event(event);
             self.update_execution_forkchoice(true).await;
         }
-
         Ok(())
     }
 
@@ -471,7 +495,16 @@ impl BeaconChain {
             finalized_epoch: head.finalized_checkpoint.epoch,
             head_root: head.head_root,
             head_slot: head.head_slot,
-            earliest_available_slot: 0,
+            earliest_available_slot: match self.db.cached_backfill_mode()? {
+                ream_storage::tables::beacon::backfill::BackfillMode::Checkpoint(meta) => meta
+                    .sidecars
+                    .frontier
+                    .unwrap_or_else(|| meta.origin.slot.saturating_add(1))
+                    .max(meta.blocks.frontier.oldest_block_slot),
+                ream_storage::tables::beacon::backfill::BackfillMode::GenesisSynced => 0,
+                // Historical serving policy for legacy databases remains a separate change.
+                ream_storage::tables::beacon::backfill::BackfillMode::Legacy => 0,
+            },
         })
     }
 

@@ -1,4 +1,5 @@
 pub mod beacon;
+mod beacon_bootstrap;
 pub mod lean;
 
 use std::{fs, io, path::PathBuf, sync::Arc};
@@ -56,6 +57,7 @@ pub const REDB_CACHE_SIZE: usize = 1_024 * 1_024 * 1_024;
 pub struct ReamDB {
     db: Arc<Database>,
     data_dir: PathBuf,
+    bootstrap_cache: Arc<std::sync::Mutex<Option<crate::tables::beacon::backfill::BackfillMode>>>,
 }
 
 impl ReamDB {
@@ -64,15 +66,24 @@ impl ReamDB {
             .set_cache_size(REDB_CACHE_SIZE)
             .create(data_dir.join(REDB_FILE))?;
 
+        for folder in [BLOB_FOLDER_NAME, COLUMN_FOLDER_NAME] {
+            let directory = data_dir.join(folder);
+            if directory.exists() {
+                crate::tables::sidecar_file::cleanup_temporary_sidecars(&directory)?;
+            }
+        }
+
         Ok(ReamDB {
             db: Arc::new(db),
             data_dir,
+            bootstrap_cache: Default::default(),
         })
     }
 
     pub fn init_beacon_db(&self) -> Result<BeaconDB, StoreError> {
         let write_txn = self.db.begin_write()?;
 
+        write_txn.open_table(crate::tables::beacon::backfill::BOOTSTRAP)?;
         write_txn.open_table(BeaconBlockTable::TABLE_DEFINITION)?;
         write_txn.open_table(BeaconStateTable::TABLE_DEFINITION)?;
         write_txn.open_table(BlockTimelinessTable::TABLE_DEFINITION)?;
@@ -94,11 +105,13 @@ impl ReamDB {
 
         fs::create_dir_all(self.data_dir.join(BLOB_FOLDER_NAME))?;
         fs::create_dir_all(self.data_dir.join(COLUMN_FOLDER_NAME))?;
+        fs::File::open(&self.data_dir)?.sync_all()?;
 
         Ok(BeaconDB {
             db: self.db.clone(),
             data_dir: self.data_dir.clone(),
             cache: None,
+            bootstrap_cache: self.bootstrap_cache.clone(),
         })
     }
 

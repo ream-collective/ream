@@ -15,12 +15,15 @@ use alloy_primitives::B256;
 use anyhow::ensure;
 use libp2p::PeerId;
 use ream_chain_beacon::beacon_chain::BeaconChain;
-use ream_consensus_beacon::data_column_sidecar::DataColumnSidecar;
+use ream_consensus_beacon::data_column_sidecar::{
+    ColumnIdentifier, DataColumnSidecar, NUMBER_OF_COLUMNS,
+};
 use ream_p2p::network::beacon::channel::{P2PCallbackResponse, P2PMessage, P2PRequest};
 use ream_polynomial_commitments::handlers::verify_data_column_sidecar_kzg_proofs;
 use ream_req_resp::beacon::messages::{
     BeaconResponseMessage, data_column_sidecars::DataColumnsByRootIdentifier,
 };
+use ream_storage::tables::table::{CustomTable, REDBTable};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 use tree_hash::TreeHash;
@@ -239,6 +242,22 @@ pub async fn fetch_missing_columns(
     block_root: B256,
     peer_id: PeerId,
 ) -> ColumnFetchOutcome {
+    match beacon_chain.db().pending_anchor_root() {
+        Ok(Some(root)) if root == block_root => {
+            return match fetch_anchor_columns(beacon_chain, p2p_sender, root, peer_id).await {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    warn!(%err, ?root, "Anchor column recovery failed; will retry");
+                    ColumnFetchOutcome::Retryable
+                }
+            };
+        }
+        Err(err) => {
+            warn!(%err, "Cannot read anchor recovery metadata");
+            return ColumnFetchOutcome::Retryable;
+        }
+        _ => {}
+    }
     // Re-read on every attempt: gossip or an earlier peer may have completed part of the set.
     let Some((missing, expected_header)) = ({
         let store = beacon_chain.store.lock().await;
@@ -270,74 +289,45 @@ pub async fn fetch_missing_columns(
         }
     };
 
-    for sidecar in sidecars {
-        let still_pending = {
-            let store = beacon_chain.store.lock().await;
-            store
+    let columns = sidecars
+        .into_iter()
+        .filter(|sidecar| {
+            let valid = missing.contains(&sidecar.index)
+                && is_valid_rpc_column(sidecar, block_root, &expected_header);
+            if !valid {
+                warn!(
+                    ?block_root,
+                    %peer_id,
+                    index = sidecar.index,
+                    "Peer returned an invalid or unrequested data column"
+                );
+            }
+            valid
+        })
+        .collect::<Vec<_>>();
+    let parent_root = expected_header.message.parent_root;
+    let slot = expected_header.message.slot;
+    if let Err(err) = beacon_chain
+        .import_data_column_sidecars_if(columns, move |store| {
+            ensure_pending_item_is_importable_with_store(
+                store,
+                slot,
+                parent_root,
+                Some(block_root),
+            )?;
+            let pending = store
                 .data_availability_checker
                 .pending_block(&block_root)
-                .is_some()
-        };
-        if !still_pending {
-            return ColumnFetchOutcome::Complete;
-        }
-        if !missing.contains(&sidecar.index) {
-            warn!(
-                ?block_root,
-                %peer_id,
-                index = sidecar.index,
-                "Peer returned a data column that was not requested"
+                .ok_or_else(|| anyhow::anyhow!("block is no longer pending availability"))?;
+            ensure!(
+                pending.signed_block.signed_header() == expected_header,
+                "data column signed header does not match the pending block"
             );
-            continue;
-        }
-        if !is_valid_rpc_column(&sidecar, block_root, &expected_header) {
-            warn!(
-                ?block_root,
-                %peer_id,
-                index = sidecar.index,
-                "Peer returned an invalid data column"
-            );
-            continue;
-        }
-
-        let sidecar_header = sidecar.signed_block_header.clone();
-        let parent_root = sidecar_header.message.parent_root;
-        let slot = sidecar_header.message.slot;
-        match beacon_chain
-            .import_data_column_sidecar_if(sidecar, move |store| {
-                ensure_pending_item_is_importable_with_store(
-                    store,
-                    slot,
-                    parent_root,
-                    Some(block_root),
-                )?;
-                let pending = store
-                    .data_availability_checker
-                    .pending_block(&block_root)
-                    .ok_or_else(|| anyhow::anyhow!("block is no longer pending availability"))?;
-                ensure!(
-                    pending.signed_block.signed_header() == sidecar_header,
-                    "data column signed header does not match the pending block"
-                );
-                Ok(())
-            })
-            .await
-        {
-            Ok(()) => {}
-            Err(err) => {
-                let still_pending = {
-                    let store = beacon_chain.store.lock().await;
-                    store
-                        .data_availability_checker
-                        .pending_block(&block_root)
-                        .is_some()
-                };
-                if !still_pending {
-                    return ColumnFetchOutcome::Complete;
-                }
-                warn!(?block_root, ?err, "Failed to import fetched data column");
-            }
-        }
+            Ok(())
+        })
+        .await
+    {
+        warn!(?block_root, ?err, "Failed to import fetched data columns");
     }
 
     let store = beacon_chain.store.lock().await;
@@ -355,6 +345,90 @@ pub async fn fetch_missing_columns(
     } else {
         ColumnFetchOutcome::Incomplete
     }
+}
+
+// The checkpoint anchor is trusted and already finalized, so live pending-block/finality
+// gates do not apply. Authenticate every column against the stored signed anchor instead.
+async fn fetch_anchor_columns(
+    chain: &BeaconChain,
+    sender: &P2PSender,
+    root: B256,
+    peer: PeerId,
+) -> anyhow::Result<ColumnFetchOutcome> {
+    let block = chain
+        .db()
+        .block_provider()
+        .get(root)?
+        .ok_or_else(|| anyhow::anyhow!("Missing checkpoint anchor"))?;
+    let spec = ream_network_spec::networks::beacon_network_spec();
+    let epoch = ream_consensus_misc::misc::compute_epoch_at_slot(block.message.slot);
+    if block.message.body.blob_kzg_commitments.is_empty()
+        || epoch
+            < spec
+                .current_epoch()
+                .saturating_sub(spec.min_epochs_for_data_column_sidecars_requests)
+    {
+        let db = chain.db().clone();
+        tokio::task::spawn_blocking(move || db.confirm_anchor_sidecars(root)).await??;
+        return Ok(ColumnFetchOutcome::Complete);
+    }
+    let header = block.signed_header();
+    let stored_header = header.clone();
+    let db = chain.db().clone();
+    let missing = tokio::task::spawn_blocking(move || {
+        let provider = db.column_sidecars_provider();
+        (0..NUMBER_OF_COLUMNS)
+            .filter_map(
+                |index| match provider.get(ColumnIdentifier::new(root, index)) {
+                    Ok(Some(column))
+                        if column.index == index
+                            && is_valid_rpc_column(&column, root, &stored_header) =>
+                    {
+                        None
+                    }
+                    Ok(_) => Some(Ok(index)),
+                    Err(
+                        ream_storage::errors::StoreError::DecodeError(_)
+                        | ream_storage::errors::StoreError::SnappyError(_),
+                    ) => Some(Ok(index)),
+                    Err(err) => Some(Err(err)),
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()
+    })
+    .await??;
+    if !missing.is_empty() {
+        let columns = match request_columns_by_root(sender, peer, root, &missing).await {
+            Ok(columns) => columns,
+            Err(err) => {
+                debug!(%err, ?root, "Anchor column request failed");
+                return Ok(if err.is_retryable() {
+                    ColumnFetchOutcome::Retryable
+                } else {
+                    ColumnFetchOutcome::Incomplete
+                });
+            }
+        };
+        let complete = columns.len() == missing.len();
+        let db = chain.db().clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            ensure!(
+                columns
+                    .iter()
+                    .all(|column| is_valid_rpc_column(column, root, &header)),
+                "Invalid anchor column response"
+            );
+            db.column_sidecars_provider().insert_batch(columns)?;
+            Ok(())
+        })
+        .await??;
+        if !complete {
+            return Ok(ColumnFetchOutcome::Incomplete);
+        }
+    }
+    let db = chain.db().clone();
+    tokio::task::spawn_blocking(move || db.confirm_anchor_sidecars(root)).await??;
+    Ok(ColumnFetchOutcome::Complete)
 }
 
 /// Applies the checks that are meaningful for a column obtained over req/resp. Gossip-only

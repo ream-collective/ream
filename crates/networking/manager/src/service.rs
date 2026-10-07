@@ -618,7 +618,12 @@ impl NetworkManagerService {
                         )
                     };
                     match slots {
-                        (Ok(current_slot), Ok(finalized_checkpoint), pending_roots) => {
+                        (Ok(current_slot), Ok(finalized_checkpoint), mut pending_roots) => {
+                            match beacon_chain.db().pending_anchor_root() {
+                                Ok(Some(root)) => pending_roots.push(root),
+                                Ok(None) => {},
+                                Err(err) => warn!(%err, "Cannot schedule anchor column recovery"),
+                            }
                             let finalized_slot =
                                 compute_start_slot_at_epoch(finalized_checkpoint.epoch);
                             let pruned_pending = block_lookup_coordinator.prune(
