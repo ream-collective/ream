@@ -22,9 +22,7 @@ use libp2p::{
         THandlerOutEvent, ToSwarm, dummy::ConnectionHandler,
     },
 };
-use ream_consensus_misc::{
-    constants::beacon::genesis_validators_root, misc::compute_epoch_at_slot,
-};
+use ream_consensus_misc::constants::beacon::genesis_validators_root;
 use tokio::sync::mpsc;
 use tracing::{error, info, trace, warn};
 
@@ -34,8 +32,9 @@ use crate::{
     persisted_enr::{advertised_ip, continue_enr_seq, load_enr, save_enr},
     subnet::{
         ATTESTATION_BITFIELD_ENR_KEY, AttestationSubnets, CUSTODY_GROUP_COUNT_ENR_KEY,
-        NEXT_FORK_DIGEST_ENR_KEY, SYNC_COMMITTEE_BITFIELD_ENR_KEY, attestation_subnet_predicate,
-        compute_subscribed_subnets, next_fork_digest, sync_committee_subnet_predicate,
+        NEXT_FORK_DIGEST_ENR_KEY, NextForkDigest, SYNC_COMMITTEE_BITFIELD_ENR_KEY,
+        attestation_subnet_predicate, compute_subscribed_subnets, next_fork_digest,
+        sync_committee_subnet_predicate,
     },
 };
 
@@ -84,19 +83,19 @@ pub struct Discovery {
     enr_save_pending: bool,
     /// Local ENR seq at the last [`Discovery::persist_local_enr`]
     persisted_seq: u64,
-    /// Signs the ENR updates made by [`Discovery::set_attestation_subnets`]
+    /// Signs the ENR updates made by [`Discovery::update_local_enr`]
     enr_key: CombinedKey,
 }
 
 impl Discovery {
-    /// The ENR advertises the backbone subnets assigned for `subnet_epoch`.
+    /// The ENR advertises the fork and the backbone subnets of the wall-clock `epoch`, not of
+    /// the head, which lags while the node syncs.
     pub async fn new(
         local_key: Keypair,
         config: &DiscoveryConfig,
-        current_slot: u64,
-        subnet_epoch: u64,
+        epoch: u64,
     ) -> anyhow::Result<Self> {
-        Self::init(local_key, config, current_slot, subnet_epoch, None).await
+        Self::init(local_key, config, epoch, None).await
     }
 
     /// Like [`Discovery::new`], but keeps the local ENR at `enr_path` so its sequence number
@@ -104,36 +103,26 @@ impl Discovery {
     pub async fn with_persisted_enr(
         local_key: Keypair,
         config: &DiscoveryConfig,
-        current_slot: u64,
-        subnet_epoch: u64,
+        epoch: u64,
         enr_path: PathBuf,
     ) -> anyhow::Result<Self> {
-        Self::init(
-            local_key,
-            config,
-            current_slot,
-            subnet_epoch,
-            Some(enr_path),
-        )
-        .await
+        Self::init(local_key, config, epoch, Some(enr_path)).await
     }
 
     async fn init(
         local_key: Keypair,
         config: &DiscoveryConfig,
-        current_slot: u64,
-        subnet_epoch: u64,
+        epoch: u64,
         enr_path: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
         let enr_key = convert_to_enr(local_key.clone())
             .map_err(|err| anyhow!("Failed to convert key: {err:?}"))?;
         let enr_local =
             convert_to_enr(local_key).map_err(|err| anyhow!("Failed to convert key: {err:?}"))?;
-        let current_epoch = compute_epoch_at_slot(current_slot);
         let attestation_subnets = advertised_attestation_subnets(
             &config.attestation_subnets,
             NodeId::from(enr_local.public()),
-            subnet_epoch,
+            epoch,
         )?;
 
         // A saved ENR from another node, e.g. after a key change, is not reused.
@@ -158,7 +147,7 @@ impl Discovery {
         let mut enr = enr_builder
             .add_value(
                 ENR_ETH2_KEY,
-                &EnrForkId::current(genesis_validators_root(), current_epoch),
+                &EnrForkId::current(genesis_validators_root(), epoch),
             )
             .add_value(ATTESTATION_BITFIELD_ENR_KEY, &attestation_subnets)
             .add_value(
@@ -166,7 +155,7 @@ impl Discovery {
                 &config.sync_committee_subnets,
             )
             .add_value(CUSTODY_GROUP_COUNT_ENR_KEY, &config.custody_group_count)
-            .add_value(NEXT_FORK_DIGEST_ENR_KEY, &next_fork_digest(current_epoch))
+            .add_value(NEXT_FORK_DIGEST_ENR_KEY, &next_fork_digest(epoch))
             .build(&enr_local)
             .map_err(|err| anyhow!("Failed to build ENR: {err}"))?;
 
@@ -248,33 +237,89 @@ impl Discovery {
     }
 
     /// Advertises `subnets` in the local ENR. Returns whether the ENR changed.
-    ///
-    /// The new record is saved while holding the lock discv5 serves the ENR from, so it is never
-    /// served before it is on disk, and a failed save or seq overflow publishes nothing.
     pub fn set_attestation_subnets(&mut self, subnets: AttestationSubnets) -> Result<bool> {
         if subnets == self.current_attestation_subnets {
             self.persist_local_enr();
             return Ok(false);
         }
 
+        self.update_local_enr(|enr, key| {
+            // `insert` RLP-encodes the value itself.
+            enr.insert(ATTESTATION_BITFIELD_ENR_KEY, &subnets, key)
+                .map_err(|err| anyhow!("Failed to update local ENR attnets: {err:?}"))?;
+            Ok(())
+        })?;
+
+        info!("Advertising attestation subnets {subnets:?}");
+        self.current_attestation_subnets = subnets;
+        Ok(true)
+    }
+
+    /// Advertises the fork of the wall-clock `epoch` in the `eth2` and `nfd` entries. Returns
+    /// whether the ENR changed; when both entries already match it is left alone, seq included.
+    pub fn update_fork_enr(&mut self, epoch: u64) -> Result<bool> {
+        self.set_fork_enr(
+            EnrForkId::current(genesis_validators_root(), epoch),
+            next_fork_digest(epoch),
+        )
+    }
+
+    fn set_fork_enr(
+        &mut self,
+        enr_fork_id: EnrForkId,
+        next_fork_digest: NextForkDigest,
+    ) -> Result<bool> {
+        let local_enr = self.discv5.local_enr();
+        if local_enr
+            .get_decodable::<EnrForkId>(ENR_ETH2_KEY)
+            .and_then(Result::ok)
+            .as_ref()
+            == Some(&enr_fork_id)
+            && local_enr
+                .get_decodable::<NextForkDigest>(NEXT_FORK_DIGEST_ENR_KEY)
+                .and_then(Result::ok)
+                == Some(next_fork_digest)
+        {
+            return Ok(false);
+        }
+
+        // Both entries go into one published record, so peers never see a mixed pair.
+        self.update_local_enr(|enr, key| {
+            enr.insert(ENR_ETH2_KEY, &enr_fork_id, key)
+                .map_err(|err| anyhow!("Failed to update local ENR eth2: {err:?}"))?;
+            enr.insert(NEXT_FORK_DIGEST_ENR_KEY, &next_fork_digest, key)
+                .map_err(|err| anyhow!("Failed to update local ENR nfd: {err:?}"))?;
+            Ok(())
+        })?;
+
+        info!(
+            fork_digest = %enr_fork_id.fork_digest,
+            next_fork_epoch = enr_fork_id.next_fork_epoch,
+            next_fork_digest = %next_fork_digest.0,
+            "Advertising fork in ENR"
+        );
+        Ok(true)
+    }
+
+    /// Applies `update` to a copy of the local ENR, saves the copy, then publishes it.
+    ///
+    /// The copy is saved while holding the lock discv5 serves the ENR from, so it is never served
+    /// before it is on disk, and a failed update, save or seq overflow publishes nothing.
+    fn update_local_enr(
+        &mut self,
+        update: impl FnOnce(&mut Enr, &CombinedKey) -> Result<()>,
+    ) -> Result<()> {
         let shared_enr = self.discv5.external_enr();
         let mut local_enr = shared_enr.write();
         let mut candidate = local_enr.clone();
-        // `insert` RLP-encodes the value itself.
-        candidate
-            .insert(ATTESTATION_BITFIELD_ENR_KEY, &subnets, &self.enr_key)
-            .map_err(|err| anyhow!("Failed to update local ENR attnets: {err:?}"))?;
+        update(&mut candidate, &self.enr_key)?;
         if let Some(enr_path) = &self.enr_path {
             save_enr(enr_path, &candidate)?;
         }
         self.persisted_seq = candidate.seq();
         self.enr_save_pending = false;
         *local_enr = candidate;
-        drop(local_enr);
-
-        info!("Advertising attestation subnets {subnets:?}");
-        self.current_attestation_subnets = subnets;
-        Ok(true)
+        Ok(())
     }
 
     /// Subnets advertised in the local ENR. The caller must stay subscribed to all of them.
@@ -548,13 +593,16 @@ mod tests {
 
     use alloy_primitives::B256;
     use libp2p::identity::Keypair;
-    use ream_consensus_misc::constants::beacon::GENESIS_VALIDATORS_ROOT;
-    use ream_network_spec::networks::initialize_test_network_spec;
+    use ream_consensus_misc::constants::beacon::{FAR_FUTURE_EPOCH, GENESIS_VALIDATORS_ROOT};
+    use ream_network_spec::networks::{
+        BeaconNetworkSpec, beacon_network_spec, initialize_test_network_spec,
+    };
     use ssz::Encode;
 
     use super::*;
     use crate::{
         config::DiscoveryConfig,
+        eth2::test_utils::bpo_spec,
         persisted_enr::test_utils::TestDir,
         subnet::{
             ATTESTATION_SUBNET_COUNT, AttestationSubnets, CustodyGroupCount, SyncCommitteeSubnets,
@@ -573,7 +621,7 @@ mod tests {
         config.attestation_subnets = AttestationSubnets::new();
         config.attestation_subnets.enable_attestation_subnet(5)?;
 
-        let discovery = Discovery::new(key, &config, 0, 0).await.unwrap();
+        let discovery = Discovery::new(key, &config, 0).await.unwrap();
         let enr_subnets = enr_attestation_subnets(&discovery.local_enr())?;
 
         let mut expected = config.attestation_subnets.clone();
@@ -602,7 +650,7 @@ mod tests {
                 discovery_port: 9101,
                 ..DiscoveryConfig::default()
             };
-            let enr = Discovery::new(Keypair::generate_secp256k1(), &config, 0, 0)
+            let enr = Discovery::new(Keypair::generate_secp256k1(), &config, 0)
                 .await?
                 .local_enr();
 
@@ -643,7 +691,7 @@ mod tests {
         config.attestation_subnets.disable_attestation_subnet(1)?;
         config.disable_discovery = true;
 
-        let discovery = Discovery::new(key, &config, 0, 0).await.unwrap();
+        let discovery = Discovery::new(key, &config, 0).await.unwrap();
         let local_enr = discovery.local_enr();
 
         // Predicate for subnet 0 should match
@@ -679,7 +727,7 @@ mod tests {
 
         config.attestation_subnets.enable_attestation_subnet(0)?; // Local node on subnet 0
         config.disable_discovery = false;
-        let mut discovery = Discovery::new(key, &config, 0, 0).await.unwrap();
+        let mut discovery = Discovery::new(key, &config, 0).await.unwrap();
 
         // Simulate a peer with another Discovery instance
         let peer_key = Keypair::generate_secp256k1();
@@ -698,7 +746,7 @@ mod tests {
         peer_config.socket_port = 9001; // Different port
         peer_config.disable_discovery = true;
 
-        let peer_discovery = Discovery::new(peer_key, &peer_config, 0, 0).await.unwrap();
+        let peer_discovery = Discovery::new(peer_key, &peer_config, 0).await.unwrap();
         let peer_enr = peer_discovery.local_enr().clone();
 
         // Add peer to discv5
@@ -738,12 +786,11 @@ mod tests {
             ..DiscoveryConfig::default()
         };
 
-        let initial_slot = 0;
-        let discovery = Discovery::new(key.clone(), &config, initial_slot, 0).await?;
+        let discovery = Discovery::new(key.clone(), &config, 0).await?;
         let subnets1 = discovery.current_attestation_subnets().clone();
 
         // Create another discovery instance with the same key
-        let discovery2 = Discovery::new(key, &config, initial_slot, 0).await?;
+        let discovery2 = Discovery::new(key, &config, 0).await?;
         let subnets2 = discovery2.current_attestation_subnets().clone();
 
         // Should have the same subnets since they have the same node_id
@@ -770,7 +817,7 @@ mod tests {
             attestation_subnets: AttestationSubnets::new(),
             ..DiscoveryConfig::default()
         };
-        let mut discovery = Discovery::new(Keypair::generate_secp256k1(), &config, 0, 0).await?;
+        let mut discovery = Discovery::new(Keypair::generate_secp256k1(), &config, 0).await?;
         let seq = discovery.local_enr().seq();
 
         rotate_attestation_subnets(&mut discovery)?;
@@ -814,7 +861,7 @@ mod tests {
         };
 
         let mut discovery =
-            Discovery::with_persisted_enr(key.clone(), &config, 0, 0, enr_path.clone()).await?;
+            Discovery::with_persisted_enr(key.clone(), &config, 0, enr_path.clone()).await?;
         let epoch = rotate_attestation_subnets(&mut discovery)?;
         let updated = discovery.local_enr();
         assert_eq!(updated.seq(), 2);
@@ -823,13 +870,13 @@ mod tests {
 
         // Same epoch: same record and seq.
         let restarted =
-            Discovery::with_persisted_enr(key.clone(), &config, 0, epoch, enr_path.clone())
+            Discovery::with_persisted_enr(key.clone(), &config, epoch, enr_path.clone())
                 .await?
                 .local_enr();
         assert_eq!(restarted, updated);
 
         // Other subscription period: other subnets, higher seq.
-        let later = Discovery::with_persisted_enr(key, &config, 0, 0, enr_path)
+        let later = Discovery::with_persisted_enr(key, &config, 0, enr_path)
             .await?
             .local_enr();
         assert_ne!(
@@ -853,7 +900,6 @@ mod tests {
         let mut discovery = Discovery::with_persisted_enr(
             Keypair::generate_secp256k1(),
             &config,
-            0,
             0,
             enr_path.clone(),
         )
@@ -900,11 +946,11 @@ mod tests {
             ..DiscoveryConfig::default()
         };
 
-        let first = Discovery::with_persisted_enr(key.clone(), &config, 0, 0, enr_path.clone())
+        let first = Discovery::with_persisted_enr(key.clone(), &config, 0, enr_path.clone())
             .await?
             .local_enr();
         config.custody_group_count = CustodyGroupCount(4);
-        let restarted = Discovery::with_persisted_enr(key, &config, 0, 0, enr_path.clone())
+        let restarted = Discovery::with_persisted_enr(key, &config, 0, enr_path.clone())
             .await?
             .local_enr();
 
@@ -943,14 +989,14 @@ mod tests {
         let external_ip = Ipv4Addr::new(203, 0, 113, 7);
 
         let mut discovery =
-            Discovery::with_persisted_enr(key.clone(), &config, 0, 0, enr_path.clone()).await?;
+            Discovery::with_persisted_enr(key.clone(), &config, 0, enr_path.clone()).await?;
         assert_eq!(discovery.local_enr().ip4(), Some(Ipv4Addr::UNSPECIFIED));
         learn_external_ip(&mut discovery, external_ip, config.discovery_port);
         let learned = discovery.local_enr();
         assert_eq!(load_enr(&enr_path)?, Some(learned.clone()));
         drop(discovery);
 
-        let restarted = Discovery::with_persisted_enr(key, &config, 0, 0, enr_path)
+        let restarted = Discovery::with_persisted_enr(key, &config, 0, enr_path)
             .await?
             .local_enr();
         assert_eq!(restarted.ip4(), Some(external_ip));
@@ -975,13 +1021,13 @@ mod tests {
         let external_ip = Ipv4Addr::new(203, 0, 113, 7);
 
         let mut discovery =
-            Discovery::with_persisted_enr(key.clone(), &config, 0, 0, enr_path.clone()).await?;
+            Discovery::with_persisted_enr(key.clone(), &config, 0, enr_path.clone()).await?;
         learn_external_ip(&mut discovery, external_ip, config.discovery_port);
         let learned = discovery.local_enr();
         drop(discovery);
 
         config.discovery_port += 1;
-        let restarted = Discovery::with_persisted_enr(key, &config, 0, 0, enr_path)
+        let restarted = Discovery::with_persisted_enr(key, &config, 0, enr_path)
             .await?
             .local_enr();
         assert_eq!(restarted.ip4(), Some(external_ip));
@@ -1004,7 +1050,7 @@ mod tests {
         };
 
         let mut discovery =
-            Discovery::with_persisted_enr(key.clone(), &config, 0, 0, enr_path.clone()).await?;
+            Discovery::with_persisted_enr(key.clone(), &config, 0, enr_path.clone()).await?;
         learn_external_ip(
             &mut discovery,
             Ipv4Addr::new(203, 0, 113, 7),
@@ -1015,11 +1061,188 @@ mod tests {
 
         let configured_ip = Ipv4Addr::new(198, 51, 100, 1);
         config.socket_address = configured_ip.into();
-        let restarted = Discovery::with_persisted_enr(key, &config, 0, 0, enr_path)
+        let restarted = Discovery::with_persisted_enr(key, &config, 0, enr_path)
             .await?
             .local_enr();
         assert_eq!(restarted.ip4(), Some(configured_ip));
         assert_eq!(restarted.seq(), learned.seq() + 1);
+        Ok(())
+    }
+
+    fn fork_entries(enr: &Enr) -> (EnrForkId, NextForkDigest) {
+        (
+            enr.get_decodable(ENR_ETH2_KEY)
+                .expect("eth2 entry")
+                .expect("valid eth2 entry"),
+            enr.get_decodable(NEXT_FORK_DIGEST_ENR_KEY)
+                .expect("nfd entry")
+                .expect("valid nfd entry"),
+        )
+    }
+
+    fn advertise_at(
+        discovery: &mut Discovery,
+        spec: &BeaconNetworkSpec,
+        epoch: u64,
+    ) -> anyhow::Result<bool> {
+        discovery.set_fork_enr(
+            EnrForkId::at_epoch(spec, B256::ZERO, epoch),
+            NextForkDigest::at_epoch(spec, B256::ZERO, epoch),
+        )
+    }
+
+    #[tokio::test]
+    async fn fork_enr_changes_only_at_fork_and_bpo_boundaries() -> anyhow::Result<()> {
+        let _ = GENESIS_VALIDATORS_ROOT.set(B256::ZERO);
+        initialize_test_network_spec();
+        let spec = bpo_spec();
+        let dir = TestDir::new();
+        let enr_path = dir.path().join("enr");
+        let config = DiscoveryConfig {
+            disable_discovery: true,
+            ..DiscoveryConfig::default()
+        };
+        let mut discovery = Discovery::with_persisted_enr(
+            Keypair::generate_secp256k1(),
+            &config,
+            0,
+            enr_path.clone(),
+        )
+        .await?;
+
+        assert!(advertise_at(&mut discovery, &spec, 19)?);
+        let electra = discovery.local_enr();
+        assert_eq!(
+            fork_entries(&electra),
+            (
+                EnrForkId::at_epoch(&spec, B256::ZERO, 19),
+                NextForkDigest(spec.fork_digest(20, B256::ZERO))
+            )
+        );
+
+        assert!(!advertise_at(&mut discovery, &spec, 19)?);
+        assert!(!advertise_at(&mut discovery, &spec, 11)?);
+        assert_eq!(discovery.local_enr(), electra);
+
+        assert!(advertise_at(&mut discovery, &spec, 20)?);
+        let fulu = discovery.local_enr();
+        assert!(fulu.seq() > electra.seq());
+        let (fork_id, next_fork_digest) = fork_entries(&fulu);
+        assert_eq!(fork_id.fork_digest, spec.fork_digest(20, B256::ZERO));
+        assert_eq!(fork_id.next_fork_epoch, 30);
+        assert_eq!(
+            next_fork_digest,
+            NextForkDigest(spec.fork_digest(30, B256::ZERO))
+        );
+        assert!(!advertise_at(&mut discovery, &spec, 29)?);
+
+        assert!(advertise_at(&mut discovery, &spec, 30)?);
+        let bpo = discovery.local_enr();
+        let (fork_id, next_fork_digest) = fork_entries(&bpo);
+        assert_eq!(fork_id.fork_digest, spec.fork_digest(30, B256::ZERO));
+        assert_eq!(fork_id.next_fork_version, spec.fulu_fork_version);
+        assert_eq!(fork_id.next_fork_epoch, 40);
+        assert_eq!(
+            next_fork_digest,
+            NextForkDigest(spec.fork_digest(40, B256::ZERO))
+        );
+        assert_eq!(load_enr(&enr_path)?, Some(bpo));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn late_fork_update_skips_to_the_latest_fork() -> anyhow::Result<()> {
+        let _ = GENESIS_VALIDATORS_ROOT.set(B256::ZERO);
+        initialize_test_network_spec();
+        let spec = bpo_spec();
+        let config = DiscoveryConfig {
+            disable_discovery: true,
+            ..DiscoveryConfig::default()
+        };
+        let mut discovery = Discovery::new(Keypair::generate_secp256k1(), &config, 0).await?;
+        assert!(advertise_at(&mut discovery, &spec, 25)?);
+
+        // Both BPO boundaries passed before the update ran.
+        assert!(advertise_at(&mut discovery, &spec, 45)?);
+        let (fork_id, next_fork_digest) = fork_entries(&discovery.local_enr());
+        assert_eq!(fork_id.fork_digest, spec.fork_digest(40, B256::ZERO));
+        assert_eq!(fork_id.next_fork_version, spec.fulu_fork_version);
+        assert_eq!(fork_id.next_fork_epoch, FAR_FUTURE_EPOCH);
+        assert_eq!(next_fork_digest, NextForkDigest::default());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fork_update_is_published_only_after_it_is_saved() -> anyhow::Result<()> {
+        let _ = GENESIS_VALIDATORS_ROOT.set(B256::ZERO);
+        initialize_test_network_spec();
+        let spec = beacon_network_spec();
+        let dir = TestDir::new();
+        let enr_path = dir.path().join("enr");
+        let config = DiscoveryConfig {
+            disable_discovery: true,
+            ..DiscoveryConfig::default()
+        };
+        let mut discovery = Discovery::with_persisted_enr(
+            Keypair::generate_secp256k1(),
+            &config,
+            spec.fulu_fork_epoch - 1,
+            enr_path.clone(),
+        )
+        .await?;
+        let published = discovery.local_enr();
+
+        fs::remove_file(&enr_path)?;
+        fs::create_dir(&enr_path)?;
+        assert!(discovery.update_fork_enr(spec.fulu_fork_epoch).is_err());
+        assert_eq!(discovery.local_enr(), published);
+        fs::remove_dir(&enr_path)?;
+
+        // The next tick retries because the served ENR still shows the old fork.
+        assert!(discovery.update_fork_enr(spec.fulu_fork_epoch)?);
+        let updated = discovery.local_enr();
+        assert!(updated.seq() > published.seq());
+        assert_eq!(
+            fork_entries(&updated).0,
+            EnrForkId::current(B256::ZERO, spec.fulu_fork_epoch)
+        );
+        assert_eq!(load_enr(&enr_path)?, Some(updated));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restart_keeps_the_record_until_the_wall_clock_fork_changes() -> anyhow::Result<()> {
+        let _ = GENESIS_VALIDATORS_ROOT.set(B256::ZERO);
+        initialize_test_network_spec();
+        let spec = beacon_network_spec();
+        let dir = TestDir::new();
+        let enr_path = dir.path().join("enr");
+        let key = Keypair::generate_secp256k1();
+        let config = DiscoveryConfig {
+            disable_discovery: true,
+            ..DiscoveryConfig::default()
+        };
+        let electra_epoch = spec.fulu_fork_epoch - 1;
+
+        let first =
+            Discovery::with_persisted_enr(key.clone(), &config, electra_epoch, enr_path.clone())
+                .await?
+                .local_enr();
+        let unchanged =
+            Discovery::with_persisted_enr(key.clone(), &config, electra_epoch, enr_path.clone())
+                .await?
+                .local_enr();
+        assert_eq!(unchanged, first);
+
+        let after_fulu =
+            Discovery::with_persisted_enr(key, &config, spec.fulu_fork_epoch, enr_path)
+                .await?
+                .local_enr();
+        assert_eq!(after_fulu.seq(), first.seq() + 1);
+        assert_eq!(
+            fork_entries(&after_fulu).0,
+            EnrForkId::current(B256::ZERO, spec.fulu_fork_epoch)
+        );
         Ok(())
     }
 }
