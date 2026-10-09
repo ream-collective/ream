@@ -1,4 +1,4 @@
-use std::{fs::remove_file, io::Read, path::PathBuf};
+use std::{io::Read, path::PathBuf};
 
 use ream_consensus_beacon::data_column_sidecar::{ColumnIdentifier, DataColumnSidecar};
 use snap::raw::{Decoder, Encoder};
@@ -66,9 +66,9 @@ impl CustomTable for ColumnSidecarsTable {
     }
 
     fn remove(&self, key: Self::Key) -> Result<Option<Self::Value>, StoreError> {
-        let column = self.get(key)?;
-        remove_file(self.column_file_path(&key))?;
-        Ok(column)
+        crate::tables::sidecar_file::remove_published(&self.column_file_path(&key), || {
+            self.get(key)
+        })
     }
 }
 

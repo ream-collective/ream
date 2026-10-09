@@ -1,8 +1,4 @@
-use std::{
-    fs::{read_dir, remove_file},
-    io::Read,
-    path::PathBuf,
-};
+use std::{fs::read_dir, io::Read, path::PathBuf};
 
 use alloy_primitives::B256;
 use ream_consensus_beacon::blob_sidecar::BlobIdentifier;
@@ -74,7 +70,7 @@ impl BlobsAndProofsTable {
                 // If the block root is not in the retention set, remove the file
                 && !blocks_to_retain.contains(&block_root)
             {
-                match remove_file(&path) {
+                match crate::tables::sidecar_file::remove_published(&path, || Ok(())) {
                     Ok(_) => {
                         pruned_count += 1;
                         debug!("Pruned blob file: {:?}", path);
@@ -122,9 +118,7 @@ impl CustomTable for BlobsAndProofsTable {
     }
 
     fn remove(&self, key: Self::Key) -> Result<Option<Self::Value>, StoreError> {
-        let blob = self.get(key)?;
-        remove_file(self.blob_file_path(&key))?;
-        Ok(blob)
+        crate::tables::sidecar_file::remove_published(&self.blob_file_path(&key), || self.get(key))
     }
 }
 

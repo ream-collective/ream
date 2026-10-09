@@ -12,39 +12,105 @@ const TEMP_PREFIX: &str = ".ream-sidecar-";
 // Only writers serialize. No filesystem I/O runs under the reader visibility lock.
 // true denotes a rollback failure: readers report an error until a writer repairs it.
 static WRITER: Mutex<()> = Mutex::new(());
-static PENDING: LazyLock<Mutex<HashMap<PathBuf, bool>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+#[derive(Default)]
+struct Visibility {
+    generation: u128,
+    pending: HashMap<PathBuf, bool>,
+}
+static PENDING: LazyLock<Mutex<Visibility>> = LazyLock::new(|| Mutex::new(Visibility::default()));
 
-fn is_pending(path: &Path) -> Result<bool, StoreError> {
-    match PENDING
-        .lock()
-        .unwrap_or_else(|err| err.into_inner())
-        .get(path)
-    {
+impl Visibility {
+    fn insert(&mut self, path: PathBuf, failed: bool) {
+        self.generation += 1;
+        self.pending.insert(path, failed);
+    }
+
+    fn remove(&mut self, path: &Path) {
+        self.generation += 1;
+        self.pending.remove(path);
+    }
+
+    fn get(&self, path: &Path) -> Option<&bool> {
+        self.pending.get(path)
+    }
+}
+
+fn visible_generation(path: &Path) -> Result<Option<u128>, StoreError> {
+    let visibility = PENDING.lock().unwrap_or_else(|err| err.into_inner());
+    match visibility.get(path) {
         Some(true) => Err(std::io::Error::other(
             "Sidecar publication rollback failed; storage repair or retry required",
         )
         .into()),
-        Some(false) => Ok(true),
-        None => Ok(false),
+        Some(false) => Ok(None),
+        None => Ok(Some(visibility.generation)),
     }
 }
 
 pub(crate) fn open_published(path: &Path) -> Result<Option<File>, StoreError> {
-    if is_pending(path)? {
-        return Ok(None);
+    open_published_with(path, || {}, || {})
+}
+
+fn open_published_with(
+    path: &Path,
+    before_open: impl FnOnce(),
+    after_open: impl FnOnce(),
+) -> Result<Option<File>, StoreError> {
+    let mut before_open = Some(before_open);
+    let mut after_open = Some(after_open);
+    loop {
+        let Some(generation) = visible_generation(path)? else {
+            return Ok(None);
+        };
+        if let Some(hook) = before_open.take() {
+            hook();
+        }
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        if let Some(hook) = after_open.take() {
+            hook();
+        }
+        // Generation survives pending-entry removal, detecting complete rollback
+        // cycles. Retry because unrelated writes also advance this global counter.
+        // No I/O or decoding holds the visibility lock.
+        if visible_generation(path)? == Some(generation) {
+            return Ok(Some(file));
+        }
     }
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err.into()),
-    };
-    // Publication might have started between the first check and open. Files are
-    // never modified in place, so a handle that passes both checks stays valid.
-    if is_pending(path)? {
-        return Ok(None);
+}
+
+/// Serialize removal (including the returned value's read) with publication.
+pub(crate) fn remove_published<T>(
+    path: &Path,
+    read: impl FnOnce() -> Result<T, StoreError>,
+) -> Result<T, StoreError> {
+    let _writer = WRITER.lock().unwrap_or_else(|err| err.into_inner());
+    let value = read()?;
+    PENDING
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .insert(path.to_path_buf(), false);
+    let result = remove_and_sync(path);
+    let mut visibility = PENDING.lock().unwrap_or_else(|err| err.into_inner());
+    if result.is_err() {
+        visibility.insert(path.to_path_buf(), true);
+    } else {
+        visibility.remove(path);
     }
-    Ok(Some(file))
+    result?;
+    Ok(value)
+}
+
+fn remove_and_sync(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    File::open(path.parent().expect("sidecar parent"))?.sync_all()
 }
 
 pub struct PreparedSidecarFile {
@@ -81,11 +147,7 @@ impl PreparedSidecarFile {
                 .copied()
                 == Some(true);
             if failed {
-                match fs::remove_file(&prepared.destination) {
-                    Ok(()) => {}
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(err) => return Err(err.into()),
-                }
+                remove_and_sync(&prepared.destination)?;
                 PENDING
                     .lock()
                     .unwrap_or_else(|err| err.into_inner())
@@ -163,7 +225,7 @@ impl Drop for Publication {
                     .and_then(|()| File::open(path.parent().expect("sidecar parent"))?.sync_all())
                     .is_err()
             } else {
-                fs::remove_file(path).is_err_and(|err| err.kind() != std::io::ErrorKind::NotFound)
+                remove_and_sync(path).is_err()
             };
             let mut pending = PENDING.lock().unwrap_or_else(|err| err.into_inner());
             if failed {
@@ -200,6 +262,59 @@ pub(crate) fn cleanup_temporary_sidecars(directory: &Path) -> Result<(), StoreEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reader_rejects_file_opened_during_rolled_back_publication() {
+        let dir = tempdir::TempDir::new("sidecar_reader_rollback").unwrap();
+        let path = dir.path().join("a");
+        let _writer = WRITER.lock().unwrap_or_else(|err| err.into_inner());
+        let publication = std::cell::RefCell::new(None);
+        let file = open_published_with(
+            &path,
+            || {
+                PENDING
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .insert(path.clone(), false);
+                fs::write(&path, b"uncommitted").unwrap();
+                *publication.borrow_mut() = Some(Publication {
+                    paths: vec![path.clone()],
+                    backups: HashMap::new(),
+                    durable: false,
+                });
+            },
+            || drop(publication.borrow_mut().take()),
+        )
+        .unwrap();
+        assert!(file.is_none());
+        assert!(!path.exists());
+        assert!(visible_generation(&path).unwrap().is_some());
+    }
+
+    #[test]
+    fn removal_waits_for_publication_and_removes_committed_file() {
+        let dir = tempdir::TempDir::new("sidecar_remove_writer").unwrap();
+        let path = dir.path().join("a");
+        let writer = WRITER.lock().unwrap_or_else(|err| err.into_inner());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let removal_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = remove_published(&removal_path, || Ok(()));
+            done_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(done_rx.try_recv().is_err());
+        // Simulate the publisher committing while still owning its writer guard.
+        fs::write(&path, b"committed").unwrap();
+        File::open(&path).unwrap().sync_all().unwrap();
+        File::open(dir.path()).unwrap().sync_all().unwrap();
+        drop(writer);
+        done_rx.recv().unwrap().unwrap();
+        worker.join().unwrap();
+        assert!(!path.exists());
+    }
+
     #[test]
     fn batch_publication_preserves_duplicates_and_cleans_staging() {
         let dir = tempdir::TempDir::new("sidecar_batch").unwrap();

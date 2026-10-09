@@ -347,6 +347,33 @@ pub async fn fetch_missing_columns(
     }
 }
 
+/// Evaluate expiry even when the fetch tracker is parked or there are no peers.
+/// current_slot must come from the Store clock, which uses persisted genesis time.
+pub async fn pending_anchor_for_recovery(
+    chain: &BeaconChain,
+    current_slot: u64,
+) -> anyhow::Result<Option<B256>> {
+    let Some(root) = chain.db().pending_anchor_root()? else {
+        return Ok(None);
+    };
+    let block = chain
+        .db()
+        .block_provider()
+        .get(root)?
+        .ok_or_else(|| anyhow::anyhow!("Missing checkpoint anchor"))?;
+    let spec = ream_network_spec::networks::beacon_network_spec();
+    let epoch = ream_consensus_misc::misc::compute_epoch_at_slot(block.message.slot);
+    let current_epoch = ream_consensus_misc::misc::compute_epoch_at_slot(current_slot);
+    if block.message.body.blob_kzg_commitments.is_empty()
+        || epoch < current_epoch.saturating_sub(spec.min_epochs_for_data_column_sidecars_requests)
+    {
+        let db = chain.db().clone();
+        tokio::task::spawn_blocking(move || db.confirm_anchor_sidecars(root)).await??;
+        return Ok(None);
+    }
+    Ok(Some(root))
+}
+
 // The checkpoint anchor is trusted and already finalized, so live pending-block/finality
 // gates do not apply. Authenticate every column against the stored signed anchor instead.
 async fn fetch_anchor_columns(
@@ -360,16 +387,8 @@ async fn fetch_anchor_columns(
         .block_provider()
         .get(root)?
         .ok_or_else(|| anyhow::anyhow!("Missing checkpoint anchor"))?;
-    let spec = ream_network_spec::networks::beacon_network_spec();
-    let epoch = ream_consensus_misc::misc::compute_epoch_at_slot(block.message.slot);
-    if block.message.body.blob_kzg_commitments.is_empty()
-        || epoch
-            < spec
-                .current_epoch()
-                .saturating_sub(spec.min_epochs_for_data_column_sidecars_requests)
-    {
-        let db = chain.db().clone();
-        tokio::task::spawn_blocking(move || db.confirm_anchor_sidecars(root)).await??;
+    let current_slot = chain.store.lock().await.get_current_slot()?;
+    if pending_anchor_for_recovery(chain, current_slot).await? != Some(root) {
         return Ok(ColumnFetchOutcome::Complete);
     }
     let header = block.signed_header();

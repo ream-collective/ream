@@ -574,3 +574,102 @@ async fn pending_anchor_recovers_from_partial_peer_responses_after_restart() {
     assert_eq!(meta.revision, 1);
     assert_eq!(other_handle.pending_anchor_root().unwrap(), None);
 }
+
+#[tokio::test]
+async fn parked_anchor_expires_using_actual_genesis_without_peer_changes() {
+    use std::time::Instant;
+
+    use ream_chain_beacon::beacon_chain::BeaconChain;
+    use ream_network_manager::data_availability_fetch::{
+        ColumnFetchOutcome, ColumnFetchTracker, NO_COLUMN_PEER_TIMEOUT, pending_anchor_for_recovery,
+    };
+    use ream_storage::tables::beacon::backfill::{
+        BackfillMeta, BlockBackfillState, BlockCoverage, Frontier, Origin, SidecarCoverage,
+    };
+
+    initialize_beacon_e2e_network_spec(beacon_e2e_dev_spec());
+    let spec = ream_network_spec::networks::beacon_network_spec();
+    let (mut state, mut anchor) = build_dev_genesis(&beacon_e2e_public_keys());
+    state.genesis_time = spec.min_genesis_time + 2 * SLOTS_PER_EPOCH * spec.seconds_per_slot();
+    state.slot = SLOTS_PER_EPOCH;
+    anchor.message.slot = state.slot;
+    anchor.message.state_root = state.tree_hash_root();
+    anchor
+        .message
+        .body
+        .blob_kzg_commitments
+        .push(
+            ream_mock_execution_engine::block_generator::sample_blob_and_commitment(9)
+                .unwrap()
+                .1,
+        )
+        .unwrap();
+    let root = anchor.message.tree_hash_root();
+    let db = create_beacon_test_node_db("parked_anchor_expiry", 1);
+    let beacon_db = db.init_beacon_db().unwrap();
+    beacon_db.begin_bootstrap().unwrap();
+    get_forkchoice_store(state.clone(), anchor.clone(), beacon_db.clone()).unwrap();
+    beacon_db
+        .finish_bootstrap(
+            state.genesis_validators_root,
+            Some(&BackfillMeta {
+                revision: 0,
+                origin: Origin {
+                    slot: state.slot,
+                    root,
+                    state_root: anchor.message.state_root,
+                },
+                blocks: BlockCoverage {
+                    frontier: Frontier {
+                        oldest_block_slot: state.slot,
+                        oldest_block_root: root,
+                        oldest_block_parent: anchor.message.parent_root,
+                    },
+                    state: BlockBackfillState::InProgress,
+                },
+                sidecars: SidecarCoverage { frontier: None },
+            }),
+        )
+        .unwrap();
+
+    let chain = BeaconChain::new(
+        beacon_db.clone(),
+        Default::default(),
+        Default::default(),
+        None,
+        None,
+    );
+    let mut tracker = ColumnFetchTracker::default();
+    let peer = PeerId::random();
+    let now = Instant::now();
+    tracker.enqueue(root);
+    assert_eq!(tracker.next_fetch(&[peer], now), Some((root, peer)));
+    tracker.finish(root, peer, ColumnFetchOutcome::Incomplete, now);
+    assert_eq!(
+        tracker.next_fetch(&[peer], now + NO_COLUMN_PEER_TIMEOUT),
+        None
+    );
+    assert!(!tracker.enqueue(root));
+
+    // Exactly at the retention boundary: still required. Using min_genesis_time
+    // would put the chain two epochs ahead and incorrectly finish recovery.
+    let boundary_slot = (1 + spec.min_epochs_for_data_column_sidecars_requests) * SLOTS_PER_EPOCH;
+    for (slot, expected) in [
+        (boundary_slot, Some(root)),
+        (boundary_slot + SLOTS_PER_EPOCH, None),
+    ] {
+        beacon_db
+            .time_provider()
+            .insert(state.genesis_time + slot * spec.seconds_per_slot())
+            .unwrap();
+        let current_slot = chain.store.lock().await.get_current_slot().unwrap();
+        assert_eq!(current_slot, slot);
+        let pending = pending_anchor_for_recovery(&chain, current_slot)
+            .await
+            .unwrap();
+        assert_eq!(pending, expected);
+        assert_eq!(beacon_db.pending_anchor_root().unwrap(), expected);
+        tracker.retain_pending(&pending.into_iter().collect::<Vec<_>>());
+    }
+    assert_eq!(tracker.tracked_count(), 0);
+}
