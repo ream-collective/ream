@@ -215,6 +215,23 @@ pub struct BeaconNetworkSpec {
 }
 
 impl BeaconNetworkSpec {
+    /// Consensus-specs `compute_min_epochs_for_block_requests`.
+    pub fn min_epochs_for_block_requests(&self) -> u64 {
+        self.min_validator_withdrawability_delay
+            .saturating_add(self.churn_limit_quotient / 2)
+    }
+
+    pub fn backfill_target_slot(&self, current_epoch: u64) -> u64 {
+        current_epoch
+            .saturating_sub(self.min_epochs_for_block_requests())
+            .saturating_mul(ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH)
+    }
+
+    pub fn oldest_supported_block_slot(&self) -> u64 {
+        self.electra_fork_epoch
+            .saturating_mul(ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH)
+    }
+
     pub fn fork_digest(&self, epoch: u64, genesis_validators_root: B256) -> B32 {
         let fork_data = ForkData {
             current_version: self.current_fork_version(epoch),
@@ -654,6 +671,28 @@ pub static DEV: LazyLock<Arc<BeaconNetworkSpec>> = LazyLock::new(|| {
     }
     .into()
 });
+
+#[cfg(test)]
+mod backfill_tests {
+    use ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH;
+
+    use super::*;
+
+    #[test]
+    fn backfill_target_slides_and_saturates_at_genesis() {
+        assert_eq!(MAINNET.min_epochs_for_block_requests(), 33024);
+        let mut spec = (**DEV).clone();
+        spec.min_validator_withdrawability_delay = 2;
+        spec.churn_limit_quotient = 4;
+        spec.electra_fork_epoch = 3;
+        assert_eq!(spec.backfill_target_slot(3), 0);
+        assert_eq!(spec.backfill_target_slot(4), 0);
+        assert_eq!(spec.backfill_target_slot(5), SLOTS_PER_EPOCH);
+        assert_eq!(spec.oldest_supported_block_slot(), 3 * SLOTS_PER_EPOCH);
+        spec.electra_fork_epoch = u64::MAX;
+        assert_eq!(spec.oldest_supported_block_slot(), u64::MAX);
+    }
+}
 
 #[cfg(test)]
 mod tests {

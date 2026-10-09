@@ -1,8 +1,4 @@
-use std::{
-    fs::{File, read_dir, remove_file},
-    io::{Read, Write},
-    path::PathBuf,
-};
+use std::{fs::read_dir, io::Read, path::PathBuf};
 
 use alloy_primitives::B256;
 use ream_consensus_beacon::blob_sidecar::BlobIdentifier;
@@ -20,6 +16,23 @@ pub struct BlobsAndProofsTable {
 }
 
 impl BlobsAndProofsTable {
+    pub fn insert_batch(
+        &self,
+        blobs: Vec<(BlobIdentifier, BlobAndProofV1)>,
+    ) -> Result<(), StoreError> {
+        let files = blobs
+            .into_iter()
+            .map(|(key, value)| {
+                let bytes = Encoder::new().compress_vec(&value.as_ssz_bytes())?;
+                crate::tables::sidecar_file::PreparedSidecarFile::new(
+                    self.blob_file_path(&key),
+                    &bytes,
+                )
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        crate::tables::sidecar_file::PreparedSidecarFile::publish_batch(files)
+    }
+
     fn blob_file_path(&self, blob_identifier: &BlobIdentifier) -> PathBuf {
         self.data_dir.join(BLOB_FOLDER_NAME).join(format!(
             "{}_{}.ssz_snappy",
@@ -57,7 +70,7 @@ impl BlobsAndProofsTable {
                 // If the block root is not in the retention set, remove the file
                 && !blocks_to_retain.contains(&block_root)
             {
-                match remove_file(&path) {
+                match crate::tables::sidecar_file::remove_published(&path, || Ok(())) {
                     Ok(_) => {
                         pruned_count += 1;
                         debug!("Pruned blob file: {:?}", path);
@@ -85,12 +98,10 @@ impl CustomTable for BlobsAndProofsTable {
     fn get(&self, key: Self::Key) -> Result<Option<Self::Value>, StoreError> {
         let file_path = self.blob_file_path(&key);
 
-        if !file_path.exists() {
+        let Some(mut file) = crate::tables::sidecar_file::open_published(&file_path)? else {
             return Ok(None);
-        }
-
+        };
         let mut bytes = vec![];
-        let mut file = File::open(file_path)?;
         file.read_to_end(&mut bytes)?;
         let mut decoder = Decoder::new();
         let snappy_decoding = decoder.decompress_vec(&bytes)?;
@@ -102,16 +113,12 @@ impl CustomTable for BlobsAndProofsTable {
         let file_path = self.blob_file_path(&key);
         let mut encoder = Encoder::new();
         let snappy_encoding = encoder.compress_vec(&value.as_ssz_bytes())?;
-        let mut file = File::create(file_path)?;
-        file.write_all(&snappy_encoding)?;
-
-        Ok(())
+        crate::tables::sidecar_file::PreparedSidecarFile::new(file_path, &snappy_encoding)?
+            .publish()
     }
 
     fn remove(&self, key: Self::Key) -> Result<Option<Self::Value>, StoreError> {
-        let blob = self.get(key)?;
-        remove_file(self.blob_file_path(&key))?;
-        Ok(blob)
+        crate::tables::sidecar_file::remove_published(&self.blob_file_path(&key), || self.get(key))
     }
 }
 
