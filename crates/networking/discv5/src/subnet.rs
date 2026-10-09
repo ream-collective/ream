@@ -3,10 +3,9 @@ use alloy_rlp::{BufMut, Decodable, Encodable, bytes::Bytes};
 use anyhow::{anyhow, ensure};
 use discv5::{Enr, enr::NodeId};
 use ream_consensus_misc::{
-    constants::beacon::{FAR_FUTURE_EPOCH, genesis_validators_root},
-    misc::compute_shuffled_index,
+    constants::beacon::genesis_validators_root, misc::compute_shuffled_index,
 };
-use ream_network_spec::networks::beacon_network_spec;
+use ream_network_spec::networks::{BeaconNetworkSpec, beacon_network_spec};
 use sha2::{Digest, Sha256};
 use ssz::{Decode, Encode};
 use ssz_types::{
@@ -14,8 +13,6 @@ use ssz_types::{
     typenum::{U4, U64},
 };
 use tracing::{error, trace};
-
-use crate::eth2::EnrForkId;
 
 pub const ATTESTATION_BITFIELD_ENR_KEY: &str = "attnets";
 pub const ATTESTATION_SUBNET_COUNT: usize = 64;
@@ -212,16 +209,21 @@ impl Decodable for NextForkDigest {
     }
 }
 
-pub fn next_fork_digest(current_epoch: u64) -> NextForkDigest {
-    let fork_id = EnrForkId::current(genesis_validators_root(), current_epoch);
-
-    if fork_id.next_fork_epoch == FAR_FUTURE_EPOCH {
-        NextForkDigest::default()
-    } else {
-        let digest =
-            beacon_network_spec().fork_digest(fork_id.next_fork_epoch, genesis_validators_root());
-        NextForkDigest(digest)
+impl NextForkDigest {
+    /// `nfd` value for the wall-clock `epoch`; zero bytes when no fork is scheduled.
+    pub fn at_epoch(spec: &BeaconNetworkSpec, genesis_validators_root: B256, epoch: u64) -> Self {
+        spec.next_fork_epoch(epoch)
+            .map(|next_fork_epoch| Self(spec.fork_digest(next_fork_epoch, genesis_validators_root)))
+            .unwrap_or_default()
     }
+}
+
+pub fn next_fork_digest(current_epoch: u64) -> NextForkDigest {
+    NextForkDigest::at_epoch(
+        &beacon_network_spec(),
+        genesis_validators_root(),
+        current_epoch,
+    )
 }
 
 /// Compute a single subscribed subnet based on node_id, epoch, and index

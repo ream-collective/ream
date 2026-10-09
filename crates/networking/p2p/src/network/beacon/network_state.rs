@@ -52,9 +52,33 @@ impl NetworkState {
             });
     }
 
+    /// Applies `update`. On change, bumps `seq_number`, since peers refetch `MetaData` only when
+    /// it grows. The new value is saved before it is served, so a failed save changes nothing
+    /// and the next call retries it.
+    pub fn update_meta_data(
+        &self,
+        update: impl FnOnce(&mut GetMetaDataV3),
+    ) -> anyhow::Result<bool> {
+        let mut meta_data = self.meta_data.write();
+        let mut updated = meta_data.clone();
+        update(&mut updated);
+        updated.seq_number = meta_data.seq_number;
+        if updated == *meta_data {
+            return Ok(false);
+        }
+        updated.seq_number = updated.seq_number.saturating_add(1);
+        self.save_meta_data(&updated)?;
+        *meta_data = updated;
+        Ok(true)
+    }
+
     pub fn write_meta_data_to_disk(&self) -> anyhow::Result<()> {
+        self.save_meta_data(&self.meta_data.read())
+    }
+
+    fn save_meta_data(&self, meta_data: &GetMetaDataV3) -> anyhow::Result<()> {
         let meta_data_path = self.data_dir.join(META_DATA_FILE_NAME);
-        fs::write(meta_data_path, self.meta_data.read().as_ssz_bytes())
+        fs::write(meta_data_path, meta_data.as_ssz_bytes())
             .map_err(|err| anyhow!("Failed to write meta data to disk: {err:?}"))?;
         Ok(())
     }

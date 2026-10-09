@@ -7,7 +7,7 @@ use std::{
 use alloy_primitives::{Address, B256, U256, address, aliases::B32, b256, fixed_bytes};
 use ream_consensus_misc::{
     blob_parameters::BlobParameters,
-    constants::beacon::GENESIS_VALIDATORS_ROOT,
+    constants::beacon::{FAR_FUTURE_EPOCH, GENESIS_VALIDATORS_ROOT},
     fork::Fork,
     fork_data::{ForkData, compute_fork_digest},
     misc::{checksummed_address, compute_epoch_at_slot},
@@ -288,6 +288,24 @@ impl BeaconNetworkSpec {
                 epoch: self.fulu_fork_epoch,
             },
         ])
+    }
+
+    /// First epoch after `epoch` at which a regular or BPO fork changes the fork digest. Blob
+    /// schedule entries before Fulu are skipped since they don't affect the digest.
+    pub fn next_fork_epoch(&self, epoch: u64) -> Option<u64> {
+        let fork_schedule = self.fork_schedule();
+        let regular_fork_epochs = fork_schedule.scheduled().map(|fork| fork.epoch);
+        let bpo_fork_epochs = self
+            .blob_schedule
+            .iter()
+            .map(|parameters| parameters.epoch)
+            .filter(|&bpo_epoch| {
+                bpo_epoch >= self.fulu_fork_epoch && bpo_epoch != FAR_FUTURE_EPOCH
+            });
+        regular_fork_epochs
+            .chain(bpo_fork_epochs)
+            .filter(|&fork_epoch| fork_epoch > epoch)
+            .min()
     }
 
     /// Returns the slot number for `n_days_ago` days ago.
@@ -673,5 +691,45 @@ mod backfill_tests {
         assert_eq!(spec.oldest_supported_block_slot(), 3 * SLOTS_PER_EPOCH);
         spec.electra_fork_epoch = u64::MAX;
         assert_eq!(spec.oldest_supported_block_slot(), u64::MAX);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Electra at 10, Fulu at 20, BPO forks at 30 and 40, and a pre-Fulu blob entry at 5.
+    fn spec() -> BeaconNetworkSpec {
+        let mut spec = (**DEV).clone();
+        spec.altair_fork_epoch = 0;
+        spec.bellatrix_fork_epoch = 0;
+        spec.capella_fork_epoch = 0;
+        spec.deneb_fork_epoch = 0;
+        spec.electra_fork_epoch = 10;
+        spec.fulu_fork_epoch = 20;
+        spec.blob_schedule = [(5, 9), (30, 15), (40, 21)]
+            .map(|(epoch, max_blobs_per_block)| BlobParameters {
+                epoch,
+                max_blobs_per_block,
+            })
+            .to_vec();
+        spec
+    }
+
+    #[test]
+    fn next_fork_epoch_covers_regular_and_bpo_forks() {
+        let spec = spec();
+        assert_eq!(spec.next_fork_epoch(0), Some(10));
+        assert_eq!(spec.next_fork_epoch(10), Some(20));
+        assert_eq!(spec.next_fork_epoch(20), Some(30));
+        assert_eq!(spec.next_fork_epoch(35), Some(40));
+        assert_eq!(spec.next_fork_epoch(40), None);
+    }
+
+    #[test]
+    fn next_fork_epoch_skips_unscheduled_forks() {
+        let mut spec = spec();
+        spec.fulu_fork_epoch = FAR_FUTURE_EPOCH;
+        assert_eq!(spec.next_fork_epoch(10), None);
     }
 }

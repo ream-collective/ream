@@ -1,14 +1,14 @@
 use alloy_primitives::{B256, aliases::B32};
 use alloy_rlp::{BufMut, Decodable, Encodable, bytes::Bytes};
 use ream_consensus_misc::constants::beacon::FAR_FUTURE_EPOCH;
-use ream_network_spec::networks::beacon_network_spec;
+use ream_network_spec::networks::{BeaconNetworkSpec, beacon_network_spec};
 use ssz::{Decode, Encode};
 use ssz_derive::{Decode, Encode};
 use tracing::warn;
 
 pub const ENR_ETH2_KEY: &str = "eth2";
 
-#[derive(Default, Debug, Encode, Decode)]
+#[derive(Clone, Default, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct EnrForkId {
     pub fork_digest: B32,
     pub next_fork_version: B32,
@@ -17,36 +17,17 @@ pub struct EnrForkId {
 
 impl EnrForkId {
     pub fn current(genesis_validators_root: B256, epoch: u64) -> Self {
-        let spec = beacon_network_spec();
+        Self::at_epoch(&beacon_network_spec(), genesis_validators_root, epoch)
+    }
 
-        let fork_digest = spec.fork_digest(epoch, genesis_validators_root);
-
-        let fork_schedule = spec.fork_schedule();
-
-        let current_version = spec.current_fork_version(epoch);
-
-        let next_regular_fork = fork_schedule.0.iter().find(|fork| fork.epoch > epoch);
-
-        let next_bpo_epoch = spec
-            .blob_schedule
-            .iter()
-            .map(|params| params.epoch)
-            .filter(|&bpo_epoch| bpo_epoch > epoch)
-            .min();
-
-        let (next_fork_version, next_fork_epoch) = match (next_regular_fork, next_bpo_epoch) {
-            (Some(regular), Some(bpo)) if regular.epoch <= bpo => {
-                (regular.current_version, regular.epoch)
-            }
-            (Some(regular), None) => (regular.current_version, regular.epoch),
-            (_, Some(bpo)) => (current_version, bpo),
-            (None, None) => (current_version, FAR_FUTURE_EPOCH),
-        };
-
+    /// `eth2` value for the wall-clock `epoch`. Only regular forks change the version, so before a
+    /// BPO fork `next_fork_version` stays the current one.
+    pub fn at_epoch(spec: &BeaconNetworkSpec, genesis_validators_root: B256, epoch: u64) -> Self {
+        let next_fork_epoch = spec.next_fork_epoch(epoch);
         Self {
-            fork_digest,
-            next_fork_version,
-            next_fork_epoch,
+            fork_digest: spec.fork_digest(epoch, genesis_validators_root),
+            next_fork_version: spec.current_fork_version(next_fork_epoch.unwrap_or(epoch)),
+            next_fork_epoch: next_fork_epoch.unwrap_or(FAR_FUTURE_EPOCH),
         }
     }
 }
@@ -71,8 +52,85 @@ impl Decodable for EnrForkId {
 }
 
 #[cfg(test)]
+pub(crate) mod test_utils {
+    use ream_consensus_misc::blob_parameters::BlobParameters;
+    use ream_network_spec::networks::{BeaconNetworkSpec, DEV};
+
+    /// Electra at epoch 10, Fulu at 20, and BPO forks at 30 and 40.
+    pub(crate) fn bpo_spec() -> BeaconNetworkSpec {
+        let mut spec = (**DEV).clone();
+        spec.altair_fork_epoch = 0;
+        spec.bellatrix_fork_epoch = 0;
+        spec.capella_fork_epoch = 0;
+        spec.deneb_fork_epoch = 0;
+        spec.electra_fork_epoch = 10;
+        spec.fulu_fork_epoch = 20;
+        spec.blob_schedule = [(30, 15), (40, 21)]
+            .map(|(epoch, max_blobs_per_block)| BlobParameters {
+                epoch,
+                max_blobs_per_block,
+            })
+            .to_vec();
+        spec
+    }
+}
+
+#[cfg(test)]
 mod tests {
-    use super::*;
+    use alloy_primitives::B256;
+
+    use super::{test_utils::bpo_spec, *};
+    use crate::subnet::NextForkDigest;
+
+    #[test]
+    fn next_regular_fork_is_advertised_with_its_version() {
+        let spec = bpo_spec();
+        let fork_id = EnrForkId::at_epoch(&spec, B256::ZERO, 15);
+        assert_eq!(fork_id.fork_digest, spec.fork_digest(15, B256::ZERO));
+        assert_eq!(fork_id.next_fork_version, spec.fulu_fork_version);
+        assert_eq!(fork_id.next_fork_epoch, 20);
+        assert_eq!(
+            NextForkDigest::at_epoch(&spec, B256::ZERO, 15),
+            NextForkDigest(spec.fork_digest(20, B256::ZERO))
+        );
+    }
+
+    #[test]
+    fn next_bpo_fork_keeps_the_current_version() {
+        let spec = bpo_spec();
+        let fork_id = EnrForkId::at_epoch(&spec, B256::ZERO, 30);
+        assert_eq!(fork_id.fork_digest, spec.fork_digest(30, B256::ZERO));
+        assert_ne!(fork_id.fork_digest, spec.fork_digest(29, B256::ZERO));
+        assert_eq!(fork_id.next_fork_version, spec.fulu_fork_version);
+        assert_eq!(fork_id.next_fork_epoch, 40);
+        assert_eq!(
+            NextForkDigest::at_epoch(&spec, B256::ZERO, 30),
+            NextForkDigest(spec.fork_digest(40, B256::ZERO))
+        );
+    }
+
+    #[test]
+    fn no_next_fork_advertises_the_current_version() {
+        let spec = bpo_spec();
+        let fork_id = EnrForkId::at_epoch(&spec, B256::ZERO, 40);
+        assert_eq!(fork_id.next_fork_version, spec.fulu_fork_version);
+        assert_eq!(fork_id.next_fork_epoch, FAR_FUTURE_EPOCH);
+        assert_eq!(
+            NextForkDigest::at_epoch(&spec, B256::ZERO, 40),
+            NextForkDigest::default()
+        );
+
+        // An unscheduled fork is not a next fork, and neither are BPO entries without Fulu.
+        let mut spec = bpo_spec();
+        spec.fulu_fork_epoch = FAR_FUTURE_EPOCH;
+        let fork_id = EnrForkId::at_epoch(&spec, B256::ZERO, 15);
+        assert_eq!(fork_id.next_fork_version, spec.electra_fork_version);
+        assert_eq!(fork_id.next_fork_epoch, FAR_FUTURE_EPOCH);
+        assert_eq!(
+            NextForkDigest::at_epoch(&spec, B256::ZERO, 15),
+            NextForkDigest::default()
+        );
+    }
 
     #[test]
     fn test_serialization() -> Result<(), Box<dyn std::error::Error>> {

@@ -10,4 +10,7 @@ pub struct NetworkConfig {
     pub gossipsub_config: GossipsubConfig,
 
     pub data_dir: PathBuf,
+
+    /// Genesis time of the chain in seconds, used to schedule subnet rotation
+    pub genesis_time: u64,
 }
