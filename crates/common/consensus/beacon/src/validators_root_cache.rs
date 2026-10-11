@@ -46,13 +46,6 @@ impl ValidatorsRootCache {
     }
 }
 
-/// The cache is derived data, so it never makes two states differ.
-impl PartialEq for ValidatorsRootCache {
-    fn eq(&self, _other: &Self) -> bool {
-        true
-    }
-}
-
 impl fmt::Debug for ValidatorsRootCache {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let validators = self

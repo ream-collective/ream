@@ -248,31 +248,25 @@ pub struct BeaconState {
     #[serde(skip)]
     #[ssz(skip_serializing, skip_deserializing)]
     #[tree_hash(skip_hashing)]
-    pub shuffling_cache: ShufflingCache,
+    pub caches: StateCaches,
+}
 
-    /// Not part of the consensus state: it is never serialized, hashed or compared.
-    #[serde(skip)]
-    #[ssz(skip_serializing, skip_deserializing)]
-    #[tree_hash(skip_hashing)]
-    pub validators_root_cache: ValidatorsRootCache,
+/// Values derived from the consensus fields of a `BeaconState` and kept to avoid recomputing them.
+/// A copy of the state shares or copies them as each cache's `Clone` decides.
+#[derive(Debug, Default, Clone)]
+pub struct StateCaches {
+    pub shuffling: ShufflingCache,
+    pub validators_root: ValidatorsRootCache,
+    pub total_active_balance: TotalActiveBalanceCache,
+    pub field_roots: StateFieldRootCaches,
+    pub sync_committee_indices: SyncCommitteeIndicesCache,
+}
 
-    /// Not part of the consensus state: it is never serialized, hashed or compared.
-    #[serde(skip)]
-    #[ssz(skip_serializing, skip_deserializing)]
-    #[tree_hash(skip_hashing)]
-    pub total_active_balance_cache: TotalActiveBalanceCache,
-
-    /// Not part of the consensus state: it is never serialized, hashed or compared.
-    #[serde(skip)]
-    #[ssz(skip_serializing, skip_deserializing)]
-    #[tree_hash(skip_hashing)]
-    pub field_root_caches: StateFieldRootCaches,
-
-    /// Not part of the consensus state: it is never serialized, hashed or compared.
-    #[serde(skip)]
-    #[ssz(skip_serializing, skip_deserializing)]
-    #[tree_hash(skip_hashing)]
-    pub sync_committee_indices_cache: SyncCommitteeIndicesCache,
+/// The caches are derived data, so they never make two states differ.
+impl PartialEq for StateCaches {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
 }
 
 /// Committees per slot for an epoch with ``active_validator_count`` active validators.
@@ -434,7 +428,7 @@ impl BeaconState {
     /// recomputing it costs a scan of the whole registry plus a shuffle.
     pub fn get_shuffled_active_validator_indices(&self, epoch: u64) -> Arc<Vec<u64>> {
         let seed = self.get_seed(epoch, DOMAIN_BEACON_ATTESTER);
-        self.shuffling_cache.get_or_insert_with(epoch, seed, || {
+        self.caches.shuffling.get_or_insert_with(epoch, seed, || {
             BEACON_SHUFFLING_CACHE_MISSES_TOTAL.inc();
             compute_shuffled_list(&self.get_active_validator_indices(epoch), seed)
         })
@@ -451,13 +445,13 @@ impl BeaconState {
         }
         let next_epoch = self.get_current_epoch() + 1;
         let seed = self.get_seed(next_epoch, DOMAIN_BEACON_ATTESTER);
-        if !self.shuffling_cache.start_computing(next_epoch, seed) {
+        if !self.caches.shuffling.start_computing(next_epoch, seed) {
             return;
         }
         let state = self.clone();
         std::thread::spawn(move || {
             state.get_shuffled_active_validator_indices(next_epoch);
-            state.shuffling_cache.finish_computing(next_epoch, seed);
+            state.caches.shuffling.finish_computing(next_epoch, seed);
         });
     }
 
@@ -485,6 +479,15 @@ impl BeaconState {
 
             i += 1;
         }
+    }
+
+    /// Whether this state already fixes the committees and proposers of ``epoch``, an epoch no
+    /// earlier than its own, so they can be read without advancing a copy of the state. The
+    /// attester seed of an epoch uses the RANDAO mix from two epochs before it, activations and
+    /// exits take effect at least four epochs after they are processed, and
+    /// ``proposer_lookahead`` holds the proposers of the current and next epoch.
+    pub fn fixes_duties_of_epoch(&self, epoch: u64) -> bool {
+        epoch <= self.get_current_epoch() + 1
     }
 
     /// Return the beacon proposer index at the current slot or a given slot.
@@ -579,7 +582,8 @@ impl BeaconState {
     /// divisions by zero.
     pub fn get_total_active_balance(&self) -> u64 {
         let epoch = self.get_current_epoch();
-        self.total_active_balance_cache
+        self.caches
+            .total_active_balance
             .get_or_insert_with(epoch, || {
                 self.get_total_balance(
                     self.get_active_validator_indices(epoch)
@@ -1793,13 +1797,14 @@ impl BeaconState {
         sync_committee: &SyncCommittee,
     ) -> anyhow::Result<Vec<usize>> {
         let key = &sync_committee.aggregate_public_key;
-        if let Some(indices) = self.sync_committee_indices_cache.get(key)
+        if let Some(indices) = self.caches.sync_committee_indices.get(key)
             && self.indices_hold_keys(&indices, sync_committee)
         {
             return Ok(indices.to_vec());
         }
         let indices = self.compute_sync_committee_indices(sync_committee)?;
-        self.sync_committee_indices_cache
+        self.caches
+            .sync_committee_indices
             .insert(key.clone(), Arc::new(indices.clone()));
         Ok(indices)
     }
@@ -2356,7 +2361,7 @@ impl BeaconState {
             self.validators[index].effective_balance = effective_balance;
         }
         // The total active balance of this epoch was summed over the old effective balances.
-        self.total_active_balance_cache.clear();
+        self.caches.total_active_balance.clear();
 
         Ok(())
     }
@@ -3555,7 +3560,7 @@ impl BeaconState {
         // Leaf chunks hold four `u64`s or 32 `u8`s, so those lists' trees are 2 and 5 levels
         // shallower than the registry limit.
         let (u64_list_depth, u8_list_depth) = (limit_depth - 2, limit_depth - 5);
-        let caches = &self.field_root_caches;
+        let caches = &self.caches.field_roots;
         let field_roots = [
             self.genesis_time.tree_hash_root(),
             self.genesis_validators_root.tree_hash_root(),
@@ -3571,7 +3576,8 @@ impl BeaconState {
             self.eth1_data.tree_hash_root(),
             self.eth1_data_votes.tree_hash_root(),
             self.eth1_deposit_index.tree_hash_root(),
-            self.validators_root_cache
+            self.caches
+                .validators_root
                 .root(&self.validators, limit_depth),
             caches
                 .balances
@@ -3742,5 +3748,67 @@ pub fn fork_name_from_version(version: [u8; 4]) -> ForkName {
         _ if version == beacon_network_spec().bellatrix_fork_version => ForkName::Bellatrix,
         _ if version == beacon_network_spec().altair_fork_version => ForkName::Altair,
         _ => ForkName::Base,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use snap::raw::Decoder;
+    use ssz::Decode;
+
+    use super::*;
+
+    fn sepolia_state() -> BeaconState {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../../../testing/gossip-validation/tests/assets/sepolia/states/grandparent_state_9552074.ssz_snappy",
+        );
+        let bytes = Decoder::new()
+            .decompress_vec(&std::fs::read(path).unwrap())
+            .unwrap();
+        BeaconState::from_ssz_bytes(&bytes).unwrap()
+    }
+
+    /// Gossip validation reads committees and proposers of the next epoch from an unadvanced
+    /// state; they must equal those of the state advanced through the epoch transition.
+    #[test]
+    fn next_epoch_duties_match_the_advanced_state() {
+        let state = sepolia_state();
+        let next_epoch = state.get_current_epoch() + 1;
+        assert!(state.fixes_duties_of_epoch(next_epoch));
+        assert!(!state.fixes_duties_of_epoch(next_epoch + 1));
+        let next_epoch_start = compute_start_slot_at_epoch(next_epoch);
+        let mut advanced = state.clone();
+        advanced.process_slots(next_epoch_start + 1).unwrap();
+
+        assert_eq!(
+            state.get_committee_count_per_slot(next_epoch),
+            advanced.get_committee_count_per_slot(next_epoch)
+        );
+        for slot in next_epoch_start..next_epoch_start + SLOTS_PER_EPOCH {
+            for index in 0..state.get_committee_count_per_slot(next_epoch) {
+                assert_eq!(
+                    state.get_beacon_committee(slot, index).unwrap(),
+                    advanced.get_beacon_committee(slot, index).unwrap(),
+                    "committee {index} at slot {slot}"
+                );
+            }
+            assert_eq!(
+                state.get_beacon_proposer_index(Some(slot)).unwrap(),
+                advanced.get_beacon_proposer_index(Some(slot)).unwrap(),
+                "proposer at slot {slot}"
+            );
+        }
+        // Later slots of the state's own epoch too.
+        for slot in state.slot + 1..next_epoch_start {
+            let mut at_slot = state.clone();
+            at_slot.process_slots(slot).unwrap();
+            assert_eq!(
+                state.get_beacon_proposer_index(Some(slot)).unwrap(),
+                at_slot.get_beacon_proposer_index(None).unwrap(),
+                "proposer at slot {slot}"
+            );
+        }
     }
 }
