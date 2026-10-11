@@ -485,7 +485,7 @@ impl Store {
         let mut justified_state = self
             .db
             .checkpoint_states_provider()
-            .get(justified_checkpoint)?;
+            .get_shared(justified_checkpoint)?;
         if justified_state.is_none() {
             // A newly justified checkpoint's state is normally stored when an attestation targeting
             // it is processed, which can come after the block that justified it.
@@ -493,7 +493,7 @@ impl Store {
             justified_state = self
                 .db
                 .checkpoint_states_provider()
-                .get(justified_checkpoint)?;
+                .get_shared(justified_checkpoint)?;
         }
         let Some(state) = justified_state else {
             // Keep the previous balances; `balances_checkpoint` stays behind so the next refresh
@@ -532,7 +532,7 @@ impl Store {
         let realized = if compute_epoch_at_slot(block.slot) >= current_epoch {
             self.db
                 .state_provider()
-                .get(root)?
+                .get_shared(root)?
                 .map(|state| state.current_justified_checkpoint)
         } else {
             None
@@ -564,9 +564,15 @@ impl Store {
             BEACON_CURRENT_JUSTIFIED_EPOCH.set(justified_checkpoint.epoch as i64);
         }
 
-        self.db
-            .previous_justified_checkpoint_provider()
-            .insert(previous_justified_checkpoint)?;
+        // Every imported block passes its checkpoints here, and they rarely change; skipping an
+        // unchanged write saves a disk sync per block.
+        if self.db.previous_justified_checkpoint_provider().get().ok()
+            != Some(previous_justified_checkpoint)
+        {
+            self.db
+                .previous_justified_checkpoint_provider()
+                .insert(previous_justified_checkpoint)?;
+        }
         BEACON_PREVIOUS_JUSTIFIED_EPOCH.set(previous_justified_checkpoint.epoch as i64);
 
         // Update finalized checkpoint
@@ -576,7 +582,11 @@ impl Store {
                 .insert(finalized_checkpoint)?;
             BEACON_FINALIZED_EPOCH.set(finalized_checkpoint.epoch as i64);
             // Clean operation pool
-            if let Some(state) = self.db.state_provider().get(finalized_checkpoint.root)? {
+            if let Some(state) = self
+                .db
+                .state_provider()
+                .get_shared(finalized_checkpoint.root)?
+            {
                 self.operation_pool.clean_signed_voluntary_exits(&state);
 
                 // Clean expired proposer preparations
@@ -607,6 +617,18 @@ impl Store {
                 Err(err) => {
                     tracing::error!("Failed to prune old blobs: {}", err);
                 }
+            }
+
+            // States before the finalized block can no longer be imported onto or voted for.
+            self.db
+                .state_provider()
+                .prune_finalized_in_background(finalized_checkpoint.root);
+            if let Err(err) = self
+                .db
+                .checkpoint_states_provider()
+                .prune_before(finalized_checkpoint.epoch)
+            {
+                warn!("Failed to prune finalized checkpoint states: {err:?}");
             }
         }
 
@@ -688,7 +710,7 @@ impl Store {
         let justified_checkpoint_state = self
             .db
             .checkpoint_states_provider()
-            .get(self.db.justified_checkpoint_provider().get()?)?
+            .get_shared(self.db.justified_checkpoint_provider().get()?)?
             .ok_or(anyhow!("Failed to find checkpoint in checkpoint states"))?;
         let committee_weight =
             get_total_active_balance(&justified_checkpoint_state) / SLOTS_PER_EPOCH;
@@ -700,7 +722,7 @@ impl Store {
         let state = &self
             .db
             .checkpoint_states_provider()
-            .get(self.db.justified_checkpoint_provider().get()?)?
+            .get_shared(self.db.justified_checkpoint_provider().get()?)?
             .ok_or_else(|| anyhow!("checkpoint_states not found"))?;
 
         let unslashed_and_active_indices: Vec<u64> = state
@@ -784,7 +806,7 @@ impl Store {
             let head_state = self
                 .db
                 .state_provider()
-                .get(block_root)?
+                .get_shared(block_root)?
                 .ok_or_else(|| anyhow!("state not found"))?;
             Ok(head_state.current_justified_checkpoint)
         }
@@ -805,7 +827,7 @@ impl Store {
         let justified_state = self
             .db
             .checkpoint_states_provider()
-            .get(self.db.justified_checkpoint_provider().get()?)?
+            .get_shared(self.db.justified_checkpoint_provider().get()?)?
             .ok_or(anyhow!("Justified checkpoint must exist in the store"))?;
 
         let reorg_threshold =
@@ -819,7 +841,7 @@ impl Store {
         let justified_state = self
             .db
             .checkpoint_states_provider()
-            .get(self.db.justified_checkpoint_provider().get()?)?
+            .get_shared(self.db.justified_checkpoint_provider().get()?)?
             .ok_or(anyhow!("Justified checkpoint must exist in the store"))?;
 
         let parent_threshold =
@@ -891,36 +913,49 @@ impl Store {
         attesting_indices: Vec<u64>,
         attestation: Attestation,
     ) -> anyhow::Result<()> {
-        let target = attestation.data.target;
-        let beacon_block_root = attestation.data.beacon_block_root;
-        let mut non_equivocating_attesting_indices = vec![];
+        self.update_latest_messages_batch(vec![(attesting_indices, attestation)])
+    }
 
+    /// ``update_latest_messages`` for several attestations, in order, with one database read and
+    /// one write. A block carries attestations from tens of thousands of validators, and reading
+    /// and committing each attestation's messages separately cost more than the block's state
+    /// transition.
+    pub fn update_latest_messages_batch(
+        &mut self,
+        attestations: Vec<(Vec<u64>, Attestation)>,
+    ) -> anyhow::Result<()> {
         let equivocating = self
             .db
             .equivocating_indices_provider()
             .get()
             .unwrap_or_default();
-
-        for &index in &attesting_indices {
-            if !equivocating.contains(&index) {
-                non_equivocating_attesting_indices.push(index);
-            }
-        }
-
         let latest_messages = self.db.latest_messages_provider();
-        let mut updates = Vec::new();
-        for index in non_equivocating_attesting_indices {
-            if latest_messages
-                .get(index)?
-                .is_none_or(|message| target.epoch > message.epoch)
-            {
-                updates.push((
-                    index,
-                    LatestMessage {
-                        epoch: target.epoch,
-                        root: beacon_block_root,
-                    },
-                ));
+        let mut stored = latest_messages.get_many(
+            attestations
+                .iter()
+                .flat_map(|(indices, _)| indices.iter().copied())
+                .filter(|index| !equivocating.contains(index))
+                .collect::<HashSet<u64>>(),
+        )?;
+
+        let mut updates = HashMap::new();
+        for (attesting_indices, attestation) in attestations {
+            let target = attestation.data.target;
+            let message = LatestMessage {
+                epoch: target.epoch,
+                root: attestation.data.beacon_block_root,
+            };
+            for index in attesting_indices {
+                if equivocating.contains(&index) {
+                    continue;
+                }
+                if stored
+                    .get(&index)
+                    .is_none_or(|latest| target.epoch > latest.epoch)
+                {
+                    stored.insert(index, message.clone());
+                    updates.insert(index, message.clone());
+                }
             }
         }
         if !updates.is_empty() {
@@ -978,7 +1013,7 @@ impl Store {
         if current_slot > previous_slot && compute_slots_since_epoch_start(current_slot) == 0 {
             match self.get_head() {
                 Ok(head) => {
-                    if let Some(state) = self.db.state_provider().get(head)? {
+                    if let Some(state) = self.db.state_provider().get_shared(head)? {
                         let active_count = state
                             .get_active_validator_indices(state.get_current_epoch())
                             .len();
@@ -1084,64 +1119,44 @@ impl Store {
         Ok(())
     }
 
+    /// Makes sure the state of ``target`` is in memory. The checkpoint states table computes it
+    /// from the target block's state, advancing it to the target epoch when needed.
     pub fn store_target_checkpoint_state(&mut self, target: Checkpoint) -> anyhow::Result<()> {
-        if self.db.checkpoint_states_provider().get(target)?.is_some() {
-            return Ok(());
-        }
-
-        let Some(mut base_state) = self.db.state_provider().get(target.root)? else {
-            return Ok(());
-        };
-
-        let target_slot = compute_start_slot_at_epoch(target.epoch);
-        if base_state.slot < target_slot {
-            base_state.process_slots(target_slot)?;
-        }
-        self.db
-            .checkpoint_states_provider()
-            .insert(target, base_state)?;
-
+        self.db.checkpoint_states_provider().get_shared(target)?;
         Ok(())
     }
 
-    pub fn compute_pulled_up_tip(&mut self, block_root: B256) -> anyhow::Result<()> {
-        let mut state = self
-            .db
-            .state_provider()
-            .get(block_root)?
-            .ok_or_else(|| anyhow!("beacon state not found"))?;
+    /// Pulls up the checkpoints of ``state``, the post-state of the block at ``block_root``.
+    pub fn compute_pulled_up_tip(
+        &mut self,
+        block_root: B256,
+        state: &BeaconState,
+    ) -> anyhow::Result<()> {
         // Pull up the post-state of the block to the next epoch boundary
-        state.process_justification_and_finalization()?;
+        let pulled_up = state.compute_justification_and_finalization()?;
 
         BEACON_CURRENT_ACTIVE_VALIDATORS.set(
             state
-                .get_active_validator_indices(state.get_current_epoch())
+                .get_shuffled_active_validator_indices(state.get_current_epoch())
                 .len() as i64,
         );
 
         self.db
             .unrealized_justifications_provider()
-            .insert(block_root, state.current_justified_checkpoint)?;
+            .insert(block_root, pulled_up.current_justified_checkpoint)?;
         self.update_unrealized_checkpoints(
-            state.current_justified_checkpoint,
-            state.finalized_checkpoint,
+            pulled_up.current_justified_checkpoint,
+            pulled_up.finalized_checkpoint,
         )?;
 
         // If the block is from a prior epoch, apply the realized values
-        let block_epoch = compute_epoch_at_slot(
-            self.db
-                .block_provider()
-                .get(block_root)?
-                .ok_or_else(|| anyhow!("block not found"))?
-                .message
-                .slot,
-        );
+        let block_epoch = compute_epoch_at_slot(state.slot);
         let current_epoch = self.get_current_store_epoch()?;
         if block_epoch < current_epoch {
             self.update_checkpoints(
-                state.current_justified_checkpoint,
-                state.finalized_checkpoint,
-                state.previous_justified_checkpoint,
+                pulled_up.current_justified_checkpoint,
+                pulled_up.finalized_checkpoint,
+                pulled_up.previous_justified_checkpoint,
             )?;
         }
 

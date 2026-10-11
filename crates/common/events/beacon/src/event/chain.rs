@@ -35,19 +35,19 @@ pub struct BlockEvent {
 }
 
 impl BlockEvent {
-    /// Creates a new `BlockEvent` from a signed block.
+    /// Creates a new `BlockEvent` from a signed block and its root.
     ///
     /// `get_checkpoint_block` is a function that computes the checkpoint block for a given epoch
     /// in the chain of the given block root.
     pub fn from_block<F>(
         signed_block: &SignedBeaconBlock,
+        block_root: B256,
         finalized_checkpoint: Option<Checkpoint>,
         get_checkpoint_block: F,
     ) -> anyhow::Result<Self>
     where
         F: FnOnce(B256, u64) -> anyhow::Result<B256>,
     {
-        let block_root = signed_block.message.block_root();
         let execution_optimistic = match finalized_checkpoint {
             Some(finalized_checkpoint) => {
                 // Block is not optimistic (finalized) if it's the finalized checkpoint block itself

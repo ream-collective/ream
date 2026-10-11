@@ -45,6 +45,12 @@ lazy_static::lazy_static! {
         "beacon_current_active_validators", "Current total active validators", default_registry()
     ).expect("failed to create BEACON_CURRENT_ACTIVE_VALIDATORS int gauge");
 
+    pub static ref BEACON_SHUFFLING_CACHE_MISSES_TOTAL: IntCounter = register_int_counter_with_registry!(
+        "beacon_shuffling_cache_misses_total",
+        "Epoch attester shufflings computed because no cached copy was available",
+        default_registry()
+    ).expect("failed to create BEACON_SHUFFLING_CACHE_MISSES_TOTAL int counter");
+
     pub static ref BEACON_REORGS_TOTAL: IntCounter = register_int_counter_with_registry!(
         "beacon_reorgs_total", "Total number of chain reorganizations", default_registry()
     ).expect("failed to create BEACON_REORGS_TOTAL int counter");

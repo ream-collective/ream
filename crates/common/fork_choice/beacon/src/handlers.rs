@@ -1,3 +1,8 @@
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    sync::Arc,
+};
+
 use alloy_primitives::{B256, map::HashSet};
 use anyhow::{anyhow, ensure};
 use ream_consensus_beacon::{
@@ -7,7 +12,9 @@ use ream_consensus_beacon::{
     predicates::is_slashable_attestation_data,
 };
 use ream_consensus_misc::{
-    constants::beacon::INTERVALS_PER_SLOT, misc::compute_start_slot_at_epoch,
+    checkpoint::Checkpoint,
+    constants::beacon::INTERVALS_PER_SLOT,
+    misc::{compute_epoch_at_slot, compute_start_slot_at_epoch},
 };
 use ream_data_availability::PendingBlock;
 use ream_execution_engine::engine_trait::ExecutionApi;
@@ -37,14 +44,33 @@ pub async fn on_block(
     execution_engine: &Option<impl ExecutionApi>,
     verify_data_availability: bool,
 ) -> anyhow::Result<OnBlockOutcome> {
+    let block_root = signed_block.message.tree_hash_root();
+    on_block_with_root(
+        store,
+        signed_block,
+        block_root,
+        execution_engine,
+        verify_data_availability,
+    )
+    .await
+}
+
+/// ``on_block`` for a block whose root the caller already computed. Hashing a mainnet block
+/// hashes its whole execution payload, a few milliseconds each time.
+pub async fn on_block_with_root(
+    store: &mut Store,
+    signed_block: &SignedBeaconBlock,
+    block_root: B256,
+    execution_engine: &Option<impl ExecutionApi>,
+    verify_data_availability: bool,
+) -> anyhow::Result<OnBlockOutcome> {
     let block = &signed_block.message;
     let parent_root = block.parent_root;
     let block_slot = block.slot;
-    let block_root = block.tree_hash_root();
 
     // Parent block must be known
     ensure!(
-        store.db.state_provider().get(parent_root)?.is_some(),
+        store.db.state_provider().contains_key(parent_root)?,
         "Missing parent block state for parent_root: {parent_root:x}",
     );
 
@@ -73,17 +99,41 @@ pub async fn on_block(
     ensure!(store.db.finalized_checkpoint_provider().get()?.root == finalized_checkpoint_block);
     // Check the block is valid and compute the post-state
     // Make a copy of the state to avoid mutability issues
-    let mut state = store
+    let mut state = Arc::unwrap_or_clone(
+        store
+            .db
+            .state_provider()
+            .get_shared(parent_root)?
+            .ok_or_else(|| anyhow!("beacon state not found"))?,
+    );
+    // The parent state is the parent block's post-state, and the parent block commits to its root,
+    // which was checked when the parent was imported.
+    let parent_state_root = store
         .db
-        .state_provider()
+        .block_provider()
         .get(parent_root)?
-        .ok_or_else(|| anyhow!("beacon state not found"))?
-        .clone();
+        .ok_or_else(|| anyhow!("parent block not found"))?
+        .message
+        .state_root;
     let state_transition_timer = BEACON_BLOCK_STATE_TRANSITION_SECONDS.start_timer();
-    state
-        .state_transition(signed_block, true, execution_engine)
+    let epoch_start_state = state
+        .state_transition_keeping_epoch_start(
+            signed_block,
+            true,
+            execution_engine,
+            Some(parent_state_root),
+        )
         .await?;
     state_transition_timer.observe_duration();
+    if let Some(epoch_start_state) = epoch_start_state {
+        store.db.checkpoint_states_provider().insert_shared(
+            Checkpoint {
+                epoch: compute_epoch_at_slot(block_slot),
+                root: parent_root,
+            },
+            Arc::new(epoch_start_state),
+        );
+    }
 
     let pending = PendingBlock {
         signed_block: signed_block.clone(),
@@ -92,7 +142,7 @@ pub async fn on_block(
 
     // If no data availability check is required, process the block immediately.
     if !verify_data_availability {
-        process_available_block(store, pending)?;
+        process_available_block(store, pending, block_root)?;
         return Ok(OnBlockOutcome::Imported);
     }
 
@@ -112,19 +162,25 @@ pub async fn on_block(
 
     match available {
         Some(available) => {
-            process_available_block(store, available)?;
+            process_available_block(store, available, block_root)?;
             Ok(OnBlockOutcome::Imported)
         }
         None => Ok(OnBlockOutcome::PendingAvailability),
     }
 }
 
-pub fn process_available_block(store: &mut Store, pending: PendingBlock) -> anyhow::Result<()> {
+/// Imports `pending`, the block at `block_root`, once its data is available.
+pub fn process_available_block(
+    store: &mut Store,
+    pending: PendingBlock,
+    block_root: B256,
+) -> anyhow::Result<()> {
+    // The block's several small writes reach the disk with one sync, when this returns.
+    let _sync = store.db.defer_sync();
     let signed_block = pending.signed_block;
-    let block_root = signed_block.message.tree_hash_root();
     let block_slot = signed_block.message.slot;
     let parent_root = signed_block.message.parent_root;
-    let state: BeaconState = pending.post_state;
+    let state = Arc::new(pending.post_state);
 
     BEACON_PROCESSED_DEPOSITS_TOTAL.set(state.eth1_deposit_index as i64);
 
@@ -135,7 +191,8 @@ pub fn process_available_block(store: &mut Store, pending: PendingBlock) -> anyh
     store
         .db
         .state_provider()
-        .insert(block_root, state.clone())?;
+        .insert_shared(block_root, state.clone())?;
+    state.prepare_next_epoch_shuffling();
 
     // Add block timeliness to the store
     let time_into_slot = (store.db.time_provider().get()?
@@ -164,7 +221,7 @@ pub fn process_available_block(store: &mut Store, pending: PendingBlock) -> anyh
     )?;
 
     // Eagerly compute unrealized justification and finality.
-    store.compute_pulled_up_tip(block_root)?;
+    store.compute_pulled_up_tip(block_root, &state)?;
 
     // Fork choice tree maintenance is the last step, once the store mutation is committed.
     store.fork_choice_insert_block(
@@ -176,6 +233,57 @@ pub fn process_available_block(store: &mut Store, pending: PendingBlock) -> anyh
     store.refresh_fork_choice();
 
     Ok(())
+}
+
+/// Runs ``on_attestation`` with ``is_from_block`` for the attestations of a block whose
+/// ``state_transition`` succeeded, returning one result per attestation.
+///
+/// ``state_transition`` already verified each attestation's signature against the same committees
+/// the target state yields, so the signature is not verified again here. Each target checkpoint
+/// state is read once per block: decoding it costs as much as the rest of the work for one
+/// attestation.
+pub fn on_block_attestations(
+    store: &mut Store,
+    attestations: &[Attestation],
+) -> Vec<anyhow::Result<()>> {
+    let mut target_states: HashMap<Checkpoint, Arc<BeaconState>> = HashMap::new();
+    let mut votes = Vec::new();
+    let mut results = Vec::with_capacity(attestations.len());
+    for attestation in attestations {
+        let attesting_indices = (|| {
+            store.validate_on_attestation(attestation, true)?;
+            let target = attestation.data.target;
+            let target_state = match target_states.entry(target) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    store.store_target_checkpoint_state(target)?;
+                    entry.insert(
+                        store
+                            .db
+                            .checkpoint_states_provider()
+                            .get_shared(target)?
+                            .ok_or_else(|| anyhow!("checkpoint_states not found"))?,
+                    )
+                }
+            };
+            anyhow::Ok(
+                target_state
+                    .get_indexed_attestation(attestation)?
+                    .attesting_indices,
+            )
+        })();
+        results.push(attesting_indices.map(|indices| {
+            votes.push((indices.to_vec(), attestation.clone()));
+        }));
+    }
+
+    // One write covers every valid attestation, so its failure fails each of them.
+    if let Err(err) = store.update_latest_messages_batch(votes) {
+        for result in results.iter_mut().filter(|result| result.is_ok()) {
+            *result = Err(anyhow!("failed to update latest messages: {err:#}"));
+        }
+    }
+    results
 }
 
 /// Run ``on_attester_slashing`` immediately upon receiving a new ``AttesterSlashing``
@@ -192,10 +300,10 @@ pub fn on_attester_slashing(
         &attestation_2.data
     ));
 
-    let state = &store
+    let state = store
         .db
         .state_provider()
-        .get(store.db.justified_checkpoint_provider().get()?.root)?
+        .get_shared(store.db.justified_checkpoint_provider().get()?.root)?
         .ok_or_else(|| anyhow!("beacon state not found"))?;
 
     ensure!(state.is_valid_indexed_attestation(&attestation_1)?);
