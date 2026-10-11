@@ -1,11 +1,17 @@
-use std::fmt;
+use std::{
+    collections::{HashSet, VecDeque},
+    fmt,
+};
 
 use alloy_primitives::B256;
 use libp2p::PeerId;
 use ream_chain_beacon::beacon_chain::{BeaconChain, BlockProcessingOutcome};
 use ream_consensus_beacon::electra::beacon_block::SignedBeaconBlock;
-use ream_p2p::network::beacon::channel::{P2PCallbackResponse, P2PMessage, P2PRequest};
-use ream_req_resp::beacon::messages::BeaconResponseMessage;
+use ream_p2p::network::beacon::{
+    channel::{P2PCallbackError, P2PCallbackResponse, P2PMessage, P2PRequest},
+    network_state::NetworkState,
+};
+use ream_req_resp::{beacon::messages::BeaconResponseMessage, error::ReqRespError};
 use ream_storage::tables::table::REDBTable;
 use ream_syncer::unknown_parent_lookups::{
     LookupActionId, ParentStatus, PayloadOrigin, UnknownBlockMeta, UnknownParentAction,
@@ -17,7 +23,7 @@ use tree_hash::TreeHash;
 
 use crate::{
     gossipsub::validate::{
-        beacon_block::validate_gossip_beacon_block, result::DependencyValidationResult,
+        beacon_block::validate_lookup_beacon_block, result::DependencyValidationResult,
     },
     p2p_sender::P2PSender,
 };
@@ -32,6 +38,7 @@ pub enum UnknownParentLookupUpdate {
     DownloadFailed {
         action_id: LookupActionId,
         requested_root: B256,
+        peer: PeerId,
         error: ParentLookupRequestError,
     },
     BlockImported {
@@ -84,6 +91,7 @@ async fn execute_unknown_parent_action(
             Err(err) => UnknownParentLookupUpdate::DownloadFailed {
                 action_id,
                 requested_root: block_root,
+                peer,
                 error: err,
             },
         },
@@ -94,7 +102,7 @@ async fn execute_unknown_parent_action(
             payload,
         } => {
             if let PayloadOrigin::Gossip = origin {
-                match validate_gossip_beacon_block(beacon_chain, cached_db, &payload).await {
+                match validate_lookup_beacon_block(beacon_chain, cached_db, &payload).await {
                     Ok(DependencyValidationResult::Accept) => {}
                     Ok(other) => {
                         return UnknownParentLookupUpdate::BlockFailed {
@@ -159,9 +167,78 @@ pub async fn parent_status(
     Ok(ParentStatus::Unknown)
 }
 
+/// Peers that answered blocks-by-root with an unsupported-protocol error. Nodes that only relay
+/// gossip do this, and they are often the first to forward a block; asking them again only spends
+/// a lookup's attempts.
+#[derive(Debug, Default)]
+pub struct BlocksByRootRefusals {
+    order: VecDeque<PeerId>,
+    peers: HashSet<PeerId>,
+}
+
+const MAX_REFUSING_PEERS: usize = 1024;
+
+impl BlocksByRootRefusals {
+    pub fn insert(&mut self, peer: PeerId) {
+        if !self.peers.insert(peer) {
+            return;
+        }
+        self.order.push_back(peer);
+        if self.order.len() > MAX_REFUSING_PEERS
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.peers.remove(&oldest);
+        }
+    }
+
+    pub fn contains(&self, peer: &PeerId) -> bool {
+        self.peers.contains(peer)
+    }
+}
+
+/// A connected peer, other than `exclude`, that sent its status and has not refused blocks by root.
+/// The choice is spread over candidates by `block_root`, so concurrent lookups ask different peers.
+pub fn fallback_lookup_peer(
+    network_state: &NetworkState,
+    refusals: &BlocksByRootRefusals,
+    exclude: &PeerId,
+    block_root: B256,
+) -> Option<PeerId> {
+    pick_fallback_peer(
+        network_state
+            .connected_peers()
+            .into_iter()
+            .map(|peer| (peer.peer_id, peer.status.is_some())),
+        refusals,
+        exclude,
+        block_root,
+    )
+}
+
+/// `fallback_lookup_peer` over `(peer, sent status)` pairs of connected peers.
+fn pick_fallback_peer(
+    peers: impl Iterator<Item = (PeerId, bool)>,
+    refusals: &BlocksByRootRefusals,
+    exclude: &PeerId,
+    block_root: B256,
+) -> Option<PeerId> {
+    let mut candidates = peers
+        .filter(|(peer, sent_status)| *sent_status && peer != exclude && !refusals.contains(peer))
+        .map(|(peer, _)| peer)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return None;
+    }
+    candidates.sort();
+    let index = u64::from_le_bytes(block_root[..8].try_into().expect("root has 32 bytes"));
+    Some(candidates[(index % candidates.len() as u64) as usize])
+}
+
 pub async fn apply_unknown_parent_update(
     coordinator: &mut UnknownParentLookupCoordinator<SignedBeaconBlock, PeerId>,
     beacon_chain: &BeaconChain,
+    network_state: &NetworkState,
+    refusals: &mut BlocksByRootRefusals,
     update: UnknownParentLookupUpdate,
 ) {
     match update {
@@ -200,13 +277,20 @@ pub async fn apply_unknown_parent_update(
         UnknownParentLookupUpdate::DownloadFailed {
             action_id,
             requested_root,
+            peer,
             error,
         } => {
             warn!(
                 ?requested_root,
+                %peer,
                 ?error,
                 "Blocks-by-root parent lookup failed"
             );
+            if matches!(error, ParentLookupRequestError::UnsupportedProtocol) {
+                refusals.insert(peer);
+            }
+            let replacement = fallback_lookup_peer(network_state, refusals, &peer, requested_root);
+            coordinator.replace_peer(requested_root, &peer, replacement);
             coordinator.download_failed(action_id, requested_root);
         }
         UnknownParentLookupUpdate::BlockImported {
@@ -246,6 +330,7 @@ pub enum ParentLookupRequestError {
     UnexpectedResponseType,
     Disconnected,
     Timeout,
+    UnsupportedProtocol,
     Callback(String),
     ResponseChannelClosed,
 }
@@ -265,6 +350,9 @@ impl fmt::Display for ParentLookupRequestError {
             }
             Self::Disconnected => write!(formatter, "peer disconnected during blocks-by-root"),
             Self::Timeout => write!(formatter, "blocks-by-root request timed out"),
+            Self::UnsupportedProtocol => {
+                write!(formatter, "peer does not serve blocks-by-root")
+            }
             Self::Callback(error) => write!(formatter, "blocks-by-root callback failed: {error}"),
             Self::ResponseChannelClosed => {
                 write!(
@@ -324,6 +412,9 @@ pub async fn request_single_block_by_root(
             }
             Ok(P2PCallbackResponse::Timeout) => {
                 return Err(ParentLookupRequestError::Timeout);
+            }
+            Err(P2PCallbackError::ReqResp(ReqRespError::UnsupportedProtocol)) => {
+                return Err(ParentLookupRequestError::UnsupportedProtocol);
             }
             Err(err) => return Err(ParentLookupRequestError::Callback(err.to_string())),
         }
@@ -501,5 +592,38 @@ mod tests {
                 "transport failed".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn fallback_skips_refusing_excluded_and_statusless_peers() {
+        let [refusing, excluded, statusless, usable] = [(); 4].map(|_| PeerId::random());
+        let mut refusals = BlocksByRootRefusals::default();
+        refusals.insert(refusing);
+        let peers = [
+            (refusing, true),
+            (excluded, true),
+            (statusless, false),
+            (usable, true),
+        ];
+        assert_eq!(
+            pick_fallback_peer(peers.into_iter(), &refusals, &excluded, B256::ZERO),
+            Some(usable)
+        );
+        assert_eq!(
+            pick_fallback_peer(peers.into_iter().take(3), &refusals, &excluded, B256::ZERO),
+            None
+        );
+    }
+
+    #[test]
+    fn refusals_forget_the_oldest_peer_beyond_capacity() {
+        let mut refusals = BlocksByRootRefusals::default();
+        let first = PeerId::random();
+        refusals.insert(first);
+        for _ in 0..MAX_REFUSING_PEERS {
+            refusals.insert(PeerId::random());
+        }
+        assert!(!refusals.contains(&first));
+        assert_eq!(refusals.peers.len(), MAX_REFUSING_PEERS);
     }
 }

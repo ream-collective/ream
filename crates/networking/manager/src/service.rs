@@ -55,11 +55,15 @@ use crate::{
     data_availability_fetch::{
         ColumnFetchOutcome, ColumnFetchTracker, fetch_missing_columns, pending_anchor_for_recovery,
     },
-    gossipsub::handle::{handle_gossipsub_message, init_gossipsub_config_with_topics},
+    gossipsub::{
+        handle::{handle_gossipsub_message, init_gossipsub_config_with_topics},
+        workers::{GossipWorkers, is_handled_concurrently},
+    },
     p2p_sender::P2PSender,
     req_resp::handle_req_resp_message,
     unknown_parent_lookup::{
-        UnknownParentLookupUpdate, apply_unknown_parent_update, spawn_unknown_parent_action,
+        BlocksByRootRefusals, UnknownParentLookupUpdate, apply_unknown_parent_update,
+        fallback_lookup_peer, spawn_unknown_parent_action,
     },
 };
 
@@ -320,11 +324,14 @@ impl NetworkManagerService {
             spawn_block_lookup_worker(beacon_chain.clone());
         let mut block_lookup_worker_active = true;
         let mut unknown_parent_lookups = UnknownParentLookupCoordinator::default();
+        let mut lookup_refusals = BlocksByRootRefusals::default();
         let (unknown_parent_update_sender, mut unknown_parent_update_receiver) =
             mpsc::channel(MAX_LOOKUPS);
         let mut column_fetch_tracker = ColumnFetchTracker::default();
         let (column_fetch_done_sender, mut column_fetch_done_receiver) =
             mpsc::unbounded_channel::<(B256, PeerId, ColumnFetchOutcome)>();
+        let gossip_workers =
+            GossipWorkers::start(beacon_chain.clone(), cached_db.clone(), p2p_sender.clone());
         let mut syncer_handle = block_range_syncer.start();
         // Avoid polling a completed JoinHandle after the syncer has caught up.
         let mut syncer_active = true;
@@ -350,6 +357,8 @@ impl NetworkManagerService {
                     apply_unknown_parent_update(
                         &mut unknown_parent_lookups,
                         &beacon_chain,
+                        &network_state,
+                        &mut lookup_refusals,
                         update,
                     ).await;
                     record_removed_lookup_entries(
@@ -671,6 +680,11 @@ impl NetworkManagerService {
                 Some(event) = manager_receiver.recv() => {
                     match event {
                         // Handles Gossipsub messages from other peers.
+                        ReamNetworkEvent::GossipsubMessage { propagation_source, message_id, message }
+                            if is_handled_concurrently(&message.topic) =>
+                        {
+                            gossip_workers.submit(message, message_id, propagation_source);
+                        }
                         ReamNetworkEvent::GossipsubMessage { propagation_source, message_id, message } => {
                             let mut pending_item = None;
                             let mut unknown_parent_block = None;
@@ -695,10 +709,22 @@ impl NetworkManagerService {
                                     slot: unknown.block.message.slot,
                                 };
                                 let before = unknown_parent_lookups.len();
+                                // A source that refused blocks by root cannot serve the parent.
+                                let lookup_peer = if lookup_refusals.contains(&propagation_source) {
+                                    fallback_lookup_peer(
+                                        &network_state,
+                                        &lookup_refusals,
+                                        &propagation_source,
+                                        meta.parent_root,
+                                    )
+                                    .unwrap_or(propagation_source)
+                                } else {
+                                    propagation_source
+                                };
                                 let outcome = unknown_parent_lookups.insert_gossip_block(
                                     meta,
                                     unknown.block,
-                                    propagation_source,
+                                    lookup_peer,
                                 );
                                 match outcome {
                                     ream_syncer::unknown_parent_lookups::InsertOutcome::Inserted => {
