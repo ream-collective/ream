@@ -15,7 +15,8 @@ mod tests {
         misc::{compute_epoch_at_slot, compute_start_slot_at_epoch},
     };
     use ream_network_manager::gossipsub::validate::{
-        beacon_block::validate_gossip_beacon_block, result::DependencyValidationResult,
+        beacon_block::{validate_gossip_beacon_block, validate_lookup_beacon_block},
+        result::DependencyValidationResult,
     };
     use ream_network_spec::networks::initialize_test_network_spec;
     use ream_operation_pool::OperationPool;
@@ -506,6 +507,46 @@ mod tests {
                 .unwrap();
         assert!(
             matches!(result, DependencyValidationResult::Ignore(reason) if reason.contains("already received"))
+        );
+    }
+
+    /// A block released by an unknown-parent lookup may have recorded its own proposer signature
+    /// when it first arrived over gossip; that must not make its import look like a duplicate.
+    #[tokio::test]
+    pub async fn test_lookup_release_accepts_its_own_recorded_signature() {
+        initialize_test_network_spec();
+        let (beacon_chain, cached_db, _block_root, _temp_dir) = db_setup().await;
+
+        let incoming_beacon_block = read_ssz_snappy_file::<SignedBeaconBlock>(
+            "./assets/sepolia/blocks/child_9552076.ssz_snappy",
+        )
+        .unwrap();
+        {
+            let state = beacon_chain
+                .store
+                .lock()
+                .await
+                .db
+                .get_latest_state()
+                .unwrap();
+            let validator =
+                &state.validators[incoming_beacon_block.message.proposer_index as usize];
+            cached_db.seen_proposer_signature.write().await.put(
+                AddressSlotIdentifier {
+                    address: validator.public_key.clone(),
+                    slot: incoming_beacon_block.message.slot,
+                },
+                incoming_beacon_block.signature.clone(),
+            );
+        }
+
+        let result =
+            validate_lookup_beacon_block(&beacon_chain, &cached_db, &incoming_beacon_block)
+                .await
+                .unwrap();
+        assert!(
+            matches!(result, DependencyValidationResult::Accept),
+            "unexpected result: {result:?}"
         );
     }
 
