@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::anyhow;
 use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::electra::{beacon_block::SignedBeaconBlock, beacon_state::BeaconState};
@@ -42,7 +44,7 @@ impl GossipValidatedBlock {
 
 struct ParentContext {
     block: SignedBeaconBlock,
-    state: BeaconState,
+    state: Arc<BeaconState>,
     pending_availability: bool,
 }
 

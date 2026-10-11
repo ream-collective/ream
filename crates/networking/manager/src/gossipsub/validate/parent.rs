@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use alloy_primitives::B256;
 use anyhow::anyhow;
 use ream_chain_beacon::beacon_chain::BeaconChain;
@@ -10,12 +12,12 @@ pub enum ParentBlock {
     /// The parent is imported. `state` is `None` if the database has the block but not its state.
     Imported {
         block: SignedBeaconBlock,
-        state: Option<BeaconState>,
+        state: Option<Arc<BeaconState>>,
     },
     /// The parent passed validation but is waiting for its data columns.
     PendingAvailability {
         block: SignedBeaconBlock,
-        state: BeaconState,
+        state: Arc<BeaconState>,
     },
 }
 
@@ -23,7 +25,7 @@ fn load_imported_parent(db: &BeaconDB, parent_root: B256) -> anyhow::Result<Opti
     let Some(block) = db.block_provider().get(parent_root)? else {
         return Ok(None);
     };
-    let state = db.state_provider().get(parent_root)?;
+    let state = db.state_provider().get_shared(parent_root)?;
     Ok(Some(ParentBlock::Imported { block, state }))
 }
 
@@ -49,7 +51,7 @@ pub async fn find_parent(
         }
         return Ok(Some(ParentBlock::PendingAvailability {
             block: pending.signed_block.clone(),
-            state: pending.post_state.clone(),
+            state: Arc::new(pending.post_state.clone()),
         }));
     }
     load_imported_parent(&store.db, parent_root)
