@@ -28,6 +28,9 @@ pub enum ReqRespError {
     #[error("Disconnected")]
     Disconnected,
 
+    #[error("The remote peer does not support the requested protocol")]
+    UnsupportedProtocol,
+
     #[error("Raw error message {0}")]
     RawError(String),
 }
