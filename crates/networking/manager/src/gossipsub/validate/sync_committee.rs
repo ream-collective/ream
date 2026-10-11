@@ -5,7 +5,7 @@ use ream_consensus_misc::{
     constants::beacon::DOMAIN_SYNC_COMMITTEE,
     misc::{compute_epoch_at_slot, compute_signing_root},
 };
-use ream_storage::cache::{BeaconCacheDB, SyncCommitteeKey};
+use ream_storage::cache::{BeaconCacheDB, SyncCommitteeKey, insert_if_unseen};
 use ream_validator_beacon::sync_committee::{
     SyncCommitteeMessage, compute_subnets_for_sync_committee,
 };
@@ -76,7 +76,11 @@ pub async fn validate_sync_committee(
         ));
     }
 
-    cached_db.seen_sync_messages.write().await.put(key, ());
+    if !insert_if_unseen(&cached_db.seen_sync_messages, key).await {
+        return Ok(ValidationResult::Ignore(
+            "Duplicate sync committee message".to_string(),
+        ));
+    }
 
     Ok(ValidationResult::Accept)
 }

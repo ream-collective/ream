@@ -2,7 +2,7 @@ use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::{
     electra::beacon_state::BeaconState, proposer_slashing::ProposerSlashing,
 };
-use ream_storage::cache::BeaconCacheDB;
+use ream_storage::cache::{BeaconCacheDB, insert_if_unseen};
 
 use super::result::ValidationResult;
 
@@ -37,11 +37,11 @@ pub async fn validate_proposer_slashing(
         )));
     }
 
-    cached_db
-        .seen_proposer_slashings
-        .write()
-        .await
-        .put(proposer_index, ());
+    if !insert_if_unseen(&cached_db.seen_proposer_slashings, proposer_index).await {
+        return Ok(ValidationResult::Ignore(
+            "A proposer slashing for this proposer has already been seen".to_string(),
+        ));
+    }
 
     Ok(ValidationResult::Accept)
 }

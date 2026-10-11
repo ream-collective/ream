@@ -7,7 +7,9 @@ use ream_consensus_misc::{
     misc::{compute_epoch_at_slot, compute_signing_root, compute_sync_committee_period},
 };
 use ream_events_beacon::contribution_and_proof::SignedContributionAndProof;
-use ream_storage::cache::{BeaconCacheDB, CacheSyncCommitteeContribution, SyncCommitteeKey};
+use ream_storage::cache::{
+    BeaconCacheDB, CacheSyncCommitteeContribution, SyncCommitteeKey, insert_if_unseen,
+};
 use ream_validator_beacon::{
     constants::{
         DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
@@ -86,22 +88,16 @@ pub async fn validate_sync_committee_contribution_and_proof(
         subcommittee_index: contribution.subcommittee_index,
     };
 
-    if cached_db
-        .seen_sync_committee_contributions
-        .read()
-        .await
-        .contains(&sync_contribution)
+    if !insert_if_unseen(
+        &cached_db.seen_sync_committee_contributions,
+        sync_contribution,
+    )
+    .await
     {
         return Ok(ValidationResult::Ignore(
             "A valid sync committee contribution with equal slot, beacon_block_root and subcommittee_index has already been seen".to_string(),
         ));
     }
-
-    cached_db
-        .seen_sync_committee_contributions
-        .write()
-        .await
-        .put(sync_contribution, ());
 
     // [IGNORE] if a valid sync committee contribution has already been seen from the
     // aggregator with index contribution_and_proof.aggregator_index for the slot contribution.slot
@@ -112,22 +108,11 @@ pub async fn validate_sync_committee_contribution_and_proof(
         validator_index: contribution_and_proof.aggregator_index,
     };
 
-    if cached_db
-        .seen_sync_messages
-        .read()
-        .await
-        .contains(&sync_committee_key)
-    {
+    if !insert_if_unseen(&cached_db.seen_sync_messages, sync_committee_key).await {
         return Ok(ValidationResult::Ignore(
             "A valid sync committee contribution for this aggregator, slot and subcommittee index has already been seen".to_string(),
         ));
     }
-
-    cached_db
-        .seen_sync_messages
-        .write()
-        .await
-        .put(sync_committee_key, ());
 
     // [REJECT] if contribution_and_proof.selection_proof is not a valid signature of the
     // SyncAggregatorSelectionData derived from the contribution of the validator
