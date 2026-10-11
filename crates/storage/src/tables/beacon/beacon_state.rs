@@ -50,6 +50,13 @@ pub struct BeaconStateTable {
     pub cache: Option<Arc<BeaconCacheDB>>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PreparedStateImport {
+    pub(crate) summary: StateSummary,
+    snapshot_after_commit: bool,
+    wrote_state_file: bool,
+}
+
 /// Table definition for the Beacon State table, which held whole states before they moved to
 /// files. Its states are still read, and deleted once finalized.
 ///
@@ -126,6 +133,71 @@ impl REDBTable for BeaconStateTable {
 }
 
 impl BeaconStateTable {
+    /// Prepare a block-import state for the database transaction without publishing it to caches.
+    /// Whole state files are written first and removed if the transaction aborts; replay summaries
+    /// are inserted by the caller in the same transaction as the block.
+    pub(crate) fn prepare_import(
+        &self,
+        block_root: B256,
+        state: &Arc<BeaconState>,
+    ) -> Result<PreparedStateImport, StoreError> {
+        let parent = self
+            .summaries()
+            .get(state.latest_block_header.parent_root)?;
+        let snapshot_after_commit = parent.is_some_and(|parent| {
+            compute_epoch_at_slot(state.slot) > compute_epoch_at_slot(parent.slot)
+        });
+        // Without a cache there is no background writer or pending overlay, so epoch snapshots
+        // must be complete before the database publishes a stored-whole summary.
+        let wrote_state_file = parent.is_none() || (snapshot_after_commit && self.cache.is_none());
+        if wrote_state_file {
+            self.set_pending(block_root, state);
+            if let Err(err) = write_state_file(&self.data_dir, block_root, state) {
+                self.clear_pending(block_root, state);
+                return Err(err);
+            }
+        }
+        Ok(PreparedStateImport {
+            summary: StateSummary {
+                slot: state.slot,
+                stored_whole: wrote_state_file,
+            },
+            snapshot_after_commit,
+            wrote_state_file,
+        })
+    }
+
+    /// Publish a state only after its block and summary transaction committed.
+    pub(crate) fn finish_import(
+        &self,
+        block_root: B256,
+        state: Arc<BeaconState>,
+        prepared: PreparedStateImport,
+    ) {
+        self.cache_state(block_root, state.clone());
+        if prepared.wrote_state_file {
+            self.clear_pending(block_root, &state);
+        } else if prepared.snapshot_after_commit {
+            // A cached table retains the state if spawning or writing fails, and shutdown retries
+            // it. The no-cache case was written synchronously in `prepare_import`.
+            let _ = self.store_whole_in_background(block_root, state);
+        }
+    }
+
+    /// Remove a whole state file prepared for a transaction that did not commit.
+    pub(crate) fn abort_import(
+        &self,
+        block_root: B256,
+        state: &Arc<BeaconState>,
+        prepared: PreparedStateImport,
+    ) -> Result<(), StoreError> {
+        self.clear_pending(block_root, state);
+        if prepared.wrote_state_file {
+            remove_state_file(&self.data_dir, block_root)?;
+        }
+        Ok(())
+    }
+
     /// The state after the block at `block_root`, shared with the in-memory cache instead of
     /// copied. Callers that only read the state should use this over `get`.
     pub fn get_shared(&self, block_root: B256) -> Result<Option<Arc<BeaconState>>, StoreError> {
@@ -153,25 +225,17 @@ impl BeaconStateTable {
         block_root: B256,
         state: Arc<BeaconState>,
     ) -> Result<(), StoreError> {
-        self.cache_state(block_root, state.clone());
-        let parent = self
-            .summaries()
-            .get(state.latest_block_header.parent_root)?;
-        let Some(parent) = parent else {
-            // Nothing to replay from, as for the checkpoint sync anchor.
-            return self.store_whole(block_root, &state);
-        };
-
-        self.summaries().insert(
-            block_root,
-            StateSummary {
-                slot: state.slot,
-                stored_whole: false,
-            },
-        )?;
-        if compute_epoch_at_slot(state.slot) > compute_epoch_at_slot(parent.slot) {
-            self.store_whole_in_background(block_root, state);
+        let _accepting = BeaconCacheDB::accept_writes(self.cache.as_ref())?;
+        let prepared = self.prepare_import(block_root, &state)?;
+        if let Err(err) = self.summaries().insert(block_root, prepared.summary) {
+            let _ = self
+                .abort_import(block_root, &state, prepared)
+                .inspect_err(|err| {
+                    warn!("Failed to remove state file of aborted insert {block_root}: {err:?}")
+                });
+            return Err(err);
         }
+        self.finish_import(block_root, state, prepared);
         Ok(())
     }
 
@@ -194,6 +258,9 @@ impl BeaconStateTable {
             }
             return;
         };
+        let Ok(_accepting) = cache.storage_write_guard() else {
+            return;
+        };
         if cache.pruning_states.swap(true, Ordering::AcqRel) {
             // The running pruning covers this block's ancestors; the next finalization catches up.
             return;
@@ -203,14 +270,18 @@ impl BeaconStateTable {
             data_dir: self.data_dir.clone(),
             cache: Some(cache.clone()),
         };
-        thread::spawn(move || {
+        let worker_cache = cache.clone();
+        if let Err(err) = cache.spawn_storage_task(move || {
             match table.prune_finalized(finalized_root) {
                 Ok(0) => {}
                 Ok(pruned) => info!("Pruned {pruned} finalized states"),
                 Err(err) => warn!("Failed to prune finalized states: {err:?}"),
             }
+            worker_cache.pruning_states.store(false, Ordering::Release);
+        }) {
             cache.pruning_states.store(false, Ordering::Release);
-        });
+            warn!("Failed to start state pruning: {err:?}");
+        }
     }
 
     /// Deletes the states of blocks before the finalized block and returns how many it deleted.
@@ -426,7 +497,7 @@ impl BeaconStateTable {
     /// Stores `state` whole and records it in its summary. While the write runs the state is
     /// pending: readable from memory, and its file is kept by `remove_unrecorded_state_files`.
     fn store_whole(&self, block_root: B256, state: &Arc<BeaconState>) -> Result<(), StoreError> {
-        self.set_pending(block_root, Some(state));
+        self.set_pending(block_root, state);
         let stored = write_state_file(&self.data_dir, block_root, state).and_then(|()| {
             let mut write_txn = self.database().begin_write()?;
             write_txn.set_durability(Durability::Immediate)?;
@@ -442,42 +513,77 @@ impl BeaconStateTable {
             write_txn.commit()?;
             Ok(())
         });
-        self.set_pending(block_root, None);
+        // A synchronous insertion reports failure to its caller and must not publish an
+        // unrecorded anchor as an accepted state in the pending overlay.
+        self.clear_pending(block_root, state);
         stored
     }
 
-    fn set_pending(&self, block_root: B256, state: Option<&Arc<BeaconState>>) {
+    fn clear_pending(&self, block_root: B256, state: &Arc<BeaconState>) {
+        if let Some(cache) = &self.cache
+            && let Ok(mut pending) = cache.pending_state_snapshots.lock()
+            && pending
+                .get(&block_root)
+                .is_some_and(|current| Arc::ptr_eq(current, state))
+        {
+            pending.remove(&block_root);
+        }
+    }
+
+    /// Retry snapshots retained after a write/enqueue failure, once workers have stopped.
+    pub(crate) fn flush(&self) -> Result<(), StoreError> {
+        let Some(cache) = &self.cache else {
+            return Ok(());
+        };
+        let snapshots: Vec<_> = cache
+            .pending_state_snapshots
+            .lock()
+            .expect("pending state snapshots lock is not poisoned")
+            .iter()
+            .map(|(root, state)| (*root, state.clone()))
+            .collect();
+        for (root, state) in snapshots {
+            self.store_whole_if_recorded(root, &state)?;
+            self.clear_pending(root, &state);
+        }
+        Ok(())
+    }
+
+    fn set_pending(&self, block_root: B256, state: &Arc<BeaconState>) {
         if let Some(cache) = &self.cache
             && let Ok(mut pending) = cache.pending_state_snapshots.lock()
         {
-            match state {
-                Some(state) => pending.insert(block_root, state.clone()),
-                None => pending.remove(&block_root),
-            };
+            pending.insert(block_root, state.clone());
         }
     }
 
     /// Stores `state` whole on another thread, keeping it readable from memory until the write
     /// commits. Its summary is already stored, and until then it is rebuilt from an older state.
-    fn store_whole_in_background(&self, block_root: B256, state: Arc<BeaconState>) {
+    fn store_whole_in_background(
+        &self,
+        block_root: B256,
+        state: Arc<BeaconState>,
+    ) -> Result<(), StoreError> {
         let Some(cache) = self.cache.clone() else {
-            if let Err(err) = self.store_whole(block_root, &state) {
-                warn!("Failed to store state {block_root}: {err:?}");
-            }
-            return;
+            return self.store_whole_if_recorded(block_root, &state);
         };
-        self.set_pending(block_root, Some(&state));
+        self.set_pending(block_root, &state);
         let table = Self {
             db: self.db.clone(),
             data_dir: self.data_dir.clone(),
             cache: Some(cache.clone()),
         };
-        thread::spawn(move || {
+        if let Err(err) = cache.spawn_storage_task(move || {
             if let Err(err) = table.store_whole_if_recorded(block_root, &state) {
                 warn!("Failed to store state {block_root}: {err:?}");
+                return;
             }
-            table.set_pending(block_root, None);
-        });
+            table.clear_pending(block_root, &state);
+        }) {
+            // Its summary and pending snapshot already make the accepted state readable.
+            warn!("Failed to start state writer {block_root}: {err:?}");
+        }
+        Ok(())
     }
 
     /// `store_whole` for a state whose summary is already stored, unless the summary was removed
@@ -549,5 +655,147 @@ fn remove_state_file(data_dir: &Path, block_root: B256) -> Result<(), StoreError
 pub(crate) fn drop_state_in_background(state: Arc<BeaconState>) {
     if Arc::strong_count(&state) == 1 {
         thread::spawn(move || drop(state));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH;
+    use tempdir::TempDir;
+
+    use super::*;
+    use crate::{cache::BeaconCacheDB, db::ReamDB, test_utils::sepolia_state};
+
+    fn child_of(parent_root: B256, parent: &BeaconState, slot: u64) -> Arc<BeaconState> {
+        let mut state = parent.clone();
+        state.latest_block_header.parent_root = parent_root;
+        state.slot = slot;
+        Arc::new(state)
+    }
+
+    /// The anchor has nothing to replay from and is stored whole; a child in the same epoch only
+    /// gets a summary; a child in a later epoch is stored whole, synchronously without a cache.
+    #[test]
+    fn insert_shared_stores_anchors_and_epoch_starts_whole() {
+        let dir = TempDir::new("ream_insert_shared").unwrap();
+        let db = ReamDB::new(dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap();
+        let states = db.state_provider();
+        let anchor = sepolia_state();
+        let anchor_root = B256::repeat_byte(1);
+        let same_epoch_root = B256::repeat_byte(2);
+        let next_epoch_root = B256::repeat_byte(3);
+        let file = |root: B256| state_file_path(dir.path(), root);
+
+        states.insert_shared(anchor_root, anchor.clone()).unwrap();
+        assert!(states.is_stored_whole(anchor_root).unwrap());
+        assert!(file(anchor_root).exists());
+
+        let same_epoch = child_of(anchor_root, &anchor, anchor.slot + 1);
+        states.insert_shared(same_epoch_root, same_epoch).unwrap();
+        assert!(!states.is_stored_whole(same_epoch_root).unwrap());
+        assert!(!file(same_epoch_root).exists());
+
+        let next_epoch = child_of(anchor_root, &anchor, anchor.slot + SLOTS_PER_EPOCH);
+        states.insert_shared(next_epoch_root, next_epoch).unwrap();
+        assert!(states.is_stored_whole(next_epoch_root).unwrap());
+        assert!(file(next_epoch_root).exists());
+        assert_eq!(
+            states.get_shared(anchor_root).unwrap().as_deref(),
+            Some(anchor.as_ref())
+        );
+    }
+
+    /// With a cache, the inserted state is shared from memory and nothing stays pending once a
+    /// synchronous write finishes.
+    #[test]
+    fn insert_shared_caches_the_inserted_state() {
+        let dir = TempDir::new("ream_insert_shared_cached").unwrap();
+        let cache = Arc::new(BeaconCacheDB::new());
+        let db = ReamDB::new(dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap()
+            .with_cache(cache.clone());
+        let anchor = sepolia_state();
+        let root = B256::repeat_byte(1);
+
+        db.state_provider()
+            .insert_shared(root, anchor.clone())
+            .unwrap();
+        let shared = db.state_provider().get_shared(root).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&shared, &anchor));
+        assert!(cache.pending_state_snapshots.lock().unwrap().is_empty());
+    }
+
+    /// State write errors propagate, a failed anchor never becomes visible, and a failed
+    /// background snapshot stays readable until a later drain stores it.
+    #[test]
+    fn state_write_failures_are_reported_and_retried() {
+        let dir = TempDir::new("ream_state_write_failure").unwrap();
+        let cache = Arc::new(BeaconCacheDB::new());
+        let db = ReamDB::new(dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap()
+            .with_cache(cache.clone());
+        // A file where the state directory should be makes every state file write fail.
+        let mut bad_db = db.clone();
+        bad_db.data_dir = dir.path().join("file_instead_of_directory");
+        std::fs::write(&bad_db.data_dir, b"not a directory").unwrap();
+        let root = B256::repeat_byte(0x71);
+        let parent = B256::repeat_byte(0x72);
+        let mut state = Arc::unwrap_or_clone(sepolia_state());
+        state.slot = 32;
+
+        // A failed anchor insertion must not remain visible through the state cache.
+        let anchor = Arc::new(state.clone());
+        assert!(bad_db.state_provider().insert_shared(root, anchor).is_err());
+        assert!(db.state_provider().get_shared(root).unwrap().is_none());
+        assert!(cache.pending_state_snapshots.lock().unwrap().is_empty());
+
+        // An epoch start whose parent is recorded in an earlier epoch.
+        db.state_provider()
+            .summaries()
+            .insert(
+                parent,
+                StateSummary {
+                    slot: 0,
+                    stored_whole: true,
+                },
+            )
+            .unwrap();
+        state.latest_block_header.parent_root = parent;
+        let child = Arc::new(state);
+
+        // Without a cache, the epoch snapshot is written synchronously and its error returned.
+        let mut uncached = bad_db.state_provider();
+        uncached.cache = None;
+        assert!(uncached.insert_shared(root, child.clone()).is_err());
+
+        // A background failure keeps the accepted snapshot readable, even after LRU eviction.
+        bad_db
+            .state_provider()
+            .insert_shared(root, child.clone())
+            .unwrap();
+        assert!(bad_db.flush_pending_writes().is_err());
+        cache.states.lock().unwrap().clear();
+        let shared = db.state_provider().get_shared(root).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&shared, &child));
+        assert!(!db.state_provider().is_stored_whole(root).unwrap());
+
+        // A drain with a working directory stores it, and a reopened database reads it.
+        db.flush_pending_writes().unwrap();
+        assert!(db.state_provider().is_stored_whole(root).unwrap());
+        assert!(cache.pending_state_snapshots.lock().unwrap().is_empty());
+        drop((uncached, bad_db, db, shared));
+        let reopened = ReamDB::new(dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap();
+        let stored = reopened.state_provider().get_shared(root).unwrap().unwrap();
+        assert_eq!(stored.slot, 32);
     }
 }

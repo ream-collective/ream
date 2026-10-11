@@ -1,9 +1,9 @@
 use std::{fmt::Debug, sync::Arc};
 
-use redb::{Database, ReadableDatabase, TableDefinition};
+use redb::{Database, Durability, ReadableDatabase, TableDefinition};
 use ssz::{Decode, Encode};
 
-use crate::{durability::commit_durability, errors::StoreError};
+use crate::errors::StoreError;
 
 pub trait REDBTable
 where
@@ -51,7 +51,7 @@ where
         value: Self::Value,
     ) -> Result<(), StoreError> {
         let mut write_txn = self.database().begin_write()?;
-        write_txn.set_durability(commit_durability())?;
+        write_txn.set_durability(Durability::Immediate)?;
         {
             let mut table = write_txn.open_table(Self::TABLE_DEFINITION)?;
             table.insert(key, value)?;

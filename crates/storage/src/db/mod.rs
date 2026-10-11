@@ -277,4 +277,62 @@ mod tests {
         let again = ream_db.init_beacon_db().unwrap();
         assert!(Arc::ptr_eq(&again.votes_db, &db.votes_db));
     }
+
+    #[test]
+    fn interrupted_vote_migration_retries_before_removing_the_source() {
+        let dir = TempDir::new("ream_vote_migration_retry").unwrap();
+        let message = LatestMessage {
+            epoch: 7,
+            root: B256::repeat_byte(3),
+        };
+        {
+            let ream_db = ReamDB::new(dir.path().to_path_buf()).unwrap();
+            let write_txn = ream_db.db.begin_write().unwrap();
+            {
+                let mut table = write_txn
+                    .open_table(LatestMessagesTable::TABLE_DEFINITION)
+                    .unwrap();
+                table.insert(5, message.clone()).unwrap();
+                table.insert(6, message.clone()).unwrap();
+            }
+            write_txn.commit().unwrap();
+            // Model restart after destination commit, before deleting the legacy table.
+            let votes_db = Database::create(dir.path().join(VOTES_REDB_FILE)).unwrap();
+            let write_txn = votes_db.begin_write().unwrap();
+            {
+                let mut table = write_txn
+                    .open_table(LatestMessagesTable::TABLE_DEFINITION)
+                    .unwrap();
+                table.insert(5, message.clone()).unwrap();
+                table.insert(6, message.clone()).unwrap();
+                table.insert(9, message.clone()).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+        {
+            let ream_db = ReamDB::new(dir.path().to_path_buf()).unwrap();
+            let db = ream_db.init_beacon_db().unwrap();
+            assert_eq!(
+                db.latest_messages_provider().get_all().unwrap(),
+                vec![
+                    (5, message.clone()),
+                    (6, message.clone()),
+                    (9, message.clone())
+                ]
+            );
+            assert!(matches!(
+                ream_db
+                    .db
+                    .begin_read()
+                    .unwrap()
+                    .open_table(LatestMessagesTable::TABLE_DEFINITION),
+                Err(redb::TableError::TableDoesNotExist(_))
+            ));
+        }
+        let db = ReamDB::new(dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap();
+        assert_eq!(db.latest_messages_provider().get_all().unwrap().len(), 3);
+    }
 }
