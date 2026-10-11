@@ -11,7 +11,8 @@
 //!    many blocks after it.
 //! 3. `REAM_BENCH_FIXTURE_DIR=<out> cargo test --release -p ream --bin ream
 //!    mainnet_block_import_bench -- --ignored --nocapture`. Set `REAM_BENCH_MAX_AVG_MS` to fail
-//!    when the average import time per block exceeds a budget.
+//!    when the average import time per block exceeds a budget. Set `REAM_BENCH_KEEP_DATA` to retain
+//!    the benchmark database after the run.
 
 use std::{
     env, fs,
@@ -283,7 +284,11 @@ async fn mainnet_block_import_bench() {
         epoch_start_ms.len(),
         average(&epoch_start_ms)
     );
-    let _ = fs::remove_dir_all(&data_dir);
+    if env::var_os("REAM_BENCH_KEEP_DATA").is_some() {
+        println!("retained benchmark data at {}", data_dir.display());
+    } else {
+        let _ = fs::remove_dir_all(&data_dir);
+    }
 
     if let Ok(budget) = env::var("REAM_BENCH_MAX_AVG_MS") {
         let budget: f64 = budget.parse().expect("REAM_BENCH_MAX_AVG_MS is a number");
@@ -291,5 +296,250 @@ async fn mainnet_block_import_bench() {
             average_ms <= budget,
             "average import time {average_ms:.0} ms exceeds the {budget:.0} ms budget"
         );
+    }
+}
+
+/// A correctness diagnostic, not a timing benchmark. Keeps its database for review.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the public mainnet import fixture; full hashing is deliberately expensive"]
+async fn mainnet_import_correctness_review() {
+    let fixture_dir = env_path("REAM_BENCH_FIXTURE_DIR");
+    set_beacon_network_spec(MAINNET.clone());
+    let anchor_state: BeaconState = read(&fixture_dir.join(ANCHOR_STATE));
+    let anchor_block: SignedBeaconBlock = read(&fixture_dir.join(ANCHOR_BLOCK));
+    set_genesis_validator_root(anchor_state.genesis_validators_root);
+    let anchor_state_root = anchor_block.message.state_root;
+    assert_eq!(anchor_state.state_root(), anchor_state.tree_hash_root());
+    assert_eq!(anchor_state.state_root(), anchor_state_root);
+
+    let epoch = anchor_state.get_current_epoch();
+    let keys: Vec<_> = anchor_state
+        .validators
+        .iter()
+        .filter(|validator| validator.is_active_validator(epoch))
+        .map(|validator| validator.public_key.clone())
+        .collect();
+    ream_bls::prewarm_public_keys(&keys);
+    drop(keys);
+    let mut dirs: Vec<_> = fs::read_dir(&fixture_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir())
+        .collect();
+    dirs.sort();
+    let first: SignedBeaconBlock = read(&dirs[0].join("block.ssz"));
+
+    let mut invalid_signature = first.clone();
+    invalid_signature.signature = Default::default();
+    assert!(
+        anchor_state
+            .clone()
+            .state_transition_from_root(
+                &invalid_signature,
+                true,
+                &None::<ream_execution_engine::ExecutionEngine>,
+                Some(anchor_state_root)
+            )
+            .await
+            .is_err()
+    );
+    let mut corrupted_state = anchor_state.clone();
+    corrupted_state.balances[100_000] += 1;
+    let error = corrupted_state
+        .state_transition_from_root(
+            &first,
+            true,
+            &None::<ream_execution_engine::ExecutionEngine>,
+            Some(anchor_state_root),
+        )
+        .await
+        .expect_err("a wrong post-state must fail validation");
+    assert!(
+        error.to_string().contains("computed_state_root"),
+        "{error:#}"
+    );
+    println!("review rejected block signature and corrupted pre-state at post-state-root check");
+
+    let data_dir = env::temp_dir().join(format!(
+        "ream_mainnet_correctness_{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&data_dir).unwrap();
+    println!("review retained database {}", data_dir.display());
+    let cache = Arc::new(BeaconCacheDB::default());
+    let db = open_db(&data_dir).with_cache(cache.clone());
+    drop(get_forkchoice_store(anchor_state, anchor_block, db.clone()).unwrap());
+    db.time_provider()
+        .insert(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+    let chain = BeaconChain::new(
+        db.clone(),
+        Arc::new(OperationPool::default()),
+        Arc::new(SyncCommitteePool::default()),
+        None,
+        None,
+    )
+    .force_data_availability_checks();
+    let mut early_state = None;
+    let mut head_root = first.message.parent_root;
+    let mut head_state_root = anchor_state_root;
+    for (position, dir) in dirs.iter().enumerate() {
+        let block: SignedBeaconBlock = read(&dir.join("block.ssz"));
+        let block_root = block.message.tree_hash_root();
+        let columns: Vec<DataColumnSidecar> = (0..NUMBER_OF_COLUMNS)
+            .filter_map(|index| {
+                let path = dir.join(format!("column_{index}.ssz"));
+                path.exists().then(|| read(&path))
+            })
+            .collect();
+        if position == 0 {
+            assert!(!block.message.body.blob_kzg_commitments.is_empty());
+            assert_eq!(columns.len(), NUMBER_OF_COLUMNS as usize);
+            assert!(matches!(
+                chain.process_block(block.clone()).await.unwrap(),
+                BlockProcessingOutcome::PendingAvailability { .. }
+            ));
+            assert!(!db.block_provider().contains_key(block_root).unwrap());
+            for column in columns {
+                let last = column.index == NUMBER_OF_COLUMNS - 1;
+                chain
+                    .import_data_column_sidecar_if(column, |_| Ok(()))
+                    .await
+                    .unwrap();
+                assert_eq!(db.block_provider().contains_key(block_root).unwrap(), last);
+            }
+            println!("review missing all columns and missing final column both prevented import");
+        } else {
+            for column in columns {
+                chain
+                    .import_data_column_sidecar_if(column, |_| Ok(()))
+                    .await
+                    .unwrap();
+            }
+            assert!(matches!(
+                chain.process_block(block.clone()).await.unwrap(),
+                BlockProcessingOutcome::Imported { .. }
+            ));
+        }
+        let state = db.state_provider().get_shared(block_root).unwrap().unwrap();
+        let cached_started = Instant::now();
+        let cached_root = state.state_root();
+        let cached_ms = cached_started.elapsed().as_secs_f64() * 1000.0;
+        let full_started = Instant::now();
+        let full_root = state.tree_hash_root();
+        let full_ms = full_started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(cached_root, full_root, "cached root at slot {}", state.slot);
+        assert_eq!(
+            full_root, block.message.state_root,
+            "full root at slot {}",
+            state.slot
+        );
+        println!(
+            "review slot={} cached_ms={cached_ms:.3} full_ms={full_ms:.3} root={full_root}",
+            state.slot
+        );
+        if position == 0 {
+            early_state = Some((state.clone(), full_root));
+        }
+        head_root = block_root;
+        head_state_root = full_root;
+    }
+    let (early_state, early_root) = early_state.unwrap();
+    assert_eq!(early_state.state_root(), early_root);
+    let head = db.state_provider().get_shared(head_root).unwrap().unwrap();
+    assert_eq!(head.state_root(), head_state_root);
+    assert_eq!(early_state.state_root(), early_root);
+    assert_eq!(chain.head().unwrap().head_root, head_root);
+
+    // This tests clean recovery after writers finish, not crash durability.
+    let deadline = Instant::now() + std::time::Duration::from_secs(30);
+    while !cache.pending_state_snapshots.lock().unwrap().is_empty()
+        || cache.pending_latest_messages.lock().unwrap().flushing
+    {
+        assert!(Instant::now() < deadline, "background writes did not drain");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    db.flush_pending_writes().unwrap();
+    let votes = db.latest_messages_provider().get_all().unwrap();
+    assert!(!votes.is_empty());
+    drop(chain);
+    drop(db);
+    let reopened = open_db(&data_dir).with_cache(Arc::new(BeaconCacheDB::default()));
+    let rebuilt = reopened
+        .state_provider()
+        .get_shared(head_root)
+        .unwrap()
+        .unwrap();
+    assert_eq!(rebuilt.state_root(), head_state_root);
+    assert_eq!(rebuilt.tree_hash_root(), head_state_root);
+    assert_eq!(
+        reopened.latest_messages_provider().get_all().unwrap(),
+        votes
+    );
+    println!(
+        "review checked {} imported states, alternating shared caches, and clean reopen with {} votes",
+        dirs.len(),
+        votes.len()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the public mainnet import fixture; does not sign new blocks"]
+async fn mainnet_operation_signature_review() {
+    let fixture_dir = env_path("REAM_BENCH_FIXTURE_DIR");
+    set_beacon_network_spec(MAINNET.clone());
+    let mut state: BeaconState = read(&fixture_dir.join(ANCHOR_STATE));
+    let anchor: SignedBeaconBlock = read(&fixture_dir.join(ANCHOR_BLOCK));
+    set_genesis_validator_root(state.genesis_validators_root);
+    let mut dirs: Vec<_> = fs::read_dir(&fixture_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir())
+        .collect();
+    dirs.sort();
+    let block: SignedBeaconBlock = read(&dirs[0].join("block.ssz"));
+    assert_eq!(state.state_root(), anchor.message.state_root);
+    state.process_slots(block.message.slot).unwrap();
+    let engine = None::<ream_execution_engine::ExecutionEngine>;
+    // This bypasses the envelope signature deliberately so each inner signature is reached.
+    state
+        .clone()
+        .process_block(&block.message, &engine)
+        .await
+        .unwrap();
+    let mut bad_randao = block.message.clone();
+    bad_randao.body.randao_reveal = Default::default();
+    let mut bad_attestation = block.message.clone();
+    assert!(!bad_attestation.body.attestations.is_empty());
+    bad_attestation.body.attestations[0].signature = Default::default();
+    let mut bad_sync = block.message.clone();
+    assert!(
+        bad_sync
+            .body
+            .sync_aggregate
+            .sync_committee_bits
+            .iter()
+            .any(|bit| bit)
+    );
+    bad_sync.body.sync_aggregate.sync_committee_signature = Default::default();
+    for (name, invalid) in [
+        ("RANDAO", bad_randao),
+        ("attestation", bad_attestation),
+        ("sync aggregate", bad_sync),
+    ] {
+        let error = state
+            .clone()
+            .process_block(&invalid, &engine)
+            .await
+            .expect_err(name);
+        println!("review rejected {name} signature: {error:#}");
     }
 }
