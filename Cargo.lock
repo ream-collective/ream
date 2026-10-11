@@ -2882,6 +2882,8 @@ dependencies = [
  "ream-consensus-beacon",
  "ream-consensus-lean",
  "ream-consensus-misc",
+ "ream-execution-engine",
+ "ream-metrics",
  "ream-network-manager",
  "ream-network-spec",
  "ream-operation-pool",
@@ -2893,6 +2895,7 @@ dependencies = [
  "snap",
  "tempdir",
  "tokio",
+ "tree_hash",
 ]
 
 [[package]]

@@ -82,9 +82,8 @@ use ream_rpc_common::config::RpcServerConfig;
 use ream_rpc_lean::{handlers::test_driver::test_driver_enabled, server::start_test_driver};
 use ream_storage::{
     cache::{BeaconCacheDB, LeanCacheDB},
-    db::{ReamDB, reset_db},
+    db::{ReamDB, beacon::BeaconDB, reset_db},
     dir::setup_data_dir,
-    tables::table::REDBTable,
 };
 use ream_sync::rwlock::Writer;
 use ream_sync_committee_pool::SyncCommitteePool;
@@ -158,7 +157,8 @@ fn main() {
         reset_db(&ream_directory).expect("Unable to delete database");
     }
 
-    let task_handle = match cli.command {
+    let (storage_sender, storage_receiver) = std::sync::mpsc::channel();
+    let mut task_handle = match cli.command {
         Commands::LeanNode(config) => {
             let ream_db =
                 ReamDB::new(ream_directory.clone()).expect("unable to init Ream Database");
@@ -167,7 +167,9 @@ fn main() {
         Commands::BeaconNode(config) => {
             let ream_db =
                 ReamDB::new(ream_directory.clone()).expect("unable to init Ream Database");
-            executor_clone.spawn(async move { run_beacon_node(*config, executor, ream_db).await })
+            executor_clone.spawn(async move {
+                run_beacon_node(*config, executor, ream_db, storage_sender).await
+            })
         }
         Commands::ValidatorNode(config) => {
             executor_clone.spawn(async move { run_validator_node(*config, executor).await })
@@ -187,21 +189,42 @@ fn main() {
         }
     };
 
-    executor_clone.runtime().block_on(async {
-        tokio::select! {
+    let service_failed = executor_clone.runtime().block_on(async {
+        let service_result = tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 info!("Ctrl-C received, shutting down...");
+                None
             }
-            _ = task_handle => {
+            result = &mut task_handle => {
                 info!("Service exited, shutting down...");
+                Some(result)
             }
-        }
+        };
 
         executor_clone.shutdown_signal();
+        match service_result {
+            None => {
+                let _ = task_handle.await;
+                false
+            }
+            // A panicking service must not look like a clean exit to supervisors.
+            Some(result) => result.is_err(),
+        }
     });
 
     executor_clone.shutdown_runtime();
 
+    if let Ok(db) = storage_receiver.try_recv()
+        && let Err(err) = db.shutdown_storage()
+    {
+        error!("Failed to drain beacon storage before shutdown: {err:?}");
+        process::exit(1);
+    }
+
+    if service_failed {
+        error!("Service failed; exiting with an error");
+        process::exit(1);
+    }
     process::exit(0);
 }
 
@@ -509,8 +532,24 @@ pub async fn run_lean_node(config: LeanNodeConfig, executor: ReamExecutor, ream_
 /// At the end of setup, it starts 2 services:
 /// 1. The HTTP server that serves Beacon API, Engine API.
 /// 2. The P2P network that handles peer discovery (discv5), gossiping (gossipsub) and Req/Resp API.
-pub async fn run_beacon_node(config: BeaconNodeConfig, executor: ReamExecutor, ream_db: ReamDB) {
-    run_beacon_node_inner(config, executor, ream_db, true, false, None).await;
+///
+/// The initialized database is sent on `storage_sender`, so `main` can drain its writes at exit.
+pub async fn run_beacon_node(
+    config: BeaconNodeConfig,
+    executor: ReamExecutor,
+    ream_db: ReamDB,
+    storage_sender: std::sync::mpsc::Sender<BeaconDB>,
+) {
+    run_beacon_node_inner(
+        config,
+        executor,
+        ream_db,
+        true,
+        false,
+        None,
+        Some(storage_sender),
+    )
+    .await;
 }
 
 // `initialize_globals` is `false` only in tests, which set the globals themselves beforehand.
@@ -521,6 +560,7 @@ async fn run_beacon_node_inner(
     initialize_globals: bool,
     force_data_availability_checks: bool,
     gossipsub_history_length: Option<usize>,
+    storage_sender: Option<std::sync::mpsc::Sender<BeaconDB>>,
 ) {
     info!("starting up beacon node...");
 
@@ -546,6 +586,10 @@ async fn run_beacon_node_inner(
         .expect("unable to init Ream Beacon Database")
         .with_cache(cache.clone());
 
+    if let Some(storage_sender) = storage_sender {
+        let _ = storage_sender.send(beacon_db.clone());
+    }
+
     info!("ream beacon database has been initialized");
 
     if initialize_globals {
@@ -565,17 +609,9 @@ async fn run_beacon_node_inner(
 
     info!("Database Initialization completed");
 
-    let oldest_root = beacon_db
-        .slot_index_provider()
-        .get_oldest_root()
-        .expect("Failed to access slot index provider")
-        .expect("No oldest root found");
     let genesis_validators_root = beacon_db
-        .state_provider()
-        .get(oldest_root)
-        .expect("Failed to access beacon state provider")
-        .expect("No beacon state found")
-        .genesis_validators_root;
+        .genesis_validators_root()
+        .expect("Failed to read the genesis validators root");
     if initialize_globals {
         set_genesis_validator_root(genesis_validators_root);
     }
@@ -634,6 +670,27 @@ async fn run_beacon_node_inner(
         beacon_chain
     };
     let beacon_chain = Arc::new(beacon_chain);
+
+    // Attestations are verified against active validators' keys, so decompress those keys in the
+    // background now instead of one at a time during the first epoch of block imports.
+    if let Ok(head) = beacon_chain.head() {
+        tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            let epoch = head.state.get_current_epoch();
+            let public_keys: Vec<_> = head
+                .state
+                .validators
+                .iter()
+                .filter(|validator| validator.is_active_validator(epoch))
+                .map(|validator| validator.public_key.clone())
+                .collect();
+            let prepared = ream_bls::prewarm_public_keys(&public_keys);
+            info!(
+                "Prepared {prepared} validator public keys for verification in {:?}",
+                started.elapsed()
+            );
+        });
+    }
 
     beacon_chain.initialize_execution_forkchoice().await;
 
@@ -701,6 +758,7 @@ async fn run_beacon_node_for_test(
         false,
         force_data_availability_checks,
         gossipsub_history_length,
+        None,
     )
     .await;
 }
@@ -996,6 +1054,7 @@ pub async fn countdown_for_genesis() {
 mod tests {
     mod block_lookup_tests;
     mod checkpoint_bootstrap_tests;
+    mod mainnet_import_bench;
 
     use std::{
         env::temp_dir,
@@ -1352,7 +1411,7 @@ mod tests {
             eth1_data: Eth1Data::default(),
             eth1_data_votes: VariableList::empty(),
             eth1_deposit_index: 0,
-            validators,
+            validators: validators.into(),
             balances,
             randao_mixes: FixedVector::<B256, U65536>::from_elem(B256::ZERO),
             slashings: FixedVector::<u64, U8192>::from_elem(0),
@@ -1379,6 +1438,7 @@ mod tests {
             pending_partial_withdrawals: VariableList::<PendingPartialWithdrawal, _>::empty(),
             pending_consolidations: VariableList::<PendingConsolidation, _>::empty(),
             proposer_lookahead: FixedVector::<u64, U64>::from_elem(0),
+            caches: Default::default(),
         };
 
         let mut genesis_block = SignedBeaconBlock {

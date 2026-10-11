@@ -5,6 +5,7 @@ use bls12_381::{
     pairing,
 };
 
+use super::public_key::{aggregate_public_key_point, decompress_public_key};
 use crate::{
     BLSSignature, PublicKey,
     constants::DST,
@@ -50,7 +51,7 @@ impl Verifiable for BLSSignature {
             DST,
         );
 
-        let gt1 = pairing(&G1Affine::try_from(public_key)?, &G2Affine::from(h));
+        let gt1 = pairing(&decompress_public_key(public_key)?, &G2Affine::from(h));
         let gt2 = pairing(&G1Affine::generator(), &G2Affine::try_from(self)?);
 
         Ok(gt1 == gt2)
@@ -60,16 +61,16 @@ impl Verifiable for BLSSignature {
     where
         P: AsRef<[&'a PublicKey]>,
     {
-        let aggregate_public_key = PublicKey::aggregate(public_keys.as_ref())?;
+        // Keep the aggregate as a point: compressing it and decompressing it again would repeat
+        // the subgroup check on a key built from already checked keys.
+        let aggregate_public_key =
+            G1Affine::from(aggregate_public_key_point(public_keys.as_ref())?);
         let h = <G2Projective as HashToCurve<ExpandMsgXmd<sha2::Sha256>>>::hash_to_curve(
             [message],
             DST,
         );
 
-        let gt1 = pairing(
-            &G1Affine::try_from(&aggregate_public_key)?,
-            &G2Affine::from(h),
-        );
+        let gt1 = pairing(&aggregate_public_key, &G2Affine::from(h));
         let gt2 = pairing(&G1Affine::generator(), &G2Affine::try_from(self)?);
 
         Ok(gt1 == gt2)

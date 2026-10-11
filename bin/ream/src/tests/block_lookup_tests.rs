@@ -42,13 +42,18 @@ use ream_network_manager::{
     },
     p2p_sender::P2PSender,
     service::NetworkManagerService,
-    unknown_parent_lookup::{apply_unknown_parent_update, spawn_unknown_parent_action},
+    unknown_parent_lookup::{
+        BlocksByRootRefusals, apply_unknown_parent_update, spawn_unknown_parent_action,
+    },
 };
 use ream_operation_pool::OperationPool;
 use ream_p2p::{
     gossipsub::beacon::topics::{GossipTopic, GossipTopicKind},
     network::{
-        beacon::channel::{GossipMessage, P2PCallbackResponse, P2PMessage, P2PRequest},
+        beacon::{
+            channel::{GossipMessage, P2PCallbackResponse, P2PMessage, P2PRequest},
+            network_state::NetworkState,
+        },
         misc::peer_id_from_enr,
     },
 };
@@ -87,6 +92,20 @@ struct BlobBlockFixture {
     signed_block: SignedBeaconBlock,
     post_state: Option<BeaconState>,
     column: DataColumnSidecar,
+}
+
+/// A network state without peers: these lookups never fall back to other peers.
+fn empty_network_state() -> NetworkState {
+    NetworkState {
+        local_enr: discv5::Enr::builder()
+            .build(&discv5::enr::CombinedKey::generate_secp256k1())
+            .expect("valid enr")
+            .into(),
+        peer_table: Default::default(),
+        meta_data: Default::default(),
+        status: Default::default(),
+        data_dir: std::path::PathBuf::new(),
+    }
 }
 
 struct GossipLookupHarness {
@@ -1291,7 +1310,14 @@ async fn test_unknown_parent_block_imports_after_parent_arrives() {
         .await
         .expect("parent download should finish")
         .expect("lookup update channel should remain open");
-    apply_unknown_parent_update(&mut coordinator, &harness.beacon_chain, update).await;
+    apply_unknown_parent_update(
+        &mut coordinator,
+        &harness.beacon_chain,
+        &empty_network_state(),
+        &mut BlocksByRootRefusals::default(),
+        update,
+    )
+    .await;
 
     for (expected_root, expected_column) in [
         (parent_root, parent.column.clone()),
@@ -1315,7 +1341,14 @@ async fn test_unknown_parent_block_imports_after_parent_arrives() {
             .await
             .expect("block processing should finish")
             .expect("lookup update channel should remain open");
-        apply_unknown_parent_update(&mut coordinator, &harness.beacon_chain, update).await;
+        apply_unknown_parent_update(
+            &mut coordinator,
+            &harness.beacon_chain,
+            &empty_network_state(),
+            &mut BlocksByRootRefusals::default(),
+            update,
+        )
+        .await;
 
         assert_eq!(
             harness

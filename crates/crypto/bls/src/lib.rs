@@ -18,3 +18,15 @@ pub use signature::BLSSignature;
 pub mod supranational;
 #[cfg(feature = "zkcrypto")]
 pub mod zkcrypto;
+
+/// Prepares the backend to verify with `public_keys` and returns how many keys it prepared.
+/// The zkcrypto backend decompresses them into its cache; other backends need no preparation.
+#[cfg(feature = "zkcrypto")]
+pub use zkcrypto::public_key::prewarm_public_keys;
+
+/// Prepares the backend to verify with `public_keys` and returns how many keys it prepared. This
+/// backend needs no preparation.
+#[cfg(not(feature = "zkcrypto"))]
+pub fn prewarm_public_keys(_public_keys: &[PublicKey]) -> usize {
+    0
+}

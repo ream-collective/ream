@@ -68,6 +68,7 @@ impl RespMessage {
                 ReqRespError::InvalidData(_) => Some(ResponseCode::InvalidRequest),
                 ReqRespError::RemoteError { code, .. } => Some(*code),
                 ReqRespError::Disconnected
+                | ReqRespError::UnsupportedProtocol
                 | ReqRespError::StreamTimedOut(_)
                 | ReqRespError::TokioTimedOut(_) => Some(ResponseCode::ResourceUnavailable),
             },
@@ -222,10 +223,15 @@ impl ReqRespConnectionHandler {
         error: StreamUpgradeError<<OutboundReqRespProtocol as OutboundUpgradeSend>::Error>,
         info: OutboundOpenInfo,
     ) {
+        let err = match error {
+            // The peer answered that it does not serve this protocol, as gossip-only nodes do.
+            StreamUpgradeError::NegotiationFailed => ReqRespError::UnsupportedProtocol,
+            error => ReqRespError::RawError(format!("Dial upgrade error: {error:?}")),
+        };
         self.behaviour_events
             .push(HandlerEvent::Err(ReqRespMessageError::Outbound {
                 request_id: info.request_id,
-                err: ReqRespError::RawError(format!("Dial upgrade error: {error:?}")),
+                err,
             }));
     }
 

@@ -70,6 +70,69 @@ pub fn compute_shuffled_index(
     Ok(index)
 }
 
+/// Shuffles a whole list so that `output[i] == indices[compute_shuffled_index(i, len, seed)]`.
+///
+/// Committees of an epoch are consecutive slices of this list. Computing it once costs one hash per
+/// 256 positions per round, while `compute_shuffled_index` costs two hashes per position per round.
+pub fn compute_shuffled_list(indices: &[u64], seed: B256) -> Vec<u64> {
+    let mut list = indices.to_vec();
+    let list_size = list.len();
+    if list_size <= 1 {
+        return list;
+    }
+    let mut buffer = [0u8; 37];
+    buffer[..32].copy_from_slice(seed.as_slice());
+    let source_for = |buffer: &mut [u8; 37], position: usize| {
+        buffer[33..37].copy_from_slice(&((position >> 8) as u32).to_le_bytes());
+        hash(&buffer[..])
+    };
+
+    // Each round pairs position `i` with `pivot - i` (below the pivot) or `pivot + list_size - i`
+    // (above it) and swaps the pair when the round's bit for the larger position is set, the same
+    // rule `compute_shuffled_index` applies to one index. Applying the rounds to the list in
+    // reverse order leaves `indices[compute_shuffled_index(i)]` at position `i`.
+    for round in (0..SHUFFLE_ROUND_COUNT).rev() {
+        buffer[32] = round;
+        let pivot = (bytes_to_int64(&hash(&buffer[..33])) % list_size as u64) as usize;
+
+        // Pairs (i, pivot - i) for i in [0, (pivot + 1) / 2).
+        let mirror = (pivot + 1) >> 1;
+        let mut source = source_for(&mut buffer, pivot);
+        let mut byte = source[(pivot & 0xff) >> 3];
+        for i in 0..mirror {
+            let j = pivot - i;
+            if j & 0xff == 0xff {
+                source = source_for(&mut buffer, j);
+            }
+            if j & 0x07 == 0x07 {
+                byte = source[(j & 0xff) >> 3];
+            }
+            if (byte >> (j & 0x07)) & 0x01 == 1 {
+                list.swap(i, j);
+            }
+        }
+
+        // Pairs (i, pivot + list_size - i) for i in (pivot, (pivot + list_size + 1) / 2).
+        let mirror = (pivot + list_size + 1) >> 1;
+        let end = list_size - 1;
+        let mut source = source_for(&mut buffer, end);
+        let mut byte = source[(end & 0xff) >> 3];
+        for (offset, i) in ((pivot + 1)..mirror).enumerate() {
+            let j = end - offset;
+            if j & 0xff == 0xff {
+                source = source_for(&mut buffer, j);
+            }
+            if j & 0x07 == 0x07 {
+                byte = source[(j & 0xff) >> 3];
+            }
+            if (byte >> (j & 0x07)) & 0x01 == 1 {
+                list.swap(i, j);
+            }
+        }
+    }
+    list
+}
+
 // Return the integer deserialization of ``data`` interpreted as ``ENDIANNESS``-endian.
 pub fn bytes_to_int64(slice: &[u8]) -> u64 {
     let mut bytes = [0u8; 8];
@@ -156,4 +219,52 @@ pub fn compute_sync_committee_period(epoch: u64) -> u64 {
 
 pub fn compute_sync_committee_period_at_slot(slot: u64) -> u64 {
     compute_sync_committee_period(compute_epoch_at_slot(slot))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn indices(len: usize) -> Vec<u64> {
+        (0..len as u64).map(|index| index * 3 + 7).collect()
+    }
+
+    #[test]
+    fn shuffled_list_matches_per_index_shuffle() {
+        for (len, seed_byte) in [
+            (2, 1u8),
+            (3, 2),
+            (7, 3),
+            (100, 4),
+            (255, 5),
+            (256, 6),
+            (257, 7),
+            (513, 8),
+            (1000, 9),
+        ] {
+            let seed = hash(&[seed_byte; 32]).as_slice().try_into().unwrap();
+            let indices = indices(len);
+            let shuffled = compute_shuffled_list(&indices, seed);
+            for (position, value) in shuffled.iter().enumerate() {
+                let expected = indices[compute_shuffled_index(position, len, seed).unwrap()];
+                assert_eq!(*value, expected, "len {len}, position {position}");
+            }
+        }
+    }
+
+    #[test]
+    fn committees_are_slices_of_the_shuffled_list() {
+        let indices = indices(777);
+        let seed = B256::repeat_byte(0x42);
+        let shuffled = compute_shuffled_list(&indices, seed);
+        let count = 20u64;
+        for index in 0..count {
+            let start = (indices.len() as u64 * index / count) as usize;
+            let end = (indices.len() as u64 * (index + 1) / count) as usize;
+            assert_eq!(
+                compute_committee(&indices, seed, index, count).unwrap(),
+                shuffled[start..end]
+            );
+        }
+    }
 }

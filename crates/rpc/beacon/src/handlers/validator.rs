@@ -412,7 +412,8 @@ pub async fn get_validator_balances_from_state(
         HttpResponse::Ok().json(BeaconResponse::new(build_validator_balances(
             &state
                 .validators
-                .into_iter()
+                .iter()
+                .cloned()
                 .zip(state.balances.into_iter())
                 .collect::<Vec<_>>(),
             query.id.as_ref(),
@@ -431,7 +432,8 @@ pub async fn post_validator_balances_from_state(
         HttpResponse::Ok().json(BeaconResponse::new(build_validator_balances(
             &state
                 .validators
-                .into_iter()
+                .iter()
+                .cloned()
                 .zip(state.balances.into_iter())
                 .collect::<Vec<_>>(),
             body.id.as_ref(),

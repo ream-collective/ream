@@ -70,43 +70,8 @@ pub async fn initialize_db_from_checkpoint(
          default checkpoint sync sources (mainnet, sepolia, hoodi).",
         beacon_network_spec().network
     );
-    let checkpoint_sync_url = sources.into_iter().next().expect("checked non-empty above");
-    info!("Initiating checkpoint sync");
-
-    info!("Fetching finalized block...");
-    let block = fetch_finalized_block(&checkpoint_sync_url).await?;
-    info!(
-        "Downloaded block: {} with root: {}. Slot: {}",
-        block.message.body.execution_payload.block_number,
-        block.message.block_root(),
-        block.message.slot
-    );
+    let (block, state) = fetch_checkpoint_from_sources(&sources, &db).await?;
     let slot = block.message.slot;
-
-    // blob_sidecars only serves pre-Fulu blobs; post-Fulu data comes as data column sidecars.
-    if compute_epoch_at_slot(slot) < beacon_network_spec().fulu_fork_epoch {
-        info!("Fetching blobs...");
-        initialize_blobs_in_db(&checkpoint_sync_url, db.clone(), block.message.block_root())
-            .await?;
-        info!(
-            "Downloaded blobs for block: {}",
-            block.message.body.execution_payload.block_number
-        );
-    } else {
-        info!("Skipping legacy blob_sidecars fetch for post-Fulu checkpoint block");
-    }
-
-    info!("Fetching initial state...");
-    let state = get_state(&checkpoint_sync_url, slot).await?;
-    info!(
-        "Downloaded state with root: {}. Slot: {}",
-        state.state_root(),
-        slot
-    );
-
-    ensure!(block.message.slot == state.slot, "Slot mismatch");
-
-    ensure!(block.message.state_root == state.state_root());
     let mut store = get_forkchoice_store(state.clone(), block, db)?;
 
     let time = beacon_network_spec().min_genesis_time
@@ -122,6 +87,81 @@ pub async fn initialize_db_from_checkpoint(
         return Ok(WeakSubjectivityState::None);
     }
     Ok(WeakSubjectivityState::CheckpointAlreadyVerified)
+}
+
+/// Rounds over the whole source list. A mainnet state is a few hundred megabytes, and one dropped
+/// connection during the download should not stop the node while another try or source can work.
+const CHECKPOINT_FETCH_ROUNDS: usize = 3;
+
+/// Fetches a finalized block and its state, trying each source in turn for up to
+/// [`CHECKPOINT_FETCH_ROUNDS`] rounds.
+async fn fetch_checkpoint_from_sources(
+    sources: &[Url],
+    db: &BeaconDB,
+) -> anyhow::Result<(SignedBeaconBlock, BeaconState)> {
+    let mut last_error = None;
+    for round in 1..=CHECKPOINT_FETCH_ROUNDS {
+        for source in sources {
+            match fetch_checkpoint(source, db).await {
+                Ok(checkpoint) => return Ok(checkpoint),
+                Err(err) => {
+                    warn!(
+                        "Checkpoint sync from {source} failed (round {round} of \
+                         {CHECKPOINT_FETCH_ROUNDS}): {err:#}"
+                    );
+                    last_error = Some(err);
+                }
+            }
+        }
+    }
+    Err(last_error
+        .expect("at least one source was tried")
+        .context("Checkpoint sync failed from every source"))
+}
+
+/// Fetches the finalized block and its state from one source and checks that they match.
+async fn fetch_checkpoint(
+    checkpoint_sync_url: &Url,
+    db: &BeaconDB,
+) -> anyhow::Result<(SignedBeaconBlock, BeaconState)> {
+    info!("Initiating checkpoint sync from {checkpoint_sync_url}");
+
+    info!("Fetching finalized block...");
+    let block = fetch_finalized_block(checkpoint_sync_url).await?;
+    info!(
+        "Downloaded block: {} with root: {}. Slot: {}",
+        block.message.body.execution_payload.block_number,
+        block.message.block_root(),
+        block.message.slot
+    );
+    let slot = block.message.slot;
+
+    // blob_sidecars only serves pre-Fulu blobs; post-Fulu data comes as data column sidecars.
+    if compute_epoch_at_slot(slot) < beacon_network_spec().fulu_fork_epoch {
+        info!("Fetching blobs...");
+        initialize_blobs_in_db(checkpoint_sync_url, db.clone(), block.message.block_root()).await?;
+        info!(
+            "Downloaded blobs for block: {}",
+            block.message.body.execution_payload.block_number
+        );
+    } else {
+        info!("Skipping legacy blob_sidecars fetch for post-Fulu checkpoint block");
+    }
+
+    info!("Fetching initial state...");
+    let state = get_state(checkpoint_sync_url, slot).await?;
+    info!(
+        "Downloaded state with root: {}. Slot: {}",
+        state.state_root(),
+        slot
+    );
+
+    ensure!(block.message.slot == state.slot, "Slot mismatch");
+    ensure!(
+        block.message.state_root == state.state_root(),
+        "Checkpoint state root does not match the block"
+    );
+    Ok((block, state))
 }
 
 // Bootstrap the database directly from a local genesis state file (SSZ-encoded BeaconState),
