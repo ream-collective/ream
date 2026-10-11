@@ -1,9 +1,9 @@
 use std::{fmt::Debug, sync::Arc};
 
-use redb::{Database, Durability, ReadableDatabase, TableDefinition};
+use redb::{Database, ReadableDatabase, TableDefinition};
 use ssz::{Decode, Encode};
 
-use crate::errors::StoreError;
+use crate::{durability::commit_durability, errors::StoreError};
 
 pub trait REDBTable
 where
@@ -34,13 +34,24 @@ where
         Ok(table.get(key)?.map(|result| result.value()))
     }
 
+    /// Whether `key` has a value. The value is not decoded, so this stays cheap for tables that
+    /// hold whole beacon states.
+    fn contains_key<'a>(
+        &self,
+        key: <Self::KeyTableDefinition as redb::Value>::SelfType<'a>,
+    ) -> Result<bool, StoreError> {
+        let read_txn = self.database().begin_read()?;
+        let table = read_txn.open_table(Self::TABLE_DEFINITION)?;
+        Ok(table.get(key)?.is_some())
+    }
+
     fn insert<'a>(
         &self,
         key: <Self::KeyTableDefinition as redb::Value>::SelfType<'a>,
         value: Self::Value,
     ) -> Result<(), StoreError> {
         let mut write_txn = self.database().begin_write()?;
-        write_txn.set_durability(Durability::Immediate)?;
+        write_txn.set_durability(commit_durability())?;
         {
             let mut table = write_txn.open_table(Self::TABLE_DEFINITION)?;
             table.insert(key, value)?;

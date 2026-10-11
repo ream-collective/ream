@@ -1,4 +1,8 @@
-use std::{num::NonZeroUsize, sync::Mutex};
+use std::{
+    collections::HashMap,
+    num::NonZeroUsize,
+    sync::{Arc, Mutex, atomic::AtomicBool},
+};
 
 use alloy_primitives::{B256, FixedBytes};
 use lru::LruCache;
@@ -7,6 +11,7 @@ use ream_consensus_beacon::{
     bls_to_execution_change::BLSToExecutionChange,
     data_column_sidecar::NUMBER_OF_COLUMNS,
     electra::{beacon_block::SignedBeaconBlock, beacon_state::BeaconState},
+    fork_choice::latest_message::LatestMessage,
 };
 use ream_consensus_lean::{block::SignedBlock, state::LeanState};
 use ream_consensus_misc::{
@@ -21,6 +26,9 @@ const LRU_CACHE_SIZE: usize = 64;
 const DATA_COLUMN_SIDECAR_CACHE_SIZE: usize = NUMBER_OF_COLUMNS as usize * SLOTS_PER_EPOCH as usize;
 const BLOCK_CACHE_SIZE: usize = 128;
 const STATE_CACHE_SIZE: usize = 8;
+// Fork choice reads the checkpoint states that blocks' attestations target, usually the current
+// and previous epoch, plus the justified and finalized ones.
+const CHECKPOINT_STATE_CACHE_SIZE: usize = 4;
 
 #[derive(Debug, Hash, PartialEq, Eq, Default, Clone)]
 pub struct AddressSlotIdentifier {
@@ -69,6 +77,13 @@ pub struct ValidatedDataColumnHeader {
     pub finalized_checkpoint: Checkpoint,
 }
 
+/// Latest messages not yet written to the database, and whether a write is running.
+#[derive(Debug, Default)]
+pub struct PendingLatestMessages {
+    pub messages: HashMap<u64, LatestMessage>,
+    pub flushing: bool,
+}
+
 /// In-memory LRU cache for beacon node (gossip validation + beacon storage).
 #[derive(Debug)]
 pub struct BeaconCacheDB {
@@ -92,7 +107,13 @@ pub struct BeaconCacheDB {
     pub seen_aggregate_and_proof: RwLock<LruCache<AggregateAndProofKey, ()>>,
     // Beacon storage caches
     pub blocks: Mutex<LruCache<B256, SignedBeaconBlock>>,
-    pub states: Mutex<LruCache<B256, BeaconState>>,
+    pub states: Mutex<LruCache<B256, Arc<BeaconState>>>,
+    /// States being stored whole on another thread, readable here until the write commits.
+    pub pending_state_snapshots: Mutex<HashMap<B256, Arc<BeaconState>>>,
+    pub checkpoint_states: Mutex<LruCache<Checkpoint, Arc<BeaconState>>>,
+    pub pending_latest_messages: Mutex<PendingLatestMessages>,
+    /// Whether finalized states are being pruned on another thread.
+    pub pruning_states: AtomicBool,
 }
 
 impl BeaconCacheDB {
@@ -158,6 +179,12 @@ impl BeaconCacheDB {
             )),
             states: Mutex::new(LruCache::new(
                 NonZeroUsize::new(STATE_CACHE_SIZE).expect("Invalid cache size"),
+            )),
+            pending_state_snapshots: Mutex::default(),
+            pruning_states: AtomicBool::new(false),
+            pending_latest_messages: Mutex::default(),
+            checkpoint_states: Mutex::new(LruCache::new(
+                NonZeroUsize::new(CHECKPOINT_STATE_CACHE_SIZE).expect("Invalid cache size"),
             )),
         }
     }

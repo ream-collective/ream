@@ -7,6 +7,7 @@ use redb::{Database, ReadableDatabase};
 
 use crate::{
     cache::BeaconCacheDB,
+    durability::DeferredSync,
     tables::{
         beacon::{
             beacon_block::BeaconBlockTable, beacon_state::BeaconStateTable,
@@ -30,6 +31,8 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct BeaconDB {
     pub db: Arc<Database>,
+    /// Validators' latest messages, in a database of their own; see `VOTES_REDB_FILE`.
+    pub votes_db: Arc<Database>,
     pub data_dir: PathBuf,
     pub(crate) cache: Option<Arc<BeaconCacheDB>>,
 }
@@ -42,6 +45,11 @@ impl BeaconDB {
         self
     }
 
+    /// Defers the disk sync of this thread's commits until the guard drops; see `DeferredSync`.
+    pub fn defer_sync(&self) -> DeferredSync {
+        DeferredSync::new(self.db.clone())
+    }
+
     pub fn block_provider(&self) -> BeaconBlockTable {
         BeaconBlockTable {
             db: self.db.clone(),
@@ -51,6 +59,7 @@ impl BeaconDB {
     pub fn state_provider(&self) -> BeaconStateTable {
         BeaconStateTable {
             db: self.db.clone(),
+            data_dir: self.data_dir.clone(),
             cache: self.cache.clone(),
         }
     }
@@ -76,12 +85,15 @@ impl BeaconDB {
     pub fn checkpoint_states_provider(&self) -> CheckpointStatesTable {
         CheckpointStatesTable {
             db: self.db.clone(),
+            data_dir: self.data_dir.clone(),
+            cache: self.cache.clone(),
         }
     }
 
     pub fn latest_messages_provider(&self) -> LatestMessagesTable {
         LatestMessagesTable {
-            db: self.db.clone(),
+            db: self.votes_db.clone(),
+            cache: self.cache.clone(),
         }
     }
 

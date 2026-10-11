@@ -2,16 +2,15 @@ use std::sync::Arc;
 
 use alloy_primitives::B256;
 use ream_consensus_beacon::electra::beacon_block::SignedBeaconBlock;
-use redb::{Database, Durability, ReadableDatabase, TableDefinition};
-use tree_hash::TreeHash;
+use redb::{Database, ReadableDatabase, TableDefinition};
 
-use super::parent_root_index::ParentRootIndexMultimapTable;
+use super::parent_root_index::PARENT_ROOT_INDEX_MULTIMAP_TABLE;
 use crate::{
     cache::BeaconCacheDB,
+    durability::commit_durability,
     errors::StoreError,
     tables::{
         beacon::{slot_index::BeaconSlotIndexTable, state_root_index::BeaconStateRootIndexTable},
-        multimap_table::MultimapTable,
         ssz_encoder::SSZEncoding,
         table::REDBTable,
     },
@@ -69,23 +68,9 @@ impl REDBTable for BeaconBlockTable {
     }
 
     fn insert(&self, key: Self::Key, value: Self::Value) -> Result<(), StoreError> {
-        // insert entry to slot_index table
-        let block_root = value.message.tree_hash_root();
-        let slot_index_table = BeaconSlotIndexTable {
-            db: self.db.clone(),
-        };
-        slot_index_table.insert(value.message.slot, block_root)?;
-
-        // insert entry to state root index table
-        let state_root_index_table = BeaconStateRootIndexTable {
-            db: self.db.clone(),
-        };
-        state_root_index_table.insert(value.message.state_root, block_root)?;
-
-        let parent_root_index_table = ParentRootIndexMultimapTable {
-            db: self.db.clone(),
-        };
-        parent_root_index_table.insert(value.message.parent_root, block_root)?;
+        // The key is the block root: indexing under it points every index entry at the key the
+        // block is stored under, and hashing the block again costs a few milliseconds.
+        let block_root = key;
 
         if let Some(cache) = &self.cache
             && let Ok(mut cache_lock) = cache.blocks.lock()
@@ -93,11 +78,24 @@ impl REDBTable for BeaconBlockTable {
             cache_lock.put(key, value.clone());
         }
 
+        // The block and its slot, state root and parent root index entries commit together: one
+        // disk sync instead of four, and no reader sees the block without its index entries.
         let mut write_txn = self.db.begin_write()?;
-        write_txn.set_durability(Durability::Immediate)?;
-        let mut table = write_txn.open_table(Self::TABLE_DEFINITION)?;
-        table.insert(key, value)?;
-        drop(table);
+        write_txn.set_durability(commit_durability())?;
+        {
+            write_txn
+                .open_table(BeaconSlotIndexTable::TABLE_DEFINITION)?
+                .insert(value.message.slot, block_root)?;
+            write_txn
+                .open_table(BeaconStateRootIndexTable::TABLE_DEFINITION)?
+                .insert(value.message.state_root, block_root)?;
+            write_txn
+                .open_multimap_table(PARENT_ROOT_INDEX_MULTIMAP_TABLE)?
+                .insert(value.message.parent_root, block_root)?;
+            write_txn
+                .open_table(Self::TABLE_DEFINITION)?
+                .insert(key, value)?;
+        }
         write_txn.commit()?;
         Ok(())
     }

@@ -1,9 +1,9 @@
 use std::{fmt::Debug, sync::Arc};
 
-use redb::{Database, Durability, ReadableDatabase, TableDefinition};
+use redb::{Database, ReadableDatabase, TableDefinition};
 use ssz::{Decode, Encode};
 
-use crate::errors::StoreError;
+use crate::{durability::commit_durability, errors::StoreError};
 
 pub trait REDBField
 where
@@ -33,7 +33,7 @@ where
         value: <Self::ValueFieldDefinition as redb::Value>::SelfType<'a>,
     ) -> Result<(), StoreError> {
         let mut write_txn = self.database().begin_write()?;
-        write_txn.set_durability(Durability::Immediate)?;
+        write_txn.set_durability(commit_durability())?;
         {
             let mut table = write_txn.open_table(Self::FIELD_DEFINITION)?;
             table.insert(Self::KEY, value)?;
