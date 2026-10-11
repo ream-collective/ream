@@ -19,7 +19,7 @@ use ream_fork_choice_beacon::{
     data_availability::PendingBlock,
     handlers::{
         OnBlockOutcome, on_attestation, on_attester_slashing, on_block_attestations,
-        on_block_with_root, on_tick, process_available_block,
+        on_block_with_root, on_gossip_attestation, on_tick, process_available_block,
     },
     store::Store,
 };
@@ -448,6 +448,21 @@ impl BeaconChain {
     ) -> anyhow::Result<()> {
         let mut store = self.store.lock().await;
         on_attestation(&mut store, attestation, is_from_block)?;
+        self.publish_cached_head(&store);
+        drop(store);
+        self.update_execution_forkchoice(false).await;
+        Ok(())
+    }
+
+    /// ``process_attestation`` for a gossip attestation whose signature gossip validation verified
+    /// for `attester_index`; see ``on_gossip_attestation``.
+    pub async fn process_gossip_attestation(
+        &self,
+        attestation: Attestation,
+        attester_index: u64,
+    ) -> anyhow::Result<()> {
+        let mut store = self.store.lock().await;
+        on_gossip_attestation(&mut store, attestation, attester_index)?;
         self.publish_cached_head(&store);
         drop(store);
         self.update_execution_forkchoice(false).await;
