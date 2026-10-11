@@ -635,6 +635,27 @@ async fn run_beacon_node_inner(
     };
     let beacon_chain = Arc::new(beacon_chain);
 
+    // Attestations are verified against active validators' keys, so decompress those keys in the
+    // background now instead of one at a time during the first epoch of block imports.
+    if let Ok(head) = beacon_chain.head() {
+        tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            let epoch = head.state.get_current_epoch();
+            let public_keys: Vec<_> = head
+                .state
+                .validators
+                .iter()
+                .filter(|validator| validator.is_active_validator(epoch))
+                .map(|validator| validator.public_key.clone())
+                .collect();
+            let prepared = ream_bls::prewarm_public_keys(&public_keys);
+            info!(
+                "Prepared {prepared} validator public keys for verification in {:?}",
+                started.elapsed()
+            );
+        });
+    }
+
     beacon_chain.initialize_execution_forkchoice().await;
 
     // Create network manager
@@ -996,6 +1017,7 @@ pub async fn countdown_for_genesis() {
 mod tests {
     mod block_lookup_tests;
     mod checkpoint_bootstrap_tests;
+    mod mainnet_import_bench;
 
     use std::{
         env::temp_dir,
@@ -1352,7 +1374,7 @@ mod tests {
             eth1_data: Eth1Data::default(),
             eth1_data_votes: VariableList::empty(),
             eth1_deposit_index: 0,
-            validators,
+            validators: validators.into(),
             balances,
             randao_mixes: FixedVector::<B256, U65536>::from_elem(B256::ZERO),
             slashings: FixedVector::<u64, U8192>::from_elem(0),
@@ -1379,6 +1401,11 @@ mod tests {
             pending_partial_withdrawals: VariableList::<PendingPartialWithdrawal, _>::empty(),
             pending_consolidations: VariableList::<PendingConsolidation, _>::empty(),
             proposer_lookahead: FixedVector::<u64, U64>::from_elem(0),
+            shuffling_cache: Default::default(),
+            validators_root_cache: Default::default(),
+            total_active_balance_cache: Default::default(),
+            field_root_caches: Default::default(),
+            sync_committee_indices_cache: Default::default(),
         };
 
         let mut genesis_block = SignedBeaconBlock {
