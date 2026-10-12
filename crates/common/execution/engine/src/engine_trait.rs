@@ -4,6 +4,7 @@ use ream_execution_rpc_types::get_blobs::{BlobAndProofV1, BlobAndProofV2};
 
 use super::new_payload_request::NewPayloadRequest;
 
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ExecutionApi {
     async fn verify_and_notify_new_payload(
