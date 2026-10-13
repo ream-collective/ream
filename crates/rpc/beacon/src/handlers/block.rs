@@ -22,9 +22,7 @@ use ream_api_types_common::{error::ApiError, id::ID};
 use ream_chain_beacon::beacon_chain::{BeaconChain, BlockProcessingOutcome};
 use ream_consensus_beacon::{
     blob_sidecar::BlobIdentifier,
-    data_column_sidecar::{
-        ColumnIdentifier, DataColumnSidecar, get_data_column_sidecars_from_block,
-    },
+    data_column_sidecar::{DataColumnSidecar, get_data_column_sidecars_from_block},
     electra::{
         beacon_block::{BeaconBlock, SignedBeaconBlock},
         beacon_block_body::BeaconBlockBody,
@@ -631,19 +629,11 @@ fn build_and_store_data_column_sidecars(
             anyhow!("Failed to build data column sidecars for block {block_root:?}: {err}")
         })?;
 
-    for sidecar in &sidecars {
-        column_sidecars_provider
-            .insert(
-                ColumnIdentifier::new(block_root, sidecar.index),
-                sidecar.clone(),
-            )
-            .map_err(|err| {
-                anyhow!(
-                    "Failed to store own data column sidecar {} for block {block_root:?}: {err}",
-                    sidecar.index
-                )
-            })?;
-    }
+    column_sidecars_provider
+        .insert_batch(sidecars.clone())
+        .map_err(|err| {
+            anyhow!("Failed to store own data columns for block {block_root:?}: {err}")
+        })?;
 
     Ok(sidecars)
 }

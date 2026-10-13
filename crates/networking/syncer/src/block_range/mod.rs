@@ -1599,11 +1599,9 @@ impl BlockRangeSyncer {
             .map_err(|err| anyhow!("Range-sync data-column task failed: {err}"))??
         };
 
-        for column in columns {
-            self.beacon_chain
-                .import_data_column_sidecar_if(column, |_| Ok(()))
-                .await?;
-        }
+        self.beacon_chain
+            .import_data_column_sidecars_if(columns, |_| Ok(()))
+            .await?;
         match self.beacon_chain.process_block(block).await? {
             BlockProcessingOutcome::Imported { .. } => {}
             BlockProcessingOutcome::PendingAvailability { block_root } => {

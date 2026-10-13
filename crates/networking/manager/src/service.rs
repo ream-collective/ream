@@ -52,7 +52,9 @@ use crate::{
         spawn_block_lookup_worker,
     },
     config::ManagerConfig,
-    data_availability_fetch::{ColumnFetchOutcome, ColumnFetchTracker, fetch_missing_columns},
+    data_availability_fetch::{
+        ColumnFetchOutcome, ColumnFetchTracker, fetch_missing_columns, pending_anchor_for_recovery,
+    },
     gossipsub::handle::{handle_gossipsub_message, init_gossipsub_config_with_topics},
     p2p_sender::P2PSender,
     req_resp::handle_req_resp_message,
@@ -620,7 +622,12 @@ impl NetworkManagerService {
                         )
                     };
                     match slots {
-                        (Ok(current_slot), Ok(finalized_checkpoint), pending_roots) => {
+                        (Ok(current_slot), Ok(finalized_checkpoint), mut pending_roots) => {
+                            match pending_anchor_for_recovery(&beacon_chain, current_slot).await {
+                                Ok(Some(root)) => pending_roots.push(root),
+                                Ok(None) => {},
+                                Err(err) => warn!(%err, "Cannot schedule anchor column recovery"),
+                            }
                             let finalized_slot =
                                 compute_start_slot_at_epoch(finalized_checkpoint.epoch);
                             let pruned_pending = block_lookup_coordinator.prune(

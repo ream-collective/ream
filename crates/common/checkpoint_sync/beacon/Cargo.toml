@@ -27,7 +27,12 @@ ream-consensus-misc.workspace = true
 ream-execution-rpc-types.workspace = true
 ream-fork-choice-beacon.workspace = true
 ream-network-spec.workspace = true
+ream-operation-pool.workspace = true
+ream-polynomial-commitments.workspace = true
 ream-storage.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
 
 [lints]
 workspace = true

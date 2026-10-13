@@ -1,3 +1,4 @@
+pub mod backfill;
 pub mod beacon_block;
 pub mod beacon_state;
 pub mod blobs_and_proofs;

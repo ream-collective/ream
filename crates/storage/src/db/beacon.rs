@@ -32,6 +32,8 @@ pub struct BeaconDB {
     pub db: Arc<Database>,
     pub data_dir: PathBuf,
     pub(crate) cache: Option<Arc<BeaconCacheDB>>,
+    pub(crate) bootstrap_cache:
+        Arc<std::sync::Mutex<Option<crate::tables::beacon::backfill::BackfillMode>>>,
 }
 
 impl BeaconDB {
@@ -165,7 +167,7 @@ impl BeaconDB {
 
     pub fn is_initialized(&self) -> bool {
         match self.slot_index_provider().get_highest_slot() {
-            Ok(Some(slot)) => slot > 0,
+            Ok(Some(_)) => !self.bootstrap_in_progress().unwrap_or(true),
             _ => false,
         }
     }

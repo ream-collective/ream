@@ -521,17 +521,24 @@ pub async fn handle_gossipsub_message(
                     Ok(validation_result) => match validation_result {
                         ValidationResult::Accept => {
                             let blob_sidecar_bytes = blob_sidecar.as_ssz_bytes();
-                            if let Err(err) = beacon_chain.db().blobs_and_proofs_provider().insert(
-                                BlobIdentifier::new(
-                                    blob_sidecar.signed_block_header.message.tree_hash_root(),
-                                    blob_sidecar.index,
-                                ),
-                                BlobAndProofV1 {
-                                    blob: blob_sidecar.blob,
-                                    proof: blob_sidecar.kzg_proof,
-                                },
-                            ) {
-                                error!("Failed to insert blob_sidecar: {err}");
+                            let provider = beacon_chain.db().blobs_and_proofs_provider();
+                            let insert_result = tokio::task::spawn_blocking(move || {
+                                provider.insert(
+                                    BlobIdentifier::new(
+                                        blob_sidecar.signed_block_header.message.tree_hash_root(),
+                                        blob_sidecar.index,
+                                    ),
+                                    BlobAndProofV1 {
+                                        blob: blob_sidecar.blob,
+                                        proof: blob_sidecar.kzg_proof,
+                                    },
+                                )
+                            })
+                            .await;
+                            match insert_result {
+                                Ok(Ok(())) => {}
+                                Ok(Err(err)) => error!("Failed to insert blob_sidecar: {err}"),
+                                Err(err) => error!("Blob persistence task failed: {err}"),
                             }
 
                             forward_gossip_message(&message, p2p_sender, blob_sidecar_bytes);
