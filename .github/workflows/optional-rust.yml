@@ -8,6 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  UDEPS_TOOLCHAIN: nightly-2026-10-09
 
 jobs:
   cargo-udeps:
@@ -20,11 +21,15 @@ jobs:
       with:
         cache-on-failure: true        
 
+    # Pinned: nightlies from 2026-10-11 hit a rustc ICE while compiling p3-monty-31.
+    - name: Install pinned nightly toolchain
+      run: rustup toolchain install ${{ env.UDEPS_TOOLCHAIN }} --profile minimal
+
     - name: Install cargo udeps
       run: cargo install cargo-udeps --locked
 
     - name: Run cargo udeps
-      run: cargo +nightly udeps --workspace --tests --all-targets --release --exclude ef-tests
+      run: cargo +${{ env.UDEPS_TOOLCHAIN }} udeps --workspace --tests --all-targets --release --exclude ef-tests
   
   cargo-workspace-lints:
     runs-on: ubuntu-latest
