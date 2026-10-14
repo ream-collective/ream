@@ -2,7 +2,7 @@ use std::{
     cmp::{max, min},
     collections::{HashMap, HashSet},
     mem::take,
-    ops::Deref,
+    ops::{Deref, Range},
     sync::Arc,
 };
 
@@ -90,16 +90,26 @@ use super::{
     zkvm_types::ValidatorRegistryLimit,
 };
 use crate::{
-    attestation::Attestation, attester_slashing::AttesterSlashing,
-    bls_to_execution_change::SignedBLSToExecutionChange, eth_1_block::Eth1Block, helpers::xor,
-    historical_summary::HistoricalSummary, merkle_tree_cache::StateFieldRootCaches,
-    pending_consolidation::PendingConsolidation, pending_deposit::PendingDeposit,
+    attestation::Attestation,
+    attester_slashing::AttesterSlashing,
+    bls_to_execution_change::SignedBLSToExecutionChange,
+    chunked_list::{CHUNK_SIZE, ChunkedList},
+    eth_1_block::Eth1Block,
+    helpers::xor,
+    historical_summary::HistoricalSummary,
+    merkle_tree_cache::StateFieldRootCaches,
+    pending_consolidation::PendingConsolidation,
+    pending_deposit::PendingDeposit,
     pending_partial_withdrawal::PendingPartialWithdrawal,
-    predicates::is_slashable_attestation_data, proposer_slashing::ProposerSlashing,
-    shuffling_cache::ShufflingCache, sync_aggregate::SyncAggregate, sync_committee::SyncCommittee,
+    predicates::is_slashable_attestation_data,
+    proposer_slashing::ProposerSlashing,
+    shuffling_cache::ShufflingCache,
+    sync_aggregate::SyncAggregate,
+    sync_committee::SyncCommittee,
     sync_committee_indices_cache::SyncCommitteeIndicesCache,
     total_active_balance_cache::TotalActiveBalanceCache,
-    validators_root_cache::ValidatorsRootCache, voluntary_exit::SignedVoluntaryExit,
+    validators_root_cache::ValidatorsRootCache,
+    voluntary_exit::SignedVoluntaryExit,
 };
 
 pub mod quoted_u8_var_list {
@@ -167,7 +177,9 @@ pub struct BeaconState {
     pub eth1_deposit_index: u64,
 
     // Registry
-    pub validators: VariableList<Validator, ValidatorRegistryLimit>,
+    /// Shared chunk by chunk between a state and its copies, so copying a state does not copy the
+    /// registry, about 300 MB on mainnet; see `ChunkedList`.
+    pub validators: ChunkedList<Validator, ValidatorRegistryLimit>,
     #[serde(with = "quoted_u64_var_list")]
     pub balances: VariableList<u64, ValidatorRegistryLimit>,
 
@@ -839,7 +851,7 @@ impl BeaconState {
 
     /// ``get_total_balance(get_unslashed_participating_indices(flag_index, epoch))`` for the
     /// previous and the current epoch, without building the index sets, which hold most of the
-    /// validator registry. The registry is scanned once, split across threads.
+    /// validator registry. The registry is scanned once, its chunks split across threads.
     pub fn get_unslashed_participating_balances(&self, flag_index: u8) -> (u64, u64) {
         let previous_epoch = self.get_previous_epoch();
         let current_epoch = self.get_current_epoch();
@@ -865,22 +877,33 @@ impl BeaconState {
             balances
         };
 
-        let validators = &self.validators[..];
+        let registry_chunks = self.validators.chunks();
         let previous = &self.previous_epoch_participation[..];
         let current = &self.current_epoch_participation[..];
+        // Registry chunks `range`, each with the participation flags of the same validators.
+        let sum_chunks = |range: Range<usize>| {
+            range.fold((0, 0), |total: (u64, u64), chunk| {
+                let validators = registry_chunks[chunk].as_slice();
+                let start = chunk * CHUNK_SIZE;
+                let end = start + validators.len();
+                let previous_flags = &previous[start.min(previous.len())..end.min(previous.len())];
+                let current_flags = &current[start.min(current.len())..end.min(current.len())];
+                let part = sum(validators, previous_flags, current_flags);
+                (total.0 + part.0, total.1 + part.1)
+            })
+        };
         // zkVM guests have no threads to spread the work over.
         let (previous_balance, current_balance) = if cfg!(target_os = "zkvm") {
-            sum(validators, previous, current)
+            sum_chunks(0..registry_chunks.len())
         } else {
             let threads = std::thread::available_parallelism().map_or(1, |threads| threads.get());
-            let chunk_size = validators.len().div_ceil(threads).max(1);
+            let per_thread = registry_chunks.len().div_ceil(threads).max(1);
             std::thread::scope(|scope| {
-                let workers: Vec<_> = validators
-                    .chunks(chunk_size)
-                    .zip(previous.chunks(chunk_size))
-                    .zip(current.chunks(chunk_size))
-                    .map(|((validators, previous), current)| {
-                        scope.spawn(move || sum(validators, previous, current))
+                let workers: Vec<_> = (0..registry_chunks.len())
+                    .step_by(per_thread)
+                    .map(|first| {
+                        let last = (first + per_thread).min(registry_chunks.len());
+                        scope.spawn(move || sum_chunks(first..last))
                     })
                     .collect();
                 workers.into_iter().fold((0, 0), |total, worker| {
@@ -2232,19 +2255,30 @@ impl BeaconState {
     }
 
     pub fn process_effective_balance_updates(&mut self) -> anyhow::Result<()> {
-        // Update effective balances with hysteresis
-        for (index, validator) in self.validators.iter_mut().enumerate() {
-            let balance = self.balances[index];
-            let hysteresis_increment = EFFECTIVE_BALANCE_INCREMENT / HYSTERESIS_QUOTIENT;
-            let downward_threshold = hysteresis_increment * HYSTERESIS_DOWNWARD_MULTIPLIER;
-            let upward_threshold = hysteresis_increment * HYSTERESIS_UPWARD_MULTIPLIER;
-
-            if balance + downward_threshold < validator.effective_balance
-                || validator.effective_balance + upward_threshold < balance
-            {
-                validator.effective_balance = (balance - balance % EFFECTIVE_BALANCE_INCREMENT)
-                    .min(validator.get_max_effective_balance());
-            }
+        // Update effective balances with hysteresis. Only the validators that cross a threshold
+        // are written: writing every validator would copy every registry chunk.
+        let hysteresis_increment = EFFECTIVE_BALANCE_INCREMENT / HYSTERESIS_QUOTIENT;
+        let downward_threshold = hysteresis_increment * HYSTERESIS_DOWNWARD_MULTIPLIER;
+        let upward_threshold = hysteresis_increment * HYSTERESIS_UPWARD_MULTIPLIER;
+        let updates: Vec<(usize, u64)> = self
+            .validators
+            .iter()
+            .zip(self.balances.iter())
+            .enumerate()
+            .filter(|(_, (validator, balance))| {
+                **balance + downward_threshold < validator.effective_balance
+                    || validator.effective_balance + upward_threshold < **balance
+            })
+            .map(|(index, (validator, balance))| {
+                (
+                    index,
+                    (balance - balance % EFFECTIVE_BALANCE_INCREMENT)
+                        .min(validator.get_max_effective_balance()),
+                )
+            })
+            .collect();
+        for (index, effective_balance) in updates {
+            self.validators[index].effective_balance = effective_balance;
         }
         // The total active balance of this epoch was summed over the old effective balances.
         self.total_active_balance_cache.clear();
@@ -2702,22 +2736,32 @@ impl BeaconState {
         let current_epoch = self.get_current_epoch();
         let activation_epoch = compute_activation_exit_epoch(current_epoch);
 
-        // Process activation eligibility, ejections, and activations
+        // Process activation eligibility, ejections, and activations. Each validator's update
+        // depends only on itself, so the registry is read first and only the validators that
+        // change are written: writing every validator would copy every registry chunk.
+        let eligibility_epoch = current_epoch
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("Epoch overflow when setting activation eligibility epoch"))?;
         let mut initiate_validator = vec![];
+        let mut queued = vec![];
+        let mut activated = vec![];
         let finalized_checkpoint_epoch = self.finalized_checkpoint.epoch;
-        for (index, validator) in self.validators.iter_mut().enumerate() {
+        for (index, validator) in self.validators.iter().enumerate() {
             if validator.is_eligible_for_activation_queue() {
-                validator.activation_eligibility_epoch =
-                    current_epoch.checked_add(1).ok_or_else(|| {
-                        anyhow!("Epoch overflow when setting activation eligibility epoch")
-                    })?;
+                queued.push(index);
             } else if validator.is_active_validator(current_epoch)
                 && validator.effective_balance <= EJECTION_BALANCE
             {
                 initiate_validator.push(index as u64);
             } else if Self::is_eligible_for_activation(finalized_checkpoint_epoch, validator) {
-                validator.activation_epoch = activation_epoch;
+                activated.push(index);
             }
+        }
+        for index in queued {
+            self.validators[index].activation_eligibility_epoch = eligibility_epoch;
+        }
+        for index in activated {
+            self.validators[index].activation_epoch = activation_epoch;
         }
 
         for index in initiate_validator {

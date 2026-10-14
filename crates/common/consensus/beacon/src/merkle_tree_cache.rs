@@ -26,10 +26,6 @@ impl MerkleTree {
         tree
     }
 
-    pub(crate) fn leaves(&self) -> &[B256] {
-        &self.levels[0]
-    }
-
     /// Writes `leaf` at `index` (or appends it when `index` is the leaf count) and returns
     /// whether the tree changed.
     pub(crate) fn set_leaf(&mut self, index: usize, leaf: B256) -> bool {
@@ -44,6 +40,19 @@ impl MerkleTree {
                 true
             }
         }
+    }
+
+    /// Drops the leaves from `len` on. Returns the index of the new last leaf, whose path to the
+    /// root must be rehashed, or `None` when there is nothing to rehash.
+    pub(crate) fn truncate(&mut self, len: usize) -> Option<usize> {
+        if len >= self.levels[0].len() {
+            return None;
+        }
+        self.levels[0].truncate(len);
+        if len == 0 {
+            self.rebuild_upper_levels();
+        }
+        len.checked_sub(1)
     }
 
     /// Rehashes the paths above the leaves at `dirty`, given in ascending order.
@@ -165,13 +174,17 @@ impl PackedListRootCache {
     ) -> B256 {
         let mut tree = cache_lock::lock(&self.0);
         match tree.as_mut() {
-            Some(tree) if tree.leaves().len() <= chunk_count => {
-                let dirty = (0..chunk_count)
+            Some(tree) => {
+                let last = tree.truncate(chunk_count);
+                let mut dirty: Vec<usize> = (0..chunk_count)
                     .filter(|&index| tree.set_leaf(index, chunk(index)))
                     .collect();
+                dirty.extend(last);
+                dirty.sort_unstable();
+                dirty.dedup();
                 tree.rehash(dirty);
             }
-            _ => *tree = Some(MerkleTree::new((0..chunk_count).map(chunk).collect())),
+            None => *tree = Some(MerkleTree::new((0..chunk_count).map(chunk).collect())),
         }
         tree.as_ref()
             .expect("the tree was built above")
@@ -203,8 +216,9 @@ impl<T: Clone + PartialEq + TreeHash> ContainerListRootCache<T> {
     pub fn root(&self, items: &[T], limit_depth: usize) -> B256 {
         let mut cached = cache_lock::lock(&self.0);
         match cached.as_mut() {
-            Some((copies, tree)) if copies.len() <= items.len() => {
-                let mut dirty = Vec::new();
+            Some((copies, tree)) => {
+                copies.truncate(items.len());
+                let mut dirty: Vec<usize> = tree.truncate(items.len()).into_iter().collect();
                 for (index, item) in items.iter().enumerate() {
                     match copies.get_mut(index) {
                         Some(copy) if copy == item => continue,
@@ -214,9 +228,11 @@ impl<T: Clone + PartialEq + TreeHash> ContainerListRootCache<T> {
                     tree.set_leaf(index, item.tree_hash_root());
                     dirty.push(index);
                 }
+                dirty.sort_unstable();
+                dirty.dedup();
                 tree.rehash(dirty);
             }
-            _ => {
+            None => {
                 *cached = Some((
                     items.to_vec(),
                     MerkleTree::new(items.iter().map(TreeHash::tree_hash_root).collect()),
@@ -277,8 +293,14 @@ mod tests {
         values[13] = 99;
         values[39] = u64::MAX;
         assert_eq!(cache.u64_list_root(&values, 38), expected(&values));
+        // Shrinking and growing back, as states before and after an epoch's deposits alternate.
+        let longer = values.clone();
         values.truncate(6);
-        assert_eq!(cache.u64_list_root(&values, 38), expected(&values));
+        for _ in 0..2 {
+            assert_eq!(cache.u64_list_root(&values, 38), expected(&values));
+            assert_eq!(cache.u64_list_root(&longer, 38), expected(&longer));
+        }
+        assert_eq!(cache.u64_list_root(&[], 38), expected(&Vec::new()));
     }
 
     #[test]
@@ -315,7 +337,11 @@ mod tests {
         items[2] = B256::repeat_byte(0xaa);
         assert_eq!(cache.root(&items, 4), expected(&items));
         // Removing from the front shifts every item, as pending deposits do.
+        let longer = items.clone();
         items.remove(0);
-        assert_eq!(cache.root(&items, 4), expected(&items));
+        for _ in 0..2 {
+            assert_eq!(cache.root(&items, 4), expected(&items));
+            assert_eq!(cache.root(&longer, 4), expected(&longer));
+        }
     }
 }

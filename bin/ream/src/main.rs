@@ -1363,7 +1363,7 @@ mod tests {
             eth1_data: Eth1Data::default(),
             eth1_data_votes: VariableList::empty(),
             eth1_deposit_index: 0,
-            validators,
+            validators: validators.into(),
             balances,
             randao_mixes: FixedVector::<B256, U65536>::from_elem(B256::ZERO),
             slashings: FixedVector::<u64, U8192>::from_elem(0),

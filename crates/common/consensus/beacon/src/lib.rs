@@ -6,6 +6,7 @@ pub mod beacon_committee_selection;
 pub mod blob_sidecar;
 pub mod bls_to_execution_change;
 mod cache_lock;
+pub mod chunked_list;
 pub mod custody_group;
 pub mod data_column_sidecar;
 pub mod electra;
