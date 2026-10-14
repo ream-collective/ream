@@ -536,10 +536,11 @@ impl BeaconChain {
         let (state, head_slot) = match previous.filter(|previous| previous.head_root == head_root) {
             Some(previous) => (previous.state.clone(), previous.head_slot),
             None => {
-                let state =
-                    store.db.state_provider().get(head_root)?.ok_or_else(|| {
-                        anyhow!("No beacon state found for head root: {head_root}")
-                    })?;
+                let state = store
+                    .db
+                    .state_provider()
+                    .get_shared(head_root)?
+                    .ok_or_else(|| anyhow!("No beacon state found for head root: {head_root}"))?;
                 let head_slot = store
                     .db
                     .block_provider()
@@ -547,7 +548,7 @@ impl BeaconChain {
                     .ok_or_else(|| anyhow!("No beacon block found for head root: {head_root}"))?
                     .message
                     .slot;
-                (Arc::new(state), head_slot)
+                (state, head_slot)
             }
         };
 

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::{
     data_column_sidecar::DataColumnSidecar, electra::beacon_state::BeaconState,
@@ -48,7 +50,7 @@ impl GossipValidatedDataColumn {
 
 struct ParentContext {
     block_slot: u64,
-    state: BeaconState,
+    state: Arc<BeaconState>,
     pending_availability: bool,
 }
 
@@ -247,7 +249,8 @@ async fn validate_data_column_sidecar_full_inner(
     }
 
     let pending_availability = match proposer_check {
-        Some((mut state, pending_availability)) => {
+        Some((state, pending_availability)) => {
+            let mut state = Arc::unwrap_or_clone(state);
             if let Err(err) = state.process_slots(header.slot) {
                 return Ok(ValidationResult::Ignore(format!(
                     "Could not advance parent state to sidecar slot: {err:?}"

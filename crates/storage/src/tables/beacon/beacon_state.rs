@@ -1,42 +1,63 @@
-use std::{sync::Arc, thread};
+use std::{
+    collections::HashSet,
+    fs,
+    io::{ErrorKind, Write},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, atomic::Ordering},
+    thread,
+};
 
 use alloy_primitives::B256;
 use ream_consensus_beacon::electra::beacon_state::BeaconState;
 use ream_consensus_misc::misc::compute_epoch_at_slot;
-use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
-use tracing::warn;
+use redb::{
+    Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
+};
+use snap::raw::{Decoder, Encoder};
+use ssz::{Decode, Encode};
+use tracing::{info, warn};
 
 use crate::{
     cache::BeaconCacheDB,
     errors::StoreError,
     tables::{
-        beacon::{beacon_block::BeaconBlockTable, state_summaries::BeaconStateSummariesTable},
-        ssz_encoder::{SSZEncoded, SSZEncoding},
+        beacon::{
+            beacon_block::BeaconBlockTable,
+            slot_index::BeaconSlotIndexTable,
+            state_summaries::{BeaconStateSummariesTable, StateSummary},
+        },
+        ssz_encoder::SSZEncoding,
         table::REDBTable,
     },
 };
 
-const STATE_TABLE_NAME: &str = "beacon_state";
+pub(crate) const STATE_FOLDER_NAME: &str = "beacon_states";
 
 /// Post-states of imported blocks.
 ///
 /// Writing a whole mainnet state takes about a second, so only some states are stored whole: the
-/// first state of each epoch on a chain, and a state whose parent's state is not stored. Every
+/// first state of each epoch on a chain, and a state whose parent's state is not recorded. Every
 /// other state is recorded in the state summaries table and rebuilt on demand by replaying blocks
 /// onto the nearest ancestor whose state is stored whole. Recent states stay in memory, so block
 /// import and fork choice rarely rebuild one.
+///
+/// Whole states are files in the data directory rather than redb values: redb reads a value's
+/// bytes whenever it reaches the value's page, so deleting, iterating or even checking for a
+/// 250 MB state read all of it, and writing one held the database's only write lock.
 pub struct BeaconStateTable {
     pub db: Arc<Database>,
+    pub data_dir: PathBuf,
     pub cache: Option<Arc<BeaconCacheDB>>,
 }
 
-/// Table definition for the Beacon State table, which holds the states stored whole
+/// Table definition for the Beacon State table, which held whole states before they moved to
+/// files. Its states are still read, and deleted once finalized.
 ///
 /// Key: block_root
 /// Value: BeaconState
 impl REDBTable for BeaconStateTable {
     const TABLE_DEFINITION: TableDefinition<'_, SSZEncoding<B256>, SSZEncoding<BeaconState>> =
-        TableDefinition::new(STATE_TABLE_NAME);
+        TableDefinition::new("beacon_state");
 
     type Key = B256;
 
@@ -61,10 +82,12 @@ impl REDBTable for BeaconStateTable {
         &self,
         key: <Self::KeyTableDefinition as redb::Value>::SelfType<'a>,
     ) -> Result<bool, StoreError> {
-        if self.in_memory(key).is_some() {
+        if self.in_memory(key).is_some() || self.summaries().contains_key(key)? {
             return Ok(true);
         }
-        Ok(self.summaries().contains_key(key)? || self.is_stored_whole(key)?)
+        let read_txn = self.database().begin_read()?;
+        let table = read_txn.open_table(Self::TABLE_DEFINITION)?;
+        Ok(table.get(key)?.is_some())
     }
 
     fn insert<'a>(
@@ -97,6 +120,7 @@ impl REDBTable for BeaconStateTable {
             write_txn.open_table(Self::TABLE_DEFINITION)?.remove(key)?;
         }
         write_txn.commit()?;
+        remove_state_file(&self.data_dir, key)?;
         Ok(state)
     }
 }
@@ -105,10 +129,14 @@ impl BeaconStateTable {
     /// The state after the block at `block_root`, shared with the in-memory cache instead of
     /// copied. Callers that only read the state should use this over `get`.
     pub fn get_shared(&self, block_root: B256) -> Result<Option<Arc<BeaconState>>, StoreError> {
-        if let Some(state) = self.in_memory_or_stored_whole(block_root)? {
+        if let Some(state) = self.in_memory(block_root) {
             return Ok(Some(state));
         }
-        if !self.summaries().contains_key(block_root)? {
+        let summary = self.summaries().get(block_root)?;
+        if let Some(state) = self.read_stored(block_root, summary)? {
+            return Ok(Some(state));
+        }
+        if summary.is_none() {
             return Ok(None);
         }
         let Some(state) = self.rebuild(block_root)? else {
@@ -126,29 +154,71 @@ impl BeaconStateTable {
         state: Arc<BeaconState>,
     ) -> Result<(), StoreError> {
         self.cache_state(block_root, state.clone());
-        let parent_slot = self
+        let parent = self
             .summaries()
             .get(state.latest_block_header.parent_root)?;
-        let Some(parent_slot) = parent_slot else {
+        let Some(parent) = parent else {
             // Nothing to replay from, as for the checkpoint sync anchor.
             return self.store_whole(block_root, &state);
         };
 
-        self.summaries().insert(block_root, state.slot)?;
-        if compute_epoch_at_slot(state.slot) > compute_epoch_at_slot(parent_slot) {
+        self.summaries().insert(
+            block_root,
+            StateSummary {
+                slot: state.slot,
+                stored_whole: false,
+            },
+        )?;
+        if compute_epoch_at_slot(state.slot) > compute_epoch_at_slot(parent.slot) {
             self.store_whole_in_background(block_root, state);
         }
         Ok(())
     }
 
-    /// Deletes the states of blocks before the finalized block, which nothing can import onto or
-    /// vote for any more. The finalized state is stored whole first, so the states after it can
-    /// still be rebuilt. Returns how many states were deleted.
+    /// Whether the state after the block at `block_root` is stored whole.
+    pub fn is_stored_whole(&self, block_root: B256) -> Result<bool, StoreError> {
+        Ok(self
+            .summaries()
+            .get(block_root)?
+            .is_some_and(|summary| summary.stored_whole))
+    }
+
+    /// Deletes, on another thread, the states of blocks before the finalized block, which nothing
+    /// can import onto or vote for any more. The finalized state is stored whole first, so the
+    /// states after it can still be rebuilt; that can mean replaying an epoch of blocks, which
+    /// block import should not wait for. Without a cache the pruning runs on this thread.
+    pub fn prune_finalized_in_background(&self, finalized_root: B256) {
+        let Some(cache) = self.cache.clone() else {
+            if let Err(err) = self.prune_finalized(finalized_root) {
+                warn!("Failed to prune finalized states: {err:?}");
+            }
+            return;
+        };
+        if cache.pruning_states.swap(true, Ordering::AcqRel) {
+            // The running pruning covers this block's ancestors; the next finalization catches up.
+            return;
+        }
+        let table = Self {
+            db: self.db.clone(),
+            data_dir: self.data_dir.clone(),
+            cache: Some(cache.clone()),
+        };
+        thread::spawn(move || {
+            match table.prune_finalized(finalized_root) {
+                Ok(0) => {}
+                Ok(pruned) => info!("Pruned {pruned} finalized states"),
+                Err(err) => warn!("Failed to prune finalized states: {err:?}"),
+            }
+            cache.pruning_states.store(false, Ordering::Release);
+        });
+    }
+
+    /// Deletes the states of blocks before the finalized block and returns how many it deleted.
     pub fn prune_finalized(&self, finalized_root: B256) -> Result<usize, StoreError> {
-        let Some(finalized_slot) = self.summaries().get(finalized_root)? else {
+        let Some(finalized) = self.summaries().get(finalized_root)? else {
             return Ok(0);
         };
-        if !self.is_stored_whole(finalized_root)? {
+        if !finalized.stored_whole {
             if self.is_pending(finalized_root) {
                 // Its write is still running; prune at the next finalization instead.
                 return Ok(0);
@@ -159,42 +229,81 @@ impl BeaconStateTable {
             self.store_whole(finalized_root, &state)?;
         }
 
-        let block_slots = BeaconBlockTable {
-            db: self.db.clone(),
-            cache: None,
-        };
+        let mut whole_roots = Vec::new();
         let write_txn = self.database().begin_write()?;
         let pruned = {
             let mut summaries =
                 write_txn.open_table(BeaconStateSummariesTable::TABLE_DEFINITION)?;
-            let mut states = write_txn.open_table(Self::TABLE_DEFINITION)?;
-            let mut old_roots = Vec::new();
+            let mut old_roots = HashSet::new();
             for entry in summaries.iter()? {
-                let (root, slot) = entry?;
-                if slot.value() < finalized_slot {
-                    old_roots.push(root.value());
-                }
-            }
-            // States stored before summaries existed have no summary; their block gives the slot.
-            for entry in states.iter()? {
-                let (root, _) = entry?;
-                let root = root.value();
-                if summaries.get(root)?.is_none()
-                    && block_slots
-                        .get(root)?
-                        .is_some_and(|block| block.message.slot < finalized_slot)
-                {
-                    old_roots.push(root);
+                let (root, summary) = entry?;
+                let summary = summary.value();
+                if summary.slot < finalized.slot {
+                    let root = root.value();
+                    if summary.stored_whole {
+                        whole_roots.push(root);
+                    }
+                    old_roots.insert(root);
                 }
             }
             for root in &old_roots {
                 summaries.remove(*root)?;
-                states.remove(*root)?;
+            }
+
+            // States stored in redb before whole states moved to files have no summary. Their
+            // blocks are in the slot index, which holds small values and is cheap to scan.
+            let mut legacy_states = write_txn.open_table(Self::TABLE_DEFINITION)?;
+            if !legacy_states.is_empty()? {
+                let slot_index = write_txn.open_table(BeaconSlotIndexTable::TABLE_DEFINITION)?;
+                for entry in slot_index.range(..finalized.slot)? {
+                    let root = entry?.1.value();
+                    if legacy_states.remove(root)?.is_some() {
+                        old_roots.insert(root);
+                    }
+                }
             }
             old_roots.len()
         };
         write_txn.commit()?;
+
+        for root in whole_roots {
+            remove_state_file(&self.data_dir, root)?;
+        }
+        self.remove_unrecorded_state_files()?;
         Ok(pruned)
+    }
+
+    /// Deletes state files that no summary records as stored whole, which a crash during a write
+    /// leaves behind. A write marks its state pending before creating any file and stops only after
+    /// recording it, so each file is checked and deleted with the pending states locked: a
+    /// temporary file found while nothing is pending, or a state file that is neither pending nor
+    /// recorded, belongs to no running write.
+    fn remove_unrecorded_state_files(&self) -> Result<(), StoreError> {
+        let no_pending = Mutex::default();
+        let pending = self
+            .cache
+            .as_ref()
+            .map_or(&no_pending, |cache| &cache.pending_state_snapshots);
+        for entry in fs::read_dir(self.data_dir.join(STATE_FOLDER_NAME))? {
+            let path = entry?.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let root = name
+                .strip_suffix(".ssz_snappy")
+                .and_then(|root| root.parse::<B256>().ok());
+            let pending = pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let unused = match root {
+                Some(root) => !pending.contains_key(&root) && !self.is_stored_whole(root)?,
+                None => pending.is_empty(),
+            };
+            if unused {
+                fs::remove_file(&path)?;
+            }
+        }
+        Ok(())
     }
 
     fn summaries(&self) -> BeaconStateSummariesTable {
@@ -219,27 +328,29 @@ impl BeaconStateTable {
             .cloned()
     }
 
-    fn in_memory_or_stored_whole(
+    /// The state if it is stored whole: in a file when its summary says so, or in the legacy redb
+    /// table when it has no summary.
+    fn read_stored(
         &self,
         block_root: B256,
+        summary: Option<StateSummary>,
     ) -> Result<Option<Arc<BeaconState>>, StoreError> {
-        if let Some(state) = self.in_memory(block_root) {
-            return Ok(Some(state));
-        }
-        let read_txn = self.database().begin_read()?;
-        let table = read_txn.open_table(Self::TABLE_DEFINITION)?;
-        let Some(state) = table.get(block_root)?.map(|value| Arc::new(value.value())) else {
+        let state = match summary {
+            Some(summary) if summary.stored_whole => {
+                Some(read_state_file(&self.data_dir, block_root)?)
+            }
+            Some(_) => None,
+            None => {
+                let read_txn = self.database().begin_read()?;
+                let table = read_txn.open_table(Self::TABLE_DEFINITION)?;
+                table.get(block_root)?.map(|value| value.value())
+            }
+        };
+        let Some(state) = state.map(Arc::new) else {
             return Ok(None);
         };
         self.cache_state(block_root, state.clone());
         Ok(Some(state))
-    }
-
-    /// Whether the state is in the state table. The value is not decoded.
-    fn is_stored_whole(&self, block_root: B256) -> Result<bool, StoreError> {
-        let read_txn = self.database().begin_read()?;
-        let table = read_txn.open_table(Self::TABLE_DEFINITION)?;
-        Ok(table.get(block_root)?.is_some())
     }
 
     fn is_pending(&self, block_root: B256) -> bool {
@@ -281,10 +392,14 @@ impl BeaconStateTable {
             })?;
             let parent_root = block.message.parent_root;
             to_replay.push(block);
-            if let Some(state) = self.in_memory_or_stored_whole(parent_root)? {
+            if let Some(state) = self.in_memory(parent_root) {
                 break (parent_root, state);
             }
-            if !self.summaries().contains_key(parent_root)? {
+            let parent = self.summaries().get(parent_root)?;
+            if let Some(state) = self.read_stored(parent_root, parent)? {
+                break (parent_root, state);
+            }
+            if parent.is_none() {
                 return Ok(None);
             }
             root = parent_root;
@@ -308,15 +423,38 @@ impl BeaconStateTable {
         Ok(Some(state))
     }
 
-    /// Stores `state` whole, with its summary, in one transaction.
-    fn store_whole(&self, block_root: B256, state: &BeaconState) -> Result<(), StoreError> {
-        write_whole_state(
-            &self.db,
-            block_root,
-            state.slot,
-            &SSZEncoded::<BeaconState>::encode(state),
-            true,
-        )
+    /// Stores `state` whole and records it in its summary. While the write runs the state is
+    /// pending: readable from memory, and its file is kept by `remove_unrecorded_state_files`.
+    fn store_whole(&self, block_root: B256, state: &Arc<BeaconState>) -> Result<(), StoreError> {
+        self.set_pending(block_root, Some(state));
+        let stored = write_state_file(&self.data_dir, block_root, state).and_then(|()| {
+            let mut write_txn = self.database().begin_write()?;
+            write_txn.set_durability(Durability::Immediate)?;
+            write_txn
+                .open_table(BeaconStateSummariesTable::TABLE_DEFINITION)?
+                .insert(
+                    block_root,
+                    StateSummary {
+                        slot: state.slot,
+                        stored_whole: true,
+                    },
+                )?;
+            write_txn.commit()?;
+            Ok(())
+        });
+        self.set_pending(block_root, None);
+        stored
+    }
+
+    fn set_pending(&self, block_root: B256, state: Option<&Arc<BeaconState>>) {
+        if let Some(cache) = &self.cache
+            && let Ok(mut pending) = cache.pending_state_snapshots.lock()
+        {
+            match state {
+                Some(state) => pending.insert(block_root, state.clone()),
+                None => pending.remove(&block_root),
+            };
+        }
     }
 
     /// Stores `state` whole on another thread, keeping it readable from memory until the write
@@ -328,50 +466,82 @@ impl BeaconStateTable {
             }
             return;
         };
-        if let Ok(mut pending) = cache.pending_state_snapshots.lock() {
-            pending.insert(block_root, state.clone());
-        }
-        let db = self.db.clone();
+        self.set_pending(block_root, Some(&state));
+        let table = Self {
+            db: self.db.clone(),
+            data_dir: self.data_dir.clone(),
+            cache: Some(cache.clone()),
+        };
         thread::spawn(move || {
-            let encoded = SSZEncoded::<BeaconState>::encode(&state);
-            if let Err(err) = write_whole_state(&db, block_root, state.slot, &encoded, false) {
+            if let Err(err) = table.store_whole_if_recorded(block_root, &state) {
                 warn!("Failed to store state {block_root}: {err:?}");
             }
-            if let Ok(mut pending) = cache.pending_state_snapshots.lock() {
-                pending.remove(&block_root);
-            }
+            table.set_pending(block_root, None);
         });
+    }
+
+    /// `store_whole` for a state whose summary is already stored, unless the summary was removed
+    /// or pruned meanwhile, so that no file outlives its summary.
+    fn store_whole_if_recorded(
+        &self,
+        block_root: B256,
+        state: &BeaconState,
+    ) -> Result<(), StoreError> {
+        write_state_file(&self.data_dir, block_root, state)?;
+        let mut write_txn = self.database().begin_write()?;
+        write_txn.set_durability(Durability::Immediate)?;
+        let recorded = {
+            let mut summaries =
+                write_txn.open_table(BeaconStateSummariesTable::TABLE_DEFINITION)?;
+            let summary = summaries.get(block_root)?.map(|summary| summary.value());
+            if let Some(mut summary) = summary {
+                summary.stored_whole = true;
+                summaries.insert(block_root, summary)?;
+            }
+            summary.is_some()
+        };
+        write_txn.commit()?;
+        if !recorded {
+            remove_state_file(&self.data_dir, block_root)?;
+        }
+        Ok(())
     }
 }
 
-/// Writes an encoded whole state. With `with_summary` the summary is written in the same
-/// transaction; otherwise the state is written only while its summary still exists, so a state
-/// removed or pruned during a background write is not left behind.
-fn write_whole_state(
-    db: &Database,
-    block_root: B256,
-    slot: u64,
-    encoded: &[u8],
-    with_summary: bool,
-) -> Result<(), StoreError> {
-    const ENCODED_STATES: TableDefinition<'_, SSZEncoding<B256>, SSZEncoded<BeaconState>> =
-        TableDefinition::new(STATE_TABLE_NAME);
+fn state_file_path(data_dir: &Path, block_root: B256) -> PathBuf {
+    data_dir
+        .join(STATE_FOLDER_NAME)
+        .join(format!("{block_root}.ssz_snappy"))
+}
 
-    let mut write_txn = db.begin_write()?;
-    write_txn.set_durability(Durability::Immediate)?;
-    {
-        let mut summaries = write_txn.open_table(BeaconStateSummariesTable::TABLE_DEFINITION)?;
-        if with_summary {
-            summaries.insert(block_root, slot)?;
-        } else if summaries.get(block_root)?.is_none() {
-            return Ok(());
-        }
-        write_txn
-            .open_table(ENCODED_STATES)?
-            .insert(block_root, encoded)?;
-    }
-    write_txn.commit()?;
+/// Writes the state to a temporary file and renames it into place once it is on disk, so a state
+/// file is either complete or absent.
+fn write_state_file(
+    data_dir: &Path,
+    block_root: B256,
+    state: &BeaconState,
+) -> Result<(), StoreError> {
+    let encoded = Encoder::new().compress_vec(&state.as_ssz_bytes())?;
+    let mut file = tempfile::NamedTempFile::new_in(data_dir.join(STATE_FOLDER_NAME))?;
+    file.write_all(&encoded)?;
+    file.as_file().sync_all()?;
+    file.persist(state_file_path(data_dir, block_root))
+        .map_err(|err| err.error)?;
     Ok(())
+}
+
+fn read_state_file(data_dir: &Path, block_root: B256) -> Result<BeaconState, StoreError> {
+    let encoded = fs::read(state_file_path(data_dir, block_root))?;
+    let bytes = Decoder::new().decompress_vec(&encoded)?;
+    BeaconState::from_ssz_bytes(&bytes)
+        .map_err(|err| StoreError::DecodeError(format!("state {block_root}: {err:?}")))
+}
+
+fn remove_state_file(data_dir: &Path, block_root: B256) -> Result<(), StoreError> {
+    match fs::remove_file(state_file_path(data_dir, block_root)) {
+        Err(err) if err.kind() != ErrorKind::NotFound => Err(err.into()),
+        _ => Ok(()),
+    }
 }
 
 /// Drops `state` on another thread when this is its last reference. Freeing the millions of

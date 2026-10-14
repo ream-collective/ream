@@ -32,9 +32,11 @@ mod tests {
     const SEPOLIA_GENESIS_TIME: u64 = 1655733600;
     const CURRENT_TIME: u64 = 1770358512;
 
-    pub async fn db_setup() -> (BeaconChain, Arc<BeaconCacheDB>, B256) {
-        let (beacon_chain, cached_db, block_root, _, _) = db_setup_with_parent(true).await;
-        (beacon_chain, cached_db, block_root)
+    /// The returned `TempDir` holds the database and state files; keep it until the test ends.
+    pub async fn db_setup() -> (BeaconChain, Arc<BeaconCacheDB>, B256, TempDir) {
+        let (beacon_chain, cached_db, block_root, _, _, temp_dir) =
+            db_setup_with_parent(true).await;
+        (beacon_chain, cached_db, block_root, temp_dir)
     }
 
     pub async fn db_setup_with_parent(
@@ -45,6 +47,7 @@ mod tests {
         B256,
         SignedBeaconBlock,
         BeaconState,
+        TempDir,
     ) {
         let temp_dir = TempDir::new("ream_gossip_test").unwrap();
         let temp_path = temp_dir.path().to_path_buf();
@@ -111,6 +114,7 @@ mod tests {
             block_root,
             parent_beacon_block,
             parent_beacon_state,
+            temp_dir,
         )
     }
 
@@ -176,7 +180,7 @@ mod tests {
     #[tokio::test]
     pub async fn test_validate_beacon_block() {
         initialize_test_network_spec();
-        let (beacon_chain, cached_db, block_root) = db_setup().await;
+        let (beacon_chain, cached_db, block_root, _temp_dir) = db_setup().await;
 
         let (latest_state_in_db, latest_block) = {
             let store = beacon_chain.store.lock().await;
@@ -212,7 +216,7 @@ mod tests {
     #[tokio::test]
     pub async fn test_block_signature_uses_the_signed_header_epoch() {
         initialize_test_network_spec();
-        let (_beacon_chain, _cached_db, _parent_root, _, mut parent_state) =
+        let (_beacon_chain, _cached_db, _parent_root, _, mut parent_state, _temp_dir) =
             db_setup_with_parent(false).await;
         let signed_block = read_ssz_snappy_file::<SignedBeaconBlock>(
             "./assets/sepolia/blocks/child_9552076.ssz_snappy",
@@ -236,7 +240,7 @@ mod tests {
     #[tokio::test]
     pub async fn test_valid_block_uses_parent_state_not_unrelated_latest_state() {
         initialize_test_network_spec();
-        let (beacon_chain, cached_db, parent_root) = db_setup().await;
+        let (beacon_chain, cached_db, parent_root, _temp_dir) = db_setup().await;
         let incoming_beacon_block = read_ssz_snappy_file::<SignedBeaconBlock>(
             "./assets/sepolia/blocks/child_9552076.ssz_snappy",
         )
@@ -324,7 +328,8 @@ mod tests {
     #[tokio::test]
     pub async fn test_unknown_parent_returns_structured_lookup_result() {
         initialize_test_network_spec();
-        let (beacon_chain, cached_db, parent_root, _, _) = db_setup_with_parent(false).await;
+        let (beacon_chain, cached_db, parent_root, _, _, _temp_dir) =
+            db_setup_with_parent(false).await;
         let incoming_beacon_block = read_ssz_snappy_file::<SignedBeaconBlock>(
             "./assets/sepolia/blocks/child_9552076.ssz_snappy",
         )
@@ -345,7 +350,8 @@ mod tests {
     #[tokio::test]
     pub async fn test_unknown_parent_is_not_signature_checked_against_head_state() {
         initialize_test_network_spec();
-        let (beacon_chain, cached_db, parent_root, _, _) = db_setup_with_parent(false).await;
+        let (beacon_chain, cached_db, parent_root, _, _, _temp_dir) =
+            db_setup_with_parent(false).await;
         let mut incoming_beacon_block = read_ssz_snappy_file::<SignedBeaconBlock>(
             "./assets/sepolia/blocks/child_9552076.ssz_snappy",
         )
@@ -366,7 +372,7 @@ mod tests {
     #[tokio::test]
     pub async fn test_locally_pending_parent_is_classified_as_data_availability() {
         initialize_test_network_spec();
-        let (beacon_chain, cached_db, parent_root, parent_block, parent_state) =
+        let (beacon_chain, cached_db, parent_root, parent_block, parent_state, _temp_dir) =
             db_setup_with_parent(false).await;
         let incoming_beacon_block = read_ssz_snappy_file::<SignedBeaconBlock>(
             "./assets/sepolia/blocks/child_9552076.ssz_snappy",
@@ -405,7 +411,7 @@ mod tests {
     #[tokio::test]
     pub async fn test_future_slot_block_is_ignored() {
         initialize_test_network_spec();
-        let (beacon_chain, cached_db, _block_root) = db_setup().await;
+        let (beacon_chain, cached_db, _block_root, _temp_dir) = db_setup().await;
 
         let mut incoming_beacon_block = read_ssz_snappy_file::<SignedBeaconBlock>(
             "./assets/sepolia/blocks/child_9552076.ssz_snappy",
@@ -426,7 +432,7 @@ mod tests {
     #[tokio::test]
     pub async fn test_block_at_or_before_finalized_slot_is_ignored() {
         initialize_test_network_spec();
-        let (beacon_chain, cached_db, _block_root) = db_setup().await;
+        let (beacon_chain, cached_db, _block_root, _temp_dir) = db_setup().await;
 
         let mut ancestor_block = read_ssz_snappy_file::<SignedBeaconBlock>(
             "./assets/sepolia/blocks/ancestor_9551968.ssz_snappy",
@@ -445,7 +451,7 @@ mod tests {
     #[tokio::test]
     pub async fn test_validator_not_found_rejects() {
         initialize_test_network_spec();
-        let (beacon_chain, cached_db, _block_root) = db_setup().await;
+        let (beacon_chain, cached_db, _block_root, _temp_dir) = db_setup().await;
 
         let mut incoming_beacon_block = read_ssz_snappy_file::<SignedBeaconBlock>(
             "./assets/sepolia/blocks/child_9552076.ssz_snappy",
@@ -467,7 +473,7 @@ mod tests {
     #[tokio::test]
     pub async fn test_duplicate_proposer_signature_is_ignored() {
         initialize_test_network_spec();
-        let (beacon_chain, cached_db, _block_root) = db_setup().await;
+        let (beacon_chain, cached_db, _block_root, _temp_dir) = db_setup().await;
 
         let incoming_beacon_block = read_ssz_snappy_file::<SignedBeaconBlock>(
             "./assets/sepolia/blocks/child_9552076.ssz_snappy",
@@ -506,7 +512,7 @@ mod tests {
     #[tokio::test]
     pub async fn test_unrelated_bls_change_cache_entry_does_not_ignore_block() {
         initialize_test_network_spec();
-        let (beacon_chain, cached_db, _block_root) = db_setup().await;
+        let (beacon_chain, cached_db, _block_root, _temp_dir) = db_setup().await;
 
         let incoming_beacon_block = read_ssz_snappy_file::<SignedBeaconBlock>(
             "./assets/sepolia/blocks/child_9552076.ssz_snappy",

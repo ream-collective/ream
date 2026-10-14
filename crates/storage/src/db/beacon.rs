@@ -53,6 +53,7 @@ impl BeaconDB {
     pub fn state_provider(&self) -> BeaconStateTable {
         BeaconStateTable {
             db: self.db.clone(),
+            data_dir: self.data_dir.clone(),
             cache: self.cache.clone(),
         }
     }
@@ -78,6 +79,7 @@ impl BeaconDB {
     pub fn checkpoint_states_provider(&self) -> CheckpointStatesTable {
         CheckpointStatesTable {
             db: self.db.clone(),
+            data_dir: self.data_dir.clone(),
             cache: self.cache.clone(),
         }
     }

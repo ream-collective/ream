@@ -14,16 +14,23 @@ use crate::{
     errors::StoreError,
     tables::{
         beacon::{
-            beacon_block::BeaconBlockTable, beacon_state::BeaconStateTable,
-            blobs_and_proofs::BLOB_FOLDER_NAME, block_timeliness::BlockTimelinessTable,
-            checkpoint_states::CheckpointStatesTable, column_sidecars::COLUMN_FOLDER_NAME,
+            beacon_block::BeaconBlockTable,
+            beacon_state::{BeaconStateTable, STATE_FOLDER_NAME},
+            blobs_and_proofs::BLOB_FOLDER_NAME,
+            block_timeliness::BlockTimelinessTable,
+            checkpoint_states::CheckpointStatesTable,
+            column_sidecars::COLUMN_FOLDER_NAME,
             equivocating_indices::EQUIVOCATING_INDICES_FIELD,
-            finalized_checkpoint::FinalizedCheckpointField, genesis_time::GenesisTimeField,
-            justified_checkpoint::JustifiedCheckpointField, latest_messages::LatestMessagesTable,
+            finalized_checkpoint::FinalizedCheckpointField,
+            genesis_time::GenesisTimeField,
+            justified_checkpoint::JustifiedCheckpointField,
+            latest_messages::LatestMessagesTable,
             parent_root_index::PARENT_ROOT_INDEX_MULTIMAP_TABLE,
-            proposer_boost_root::ProposerBoostRootField, slot_index::BeaconSlotIndexTable,
+            proposer_boost_root::ProposerBoostRootField,
+            slot_index::BeaconSlotIndexTable,
             state_root_index::BeaconStateRootIndexTable,
-            state_summaries::BeaconStateSummariesTable, time::TimeField,
+            state_summaries::BeaconStateSummariesTable,
+            time::TimeField,
             unrealized_finalized_checkpoint::UnrealizedFinalizedCheckpointField,
             unrealized_justifications::UnrealizedJustificationsTable,
             unrealized_justified_checkpoint::UnrealizedJustifiedCheckpointField,
@@ -107,6 +114,7 @@ impl ReamDB {
 
         fs::create_dir_all(self.data_dir.join(BLOB_FOLDER_NAME))?;
         fs::create_dir_all(self.data_dir.join(COLUMN_FOLDER_NAME))?;
+        fs::create_dir_all(self.data_dir.join(STATE_FOLDER_NAME))?;
         fs::File::open(&self.data_dir)?.sync_all()?;
 
         Ok(BeaconDB {

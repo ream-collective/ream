@@ -564,9 +564,15 @@ impl Store {
             BEACON_CURRENT_JUSTIFIED_EPOCH.set(justified_checkpoint.epoch as i64);
         }
 
-        self.db
-            .previous_justified_checkpoint_provider()
-            .insert(previous_justified_checkpoint)?;
+        // Every imported block passes its checkpoints here, and they rarely change; skipping an
+        // unchanged write saves a disk sync per block.
+        if self.db.previous_justified_checkpoint_provider().get().ok()
+            != Some(previous_justified_checkpoint)
+        {
+            self.db
+                .previous_justified_checkpoint_provider()
+                .insert(previous_justified_checkpoint)?;
+        }
         BEACON_PREVIOUS_JUSTIFIED_EPOCH.set(previous_justified_checkpoint.epoch as i64);
 
         // Update finalized checkpoint
@@ -614,21 +620,15 @@ impl Store {
             }
 
             // States before the finalized block can no longer be imported onto or voted for.
-            match self
-                .db
+            self.db
                 .state_provider()
-                .prune_finalized(finalized_checkpoint.root)
-            {
-                Ok(pruned) => debug!("Pruned {pruned} finalized states"),
-                Err(err) => warn!("Failed to prune finalized states: {err:?}"),
-            }
-            match self
+                .prune_finalized_in_background(finalized_checkpoint.root);
+            if let Err(err) = self
                 .db
                 .checkpoint_states_provider()
                 .prune_before(finalized_checkpoint.epoch)
             {
-                Ok(pruned) => debug!("Pruned {pruned} finalized checkpoint states"),
-                Err(err) => warn!("Failed to prune finalized checkpoint states: {err:?}"),
+                warn!("Failed to prune finalized checkpoint states: {err:?}");
             }
         }
 
@@ -1119,23 +1119,10 @@ impl Store {
         Ok(())
     }
 
+    /// Makes sure the state of ``target`` is in memory. The checkpoint states table computes it
+    /// from the target block's state, advancing it to the target epoch when needed.
     pub fn store_target_checkpoint_state(&mut self, target: Checkpoint) -> anyhow::Result<()> {
-        if self.db.checkpoint_states_provider().contains_key(target)? {
-            return Ok(());
-        }
-
-        let Some(mut base_state) = self.db.state_provider().get(target.root)? else {
-            return Ok(());
-        };
-
-        let target_slot = compute_start_slot_at_epoch(target.epoch);
-        if base_state.slot < target_slot {
-            base_state.process_slots(target_slot)?;
-        }
-        self.db
-            .checkpoint_states_provider()
-            .insert(target, base_state)?;
-
+        self.db.checkpoint_states_provider().get_shared(target)?;
         Ok(())
     }
 

@@ -12,6 +12,7 @@ use crate::{
     tables::{
         beacon::{
             backfill::{BOOTSTRAP, BackfillMeta, BackfillMode, GVR, IN_PROGRESS, MARKER, META},
+            beacon_state::STATE_FOLDER_NAME,
             blobs_and_proofs::BLOB_FOLDER_NAME,
             column_sidecars::COLUMN_FOLDER_NAME,
         },
@@ -320,7 +321,7 @@ impl BeaconDB {
                 "Conflicting bootstrap markers; refusing recovery"
             );
         }
-        for folder in [BLOB_FOLDER_NAME, COLUMN_FOLDER_NAME] {
+        for folder in [BLOB_FOLDER_NAME, COLUMN_FOLDER_NAME, STATE_FOLDER_NAME] {
             let dir = self.data_dir.join(folder);
             for entry in fs::read_dir(&dir)? {
                 let entry = entry?;
@@ -365,6 +366,22 @@ impl BeaconDB {
                 .states
                 .lock()
                 .map_err(|err| anyhow::anyhow!("Poisoned state cache: {err}"))?
+                .clear();
+            cache
+                .pending_state_snapshots
+                .lock()
+                .map_err(|err| anyhow::anyhow!("Poisoned state snapshot cache: {err}"))?
+                .clear();
+            cache
+                .checkpoint_states
+                .lock()
+                .map_err(|err| anyhow::anyhow!("Poisoned checkpoint state cache: {err}"))?
+                .clear();
+            cache
+                .pending_latest_messages
+                .lock()
+                .map_err(|err| anyhow::anyhow!("Poisoned pending vote cache: {err}"))?
+                .messages
                 .clear();
         }
         Ok(true)

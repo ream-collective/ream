@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     num::NonZeroUsize,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicBool},
 };
 
 use alloy_primitives::{B256, FixedBytes};
@@ -112,8 +112,8 @@ pub struct BeaconCacheDB {
     pub pending_state_snapshots: Mutex<HashMap<B256, Arc<BeaconState>>>,
     pub checkpoint_states: Mutex<LruCache<Checkpoint, Arc<BeaconState>>>,
     pub pending_latest_messages: Mutex<PendingLatestMessages>,
-    /// Checkpoint states being written on another thread, readable here until the write commits.
-    pub pending_checkpoint_states: Mutex<HashMap<Checkpoint, Arc<BeaconState>>>,
+    /// Whether finalized states are being pruned on another thread.
+    pub pruning_states: AtomicBool,
 }
 
 impl BeaconCacheDB {
@@ -181,7 +181,7 @@ impl BeaconCacheDB {
                 NonZeroUsize::new(STATE_CACHE_SIZE).expect("Invalid cache size"),
             )),
             pending_state_snapshots: Mutex::default(),
-            pending_checkpoint_states: Mutex::default(),
+            pruning_states: AtomicBool::new(false),
             pending_latest_messages: Mutex::default(),
             checkpoint_states: Mutex::new(LruCache::new(
                 NonZeroUsize::new(CHECKPOINT_STATE_CACHE_SIZE).expect("Invalid cache size"),
