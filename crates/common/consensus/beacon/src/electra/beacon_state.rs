@@ -3,6 +3,7 @@ use std::{
     collections::{HashMap, HashSet},
     mem::take,
     ops::{Deref, Range},
+    slice,
     sync::Arc,
 };
 
@@ -284,6 +285,16 @@ fn depth<N: Unsigned>() -> usize {
 fn committee_count_per_slot(active_validator_count: usize) -> u64 {
     (active_validator_count as u64 / SLOTS_PER_EPOCH / TARGET_COMMITTEE_SIZE)
         .clamp(1, MAX_COMMITTEES_PER_SLOT)
+}
+
+/// The first 8 bytes of a public key as an integer, for comparing keys quickly before comparing
+/// them whole.
+fn public_key_prefix(public_key: &PublicKey) -> u64 {
+    u64::from_le_bytes(
+        public_key.inner[..8]
+            .try_into()
+            .expect("a public key has 48 bytes"),
+    )
 }
 
 /// The fields that justification and finalization update.
@@ -1305,11 +1316,7 @@ impl BeaconState {
         amount: u64,
         signature: BLSSignature,
     ) -> anyhow::Result<()> {
-        if !self
-            .validators
-            .iter()
-            .any(|validator| validator.public_key == public_key)
-        {
+        if self.find_validator_index(&public_key).is_none() {
             // Verify the deposit signature (proof of possession) which is not checked by the
             // deposit contract
             match is_valid_deposit_signature(
@@ -1514,13 +1521,11 @@ impl BeaconState {
         }
 
         // Verify public_key exists
-        let Some((index, validator)) =
-            self.validators.iter().enumerate().find(|(_, validator)| {
-                validator.public_key == withdrawal_request.validator_public_key
-            })
+        let Some(index) = self.find_validator_index(&withdrawal_request.validator_public_key)
         else {
             return Ok(());
         };
+        let validator = &self.validators[index];
 
         // Verify withdrawal credentials
         let has_correct_credentials = validator.has_execution_withdrawal_credential();
@@ -1609,9 +1614,12 @@ impl BeaconState {
         Ok(())
     }
 
-    pub fn is_valid_switch_to_compounding_request(
+    /// ``is_valid_switch_to_compounding_request`` for a request whose source validator, if any,
+    /// is at ``source_index``.
+    fn is_valid_switch_with_source(
         &self,
         consolidation_request: &ConsolidationRequest,
+        source_index: Option<usize>,
     ) -> bool {
         // Switch to compounding requires source and target be equal
         if consolidation_request.source_public_key != consolidation_request.target_public_key {
@@ -1619,11 +1627,7 @@ impl BeaconState {
         }
 
         // Verify public_key exists
-        let Some(source_validator) = self
-            .validators
-            .iter()
-            .find(|validator| validator.public_key == consolidation_request.source_public_key)
-        else {
+        let Some(source_validator) = source_index.map(|index| &self.validators[index]) else {
             return false;
         };
 
@@ -1654,10 +1658,20 @@ impl BeaconState {
         &mut self,
         consolidation_request: &ConsolidationRequest,
     ) -> anyhow::Result<()> {
-        if self.is_valid_switch_to_compounding_request(consolidation_request) {
-            let Some((index, _)) = self.validators.iter().enumerate().find(|(_, validator)| {
-                validator.public_key == consolidation_request.source_public_key
-            }) else {
+        // Both validators are found in one pass over the registry.
+        let indices = self.find_validator_indices(&[
+            consolidation_request.source_public_key.clone(),
+            consolidation_request.target_public_key.clone(),
+        ]);
+        let source_index = indices
+            .get(&consolidation_request.source_public_key)
+            .copied();
+        let target_index = indices
+            .get(&consolidation_request.target_public_key)
+            .copied();
+
+        if self.is_valid_switch_with_source(consolidation_request, source_index) {
+            let Some(index) = source_index else {
                 bail!("Validator not found");
             };
             self.switch_to_compounding_validator(index as u64)?;
@@ -1680,20 +1694,11 @@ impl BeaconState {
             return Ok(());
         }
 
-        let Some((source_index, source_validator)) =
-            self.validators.iter().enumerate().find(|(_, validator)| {
-                validator.public_key == consolidation_request.source_public_key
-            })
-        else {
+        let (Some(source_index), Some(target_index)) = (source_index, target_index) else {
             return Ok(());
         };
-        let Some((target_index, target_validator)) =
-            self.validators.iter().enumerate().find(|(_, validator)| {
-                validator.public_key == consolidation_request.target_public_key
-            })
-        else {
-            return Ok(());
-        };
+        let source_validator = &self.validators[source_index];
+        let target_validator = &self.validators[target_index];
 
         // Verify source withdrawal credentials
         let has_correct_credential = source_validator.has_execution_withdrawal_credential();
@@ -2513,10 +2518,7 @@ impl BeaconState {
 
     /// Applies ``deposit`` to the ``state``.
     pub fn apply_pending_deposit(&mut self, deposit: &PendingDeposit) -> anyhow::Result<()> {
-        let validator_index = self
-            .validators
-            .iter()
-            .position(|validator| validator.public_key == deposit.public_key);
+        let validator_index = self.find_validator_index(&deposit.public_key);
         self.apply_pending_deposit_to(deposit, validator_index)?;
         Ok(())
     }
@@ -2552,28 +2554,61 @@ impl BeaconState {
         Ok(Some(self.validators.len() - 1))
     }
 
+    /// Registry index of the first validator with ``public_key``.
+    pub fn find_validator_index(&self, public_key: &PublicKey) -> Option<usize> {
+        self.find_validator_indices(slice::from_ref(public_key))
+            .remove(public_key)
+    }
+
     /// Registry indices of ``public_keys``, found in one pass over the registry. A key held by
-    /// more than one validator maps to the first, as a search from the start finds. The first 8
-    /// bytes of each key are compared first, because the full 48 bytes rarely need comparing.
+    /// more than one validator maps to the first, as a search from the start finds.
+    ///
+    /// A pass reads all of mainnet's 2.4 million validators, several milliseconds of memory
+    /// traffic, so it is split across cores, and each key's first 8 bytes are compared as one
+    /// integer before all 48.
     fn find_validator_indices(&self, public_keys: &[PublicKey]) -> HashMap<PublicKey, usize> {
         if public_keys.is_empty() {
             return HashMap::new();
         }
-        let prefix = |key: &PublicKey| {
-            u64::from_le_bytes(
-                key.inner[..8]
-                    .try_into()
-                    .expect("a public key has 48 bytes"),
-            )
-        };
-        let prefixes: Vec<u64> = public_keys.iter().map(prefix).collect();
-        let mut indices = HashMap::new();
-        for (index, validator) in self.validators.iter().enumerate() {
-            if prefixes.contains(&prefix(&validator.public_key))
-                && public_keys.contains(&validator.public_key)
-            {
-                indices.entry(validator.public_key.clone()).or_insert(index);
+        let prefixes: Vec<u64> = public_keys.iter().map(public_key_prefix).collect();
+        let chunks = self.validators.chunks();
+        // Matches in registry chunks `range`, in ascending order of index.
+        let scan = |range: Range<usize>| {
+            let mut matches = Vec::new();
+            for chunk in range {
+                for (offset, validator) in chunks[chunk].iter().enumerate() {
+                    if prefixes.contains(&public_key_prefix(&validator.public_key))
+                        && public_keys.contains(&validator.public_key)
+                    {
+                        matches.push((chunk * CHUNK_SIZE + offset, &validator.public_key));
+                    }
+                }
             }
+            matches
+        };
+        let threads = std::thread::available_parallelism().map_or(1, |threads| threads.get());
+        // zkVM guests have no threads to spread the work over.
+        let matches: Vec<(usize, &PublicKey)> = if cfg!(target_os = "zkvm") || threads == 1 {
+            scan(0..chunks.len())
+        } else {
+            let per_thread = chunks.len().div_ceil(threads).max(1);
+            std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..chunks.len())
+                    .step_by(per_thread)
+                    .map(|first| {
+                        let last = (first + per_thread).min(chunks.len());
+                        scope.spawn(move || scan(first..last))
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .flat_map(|worker| worker.join().expect("lookup worker does not panic"))
+                    .collect()
+            })
+        };
+        let mut indices = HashMap::new();
+        for (index, public_key) in matches {
+            indices.entry(public_key.clone()).or_insert(index);
         }
         indices
     }
