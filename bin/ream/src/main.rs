@@ -1196,6 +1196,7 @@ mod service_exit_tests {
 
 #[cfg(test)]
 mod tests {
+    mod backfill_tests;
     mod block_lookup_tests;
     mod checkpoint_bootstrap_tests;
     mod mainnet_import_bench;

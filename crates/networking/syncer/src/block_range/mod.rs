@@ -1,6 +1,6 @@
 mod block_cache;
 mod peer_manager;
-mod peer_range_downloader;
+pub(crate) mod peer_range_downloader;
 mod recovery;
 
 use std::{
@@ -1871,6 +1871,14 @@ fn handle_stream_outcome<T>(
             None
         }
         StreamOutcome::Failed(DownloadFailure::InvalidData(detail)) => {
+            warn!("Invalid data from peer {peer_id}: {detail}");
+            peer_manager.ban_peer(peer_id, BanReason::ProtocolError(detail));
+            None
+        }
+        StreamOutcome::Failed(DownloadFailure::UnsupportedFork) => {
+            // Forward sync only asks for slots at or after the anchor, so an older fork is a
+            // malformed response here.
+            let detail = "response belongs to an unsupported fork".to_string();
             warn!("Invalid data from peer {peer_id}: {detail}");
             peer_manager.ban_peer(peer_id, BanReason::ProtocolError(detail));
             None

@@ -1004,7 +1004,15 @@ impl Network {
                             )))
                             .await
                     {
-                        warn!("Failed to send response: {err:?}");
+                        // The consumer cancelled or hit its receive budget. Release the RPC
+                        // stream instead of decoding the rest of a now unwanted response.
+                        self.callbacks.remove(&request_id);
+                        self.swarm.behaviour_mut().req_resp.cancel_request(
+                            peer_id,
+                            connection_id,
+                            request_id,
+                        );
+                        trace!("Response consumer dropped: {err:?}");
                     }
                 } else {
                     warn!(
@@ -1418,6 +1426,64 @@ mod tests {
             },
         )
         .await
+    }
+
+    #[test]
+    fn dropped_response_consumer_cancels_only_its_rpc_stream() {
+        initialize_test_network_spec();
+        let runtime = Runtime::new().unwrap();
+        let data_dir = TestDataDir::new();
+        let mut network = runtime
+            .block_on(create_network(
+                "127.0.0.1".parse().unwrap(),
+                0,
+                0,
+                vec![],
+                true,
+                vec![],
+                data_dir.path(),
+            ))
+            .unwrap();
+        let peer_id = PeerId::random();
+        let connection_id = libp2p::swarm::ConnectionId::new_unchecked(42);
+        let (callback, receiver) = mpsc::channel(1);
+        drop(receiver);
+        runtime.block_on(async {
+            network.callbacks.insert(17, callback);
+            network
+                .handle_request_response_event(ReqRespMessage {
+                    peer_id,
+                    connection_id,
+                    message: Ok(ReqRespMessageReceived::Response {
+                        request_id: 17,
+                        message: Box::new(ResponseMessage::Beacon(Arc::new(
+                            BeaconResponseMessage::BeaconBlocksByRange(
+                                ream_consensus_beacon::electra::beacon_block::SignedBeaconBlock {
+                                    message: Default::default(),
+                                    signature: Default::default(),
+                                },
+                            ),
+                        ))),
+                    }),
+                })
+                .await;
+        });
+        assert!(network.callbacks.get(&17).is_none());
+        assert!(
+            network
+                .swarm
+                .behaviour()
+                .req_resp
+                .events
+                .iter()
+                .any(|event| {
+                    matches!(event, libp2p::swarm::ToSwarm::NotifyHandler {
+                peer_id: peer,
+                handler: libp2p::swarm::NotifyHandler::One(connection),
+                event: ream_req_resp::ConnectionRequest::CancelRequest { request_id: 17 },
+            } if *peer == peer_id && *connection == connection_id)
+                })
+        );
     }
 
     #[test]
