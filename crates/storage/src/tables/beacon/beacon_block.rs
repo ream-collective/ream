@@ -71,12 +71,6 @@ impl REDBTable for BeaconBlockTable {
         // block is stored under, and hashing the block again costs a few milliseconds.
         let block_root = key;
 
-        if let Some(cache) = &self.cache
-            && let Ok(mut cache_lock) = cache.blocks.lock()
-        {
-            cache_lock.put(key, value.clone());
-        }
-
         // The block and its slot, state root and parent root index entries commit together: one
         // disk sync instead of four, and no reader sees the block without its index entries.
         let mut write_txn = self.db.begin_write()?;
@@ -93,9 +87,10 @@ impl REDBTable for BeaconBlockTable {
                 .insert(value.message.parent_root, block_root)?;
             write_txn
                 .open_table(Self::TABLE_DEFINITION)?
-                .insert(key, value)?;
+                .insert(key, value.clone())?;
         }
         write_txn.commit()?;
+        self.cache_committed(key, value);
         Ok(())
     }
 
@@ -122,5 +117,15 @@ impl REDBTable for BeaconBlockTable {
         drop(table);
         write_txn.commit()?;
         Ok(value)
+    }
+}
+
+impl BeaconBlockTable {
+    pub(crate) fn cache_committed(&self, block_root: B256, block: SignedBeaconBlock) {
+        if let Some(cache) = &self.cache
+            && let Ok(mut cache_lock) = cache.blocks.lock()
+        {
+            cache_lock.put(block_root, block);
+        }
     }
 }

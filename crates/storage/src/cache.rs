@@ -1,7 +1,8 @@
 use std::{
     collections::HashMap,
     num::NonZeroUsize,
-    sync::{Arc, Mutex, atomic::AtomicBool},
+    sync::{Arc, Mutex, MutexGuard, RwLock as StorageRwLock, RwLockReadGuard, atomic::AtomicBool},
+    thread::{self, JoinHandle},
 };
 
 use alloy_primitives::{B256, FixedBytes};
@@ -112,8 +113,27 @@ pub struct BeaconCacheDB {
     pub pending_state_snapshots: Mutex<HashMap<B256, Arc<BeaconState>>>,
     pub checkpoint_states: Mutex<LruCache<Checkpoint, Arc<BeaconState>>>,
     pub pending_latest_messages: Mutex<PendingLatestMessages>,
+    /// Serializes vote flushes and removals without blocking readers on a DB write.
+    pub(crate) latest_messages_write_lock: Mutex<()>,
+    storage_tasks: Mutex<Vec<JoinHandle<()>>>,
+    accepting_storage_writes: StorageRwLock<bool>,
     /// Whether finalized states are being pruned on another thread.
     pub pruning_states: AtomicBool,
+}
+
+/// Records `key` in `seen` and returns whether it was not there yet. Gossip messages are
+/// validated concurrently and an early `contains` check holds no lock through the validation, so
+/// the record step checks again under the write lock.
+pub async fn insert_if_unseen<K: std::hash::Hash + Eq>(
+    seen: &RwLock<LruCache<K, ()>>,
+    key: K,
+) -> bool {
+    let mut seen = seen.write().await;
+    if seen.contains(&key) {
+        return false;
+    }
+    seen.put(key, ());
+    true
 }
 
 impl BeaconCacheDB {
@@ -183,11 +203,105 @@ impl BeaconCacheDB {
             pending_state_snapshots: Mutex::default(),
             pruning_states: AtomicBool::new(false),
             pending_latest_messages: Mutex::default(),
+            latest_messages_write_lock: Mutex::default(),
+            storage_tasks: Mutex::default(),
+            accepting_storage_writes: StorageRwLock::new(true),
             checkpoint_states: Mutex::new(LruCache::new(
                 NonZeroUsize::new(CHECKPOINT_STATE_CACHE_SIZE).expect("Invalid cache size"),
             )),
         }
     }
+
+    pub(crate) fn spawn_storage_task(
+        &self,
+        task: impl FnOnce() + Send + 'static,
+    ) -> std::io::Result<()> {
+        #[cfg(test)]
+        if FAIL_NEXT_STORAGE_SPAWN.with(|fail| fail.replace(false)) {
+            return Err(std::io::Error::other(
+                "injected storage worker spawn failure",
+            ));
+        }
+        let mut tasks = self
+            .storage_tasks
+            .lock()
+            .expect("storage tasks lock is not poisoned");
+        // Finished workers no longer own data or a DB handle.
+        let mut index = 0;
+        while index < tasks.len() {
+            if tasks[index].is_finished() {
+                if tasks.swap_remove(index).join().is_err() {
+                    return Err(std::io::Error::other("storage worker panicked"));
+                }
+            } else {
+                index += 1;
+            }
+        }
+        tasks.push(thread::Builder::new().spawn(task)?);
+        Ok(())
+    }
+
+    /// The pending vote overlay, locked.
+    pub(crate) fn pending_votes(&self) -> MutexGuard<'_, PendingLatestMessages> {
+        self.pending_latest_messages
+            .lock()
+            .expect("pending latest messages lock is not poisoned")
+    }
+
+    /// The write gate guard for a cached database. Without a cache there are no background
+    /// writers to drain at shutdown, so writes are always accepted.
+    pub(crate) fn accept_writes(
+        cache: Option<&Arc<Self>>,
+    ) -> Result<Option<RwLockReadGuard<'_, bool>>, crate::errors::StoreError> {
+        cache.map(|cache| cache.storage_write_guard()).transpose()
+    }
+
+    pub(crate) fn storage_write_guard(
+        &self,
+    ) -> Result<RwLockReadGuard<'_, bool>, crate::errors::StoreError> {
+        let guard = self
+            .accepting_storage_writes
+            .read()
+            .expect("storage write gate is not poisoned");
+        if !*guard {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "beacon storage is shutting down",
+            )
+            .into());
+        }
+        Ok(guard)
+    }
+
+    pub(crate) fn stop_storage_writes(&self) {
+        *self
+            .accepting_storage_writes
+            .write()
+            .expect("storage write gate is not poisoned") = false;
+    }
+
+    /// Call after stopping producers. Do not hold a pending/cache lock while joining workers.
+    pub(crate) fn join_storage_tasks(&self) -> Result<(), crate::errors::StoreError> {
+        let tasks = std::mem::take(
+            &mut *self
+                .storage_tasks
+                .lock()
+                .expect("storage tasks lock is not poisoned"),
+        );
+        let mut panicked = false;
+        for task in tasks {
+            panicked |= task.join().is_err();
+        }
+        if panicked {
+            return Err(std::io::Error::other("storage worker panicked").into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_NEXT_STORAGE_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 impl Default for BeaconCacheDB {
@@ -220,5 +334,23 @@ impl LeanCacheDB {
 impl Default for LeanCacheDB {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod insert_if_unseen_tests {
+    use std::num::NonZeroUsize;
+
+    use lru::LruCache;
+    use tokio::sync::RwLock;
+
+    use super::insert_if_unseen;
+
+    #[tokio::test]
+    async fn only_the_first_insert_of_a_key_succeeds() {
+        let seen = RwLock::new(LruCache::new(NonZeroUsize::new(4).unwrap()));
+        assert!(insert_if_unseen(&seen, 1u64).await);
+        assert!(!insert_if_unseen(&seen, 1u64).await);
+        assert!(insert_if_unseen(&seen, 2u64).await);
     }
 }
