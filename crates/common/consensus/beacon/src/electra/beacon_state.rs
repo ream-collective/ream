@@ -485,8 +485,9 @@ impl BeaconState {
 
     /// Computes the next epoch's attester shuffling on another thread, unless a state sharing this
     /// one's caches has it or is computing it. This takes the shuffling, about 120 ms on mainnet,
-    /// off the import of the next epoch's first block.
-    pub fn prepare_next_epoch_shuffling(self: &Arc<Self>) {
+    /// off the import of the next epoch's first block. The state is copied for the thread only when
+    /// there is something to compute.
+    pub fn prepare_next_epoch_shuffling(&self) {
         // zkVM guests have no threads to run it on.
         if cfg!(target_os = "zkvm") {
             return;
@@ -498,6 +499,7 @@ impl BeaconState {
         if self.caches.shuffling.contains(next_epoch, decision_root) {
             return;
         }
+        // The copy shares the registry and these caches with this state.
         let state = self.clone();
         std::thread::spawn(move || {
             state.get_shuffled_active_validator_indices(next_epoch);

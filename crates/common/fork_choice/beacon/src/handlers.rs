@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use alloy_primitives::{B256, map::HashSet};
 use anyhow::{anyhow, ensure};
 use ream_consensus_beacon::{
@@ -154,7 +152,7 @@ pub fn process_available_block(store: &mut Store, pending: PendingBlock) -> anyh
         .insert(block_root, state.clone())?;
     // The state cache keeps a clone that shares this state's caches, so its children reuse the
     // shuffling computed here.
-    Arc::new(state.clone()).prepare_next_epoch_shuffling();
+    state.prepare_next_epoch_shuffling();
 
     // Add block timeliness to the store
     let time_into_slot = (store.db.time_provider().get()?
