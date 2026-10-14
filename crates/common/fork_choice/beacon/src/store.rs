@@ -1104,44 +1104,39 @@ impl Store {
         Ok(())
     }
 
-    pub fn compute_pulled_up_tip(&mut self, block_root: B256) -> anyhow::Result<()> {
-        let mut state = self
-            .db
-            .state_provider()
-            .get(block_root)?
-            .ok_or_else(|| anyhow!("beacon state not found"))?;
+    /// Pulls up the checkpoints of ``state``, the post-state of the block at ``block_root``.
+    pub fn compute_pulled_up_tip(
+        &mut self,
+        block_root: B256,
+        state: &BeaconState,
+    ) -> anyhow::Result<()> {
         // Pull up the post-state of the block to the next epoch boundary
-        state.process_justification_and_finalization()?;
+        let pulled_up = state.compute_justification_and_finalization()?;
 
+        // Reading the count from the shuffling also computes it for the epoch's first block, which
+        // its attestations need next.
         BEACON_CURRENT_ACTIVE_VALIDATORS.set(
             state
-                .get_active_validator_indices(state.get_current_epoch())
+                .get_shuffled_active_validator_indices(state.get_current_epoch())
                 .len() as i64,
         );
 
         self.db
             .unrealized_justifications_provider()
-            .insert(block_root, state.current_justified_checkpoint)?;
+            .insert(block_root, pulled_up.current_justified_checkpoint)?;
         self.update_unrealized_checkpoints(
-            state.current_justified_checkpoint,
-            state.finalized_checkpoint,
+            pulled_up.current_justified_checkpoint,
+            pulled_up.finalized_checkpoint,
         )?;
 
         // If the block is from a prior epoch, apply the realized values
-        let block_epoch = compute_epoch_at_slot(
-            self.db
-                .block_provider()
-                .get(block_root)?
-                .ok_or_else(|| anyhow!("block not found"))?
-                .message
-                .slot,
-        );
+        let block_epoch = compute_epoch_at_slot(state.slot);
         let current_epoch = self.get_current_store_epoch()?;
         if block_epoch < current_epoch {
             self.update_checkpoints(
-                state.current_justified_checkpoint,
-                state.finalized_checkpoint,
-                state.previous_justified_checkpoint,
+                pulled_up.current_justified_checkpoint,
+                pulled_up.finalized_checkpoint,
+                pulled_up.previous_justified_checkpoint,
             )?;
         }
 

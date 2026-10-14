@@ -178,7 +178,7 @@ pub fn process_available_block(store: &mut Store, pending: PendingBlock) -> anyh
     )?;
 
     // Eagerly compute unrealized justification and finality.
-    store.compute_pulled_up_tip(block_root)?;
+    store.compute_pulled_up_tip(block_root, &state)?;
 
     // Fork choice tree maintenance is the last step, once the store mutation is committed.
     store.fork_choice_insert_block(

@@ -268,6 +268,15 @@ fn committee_count_per_slot(active_validator_count: usize) -> u64 {
         .clamp(1, MAX_COMMITTEES_PER_SLOT)
 }
 
+/// The fields that justification and finalization update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JustificationAndFinalization {
+    pub justification_bits: BitVector<U4>,
+    pub previous_justified_checkpoint: Checkpoint,
+    pub current_justified_checkpoint: Checkpoint,
+    pub finalized_checkpoint: Checkpoint,
+}
+
 impl BeaconState {
     /// Return the current epoch.
     pub fn get_current_epoch(&self) -> u64 {
@@ -826,6 +835,64 @@ impl BeaconState {
             .filter(|&index| !self.validators[index as usize].slashed)
             .collect();
         Ok(filtered_indices)
+    }
+
+    /// ``get_total_balance(get_unslashed_participating_indices(flag_index, epoch))`` for the
+    /// previous and the current epoch, without building the index sets, which hold most of the
+    /// validator registry. The registry is scanned once, split across threads.
+    pub fn get_unslashed_participating_balances(&self, flag_index: u8) -> (u64, u64) {
+        let previous_epoch = self.get_previous_epoch();
+        let current_epoch = self.get_current_epoch();
+        let sum = |validators: &[Validator], previous: &[u8], current: &[u8]| {
+            let mut balances = (0u64, 0u64);
+            for ((validator, previous_flags), current_flags) in
+                validators.iter().zip(previous).zip(current)
+            {
+                if validator.slashed {
+                    continue;
+                }
+                if validator.is_active_validator(previous_epoch)
+                    && Self::has_flag(*previous_flags, flag_index)
+                {
+                    balances.0 += validator.effective_balance;
+                }
+                if validator.is_active_validator(current_epoch)
+                    && Self::has_flag(*current_flags, flag_index)
+                {
+                    balances.1 += validator.effective_balance;
+                }
+            }
+            balances
+        };
+
+        let validators = &self.validators[..];
+        let previous = &self.previous_epoch_participation[..];
+        let current = &self.current_epoch_participation[..];
+        // zkVM guests have no threads to spread the work over.
+        let (previous_balance, current_balance) = if cfg!(target_os = "zkvm") {
+            sum(validators, previous, current)
+        } else {
+            let threads = std::thread::available_parallelism().map_or(1, |threads| threads.get());
+            let chunk_size = validators.len().div_ceil(threads).max(1);
+            std::thread::scope(|scope| {
+                let workers: Vec<_> = validators
+                    .chunks(chunk_size)
+                    .zip(previous.chunks(chunk_size))
+                    .zip(current.chunks(chunk_size))
+                    .map(|((validators, previous), current)| {
+                        scope.spawn(move || sum(validators, previous, current))
+                    })
+                    .collect();
+                workers.into_iter().fold((0, 0), |total, worker| {
+                    let part = worker.join().expect("balance worker does not panic");
+                    (total.0 + part.0, total.1 + part.1)
+                })
+            })
+        };
+        (
+            max(EFFECTIVE_BALANCE_INCREMENT, previous_balance),
+            max(EFFECTIVE_BALANCE_INCREMENT, current_balance),
+        )
     }
 
     pub fn process_inactivity_updates(&mut self) -> anyhow::Result<()> {
@@ -2006,33 +2073,33 @@ impl BeaconState {
     }
 
     pub fn process_justification_and_finalization(&mut self) -> anyhow::Result<()> {
+        let outcome = self.compute_justification_and_finalization()?;
+        self.apply_justification_and_finalization(outcome);
+        Ok(())
+    }
+
+    /// The justification bits and checkpoints that ``process_justification_and_finalization``
+    /// would produce, leaving the state unchanged. Fork choice pulls up every imported block's
+    /// checkpoints this way.
+    pub fn compute_justification_and_finalization(
+        &self,
+    ) -> anyhow::Result<JustificationAndFinalization> {
         // Initial FFG checkpoint values have a `0x00` stub for `root`.
         // Skip FFG updates in the first two epochs to avoid corner cases that might result in
         // modifying this stub.
         if self.get_current_epoch() <= GENESIS_EPOCH + 1 {
-            return Ok(());
+            return Ok(self.current_justification());
         }
 
-        let previous_indices = self.get_unslashed_participating_indices(
-            TIMELY_TARGET_FLAG_INDEX,
-            self.get_previous_epoch(),
-        )?;
-        let current_indices = self.get_unslashed_participating_indices(
-            TIMELY_TARGET_FLAG_INDEX,
-            self.get_current_epoch(),
-        )?;
-
         let total_active_balance = self.get_total_active_balance();
-        let previous_target_balance = self.get_total_balance(previous_indices);
-        let current_target_balance = self.get_total_balance(current_indices);
+        let (previous_target_balance, current_target_balance) =
+            self.get_unslashed_participating_balances(TIMELY_TARGET_FLAG_INDEX);
 
-        self.weigh_justification_and_finalization(
+        self.justification_outcome(
             total_active_balance,
             previous_target_balance,
             current_target_balance,
-        )?;
-
-        Ok(())
+        )
     }
 
     pub fn weigh_justification_and_finalization(
@@ -2041,79 +2108,116 @@ impl BeaconState {
         previous_epoch_target_balance: u64,
         current_epoch_target_balance: u64,
     ) -> anyhow::Result<()> {
+        let outcome = self.justification_outcome(
+            total_active_balance,
+            previous_epoch_target_balance,
+            current_epoch_target_balance,
+        )?;
+        self.apply_justification_and_finalization(outcome);
+        Ok(())
+    }
+
+    fn current_justification(&self) -> JustificationAndFinalization {
+        JustificationAndFinalization {
+            justification_bits: self.justification_bits.clone(),
+            previous_justified_checkpoint: self.previous_justified_checkpoint,
+            current_justified_checkpoint: self.current_justified_checkpoint,
+            finalized_checkpoint: self.finalized_checkpoint,
+        }
+    }
+
+    fn apply_justification_and_finalization(&mut self, outcome: JustificationAndFinalization) {
+        self.justification_bits = outcome.justification_bits;
+        self.previous_justified_checkpoint = outcome.previous_justified_checkpoint;
+        self.current_justified_checkpoint = outcome.current_justified_checkpoint;
+        self.finalized_checkpoint = outcome.finalized_checkpoint;
+    }
+
+    /// ``weigh_justification_and_finalization`` computed into a new value instead of the state.
+    fn justification_outcome(
+        &self,
+        total_active_balance: u64,
+        previous_epoch_target_balance: u64,
+        current_epoch_target_balance: u64,
+    ) -> anyhow::Result<JustificationAndFinalization> {
         let previous_epoch = self.get_previous_epoch();
         let current_epoch = self.get_current_epoch();
         let old_previous_justified_checkpoint = self.previous_justified_checkpoint;
         let old_current_justified_checkpoint = self.current_justified_checkpoint;
+        let mut outcome = self.current_justification();
 
-        self.previous_justified_checkpoint = self.current_justified_checkpoint;
+        outcome.previous_justified_checkpoint = self.current_justified_checkpoint;
 
         for i in (1..JUSTIFICATION_BITS_LENGTH).rev() {
-            let bit = self
+            let bit = outcome
                 .justification_bits
                 .get(i - 1)
                 .map_err(|err| anyhow!("Failed to get justification bit {err:?}"))?;
-            self.justification_bits
+            outcome
+                .justification_bits
                 .set(i, bit)
                 .map_err(|err| anyhow!("Failed to set justification bit {err:?}"))?;
         }
 
-        self.justification_bits
+        outcome
+            .justification_bits
             .set(0, false)
             .map_err(|err| anyhow!("Failed to set justification bit 0: {err:?}"))?;
 
         if previous_epoch_target_balance * 3 >= total_active_balance * 2 {
-            self.current_justified_checkpoint = Checkpoint {
+            outcome.current_justified_checkpoint = Checkpoint {
                 epoch: previous_epoch,
                 root: self.get_block_root(previous_epoch)?,
             };
-            self.justification_bits
+            outcome
+                .justification_bits
                 .set(1, true)
                 .map_err(|err| anyhow!("Failed to set justification bit 1: {err:?}"))?;
         }
 
         if current_epoch_target_balance * 3 >= total_active_balance * 2 {
-            self.current_justified_checkpoint = Checkpoint {
+            outcome.current_justified_checkpoint = Checkpoint {
                 epoch: current_epoch,
                 root: self.get_block_root(current_epoch)?,
             };
-            self.justification_bits
+            outcome
+                .justification_bits
                 .set(0, true)
                 .map_err(|err| anyhow!("Failed to set justification bit 0: {err:?}"))?;
         }
 
         // Process finalizations
-        let bits: Vec<bool> = self.justification_bits.iter().collect();
+        let bits: Vec<bool> = outcome.justification_bits.iter().collect();
 
         // The 2nd/3rd/4th most recent epochs are justified, the 2nd using the 4th as source
         if bits[1..4].iter().all(|&b| b)
             && old_previous_justified_checkpoint.epoch + 3 == current_epoch
         {
-            self.finalized_checkpoint = old_previous_justified_checkpoint;
+            outcome.finalized_checkpoint = old_previous_justified_checkpoint;
         }
 
         // The 2nd/3rd most recent epochs are justified, the 2nd using the 3rd as source
         if bits[1..3].iter().all(|&b| b)
             && old_previous_justified_checkpoint.epoch + 2 == current_epoch
         {
-            self.finalized_checkpoint = old_previous_justified_checkpoint;
+            outcome.finalized_checkpoint = old_previous_justified_checkpoint;
         }
 
         // The 1st/2nd/3rd most recent epochs are justified, the 1st using the 3rd as source
         if bits[0..3].iter().all(|&b| b)
             && old_current_justified_checkpoint.epoch + 2 == current_epoch
         {
-            self.finalized_checkpoint = old_current_justified_checkpoint;
+            outcome.finalized_checkpoint = old_current_justified_checkpoint;
         }
 
         // The 1st/2nd most recent epochs are justified, the 1st using the 2nd as source
         if bits[0..2].iter().all(|&b| b)
             && old_current_justified_checkpoint.epoch + 1 == current_epoch
         {
-            self.finalized_checkpoint = old_current_justified_checkpoint;
+            outcome.finalized_checkpoint = old_current_justified_checkpoint;
         }
 
-        Ok(())
+        Ok(outcome)
     }
 
     pub fn process_eth1_data_reset(&mut self) -> anyhow::Result<()> {
@@ -2798,31 +2902,15 @@ impl BeaconState {
         execution_engine: &Option<impl ExecutionApi>,
     ) -> anyhow::Result<()> {
         let payload = &body.execution_payload;
-
-        // Verify consistency of the parent hash with respect to the previous execution payload
-        // header
-        ensure!(payload.parent_hash == self.latest_execution_payload_header.block_hash);
-        // Verify prev_randao
-        ensure!(payload.prev_randao == self.get_randao_mix(self.get_current_epoch()));
-        // Verify timestamp
-        ensure!(payload.timestamp == self.compute_timestamp_at_slot(self.slot));
-        // Verify commitments are under limit
-        ensure!(
-            body.blob_kzg_commitments.len()
-                <= get_blob_parameters(
-                    &beacon_network_spec().blob_schedule,
-                    self.get_current_epoch()
-                )
-                .max_blobs_per_block as usize
-        );
+        self.verify_execution_payload_consistency(body)?;
 
         // Verify the execution payload is valid
-        let mut versioned_hashes = vec![];
-        for commitment in body.blob_kzg_commitments.iter() {
-            versioned_hashes.push(commitment.calculate_versioned_hash());
-        }
-
         if let Some(execution_engine) = execution_engine {
+            let versioned_hashes = body
+                .blob_kzg_commitments
+                .iter()
+                .map(|commitment| commitment.calculate_versioned_hash())
+                .collect();
             let new_payload_timer =
                 BEACON_ENGINE_NEW_PAYLOAD_REQUEST_DURATION_SECONDS.start_timer();
             let new_payload_result = execution_engine
@@ -2843,6 +2931,29 @@ impl BeaconState {
         Ok(())
     }
 
+    /// The checks of ``process_execution_payload`` that need no execution engine.
+    fn verify_execution_payload_consistency(&self, body: &BeaconBlockBody) -> anyhow::Result<()> {
+        let payload = &body.execution_payload;
+
+        // Verify consistency of the parent hash with respect to the previous execution payload
+        // header
+        ensure!(payload.parent_hash == self.latest_execution_payload_header.block_hash);
+        // Verify prev_randao
+        ensure!(payload.prev_randao == self.get_randao_mix(self.get_current_epoch()));
+        // Verify timestamp
+        ensure!(payload.timestamp == self.compute_timestamp_at_slot(self.slot));
+        // Verify commitments are under limit
+        ensure!(
+            body.blob_kzg_commitments.len()
+                <= get_blob_parameters(
+                    &beacon_network_spec().blob_schedule,
+                    self.get_current_epoch()
+                )
+                .max_blobs_per_block as usize
+        );
+        Ok(())
+    }
+
     pub async fn process_block(
         &mut self,
         block: &BeaconBlock,
@@ -2852,12 +2963,38 @@ impl BeaconState {
         self.process_withdrawals(&block.body.execution_payload)?;
         self.process_execution_payload(&block.body, execution_engine)
             .await?;
-        self.process_randao(&block.body)?;
-        self.process_eth1_data(&block.body)?;
-        self.process_operations(&block.body)?;
-        self.process_sync_aggregate(&block.body.sync_aggregate)?;
+        self.process_block_after_execution_payload(&block.body)
+    }
+
+    fn process_block_after_execution_payload(
+        &mut self,
+        body: &BeaconBlockBody,
+    ) -> anyhow::Result<()> {
+        self.process_randao(body)?;
+        self.process_eth1_data(body)?;
+        self.process_operations(body)?;
+        self.process_sync_aggregate(&body.sync_aggregate)?;
 
         Ok(())
+    }
+
+    /// Applies a block that was already imported onto its parent's post-state, to rebuild a state
+    /// that was not stored. The execution engine already accepted its payload and the block
+    /// already matched its state root, so neither is checked again. ``pre_state_root`` is the
+    /// parent block's state root, which saves hashing the state.
+    pub fn replay_block(
+        &mut self,
+        signed_block: &SignedBeaconBlock,
+        pre_state_root: Option<B256>,
+    ) -> anyhow::Result<()> {
+        let block = &signed_block.message;
+        self.process_slots_from_root(block.slot, pre_state_root)?;
+        self.process_block_header(block)?;
+        self.process_withdrawals(&block.body.execution_payload)?;
+        self.verify_execution_payload_consistency(&block.body)?;
+        self.latest_execution_payload_header =
+            block.body.execution_payload.to_execution_payload_header();
+        self.process_block_after_execution_payload(&block.body)
     }
 
     pub async fn state_transition(
@@ -2881,9 +3018,54 @@ impl BeaconState {
         execution_engine: &Option<impl ExecutionApi>,
         pre_state_root: Option<B256>,
     ) -> anyhow::Result<()> {
-        let block = &signed_block.message;
         // Process slots (including those with no blocks) since block
-        self.process_slots_from_root(block.slot, pre_state_root)?;
+        self.process_slots_from_root(signed_block.message.slot, pre_state_root)?;
+        self.process_signed_block(signed_block, validate_result, execution_engine)
+            .await
+    }
+
+    /// ``state_transition_from_root`` that also returns the pre-state advanced to the first slot
+    /// of the block's epoch, when the block is in a later epoch than the pre-state. That state is
+    /// the checkpoint state of the block's epoch for the parent block, which fork choice needs
+    /// when attestations target the parent; computing it again repeats a whole epoch processing.
+    pub async fn state_transition_keeping_epoch_start(
+        &mut self,
+        signed_block: &SignedBeaconBlock,
+        validate_result: bool,
+        execution_engine: &Option<impl ExecutionApi>,
+        pre_state_root: Option<B256>,
+    ) -> anyhow::Result<Option<BeaconState>> {
+        let block_slot = signed_block.message.slot;
+        let block_epoch = compute_epoch_at_slot(block_slot);
+        if self.get_current_epoch() >= block_epoch {
+            self.state_transition_from_root(
+                signed_block,
+                validate_result,
+                execution_engine,
+                pre_state_root,
+            )
+            .await?;
+            return Ok(None);
+        }
+
+        self.process_slots_from_root(compute_start_slot_at_epoch(block_epoch), pre_state_root)?;
+        let epoch_start_state = self.clone();
+        if self.slot < block_slot {
+            self.process_slots(block_slot)?;
+        }
+        self.process_signed_block(signed_block, validate_result, execution_engine)
+            .await?;
+        Ok(Some(epoch_start_state))
+    }
+
+    /// The part of ``state_transition`` after ``process_slots``.
+    async fn process_signed_block(
+        &mut self,
+        signed_block: &SignedBeaconBlock,
+        validate_result: bool,
+        execution_engine: &Option<impl ExecutionApi>,
+    ) -> anyhow::Result<()> {
+        let block = &signed_block.message;
 
         // Verify block signature
         if validate_result {
