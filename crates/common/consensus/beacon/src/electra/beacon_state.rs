@@ -855,6 +855,41 @@ impl BeaconState {
         Ok(filtered_indices)
     }
 
+    /// Membership in ``get_unslashed_participating_indices(flag_index, epoch)`` by validator
+    /// index, with the members' ``get_total_balance``. Epoch processing asks whether each of about
+    /// 870,000 validators participated, and a vector answers that without building a hash set.
+    pub fn get_unslashed_participating_mask(
+        &self,
+        flag_index: u8,
+        epoch: u64,
+    ) -> anyhow::Result<(Vec<bool>, u64)> {
+        ensure!(
+            epoch == self.get_previous_epoch() || epoch == self.get_current_epoch(),
+            "Epoch must be either the previous or current epoch"
+        );
+        let epoch_participation = if epoch == self.get_current_epoch() {
+            &self.current_epoch_participation
+        } else {
+            &self.previous_epoch_participation
+        };
+        let mut balance = 0;
+        let mask = self
+            .validators
+            .iter()
+            .zip(epoch_participation.iter())
+            .map(|(validator, flags)| {
+                let participating = validator.is_active_validator(epoch)
+                    && !validator.slashed
+                    && Self::has_flag(*flags, flag_index);
+                if participating {
+                    balance += validator.effective_balance;
+                }
+                participating
+            })
+            .collect();
+        Ok((mask, max(EFFECTIVE_BALANCE_INCREMENT, balance)))
+    }
+
     /// ``get_total_balance(get_unslashed_participating_indices(flag_index, epoch))`` for the
     /// previous and the current epoch, without building the index sets, which hold most of the
     /// validator registry. The registry is scanned once, its chunks split across threads.
@@ -929,13 +964,14 @@ impl BeaconState {
         if self.get_current_epoch() == GENESIS_EPOCH {
             return Ok(());
         }
-        let unslashed_participating_indices = self.get_unslashed_participating_indices(
+        let (unslashed_participating, _) = self.get_unslashed_participating_mask(
             TIMELY_TARGET_FLAG_INDEX,
             self.get_previous_epoch(),
         )?;
+        let is_in_inactivity_leak = self.is_in_inactivity_leak();
         for index in self.get_eligible_validator_indices()? {
             // Increase the inactivity score of inactive validators
-            if unslashed_participating_indices.contains(&index) {
+            if unslashed_participating[index as usize] {
                 self.inactivity_scores[index as usize] -=
                     min(1, self.inactivity_scores[index as usize])
             } else {
@@ -943,7 +979,7 @@ impl BeaconState {
             }
 
             // Decrease the inactivity score of all eligible validators during a leak-free epoch
-            if !self.is_in_inactivity_leak() {
+            if !is_in_inactivity_leak {
                 self.inactivity_scores[index as usize] -= min(
                     INACTIVITY_SCORE_RECOVERY_RATE,
                     self.inactivity_scores[index as usize],
@@ -1036,10 +1072,10 @@ impl BeaconState {
         let rewards = vec![0; self.validators.len()];
         let mut penalties = vec![0; self.validators.len()];
         let previous_epoch = self.get_previous_epoch();
-        let matching_target_indices =
-            self.get_unslashed_participating_indices(TIMELY_TARGET_FLAG_INDEX, previous_epoch)?;
+        let (matching_target, _) =
+            self.get_unslashed_participating_mask(TIMELY_TARGET_FLAG_INDEX, previous_epoch)?;
         for index in self.get_eligible_validator_indices()? {
-            if !matching_target_indices.contains(&index) {
+            if !matching_target[index as usize] {
                 let penalty_numerator = self.validators[index as usize].effective_balance
                     * self.inactivity_scores[index as usize];
                 let penalty_denominator =
@@ -2477,33 +2513,69 @@ impl BeaconState {
 
     /// Applies ``deposit`` to the ``state``.
     pub fn apply_pending_deposit(&mut self, deposit: &PendingDeposit) -> anyhow::Result<()> {
-        if let Some((index, _validator)) = self
+        let validator_index = self
             .validators
             .iter()
-            .enumerate()
-            .find(|(_, validator)| validator.public_key == deposit.public_key)
-        {
+            .position(|validator| validator.public_key == deposit.public_key);
+        self.apply_pending_deposit_to(deposit, validator_index)?;
+        Ok(())
+    }
+
+    /// ``apply_pending_deposit`` for a deposit whose validator, if it has one, is at
+    /// ``validator_index``. Returns the index of the validator it added, if any.
+    fn apply_pending_deposit_to(
+        &mut self,
+        deposit: &PendingDeposit,
+        validator_index: Option<usize>,
+    ) -> anyhow::Result<Option<usize>> {
+        if let Some(index) = validator_index {
             self.increase_balance(index as u64, deposit.amount)?;
-        } else {
-            // Verify the deposit signature (proof of possession) which is not checked by the
-            // deposit contract
-            if is_valid_deposit_signature(
-                &deposit.public_key,
-                deposit.withdrawal_credentials,
-                deposit.amount,
-                &deposit.signature,
+            return Ok(None);
+        }
+        // Verify the deposit signature (proof of possession) which is not checked by the
+        // deposit contract
+        if !is_valid_deposit_signature(
+            &deposit.public_key,
+            deposit.withdrawal_credentials,
+            deposit.amount,
+            &deposit.signature,
+        )
+        .unwrap_or_default()
+        {
+            return Ok(None);
+        }
+        self.add_validator_to_registry(
+            deposit.public_key.clone(),
+            deposit.withdrawal_credentials,
+            deposit.amount,
+        )?;
+        Ok(Some(self.validators.len() - 1))
+    }
+
+    /// Registry indices of ``public_keys``, found in one pass over the registry. A key held by
+    /// more than one validator maps to the first, as a search from the start finds. The first 8
+    /// bytes of each key are compared first, because the full 48 bytes rarely need comparing.
+    fn find_validator_indices(&self, public_keys: &[PublicKey]) -> HashMap<PublicKey, usize> {
+        if public_keys.is_empty() {
+            return HashMap::new();
+        }
+        let prefix = |key: &PublicKey| {
+            u64::from_le_bytes(
+                key.inner[..8]
+                    .try_into()
+                    .expect("a public key has 48 bytes"),
             )
-            .unwrap_or_default()
+        };
+        let prefixes: Vec<u64> = public_keys.iter().map(prefix).collect();
+        let mut indices = HashMap::new();
+        for (index, validator) in self.validators.iter().enumerate() {
+            if prefixes.contains(&prefix(&validator.public_key))
+                && public_keys.contains(&validator.public_key)
             {
-                self.add_validator_to_registry(
-                    deposit.public_key.clone(),
-                    deposit.withdrawal_credentials,
-                    deposit.amount,
-                )?;
+                indices.entry(validator.public_key.clone()).or_insert(index);
             }
         }
-
-        Ok(())
+        indices
     }
 
     pub fn process_pending_deposits(&mut self) -> anyhow::Result<()> {
@@ -2515,6 +2587,15 @@ impl BeaconState {
         let mut deposits_to_postpone = vec![];
         let mut is_churn_limit_reached = false;
         let finalized_slot = compute_start_slot_at_epoch(self.finalized_checkpoint.epoch);
+        // Only the first MAX_PENDING_DEPOSITS_PER_EPOCH deposits can be processed, so their
+        // validators are looked up together in one registry pass.
+        let batch: Vec<PublicKey> = self
+            .pending_deposits
+            .iter()
+            .take(MAX_PENDING_DEPOSITS_PER_EPOCH as usize)
+            .map(|deposit| deposit.public_key.clone())
+            .collect();
+        let mut validator_indices = self.find_validator_indices(&batch);
 
         for index in 0..self.pending_deposits.len() {
             let Some(deposit) = self.pending_deposits.get(index).cloned() else {
@@ -2542,23 +2623,20 @@ impl BeaconState {
             }
 
             // Read validator state
-            let (is_validator_exited, is_validator_withdrawn) = if let Some(validator) = self
-                .validators
-                .iter()
-                .find(|validator| validator.public_key == deposit.public_key)
-            {
-                (
-                    validator.exit_epoch < FAR_FUTURE_EPOCH,
-                    validator.withdrawable_epoch < next_epoch,
-                )
-            } else {
-                (false, false)
-            };
+            let validator_index = validator_indices.get(&deposit.public_key).copied();
+            let (is_validator_exited, is_validator_withdrawn) =
+                match validator_index.and_then(|index| self.validators.get(index)) {
+                    Some(validator) => (
+                        validator.exit_epoch < FAR_FUTURE_EPOCH,
+                        validator.withdrawable_epoch < next_epoch,
+                    ),
+                    None => (false, false),
+                };
 
             if is_validator_withdrawn {
                 // Deposited balance will never become active. Increase balance but do not consume
                 // churn
-                self.apply_pending_deposit(&deposit)?;
+                self.apply_pending_deposit_to(&deposit, validator_index)?;
             } else if is_validator_exited {
                 // Validator is exiting, postpone the deposit until after withdrawable epoch
                 deposits_to_postpone.push(deposit.clone());
@@ -2573,7 +2651,9 @@ impl BeaconState {
 
                 // Consume churn and apply deposit.
                 processed_amount += deposit.amount;
-                self.apply_pending_deposit(&deposit)?;
+                if let Some(added) = self.apply_pending_deposit_to(&deposit, validator_index)? {
+                    validator_indices.insert(deposit.public_key.clone(), added);
+                }
             }
 
             // Regardless of how the deposit was handled, we move on in the queue.
@@ -2783,21 +2863,20 @@ impl BeaconState {
         let mut penalties = vec![0; self.validators.len()];
 
         let previous_epoch = self.get_previous_epoch();
-        let unslashed_participating_indices =
-            self.get_unslashed_participating_indices(flag_index, previous_epoch)?;
+        let (unslashed_participating, unslashed_participating_balance) =
+            self.get_unslashed_participating_mask(flag_index, previous_epoch)?;
         let weight = PARTICIPATION_FLAG_WEIGHTS[flag_index as usize];
-        let unslashed_participating_balance =
-            self.get_total_balance(unslashed_participating_indices.clone());
         let unslashed_participating_increments =
             unslashed_participating_balance / EFFECTIVE_BALANCE_INCREMENT;
         let active_increments = self.get_total_active_balance() / EFFECTIVE_BALANCE_INCREMENT;
 
         let base_reward_per_increment = self.get_base_reward_per_increment();
+        let is_in_inactivity_leak = self.is_in_inactivity_leak();
         for index in self.get_eligible_validator_indices()? {
             let base_reward = self.get_base_reward(index, base_reward_per_increment);
 
-            if unslashed_participating_indices.contains(&index) {
-                if !self.is_in_inactivity_leak() {
+            if unslashed_participating[index as usize] {
+                if !is_in_inactivity_leak {
                     let reward_numerator =
                         base_reward * weight * unslashed_participating_increments;
                     rewards[index as usize] +=
@@ -2817,23 +2896,59 @@ impl BeaconState {
         if self.get_current_epoch() == GENESIS_EPOCH {
             return Ok(());
         }
+        ensure!(
+            self.balances.len() >= self.validators.len(),
+            "failed to apply rewards and penalties: fewer balances than validators"
+        );
 
-        // Get deltas for each flag index and inactivity penalties
-        let mut deltas = vec![];
-
-        // Collect the flag deltas for each participation flag index
+        // The deltas of `get_flag_index_deltas` for each flag and of
+        // `get_inactivity_penalty_deltas`, applied in that order, one validator at a time instead
+        // of as eight registry-sized vectors. A validator's deltas depend on its effective
+        // balance, participation and inactivity score but never on balances, so computing them
+        // while balances change gives the same result.
+        let previous_epoch = self.get_previous_epoch();
+        let mut flags = Vec::with_capacity(PARTICIPATION_FLAG_WEIGHTS.len());
         for flag_index in 0..PARTICIPATION_FLAG_WEIGHTS.len() {
-            deltas.push(self.get_flag_index_deltas(flag_index as u8)?);
+            let (participating, participating_balance) =
+                self.get_unslashed_participating_mask(flag_index as u8, previous_epoch)?;
+            flags.push((
+                participating,
+                participating_balance / EFFECTIVE_BALANCE_INCREMENT,
+            ));
         }
+        let active_increments = self.get_total_active_balance() / EFFECTIVE_BALANCE_INCREMENT;
+        let base_reward_per_increment = self.get_base_reward_per_increment();
+        let is_in_inactivity_leak = self.is_in_inactivity_leak();
+        let inactivity_penalty_denominator =
+            INACTIVITY_SCORE_BIAS * INACTIVITY_PENALTY_QUOTIENT_BELLATRIX;
 
-        // Add the inactivity penalties
-        deltas.push(self.get_inactivity_penalty_deltas()?);
-
-        // Iterate over rewards and penalties for each delta
-        for (rewards, penalties) in deltas {
-            for index in 0..self.validators.len() {
-                self.increase_balance(index as u64, rewards[index])?;
-                self.decrease_balance(index as u64, penalties[index])?;
+        for index in 0..self.validators.len() {
+            let validator = &self.validators[index];
+            let is_eligible = validator.is_active_validator(previous_epoch)
+                || (validator.slashed && previous_epoch + 1 < validator.withdrawable_epoch);
+            if !is_eligible {
+                continue;
+            }
+            let base_reward = validator.effective_balance / EFFECTIVE_BALANCE_INCREMENT
+                * base_reward_per_increment;
+            let balance = &mut self.balances[index];
+            for (flag_index, (participating, participating_increments)) in flags.iter().enumerate()
+            {
+                let weight = PARTICIPATION_FLAG_WEIGHTS[flag_index];
+                if participating[index] {
+                    if !is_in_inactivity_leak {
+                        *balance += base_reward * weight * participating_increments
+                            / (active_increments * WEIGHT_DENOMINATOR);
+                    }
+                } else if flag_index != TIMELY_HEAD_FLAG_INDEX as usize {
+                    *balance = balance.saturating_sub(base_reward * weight / WEIGHT_DENOMINATOR);
+                }
+            }
+            if !flags[TIMELY_TARGET_FLAG_INDEX as usize].0[index] {
+                *balance = balance.saturating_sub(
+                    validator.effective_balance * self.inactivity_scores[index]
+                        / inactivity_penalty_denominator,
+                );
             }
         }
 
