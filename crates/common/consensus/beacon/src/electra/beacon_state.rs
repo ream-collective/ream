@@ -446,6 +446,27 @@ impl BeaconState {
         })
     }
 
+    /// Computes the next epoch's attester shuffling on another thread, unless a state sharing this
+    /// one's caches has it or is computing it. The next epoch's seed and active validators are
+    /// already fixed, so this takes the shuffling, about 120 ms on mainnet, off the import of the
+    /// next epoch's first block.
+    pub fn prepare_next_epoch_shuffling(self: &Arc<Self>) {
+        // zkVM guests have no threads to run it on.
+        if cfg!(target_os = "zkvm") {
+            return;
+        }
+        let next_epoch = self.get_current_epoch() + 1;
+        let seed = self.get_seed(next_epoch, DOMAIN_BEACON_ATTESTER);
+        if !self.shuffling_cache.start_computing(next_epoch, seed) {
+            return;
+        }
+        let state = self.clone();
+        std::thread::spawn(move || {
+            state.get_shuffled_active_validator_indices(next_epoch);
+            state.shuffling_cache.finish_computing(next_epoch, seed);
+        });
+    }
+
     /// Return from ``indices`` a random index sampled by effective balance
     pub fn compute_proposer_index(&self, indices: &[u64], seed: B256) -> anyhow::Result<u64> {
         ensure!(!indices.is_empty(), "Index must be less than index_count");

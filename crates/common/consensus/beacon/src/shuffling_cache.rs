@@ -1,7 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use alloy_primitives::B256;
@@ -18,7 +18,14 @@ type ShufflingKey = (u64, B256);
 /// Entries stay valid for descendants, since an epoch's seed and active set are fixed epochs ahead.
 /// Independently built states start empty, so they never share entries.
 #[derive(Clone, Default)]
-pub struct ShufflingCache(Arc<RwLock<HashMap<ShufflingKey, Arc<Vec<u64>>>>>);
+pub struct ShufflingCache(Arc<ShufflingCacheInner>);
+
+#[derive(Default)]
+struct ShufflingCacheInner {
+    entries: RwLock<HashMap<ShufflingKey, Arc<Vec<u64>>>>,
+    /// Shufflings being computed ahead on another thread.
+    computing: Mutex<HashSet<ShufflingKey>>,
+}
 
 impl ShufflingCache {
     pub fn get_or_insert_with(
@@ -27,12 +34,12 @@ impl ShufflingCache {
         seed: B256,
         compute: impl FnOnce() -> Vec<u64>,
     ) -> Arc<Vec<u64>> {
-        if let Some(shuffling) = cache_lock::read(&self.0).get(&(epoch, seed)) {
+        if let Some(shuffling) = cache_lock::read(&self.0.entries).get(&(epoch, seed)) {
             return shuffling.clone();
         }
 
         let shuffling = Arc::new(compute());
-        let mut entries = cache_lock::write(&self.0);
+        let mut entries = cache_lock::write(&self.0.entries);
         if entries.len() >= MAX_CACHED_EPOCHS
             && let Some(oldest) = entries.keys().min_by_key(|(epoch, _)| *epoch).copied()
         {
@@ -40,6 +47,16 @@ impl ShufflingCache {
         }
         entries.insert((epoch, seed), shuffling.clone());
         shuffling
+    }
+
+    /// Claims `(epoch, seed)` for computing ahead; false if it is cached or already claimed.
+    pub fn start_computing(&self, epoch: u64, seed: B256) -> bool {
+        let cached = cache_lock::read(&self.0.entries).contains_key(&(epoch, seed));
+        !cached && cache_lock::lock(&self.0.computing).insert((epoch, seed))
+    }
+
+    pub fn finish_computing(&self, epoch: u64, seed: B256) {
+        cache_lock::lock(&self.0.computing).remove(&(epoch, seed));
     }
 }
 
@@ -52,7 +69,12 @@ impl PartialEq for ShufflingCache {
 
 impl fmt::Debug for ShufflingCache {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let entries = self.0.read().map(|entries| entries.len()).unwrap_or(0);
+        let entries = self
+            .0
+            .entries
+            .read()
+            .map(|entries| entries.len())
+            .unwrap_or(0);
         formatter
             .debug_struct("ShufflingCache")
             .field("entries", &entries)
