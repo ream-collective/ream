@@ -213,10 +213,11 @@ pub fn on_block_attestations(
     store: &mut Store,
     attestations: &[Attestation],
 ) -> Vec<anyhow::Result<()>> {
-    let mut target_states: HashMap<Checkpoint, BeaconState> = HashMap::new();
-    attestations
-        .iter()
-        .map(|attestation| {
+    let mut target_states: HashMap<Checkpoint, Arc<BeaconState>> = HashMap::new();
+    let mut votes = Vec::new();
+    let mut results = Vec::with_capacity(attestations.len());
+    for attestation in attestations {
+        let attesting_indices = (|| {
             store.validate_on_attestation(attestation, true)?;
             let target = attestation.data.target;
             let target_state = match target_states.entry(target) {
@@ -227,18 +228,29 @@ pub fn on_block_attestations(
                         store
                             .db
                             .checkpoint_states_provider()
-                            .get(target)?
+                            .get_shared(target)?
                             .ok_or_else(|| anyhow!("checkpoint_states not found"))?,
                     )
                 }
             };
-            let indexed_attestation = target_state.get_indexed_attestation(attestation)?;
-            store.update_latest_messages(
-                indexed_attestation.attesting_indices.to_vec(),
-                attestation.clone(),
+            anyhow::Ok(
+                target_state
+                    .get_indexed_attestation(attestation)?
+                    .attesting_indices,
             )
-        })
-        .collect()
+        })();
+        results.push(attesting_indices.map(|indices| {
+            votes.push((indices.to_vec(), attestation.clone()));
+        }));
+    }
+
+    // One write covers every valid attestation, so its failure fails each of them.
+    if let Err(err) = store.update_latest_messages_batch(votes) {
+        for result in results.iter_mut().filter(|result| result.is_ok()) {
+            *result = Err(anyhow!("failed to update latest messages: {err:#}"));
+        }
+    }
+    results
 }
 
 /// Run ``on_attester_slashing`` immediately upon receiving a new ``AttesterSlashing``

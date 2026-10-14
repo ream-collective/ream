@@ -913,36 +913,49 @@ impl Store {
         attesting_indices: Vec<u64>,
         attestation: Attestation,
     ) -> anyhow::Result<()> {
-        let target = attestation.data.target;
-        let beacon_block_root = attestation.data.beacon_block_root;
-        let mut non_equivocating_attesting_indices = vec![];
+        self.update_latest_messages_batch(vec![(attesting_indices, attestation)])
+    }
 
+    /// ``update_latest_messages`` for several attestations, in order, with one database read and
+    /// one write. A block carries attestations from tens of thousands of validators, and reading
+    /// and committing each attestation's messages separately cost more than the block's state
+    /// transition.
+    pub fn update_latest_messages_batch(
+        &mut self,
+        attestations: Vec<(Vec<u64>, Attestation)>,
+    ) -> anyhow::Result<()> {
         let equivocating = self
             .db
             .equivocating_indices_provider()
             .get()
             .unwrap_or_default();
-
-        for &index in &attesting_indices {
-            if !equivocating.contains(&index) {
-                non_equivocating_attesting_indices.push(index);
-            }
-        }
-
         let latest_messages = self.db.latest_messages_provider();
-        let mut updates = Vec::new();
-        for index in non_equivocating_attesting_indices {
-            if latest_messages
-                .get(index)?
-                .is_none_or(|message| target.epoch > message.epoch)
-            {
-                updates.push((
-                    index,
-                    LatestMessage {
-                        epoch: target.epoch,
-                        root: beacon_block_root,
-                    },
-                ));
+        let mut stored = latest_messages.get_many(
+            attestations
+                .iter()
+                .flat_map(|(indices, _)| indices.iter().copied())
+                .filter(|index| !equivocating.contains(index))
+                .collect::<HashSet<u64>>(),
+        )?;
+
+        let mut updates = HashMap::new();
+        for (attesting_indices, attestation) in attestations {
+            let target = attestation.data.target;
+            let message = LatestMessage {
+                epoch: target.epoch,
+                root: attestation.data.beacon_block_root,
+            };
+            for index in attesting_indices {
+                if equivocating.contains(&index) {
+                    continue;
+                }
+                if stored
+                    .get(&index)
+                    .is_none_or(|latest| target.epoch > latest.epoch)
+                {
+                    stored.insert(index, message.clone());
+                    updates.insert(index, message.clone());
+                }
             }
         }
         if !updates.is_empty() {

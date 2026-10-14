@@ -11,6 +11,7 @@ use ream_consensus_beacon::{
     bls_to_execution_change::BLSToExecutionChange,
     data_column_sidecar::NUMBER_OF_COLUMNS,
     electra::{beacon_block::SignedBeaconBlock, beacon_state::BeaconState},
+    fork_choice::latest_message::LatestMessage,
 };
 use ream_consensus_lean::{block::SignedBlock, state::LeanState};
 use ream_consensus_misc::{
@@ -76,6 +77,13 @@ pub struct ValidatedDataColumnHeader {
     pub finalized_checkpoint: Checkpoint,
 }
 
+/// Latest messages not yet written to the database, and whether a write is running.
+#[derive(Debug, Default)]
+pub struct PendingLatestMessages {
+    pub messages: HashMap<u64, LatestMessage>,
+    pub flushing: bool,
+}
+
 /// In-memory LRU cache for beacon node (gossip validation + beacon storage).
 #[derive(Debug)]
 pub struct BeaconCacheDB {
@@ -103,6 +111,7 @@ pub struct BeaconCacheDB {
     /// States being stored whole on another thread, readable here until the write commits.
     pub pending_state_snapshots: Mutex<HashMap<B256, Arc<BeaconState>>>,
     pub checkpoint_states: Mutex<LruCache<Checkpoint, Arc<BeaconState>>>,
+    pub pending_latest_messages: Mutex<PendingLatestMessages>,
     /// Checkpoint states being written on another thread, readable here until the write commits.
     pub pending_checkpoint_states: Mutex<HashMap<Checkpoint, Arc<BeaconState>>>,
 }
@@ -173,6 +182,7 @@ impl BeaconCacheDB {
             )),
             pending_state_snapshots: Mutex::default(),
             pending_checkpoint_states: Mutex::default(),
+            pending_latest_messages: Mutex::default(),
             checkpoint_states: Mutex::new(LruCache::new(
                 NonZeroUsize::new(CHECKPOINT_STATE_CACHE_SIZE).expect("Invalid cache size"),
             )),

@@ -85,6 +85,7 @@ impl BeaconDB {
     pub fn latest_messages_provider(&self) -> LatestMessagesTable {
         LatestMessagesTable {
             db: self.db.clone(),
+            cache: self.cache.clone(),
         }
     }
 
