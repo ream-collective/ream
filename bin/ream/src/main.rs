@@ -82,7 +82,7 @@ use ream_rpc_common::config::RpcServerConfig;
 use ream_rpc_lean::{handlers::test_driver::test_driver_enabled, server::start_test_driver};
 use ream_storage::{
     cache::{BeaconCacheDB, LeanCacheDB},
-    db::{ReamDB, reset_db},
+    db::{ReamDB, beacon::BeaconDB, reset_db},
     dir::setup_data_dir,
 };
 use ream_sync::rwlock::Writer;
@@ -157,7 +157,8 @@ fn main() {
         reset_db(&ream_directory).expect("Unable to delete database");
     }
 
-    let task_handle = match cli.command {
+    let (storage_sender, storage_receiver) = std::sync::mpsc::channel();
+    let mut task_handle = match cli.command {
         Commands::LeanNode(config) => {
             let ream_db =
                 ReamDB::new(ream_directory.clone()).expect("unable to init Ream Database");
@@ -166,7 +167,9 @@ fn main() {
         Commands::BeaconNode(config) => {
             let ream_db =
                 ReamDB::new(ream_directory.clone()).expect("unable to init Ream Database");
-            executor_clone.spawn(async move { run_beacon_node(*config, executor, ream_db).await })
+            executor_clone.spawn(async move {
+                run_beacon_node(*config, executor, ream_db, storage_sender).await
+            })
         }
         Commands::ValidatorNode(config) => {
             executor_clone.spawn(async move { run_validator_node(*config, executor).await })
@@ -186,21 +189,42 @@ fn main() {
         }
     };
 
-    executor_clone.runtime().block_on(async {
-        tokio::select! {
+    let service_failed = executor_clone.runtime().block_on(async {
+        let service_result = tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 info!("Ctrl-C received, shutting down...");
+                None
             }
-            _ = task_handle => {
+            result = &mut task_handle => {
                 info!("Service exited, shutting down...");
+                Some(result)
             }
-        }
+        };
 
         executor_clone.shutdown_signal();
+        match service_result {
+            None => {
+                let _ = task_handle.await;
+                false
+            }
+            // A panicking service must not look like a clean exit to supervisors.
+            Some(result) => result.is_err(),
+        }
     });
 
     executor_clone.shutdown_runtime();
 
+    if let Ok(db) = storage_receiver.try_recv()
+        && let Err(err) = db.shutdown_storage()
+    {
+        error!("Failed to drain beacon storage before shutdown: {err:?}");
+        process::exit(1);
+    }
+
+    if service_failed {
+        error!("Service failed; exiting with an error");
+        process::exit(1);
+    }
     process::exit(0);
 }
 
@@ -508,8 +532,24 @@ pub async fn run_lean_node(config: LeanNodeConfig, executor: ReamExecutor, ream_
 /// At the end of setup, it starts 2 services:
 /// 1. The HTTP server that serves Beacon API, Engine API.
 /// 2. The P2P network that handles peer discovery (discv5), gossiping (gossipsub) and Req/Resp API.
-pub async fn run_beacon_node(config: BeaconNodeConfig, executor: ReamExecutor, ream_db: ReamDB) {
-    run_beacon_node_inner(config, executor, ream_db, true, false, None).await;
+///
+/// The initialized database is sent on `storage_sender`, so `main` can drain its writes at exit.
+pub async fn run_beacon_node(
+    config: BeaconNodeConfig,
+    executor: ReamExecutor,
+    ream_db: ReamDB,
+    storage_sender: std::sync::mpsc::Sender<BeaconDB>,
+) {
+    run_beacon_node_inner(
+        config,
+        executor,
+        ream_db,
+        true,
+        false,
+        None,
+        Some(storage_sender),
+    )
+    .await;
 }
 
 // `initialize_globals` is `false` only in tests, which set the globals themselves beforehand.
@@ -520,6 +560,7 @@ async fn run_beacon_node_inner(
     initialize_globals: bool,
     force_data_availability_checks: bool,
     gossipsub_history_length: Option<usize>,
+    storage_sender: Option<std::sync::mpsc::Sender<BeaconDB>>,
 ) {
     info!("starting up beacon node...");
 
@@ -544,6 +585,10 @@ async fn run_beacon_node_inner(
         .init_beacon_db()
         .expect("unable to init Ream Beacon Database")
         .with_cache(cache.clone());
+
+    if let Some(storage_sender) = storage_sender {
+        let _ = storage_sender.send(beacon_db.clone());
+    }
 
     info!("ream beacon database has been initialized");
 
@@ -712,6 +757,7 @@ async fn run_beacon_node_for_test(
         false,
         force_data_availability_checks,
         gossipsub_history_length,
+        None,
     )
     .await;
 }
