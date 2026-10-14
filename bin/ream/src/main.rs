@@ -1390,11 +1390,7 @@ mod tests {
             pending_partial_withdrawals: VariableList::<PendingPartialWithdrawal, _>::empty(),
             pending_consolidations: VariableList::<PendingConsolidation, _>::empty(),
             proposer_lookahead: FixedVector::<u64, U64>::from_elem(0),
-            shuffling_cache: Default::default(),
-            validators_root_cache: Default::default(),
-            total_active_balance_cache: Default::default(),
-            field_root_caches: Default::default(),
-            sync_committee_indices_cache: Default::default(),
+            caches: Default::default(),
         };
 
         let mut genesis_block = SignedBeaconBlock {

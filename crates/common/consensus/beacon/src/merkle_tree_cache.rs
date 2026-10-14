@@ -377,13 +377,6 @@ pub struct StateFieldRootCaches {
     pub pending_consolidations: ContainerListRootCache<PendingConsolidation>,
 }
 
-/// The caches are derived data, so they never make two states differ.
-impl PartialEq for StateFieldRootCaches {
-    fn eq(&self, _other: &Self) -> bool {
-        true
-    }
-}
-
 impl fmt::Debug for StateFieldRootCaches {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.debug_struct("StateFieldRootCaches").finish()

@@ -36,13 +36,6 @@ impl Clone for TotalActiveBalanceCache {
     }
 }
 
-/// The cache is derived data, so it never makes two states differ.
-impl PartialEq for TotalActiveBalanceCache {
-    fn eq(&self, _other: &Self) -> bool {
-        true
-    }
-}
-
 impl fmt::Debug for TotalActiveBalanceCache {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter

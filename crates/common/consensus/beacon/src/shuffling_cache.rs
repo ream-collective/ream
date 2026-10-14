@@ -60,13 +60,6 @@ impl ShufflingCache {
     }
 }
 
-/// The cache is derived data, so it never makes two states differ.
-impl PartialEq for ShufflingCache {
-    fn eq(&self, _other: &Self) -> bool {
-        true
-    }
-}
-
 impl fmt::Debug for ShufflingCache {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let entries = self

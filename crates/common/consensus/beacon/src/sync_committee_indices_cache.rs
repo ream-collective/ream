@@ -36,13 +36,6 @@ impl SyncCommitteeIndicesCache {
     }
 }
 
-/// The cache is derived data, so it never makes two states differ.
-impl PartialEq for SyncCommitteeIndicesCache {
-    fn eq(&self, _other: &Self) -> bool {
-        true
-    }
-}
-
 impl fmt::Debug for SyncCommitteeIndicesCache {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let committees = self.0.lock().map(|entries| entries.len()).unwrap_or(0);
