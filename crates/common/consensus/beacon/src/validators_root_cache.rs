@@ -11,7 +11,8 @@ use crate::{
     cache_lock,
     chunked_list::{CHUNK_SIZE, ChunkedList},
     electra::zkvm_types::ValidatorRegistryLimit,
-    merkle_tree_cache::{MerkleTree, parallel_map},
+    merkle_tree_cache::MerkleTree,
+    parallel::{parallel_map, thread_count},
 };
 
 /// Validator registry, shared chunk by chunk between a state and its copies.
@@ -58,36 +59,20 @@ fn changed_indices(hashed: &Registry, validators: &Registry, len: usize) -> Vec<
     let differing_chunks: Vec<usize> = (0..len.div_ceil(CHUNK_SIZE))
         .filter(|&chunk| !Arc::ptr_eq(&hashed.chunks()[chunk], &validators.chunks()[chunk]))
         .collect();
-    let compare =
-        |chunks: &[usize]| {
-            let mut changed = Vec::new();
-            for &chunk in chunks {
-                let start = chunk * CHUNK_SIZE;
-                let end = (start + CHUNK_SIZE).min(len);
-                let hashed_chunk = &hashed.chunks()[chunk];
-                let chunk_validators = &validators.chunks()[chunk];
-                changed.extend((start..end).filter(|&index| {
-                    hashed_chunk[index - start] != chunk_validators[index - start]
-                }));
-            }
-            changed
-        };
-    // zkVM guests have no threads.
-    let threads = std::thread::available_parallelism().map_or(1, |threads| threads.get());
-    if cfg!(target_os = "zkvm") || differing_chunks.len() < threads * 4 {
-        return compare(&differing_chunks);
-    }
-    let per_thread = differing_chunks.len().div_ceil(threads);
-    std::thread::scope(|scope| {
-        let workers: Vec<_> = differing_chunks
-            .chunks(per_thread)
-            .map(|chunks| scope.spawn(move || compare(chunks)))
-            .collect();
-        workers
-            .into_iter()
-            .flat_map(|worker| worker.join().expect("comparison worker does not panic"))
-            .collect()
-    })
+    let changed_in = |&chunk: &usize| {
+        let start = chunk * CHUNK_SIZE;
+        let end = (start + CHUNK_SIZE).min(len);
+        let hashed_chunk = &hashed.chunks()[chunk];
+        let chunk_validators = &validators.chunks()[chunk];
+        (start..end)
+            .filter(|&index| hashed_chunk[index - start] != chunk_validators[index - start])
+            .collect::<Vec<_>>()
+    };
+    // A chunk compares quickly, so threads only pay off with several chunks each.
+    parallel_map(&differing_chunks, 4 * thread_count(), changed_in)
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 /// The registry hashed last time, and the tree over its validators' roots.

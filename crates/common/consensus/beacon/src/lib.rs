@@ -18,6 +18,7 @@ pub mod helpers;
 pub mod historical_summary;
 pub mod matrix_entry;
 pub mod merkle_tree_cache;
+mod parallel;
 pub mod pending_consolidation;
 pub mod pending_deposit;
 pub mod pending_partial_withdrawal;

@@ -11,9 +11,9 @@ use ethereum_hashing::{ZERO_HASHES, ZERO_HASHES_MAX_INDEX, hash32_concat};
 use tree_hash::{TreeHash, mix_in_length};
 
 use crate::{
-    cache_lock, historical_summary::HistoricalSummary, pending_consolidation::PendingConsolidation,
-    pending_deposit::PendingDeposit, pending_partial_withdrawal::PendingPartialWithdrawal,
-    sync_committee::SyncCommittee,
+    cache_lock, historical_summary::HistoricalSummary, parallel::parallel_map,
+    pending_consolidation::PendingConsolidation, pending_deposit::PendingDeposit,
+    pending_partial_withdrawal::PendingPartialWithdrawal, sync_committee::SyncCommittee,
 };
 
 /// Levels of a Merkle tree, leaves first. A missing right child is the zero subtree, as in SSZ.
@@ -140,31 +140,6 @@ pub(crate) fn zero_hash(depth: usize) -> B256 {
 
 /// Below this many nodes, hashing stays on the calling thread.
 pub(crate) const PARALLEL_HASH_THRESHOLD: usize = 16_384;
-
-/// `items.iter().map(map).collect()`, in parallel when there are at least `threshold` items.
-pub(crate) fn parallel_map<T: Sync, R: Send>(
-    items: &[T],
-    threshold: usize,
-    map: impl Fn(&T) -> R + Sync,
-) -> Vec<R> {
-    // zkVM guests have no threads.
-    if cfg!(target_os = "zkvm") || items.len() < threshold {
-        return items.iter().map(map).collect();
-    }
-    let threads = std::thread::available_parallelism().map_or(1, |threads| threads.get());
-    let chunk_size = items.len().div_ceil(threads);
-    let map = &map;
-    std::thread::scope(|scope| {
-        let workers: Vec<_> = items
-            .chunks(chunk_size)
-            .map(|chunk| scope.spawn(move || chunk.iter().map(map).collect::<Vec<R>>()))
-            .collect();
-        workers
-            .into_iter()
-            .flat_map(|worker| worker.join().expect("map worker does not panic"))
-            .collect()
-    })
-}
 
 /// Root of an SSZ list or vector of basic values, shared by a state and its clones.
 #[derive(Clone, Default)]

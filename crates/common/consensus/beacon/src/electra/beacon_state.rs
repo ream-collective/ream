@@ -2,7 +2,7 @@ use std::{
     cmp::{max, min},
     collections::{HashMap, HashSet},
     mem::take,
-    ops::{Deref, Range},
+    ops::Deref,
     slice,
     sync::Arc,
 };
@@ -80,7 +80,7 @@ use ssz_derive::{Decode, Encode};
 use ssz_types::{
     BitVector, FixedVector, VariableList,
     serde_utils::{quoted_u64_fixed_vec, quoted_u64_var_list},
-    typenum::{U4, U32, U64, U2048, U8192, U65536, U262144, U16777216, U134217728, Unsigned},
+    typenum::{U4, U32, U64, U2048, U8192, U65536, U262144, U16777216, U134217728},
 };
 use tree_hash::TreeHash;
 use tree_hash_derive::TreeHash;
@@ -99,6 +99,7 @@ use crate::{
     helpers::xor,
     historical_summary::HistoricalSummary,
     merkle_tree_cache::StateFieldRootCaches,
+    parallel::parallel_map,
     pending_consolidation::PendingConsolidation,
     pending_deposit::PendingDeposit,
     pending_partial_withdrawal::PendingPartialWithdrawal,
@@ -271,7 +272,7 @@ impl PartialEq for StateCaches {
 
 /// Depth of the Merkle tree of a list whose limit is the power of two ``N``.
 #[cfg(not(feature = "zkvm"))]
-fn depth<N: Unsigned>() -> usize {
+fn depth<N: ssz_types::typenum::Unsigned>() -> usize {
     N::to_u64().trailing_zeros() as usize
 }
 
@@ -970,38 +971,19 @@ impl BeaconState {
         let registry_chunks = self.validators.chunks();
         let previous = &self.previous_epoch_participation[..];
         let current = &self.current_epoch_participation[..];
-        // Registry chunks `range`, each with the participation flags of the same validators.
-        let sum_chunks = |range: Range<usize>| {
-            range.fold((0, 0), |total: (u64, u64), chunk| {
-                let validators = registry_chunks[chunk].as_slice();
-                let start = chunk * CHUNK_SIZE;
-                let end = start + validators.len();
-                let previous_flags = &previous[start.min(previous.len())..end.min(previous.len())];
-                let current_flags = &current[start.min(current.len())..end.min(current.len())];
-                let part = sum(validators, previous_flags, current_flags);
-                (total.0 + part.0, total.1 + part.1)
-            })
+        // One registry chunk, with the participation flags of the same validators.
+        let sum_chunk = |&chunk: &usize| {
+            let validators = registry_chunks[chunk].as_slice();
+            let start = chunk * CHUNK_SIZE;
+            let end = start + validators.len();
+            let previous_flags = &previous[start.min(previous.len())..end.min(previous.len())];
+            let current_flags = &current[start.min(current.len())..end.min(current.len())];
+            sum(validators, previous_flags, current_flags)
         };
-        // zkVM guests have no threads to spread the work over.
-        let (previous_balance, current_balance) = if cfg!(target_os = "zkvm") {
-            sum_chunks(0..registry_chunks.len())
-        } else {
-            let threads = std::thread::available_parallelism().map_or(1, |threads| threads.get());
-            let per_thread = registry_chunks.len().div_ceil(threads).max(1);
-            std::thread::scope(|scope| {
-                let workers: Vec<_> = (0..registry_chunks.len())
-                    .step_by(per_thread)
-                    .map(|first| {
-                        let last = (first + per_thread).min(registry_chunks.len());
-                        scope.spawn(move || sum_chunks(first..last))
-                    })
-                    .collect();
-                workers.into_iter().fold((0, 0), |total, worker| {
-                    let part = worker.join().expect("balance worker does not panic");
-                    (total.0 + part.0, total.1 + part.1)
-                })
-            })
-        };
+        let chunk_indices: Vec<usize> = (0..registry_chunks.len()).collect();
+        let (previous_balance, current_balance) = parallel_map(&chunk_indices, 2, sum_chunk)
+            .into_iter()
+            .fold((0, 0), |total, part| (total.0 + part.0, total.1 + part.1));
         (
             max(EFFECTIVE_BALANCE_INCREMENT, previous_balance),
             max(EFFECTIVE_BALANCE_INCREMENT, current_balance),
@@ -2599,52 +2581,31 @@ impl BeaconState {
             .remove(public_key)
     }
 
-    /// Registry indices of ``public_keys``, found in one pass over the registry. A key held by
-    /// more than one validator maps to the first, as a search from the start finds.
-    ///
-    /// A pass reads all of mainnet's 2.4 million validators, several milliseconds of memory
-    /// traffic, so it is split across cores, and each key's first 8 bytes are compared as one
-    /// integer before all 48.
+    /// Registry indices of ``public_keys``, found in one pass over the registry split across
+    /// cores. A key held by more than one validator maps to the first, as a search from the start
+    /// finds. Each key's first 8 bytes are compared as one integer before all 48.
     fn find_validator_indices(&self, public_keys: &[PublicKey]) -> HashMap<PublicKey, usize> {
         if public_keys.is_empty() {
             return HashMap::new();
         }
         let prefixes: Vec<u64> = public_keys.iter().map(public_key_prefix).collect();
         let chunks = self.validators.chunks();
-        // Matches in registry chunks `range`, in ascending order of index.
-        let scan = |range: Range<usize>| {
-            let mut matches = Vec::new();
-            for chunk in range {
-                for (offset, validator) in chunks[chunk].iter().enumerate() {
-                    if prefixes.contains(&public_key_prefix(&validator.public_key))
+        // Matches in one registry chunk, in ascending order of index.
+        let scan_chunk = |&chunk: &usize| {
+            chunks[chunk]
+                .iter()
+                .enumerate()
+                .filter(|(_, validator)| {
+                    prefixes.contains(&public_key_prefix(&validator.public_key))
                         && public_keys.contains(&validator.public_key)
-                    {
-                        matches.push((chunk * CHUNK_SIZE + offset, &validator.public_key));
-                    }
-                }
-            }
-            matches
+                })
+                .map(|(offset, validator)| (chunk * CHUNK_SIZE + offset, &validator.public_key))
+                .collect::<Vec<_>>()
         };
-        let threads = std::thread::available_parallelism().map_or(1, |threads| threads.get());
-        // zkVM guests have no threads to spread the work over.
-        let matches: Vec<(usize, &PublicKey)> = if cfg!(target_os = "zkvm") || threads == 1 {
-            scan(0..chunks.len())
-        } else {
-            let per_thread = chunks.len().div_ceil(threads).max(1);
-            std::thread::scope(|scope| {
-                let workers: Vec<_> = (0..chunks.len())
-                    .step_by(per_thread)
-                    .map(|first| {
-                        let last = (first + per_thread).min(chunks.len());
-                        scope.spawn(move || scan(first..last))
-                    })
-                    .collect();
-                workers
-                    .into_iter()
-                    .flat_map(|worker| worker.join().expect("lookup worker does not panic"))
-                    .collect()
-            })
-        };
+        let chunk_indices: Vec<usize> = (0..chunks.len()).collect();
+        let matches = parallel_map(&chunk_indices, 2, scan_chunk)
+            .into_iter()
+            .flatten();
         let mut indices = HashMap::new();
         for (index, public_key) in matches {
             indices.entry(public_key.clone()).or_insert(index);
