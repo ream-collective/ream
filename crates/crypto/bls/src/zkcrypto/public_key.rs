@@ -38,16 +38,13 @@ impl TryFrom<&PublicKey> for G1Affine {
     }
 }
 
-/// Validator keys that were already decompressed. Decompressing a key checks that it is on the
-/// curve and in the G1 subgroup, which costs more than the pairing that uses it, and every
-/// attestation aggregates the same validator keys again. Only individual keys are cached, never
-/// aggregates, so the size follows the validator registry.
+/// Decompressed validator keys. Decompressing (curve + subgroup check) costs more than the
+/// pairing, so each key is done once. Aggregates are never cached.
 #[cfg(not(target_os = "zkvm"))]
 static DECOMPRESSED_PUBLIC_KEYS: LazyLock<RwLock<HashMap<[u8; 48], G1Affine>>> =
     LazyLock::new(Default::default);
 
-/// Above mainnet's validator count. Reaching it means keys that are not validators are being
-/// verified, so the cache starts over rather than growing without bound.
+/// Above mainnet's validator count; the cache is cleared if it gets this big.
 #[cfg(not(target_os = "zkvm"))]
 const MAX_CACHED_PUBLIC_KEYS: usize = 4_000_000;
 
@@ -58,7 +55,7 @@ fn key_bytes(public_key: &PublicKey) -> Result<[u8; 48], BLSError> {
         .map_err(|err| BLSError::InvalidByteLength(anyhow!("Failed to convert to array {err:?}")))
 }
 
-/// Decompresses a single public key, reusing an earlier decompression of the same bytes.
+/// Decompresses `public_key`, using the cache when possible.
 #[cfg(not(target_os = "zkvm"))]
 pub(crate) fn decompress_public_key(public_key: &PublicKey) -> Result<G1Affine, BLSError> {
     let bytes = key_bytes(public_key)?;
@@ -85,10 +82,8 @@ pub(crate) fn decompress_public_key(public_key: &PublicKey) -> Result<G1Affine, 
     G1Affine::try_from(public_key)
 }
 
-/// Decompresses `public_keys` into the cache ahead of use, spread over the available cores, and
-/// returns how many were added. A node calls this for its validators at startup, so that the
-/// first epoch of attestations does not pay for decompressing every key one at a time. Invalid
-/// keys are skipped; verifying with them later reports the error.
+/// Decompresses `public_keys` into the cache in parallel and returns how many were added.
+/// Invalid keys are skipped.
 #[cfg(not(target_os = "zkvm"))]
 pub fn prewarm_public_keys(public_keys: &[PublicKey]) -> usize {
     let missing: Vec<&PublicKey> = {
@@ -143,13 +138,11 @@ pub fn prewarm_public_keys(_public_keys: &[PublicKey]) -> usize {
     0
 }
 
-/// Below this many keys an aggregate is summed on the calling thread: starting threads costs more
-/// than the additions they would share.
+/// Below this, spawning threads costs more than it saves.
 #[cfg(not(target_os = "zkvm"))]
 const PARALLEL_AGGREGATION_THRESHOLD: usize = 4096;
 
-/// Sum of the given individual public keys as a curve point. A mainnet attestation aggregates
-/// about 30,000 keys, so large sets are summed in parallel chunks.
+/// Sums `public_keys` into one point, in parallel for large sets.
 pub(crate) fn aggregate_public_key_point(
     public_keys: &[&PublicKey],
 ) -> Result<G1Projective, BLSError> {
@@ -182,7 +175,7 @@ fn sum_public_keys(public_keys: &[&PublicKey]) -> Result<G1Projective, BLSError>
     let missing = public_keys;
     #[cfg(not(target_os = "zkvm"))]
     {
-        // One read lock for the whole sum; keys seen for the first time are added below.
+        // Hold one read lock for the whole sum.
         let cache = DECOMPRESSED_PUBLIC_KEYS
             .read()
             .expect("public key cache lock is not poisoned");

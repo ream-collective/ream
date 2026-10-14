@@ -626,8 +626,7 @@ async fn run_beacon_node_inner(
     };
     let beacon_chain = Arc::new(beacon_chain);
 
-    // Attestations are verified against active validators' keys, so decompress those keys in the
-    // background now instead of one at a time during the first epoch of block imports.
+    // Warm the BLS key cache so the first blocks after startup don't decompress every key.
     if let Ok(head) = beacon_chain.head() {
         tokio::task::spawn_blocking(move || {
             let started = std::time::Instant::now();

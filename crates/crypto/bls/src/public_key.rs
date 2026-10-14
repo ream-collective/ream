@@ -8,8 +8,7 @@ use tree_hash_derive::TreeHash;
 
 use crate::errors::BLSError;
 
-/// A compressed BLS public key. The bytes are stored inline: a mainnet state holds millions of
-/// keys, and a heap allocation per key made copying or freeing a state cost tens of milliseconds.
+/// Compressed BLS public key, stored inline to avoid a heap allocation per key.
 #[derive(Debug, PartialEq, Clone, Encode, Decode, TreeHash, Default, Eq, Hash)]
 pub struct PublicKey {
     pub inner: FixedBytes<48>,

@@ -61,8 +61,7 @@ impl Verifiable for BLSSignature {
     where
         P: AsRef<[&'a PublicKey]>,
     {
-        // Keep the aggregate as a point: compressing it and decompressing it again would repeat
-        // the subgroup check on a key built from already checked keys.
+        // Use the point directly; recompressing would redo the subgroup check.
         let aggregate_public_key =
             G1Affine::from(aggregate_public_key_point(public_keys.as_ref())?);
         let h = <G2Projective as HashToCurve<ExpandMsgXmd<sha2::Sha256>>>::hash_to_curve(
