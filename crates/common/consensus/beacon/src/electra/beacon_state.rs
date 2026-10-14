@@ -56,8 +56,8 @@ use ream_consensus_misc::{
     fork_name::ForkName,
     indexed_attestation::IndexedAttestation,
     misc::{
-        bytes_to_int64, compute_activation_exit_epoch, compute_committee, compute_domain,
-        compute_epoch_at_slot, compute_shuffled_index, compute_signing_root,
+        bytes_to_int64, compute_activation_exit_epoch, compute_domain, compute_epoch_at_slot,
+        compute_shuffled_index, compute_shuffled_list, compute_signing_root,
         compute_start_slot_at_epoch, get_committee_indices, is_sorted_and_unique,
     },
     validator::Validator,
@@ -71,6 +71,7 @@ use ream_execution_rpc_types::electra::{
 use ream_merkle::{generate_proof, is_valid_merkle_branch, merkle_tree};
 use ream_metrics::{
     BEACON_BLOCK_STATE_ROOT_SECONDS, BEACON_ENGINE_NEW_PAYLOAD_REQUEST_DURATION_SECONDS,
+    BEACON_SHUFFLING_CACHE_MISSES_TOTAL,
 };
 use ream_network_spec::networks::beacon_network_spec;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -78,7 +79,7 @@ use ssz_derive::{Decode, Encode};
 use ssz_types::{
     BitVector, FixedVector, VariableList,
     serde_utils::{quoted_u64_fixed_vec, quoted_u64_var_list},
-    typenum::{U4, U32, U64, U2048, U8192, U65536, U262144, U16777216, U134217728},
+    typenum::{U4, U32, U64, U2048, U8192, U65536, U262144, U16777216, U134217728, Unsigned},
 };
 use tree_hash::TreeHash;
 use tree_hash_derive::TreeHash;
@@ -91,11 +92,14 @@ use super::{
 use crate::{
     attestation::Attestation, attester_slashing::AttesterSlashing,
     bls_to_execution_change::SignedBLSToExecutionChange, eth_1_block::Eth1Block, helpers::xor,
-    historical_summary::HistoricalSummary, pending_consolidation::PendingConsolidation,
-    pending_deposit::PendingDeposit, pending_partial_withdrawal::PendingPartialWithdrawal,
+    historical_summary::HistoricalSummary, merkle_tree_cache::StateFieldRootCaches,
+    pending_consolidation::PendingConsolidation, pending_deposit::PendingDeposit,
+    pending_partial_withdrawal::PendingPartialWithdrawal,
     predicates::is_slashable_attestation_data, proposer_slashing::ProposerSlashing,
-    sync_aggregate::SyncAggregate, sync_committee::SyncCommittee,
-    voluntary_exit::SignedVoluntaryExit,
+    shuffling_cache::ShufflingCache, sync_aggregate::SyncAggregate, sync_committee::SyncCommittee,
+    sync_committee_indices_cache::SyncCommitteeIndicesCache,
+    total_active_balance_cache::TotalActiveBalanceCache,
+    validators_root_cache::ValidatorsRootCache, voluntary_exit::SignedVoluntaryExit,
 };
 
 pub mod quoted_u8_var_list {
@@ -226,6 +230,42 @@ pub struct BeaconState {
     // Fulu
     #[serde(with = "quoted_u64_fixed_vec")]
     pub proposer_lookahead: FixedVector<u64, U64>,
+
+    /// Not part of the consensus state: it is never serialized, hashed or compared.
+    #[serde(skip)]
+    #[ssz(skip_serializing, skip_deserializing)]
+    #[tree_hash(skip_hashing)]
+    pub shuffling_cache: ShufflingCache,
+
+    /// Not part of the consensus state: it is never serialized, hashed or compared.
+    #[serde(skip)]
+    #[ssz(skip_serializing, skip_deserializing)]
+    #[tree_hash(skip_hashing)]
+    pub validators_root_cache: ValidatorsRootCache,
+
+    /// Not part of the consensus state: it is never serialized, hashed or compared.
+    #[serde(skip)]
+    #[ssz(skip_serializing, skip_deserializing)]
+    #[tree_hash(skip_hashing)]
+    pub total_active_balance_cache: TotalActiveBalanceCache,
+
+    /// Not part of the consensus state: it is never serialized, hashed or compared.
+    #[serde(skip)]
+    #[ssz(skip_serializing, skip_deserializing)]
+    #[tree_hash(skip_hashing)]
+    pub field_root_caches: StateFieldRootCaches,
+
+    /// Not part of the consensus state: it is never serialized, hashed or compared.
+    #[serde(skip)]
+    #[ssz(skip_serializing, skip_deserializing)]
+    #[tree_hash(skip_hashing)]
+    pub sync_committee_indices_cache: SyncCommitteeIndicesCache,
+}
+
+/// Committees per slot for an epoch with ``active_validator_count`` active validators.
+fn committee_count_per_slot(active_validator_count: usize) -> u64 {
+    (active_validator_count as u64 / SLOTS_PER_EPOCH / TARGET_COMMITTEE_SIZE)
+        .clamp(1, MAX_COMMITTEES_PER_SLOT)
 }
 
 impl BeaconState {
@@ -354,10 +394,18 @@ impl BeaconState {
 
     /// Return the number of committees in each slot for the given ``epoch``.
     pub fn get_committee_count_per_slot(&self, epoch: u64) -> u64 {
-        (self.get_active_validator_indices(epoch).len() as u64
-            / SLOTS_PER_EPOCH
-            / TARGET_COMMITTEE_SIZE)
-            .clamp(1, MAX_COMMITTEES_PER_SLOT)
+        committee_count_per_slot(self.get_shuffled_active_validator_indices(epoch).len())
+    }
+
+    /// Active validator indices of ``epoch`` in committee order: the committees of the epoch are
+    /// consecutive slices of this list. It is computed once per epoch and seed and cached, because
+    /// recomputing it costs a scan of the whole registry plus a shuffle.
+    pub fn get_shuffled_active_validator_indices(&self, epoch: u64) -> Arc<Vec<u64>> {
+        let seed = self.get_seed(epoch, DOMAIN_BEACON_ATTESTER);
+        self.shuffling_cache.get_or_insert_with(epoch, seed, || {
+            BEACON_SHUFFLING_CACHE_MISSES_TOTAL.inc();
+            compute_shuffled_list(&self.get_active_validator_indices(epoch), seed)
+        })
     }
 
     /// Return from ``indices`` a random index sampled by effective balance
@@ -477,11 +525,15 @@ impl BeaconState {
     /// Note: ``get_total_balance`` returns ``EFFECTIVE_BALANCE_INCREMENT`` Gwei minimum to avoid
     /// divisions by zero.
     pub fn get_total_active_balance(&self) -> u64 {
-        self.get_total_balance(
-            self.get_active_validator_indices(self.get_current_epoch())
-                .into_iter()
-                .collect::<HashSet<_>>(),
-        )
+        let epoch = self.get_current_epoch();
+        self.total_active_balance_cache
+            .get_or_insert_with(epoch, || {
+                self.get_total_balance(
+                    self.get_active_validator_indices(epoch)
+                        .into_iter()
+                        .collect::<HashSet<_>>(),
+                )
+            })
     }
 
     /// Return the signature domain (fork version concatenated with domain type) of a message.
@@ -504,14 +556,19 @@ impl BeaconState {
 
     /// Return the beacon committee at ``slot`` for ``index``.
     pub fn get_beacon_committee(&self, slot: u64, index: u64) -> anyhow::Result<Vec<u64>> {
-        let epoch = compute_epoch_at_slot(slot);
-        let committees_per_slot = self.get_committee_count_per_slot(epoch);
-        compute_committee(
-            &self.get_active_validator_indices(epoch),
-            self.get_seed(epoch, DOMAIN_BEACON_ATTESTER),
-            (slot % SLOTS_PER_EPOCH) * committees_per_slot + index,
-            committees_per_slot * SLOTS_PER_EPOCH,
-        )
+        let shuffled = self.get_shuffled_active_validator_indices(compute_epoch_at_slot(slot));
+        let committees_per_slot = committee_count_per_slot(shuffled.len());
+        let count = committees_per_slot * SLOTS_PER_EPOCH;
+        let committee = (slot % SLOTS_PER_EPOCH) * committees_per_slot + index;
+        ensure!(
+            committee < count,
+            "Committee index {index} is out of range for {committees_per_slot} committees per slot"
+        );
+        // Same bounds as ``compute_committee``, taken from the already shuffled list.
+        let length = shuffled.len() as u64;
+        let start = (length * committee / count) as usize;
+        let end = (length * (committee + 1) / count) as usize;
+        Ok(shuffled[start..end].to_vec())
     }
 
     /// Return the committee assignment in the ``epoch`` for ``validator_index``.
@@ -585,22 +642,21 @@ impl BeaconState {
     /// Return the set of attesting indices corresponding to ``aggregation_bits`` and
     /// ``committee_bits``.
     pub fn get_attesting_indices(&self, attestation: &Attestation) -> anyhow::Result<HashSet<u64>> {
+        // Collect every committee's attesters into one set.
         let mut output = HashSet::new();
         let mut committee_offset = 0;
         for committee_index in get_committee_indices(&attestation.committee_bits) {
             let committee = self.get_beacon_committee(attestation.data.slot, committee_index)?;
 
-            let mut committee_attesters = HashSet::new();
             for (i, attester_index) in committee.iter().enumerate() {
                 if attestation
                     .aggregation_bits
                     .get(committee_offset + i)
                     .map_err(|err| anyhow!("Failed to get aggregation_bit {err:?}"))?
                 {
-                    committee_attesters.insert(*attester_index);
+                    output.insert(*attester_index);
                 }
             }
-            output = output.union(&committee_attesters).copied().collect();
 
             committee_offset += committee.len();
         }
@@ -1571,6 +1627,35 @@ impl BeaconState {
         &self,
         sync_committee: &SyncCommittee,
     ) -> anyhow::Result<Vec<usize>> {
+        let key = &sync_committee.aggregate_public_key;
+        if let Some(indices) = self.sync_committee_indices_cache.get(key)
+            && self.indices_hold_keys(&indices, sync_committee)
+        {
+            return Ok(indices.to_vec());
+        }
+        let indices = self.compute_sync_committee_indices(sync_committee)?;
+        self.sync_committee_indices_cache
+            .insert(key.clone(), Arc::new(indices.clone()));
+        Ok(indices)
+    }
+
+    /// Whether each of `indices` is the registry index of the committee member at its position.
+    fn indices_hold_keys(&self, indices: &[usize], sync_committee: &SyncCommittee) -> bool {
+        indices.len() == sync_committee.public_keys.len()
+            && indices
+                .iter()
+                .zip(sync_committee.public_keys.iter())
+                .all(|(&index, public_key)| {
+                    self.validators
+                        .get(index)
+                        .is_some_and(|validator| validator.public_key == *public_key)
+                })
+    }
+
+    fn compute_sync_committee_indices(
+        &self,
+        sync_committee: &SyncCommittee,
+    ) -> anyhow::Result<Vec<usize>> {
         let pubkey_to_index: HashMap<_, _> = self
             .validators
             .iter()
@@ -2057,6 +2142,8 @@ impl BeaconState {
                     .min(validator.get_max_effective_balance());
             }
         }
+        // The total active balance of this epoch was summed over the old effective balances.
+        self.total_active_balance_cache.clear();
 
         Ok(())
     }
@@ -2135,20 +2222,14 @@ impl BeaconState {
         for committee_index in committee_indices {
             ensure!(committee_index < self.get_committee_count_per_slot(data.target.epoch));
             let committee = self.get_beacon_committee(data.slot, committee_index)?;
-            let mut committee_attesters = HashSet::new();
-            for (i, &attester_index) in committee.iter().enumerate() {
-                if attestation
+            let mut has_attester = false;
+            for i in 0..committee.len() {
+                has_attester |= attestation
                     .aggregation_bits
                     .get(committee_offset + i)
-                    .map_err(|err| anyhow!("Failed to get aggregation bit {err:?}"))?
-                {
-                    committee_attesters.insert(attester_index);
-                }
+                    .map_err(|err| anyhow!("Failed to get aggregation bit {err:?}"))?;
             }
-            ensure!(
-                !committee_attesters.is_empty(),
-                "Committee attesters must not be empty"
-            );
+            ensure!(has_attester, "Committee attesters must not be empty");
             committee_offset += committee.len();
         }
         // Bitfield length matches total number of participants
@@ -2161,15 +2242,17 @@ impl BeaconState {
         // Participation flag indices
         let participation_flag_indices =
             self.get_attestation_participation_flag_indices(data, self.slot - data.slot)?;
-        // Verify signature
+        // Verify signature. The indexed attestation holds the attesting indices, so it also
+        // drives the participation updates below.
+        let indexed_attestation = self.get_indexed_attestation(attestation)?;
         ensure!(
-            self.is_valid_indexed_attestation(&self.get_indexed_attestation(attestation)?)?,
+            self.is_valid_indexed_attestation(&indexed_attestation)?,
             "Attestation signature must be valid"
         );
 
         let base_reward_per_increment = self.get_base_reward_per_increment();
         let mut proposer_reward_numerator = 0;
-        for index in self.get_attesting_indices(attestation)? {
+        for &index in indexed_attestation.attesting_indices.iter() {
             let index = index as usize;
             for (flag_index, &weight) in PARTICIPATION_FLAG_WEIGHTS.iter().enumerate() {
                 let flag_index = flag_index as u8;
@@ -2662,10 +2745,21 @@ impl BeaconState {
     }
 
     pub fn process_slots(&mut self, slot: u64) -> anyhow::Result<()> {
+        self.process_slots_from_root(slot, None)
+    }
+
+    /// ``process_slots`` for a state whose ``hash_tree_root`` the caller already knows. The first
+    /// slot records that root instead of hashing the whole state; later slots hash as usual,
+    /// because processing a slot changes the state.
+    fn process_slots_from_root(
+        &mut self,
+        slot: u64,
+        mut known_state_root: Option<B256>,
+    ) -> anyhow::Result<()> {
         ensure!(self.slot < slot);
 
         while self.slot < slot {
-            self.process_slot()?;
+            self.process_slot_with_root(known_state_root.take())?;
             // Process epoch on the start slot of the next epoch
             if (self.slot + 1).is_multiple_of(SLOTS_PER_EPOCH) {
                 self.process_epoch()?;
@@ -2678,8 +2772,12 @@ impl BeaconState {
     }
 
     pub fn process_slot(&mut self) -> anyhow::Result<()> {
+        self.process_slot_with_root(None)
+    }
+
+    fn process_slot_with_root(&mut self, known_state_root: Option<B256>) -> anyhow::Result<()> {
         // Cache state root
-        let previous_state_root = self.tree_hash_root();
+        let previous_state_root = known_state_root.unwrap_or_else(|| self.state_root());
         self.state_roots[(self.slot % SLOTS_PER_HISTORICAL_ROOT) as usize] = previous_state_root;
 
         // Cache latest block header state root
@@ -2768,9 +2866,24 @@ impl BeaconState {
         validate_result: bool,
         execution_engine: &Option<impl ExecutionApi>,
     ) -> anyhow::Result<()> {
+        self.state_transition_from_root(signed_block, validate_result, execution_engine, None)
+            .await
+    }
+
+    /// ``state_transition`` for a pre-state whose root is already known, typically the parent
+    /// block's ``state_root``, so the first slot records it instead of computing it. A wrong root
+    /// corrupts ``state_roots``, so with ``validate_result`` the block then fails the state root
+    /// check.
+    pub async fn state_transition_from_root(
+        &mut self,
+        signed_block: &SignedBeaconBlock,
+        validate_result: bool,
+        execution_engine: &Option<impl ExecutionApi>,
+        pre_state_root: Option<B256>,
+    ) -> anyhow::Result<()> {
         let block = &signed_block.message;
         // Process slots (including those with no blocks) since block
-        self.process_slots(block.slot)?;
+        self.process_slots_from_root(block.slot, pre_state_root)?;
 
         // Verify block signature
         if validate_result {
@@ -2782,7 +2895,7 @@ impl BeaconState {
         // Verify state root
         if validate_result {
             let state_root_timer = BEACON_BLOCK_STATE_ROOT_SECONDS.start_timer();
-            let computed_state_root = self.tree_hash_root();
+            let computed_state_root = self.state_root();
             state_root_timer.observe_duration();
             ensure!(block.state_root == computed_state_root)
         }
@@ -3025,6 +3138,74 @@ impl BeaconState {
         .concat())
     }
 
+    /// ``hash_tree_root`` of the state. The roots of the validator registry and the other lists
+    /// sized by it come from caches that rehash only what changed, which is most of the cost on
+    /// mainnet.
+    #[cfg(not(feature = "zkvm"))]
+    pub fn state_root(&self) -> B256 {
+        let limit_depth = ValidatorRegistryLimit::to_u64().trailing_zeros() as usize;
+        // Leaf chunks hold four `u64`s or 32 `u8`s, so those lists' trees are 2 and 5 levels
+        // shallower than the registry limit.
+        let (u64_list_depth, u8_list_depth) = (limit_depth - 2, limit_depth - 5);
+        let caches = &self.field_root_caches;
+        let field_roots = [
+            self.genesis_time.tree_hash_root(),
+            self.genesis_validators_root.tree_hash_root(),
+            self.slot.tree_hash_root(),
+            self.fork.tree_hash_root(),
+            self.latest_block_header.tree_hash_root(),
+            self.block_roots.tree_hash_root(),
+            self.state_roots.tree_hash_root(),
+            self.historical_roots.tree_hash_root(),
+            self.eth1_data.tree_hash_root(),
+            self.eth1_data_votes.tree_hash_root(),
+            self.eth1_deposit_index.tree_hash_root(),
+            self.validators_root_cache
+                .root(&self.validators, limit_depth),
+            caches
+                .balances
+                .u64_list_root(&self.balances, u64_list_depth),
+            self.randao_mixes.tree_hash_root(),
+            self.slashings.tree_hash_root(),
+            caches
+                .previous_epoch_participation
+                .u8_list_root(&self.previous_epoch_participation, u8_list_depth),
+            caches
+                .current_epoch_participation
+                .u8_list_root(&self.current_epoch_participation, u8_list_depth),
+            self.justification_bits.tree_hash_root(),
+            self.previous_justified_checkpoint.tree_hash_root(),
+            self.current_justified_checkpoint.tree_hash_root(),
+            self.finalized_checkpoint.tree_hash_root(),
+            caches
+                .inactivity_scores
+                .u64_list_root(&self.inactivity_scores, u64_list_depth),
+            self.current_sync_committee.tree_hash_root(),
+            self.next_sync_committee.tree_hash_root(),
+            self.latest_execution_payload_header.tree_hash_root(),
+            self.next_withdrawal_index.tree_hash_root(),
+            self.next_withdrawal_validator_index.tree_hash_root(),
+            self.historical_summaries.tree_hash_root(),
+            self.deposit_requests_start_index.tree_hash_root(),
+            self.deposit_balance_to_consume.tree_hash_root(),
+            self.exit_balance_to_consume.tree_hash_root(),
+            self.earliest_exit_epoch.tree_hash_root(),
+            self.consolidation_balance_to_consume.tree_hash_root(),
+            self.earliest_consolidation_epoch.tree_hash_root(),
+            caches.pending_deposits.root(
+                &self.pending_deposits,
+                U134217728::to_u64().trailing_zeros() as usize,
+            ),
+            self.pending_partial_withdrawals.tree_hash_root(),
+            self.pending_consolidations.tree_hash_root(),
+            self.proposer_lookahead.tree_hash_root(),
+        ];
+        tree_hash::merkle_root(field_roots.concat().as_slice(), field_roots.len())
+    }
+
+    /// zkVM builds hash through a patched ``VariableList`` that treats its 2^29 limit as 2^40,
+    /// which the caches do not model, so they keep the derived root.
+    #[cfg(feature = "zkvm")]
     pub fn state_root(&self) -> B256 {
         self.tree_hash_root()
     }
