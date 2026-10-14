@@ -1363,7 +1363,7 @@ mod tests {
             eth1_data: Eth1Data::default(),
             eth1_data_votes: VariableList::empty(),
             eth1_deposit_index: 0,
-            validators,
+            validators: validators.into(),
             balances,
             randao_mixes: FixedVector::<B256, U65536>::from_elem(B256::ZERO),
             slashings: FixedVector::<u64, U8192>::from_elem(0),
@@ -1390,6 +1390,7 @@ mod tests {
             pending_partial_withdrawals: VariableList::<PendingPartialWithdrawal, _>::empty(),
             pending_consolidations: VariableList::<PendingConsolidation, _>::empty(),
             proposer_lookahead: FixedVector::<u64, U64>::from_elem(0),
+            caches: Default::default(),
         };
 
         let mut genesis_block = SignedBeaconBlock {

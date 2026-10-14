@@ -79,9 +79,23 @@ pub async fn on_block(
         .get(parent_root)?
         .ok_or_else(|| anyhow!("beacon state not found"))?
         .clone();
+    // The parent state is the parent block's post-state, and the parent block commits to its root,
+    // which was checked when the parent was imported.
+    let parent_state_root = store
+        .db
+        .block_provider()
+        .get(parent_root)?
+        .ok_or_else(|| anyhow!("parent block not found"))?
+        .message
+        .state_root;
     let state_transition_timer = BEACON_BLOCK_STATE_TRANSITION_SECONDS.start_timer();
     state
-        .state_transition(signed_block, true, execution_engine)
+        .state_transition_from_root(
+            signed_block,
+            true,
+            execution_engine,
+            Some(parent_state_root),
+        )
         .await?;
     state_transition_timer.observe_duration();
 
@@ -136,6 +150,9 @@ pub fn process_available_block(store: &mut Store, pending: PendingBlock) -> anyh
         .db
         .state_provider()
         .insert(block_root, state.clone())?;
+    // The state cache keeps a clone that shares this state's caches, so its children reuse the
+    // shuffling computed here.
+    state.prepare_next_epoch_shuffling();
 
     // Add block timeliness to the store
     let time_into_slot = (store.db.time_provider().get()?
@@ -164,7 +181,7 @@ pub fn process_available_block(store: &mut Store, pending: PendingBlock) -> anyh
     )?;
 
     // Eagerly compute unrealized justification and finality.
-    store.compute_pulled_up_tip(block_root)?;
+    store.compute_pulled_up_tip(block_root, &state)?;
 
     // Fork choice tree maintenance is the last step, once the store mutation is committed.
     store.fork_choice_insert_block(
