@@ -434,16 +434,23 @@ impl BeaconState {
     /// recomputing it costs a scan of the whole registry plus a shuffle.
     pub fn get_shuffled_active_validator_indices(&self, epoch: u64) -> Arc<Vec<u64>> {
         let seed = self.get_seed(epoch, DOMAIN_BEACON_ATTESTER);
-        self.caches.shuffling.get_or_insert_with(epoch, seed, || {
+        let compute = || {
             BEACON_SHUFFLING_CACHE_MISSES_TOTAL.inc();
             compute_shuffled_list(&self.get_active_validator_indices(epoch), seed)
-        })
+        };
+        // Beyond the next epoch a descendant can still change the seed's mix or the active set, so
+        // the result must not be shared with it.
+        if epoch > self.get_current_epoch() + 1 {
+            return Arc::new(compute());
+        }
+        self.caches
+            .shuffling
+            .get_or_insert_with(epoch, seed, compute)
     }
 
     /// Computes the next epoch's attester shuffling on another thread, unless a state sharing this
-    /// one's caches has it or is computing it. The next epoch's seed and active validators are
-    /// already fixed, so this takes the shuffling, about 120 ms on mainnet, off the import of the
-    /// next epoch's first block.
+    /// one's caches has it or is computing it. This takes the shuffling, about 120 ms on mainnet,
+    /// off the import of the next epoch's first block.
     pub fn prepare_next_epoch_shuffling(self: &Arc<Self>) {
         // zkVM guests have no threads to run it on.
         if cfg!(target_os = "zkvm") {
@@ -451,13 +458,12 @@ impl BeaconState {
         }
         let next_epoch = self.get_current_epoch() + 1;
         let seed = self.get_seed(next_epoch, DOMAIN_BEACON_ATTESTER);
-        if !self.caches.shuffling.start_computing(next_epoch, seed) {
+        if self.caches.shuffling.contains(next_epoch, seed) {
             return;
         }
         let state = self.clone();
         std::thread::spawn(move || {
             state.get_shuffled_active_validator_indices(next_epoch);
-            state.caches.shuffling.finish_computing(next_epoch, seed);
         });
     }
 

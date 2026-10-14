@@ -1,7 +1,7 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fmt,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, OnceLock, RwLock},
 };
 
 use alloy_primitives::B256;
@@ -14,60 +14,52 @@ const MAX_CACHED_EPOCHS: usize = 8;
 /// `(epoch, seed)` of one epoch's attester shuffling.
 type ShufflingKey = (u64, B256);
 
+/// One epoch's shuffling, filled by the first caller while later callers wait for it.
+type ShufflingSlot = Arc<OnceLock<Arc<Vec<u64>>>>;
+
 /// Shuffled active validator indices per `(epoch, seed)`, shared by a state and its clones.
 /// Entries stay valid for descendants, since an epoch's seed and active set are fixed epochs ahead.
 /// Independently built states start empty, so they never share entries.
 #[derive(Clone, Default)]
-pub struct ShufflingCache(Arc<ShufflingCacheInner>);
-
-#[derive(Default)]
-struct ShufflingCacheInner {
-    entries: RwLock<HashMap<ShufflingKey, Arc<Vec<u64>>>>,
-    /// Shufflings being computed ahead on another thread.
-    computing: Mutex<HashSet<ShufflingKey>>,
-}
+pub struct ShufflingCache(Arc<RwLock<HashMap<ShufflingKey, ShufflingSlot>>>);
 
 impl ShufflingCache {
+    /// The shuffling of `(epoch, seed)`. Only one caller runs `compute`, outside the cache's lock;
+    /// the others wait for its result. `compute` must not ask this cache for the same key.
     pub fn get_or_insert_with(
         &self,
         epoch: u64,
         seed: B256,
         compute: impl FnOnce() -> Vec<u64>,
     ) -> Arc<Vec<u64>> {
-        if let Some(shuffling) = cache_lock::read(&self.0.entries).get(&(epoch, seed)) {
-            return shuffling.clone();
-        }
+        self.slot((epoch, seed))
+            .get_or_init(|| Arc::new(compute()))
+            .clone()
+    }
 
-        let shuffling = Arc::new(compute());
-        let mut entries = cache_lock::write(&self.0.entries);
-        if entries.len() >= MAX_CACHED_EPOCHS
+    /// Whether `(epoch, seed)` is cached or being computed.
+    pub fn contains(&self, epoch: u64, seed: B256) -> bool {
+        cache_lock::read(&self.0).contains_key(&(epoch, seed))
+    }
+
+    fn slot(&self, key: ShufflingKey) -> ShufflingSlot {
+        if let Some(slot) = cache_lock::read(&self.0).get(&key) {
+            return slot.clone();
+        }
+        let mut entries = cache_lock::write(&self.0);
+        if !entries.contains_key(&key)
+            && entries.len() >= MAX_CACHED_EPOCHS
             && let Some(oldest) = entries.keys().min_by_key(|(epoch, _)| *epoch).copied()
         {
             entries.remove(&oldest);
         }
-        entries.insert((epoch, seed), shuffling.clone());
-        shuffling
-    }
-
-    /// Claims `(epoch, seed)` for computing ahead; false if it is cached or already claimed.
-    pub fn start_computing(&self, epoch: u64, seed: B256) -> bool {
-        let cached = cache_lock::read(&self.0.entries).contains_key(&(epoch, seed));
-        !cached && cache_lock::lock(&self.0.computing).insert((epoch, seed))
-    }
-
-    pub fn finish_computing(&self, epoch: u64, seed: B256) {
-        cache_lock::lock(&self.0.computing).remove(&(epoch, seed));
+        entries.entry(key).or_default().clone()
     }
 }
 
 impl fmt::Debug for ShufflingCache {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let entries = self
-            .0
-            .entries
-            .read()
-            .map(|entries| entries.len())
-            .unwrap_or(0);
+        let entries = self.0.read().map(|entries| entries.len()).unwrap_or(0);
         formatter
             .debug_struct("ShufflingCache")
             .field("entries", &entries)
@@ -109,5 +101,26 @@ mod tests {
             recomputed,
             "the oldest epoch is evicted once the cache is full"
         );
+    }
+
+    #[test]
+    fn concurrent_callers_compute_a_shuffling_once() {
+        let cache = ShufflingCache::default();
+        let computed = std::sync::atomic::AtomicUsize::new(0);
+        let seed = B256::repeat_byte(2);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    let shuffling = cache.get_or_insert_with(3, seed, || {
+                        computed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        vec![4, 2]
+                    });
+                    assert_eq!(*shuffling, [4, 2]);
+                });
+            }
+        });
+        assert_eq!(computed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(cache.contains(3, seed));
     }
 }
