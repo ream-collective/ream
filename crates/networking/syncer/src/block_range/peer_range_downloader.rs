@@ -36,7 +36,12 @@ impl Range {
 pub enum DownloadFailure {
     Transport(String),
     InvalidData(String),
-    RemoteError { code: ResponseCode, message: String },
+    RemoteError {
+        code: ResponseCode,
+        message: String,
+    },
+    /// The peer answered with a block of a fork older than we can decode.
+    UnsupportedFork,
 }
 
 pub enum StreamOutcome<T> {
@@ -50,6 +55,7 @@ fn classify_req_resp_error(err: ReqRespError) -> DownloadFailure {
             DownloadFailure::RemoteError { code, message }
         }
         ReqRespError::InvalidData(message) => DownloadFailure::InvalidData(message),
+        ReqRespError::UnsupportedFork(_) => DownloadFailure::UnsupportedFork,
         other => DownloadFailure::Transport(format!("{other:?}")),
     }
 }

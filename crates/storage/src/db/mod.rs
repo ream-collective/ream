@@ -1,4 +1,5 @@
 pub mod beacon;
+pub mod beacon_backfill;
 mod beacon_bootstrap;
 pub mod lean;
 

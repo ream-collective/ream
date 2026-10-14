@@ -58,6 +58,9 @@ pub enum ConnectionRequest {
         stream_id: u64,
         message: Box<RespMessage>,
     },
+    CancelRequest {
+        request_id: u64,
+    },
     Shutdown,
 }
 
@@ -82,6 +85,20 @@ impl ReqResp {
                 request_id,
                 message,
             },
+        });
+    }
+
+    /// Stop consuming an established outbound stream whose caller dropped its receiver.
+    pub fn cancel_request(
+        &mut self,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        request_id: u64,
+    ) {
+        self.events.push(ToSwarm::NotifyHandler {
+            peer_id,
+            handler: NotifyHandler::One(connection_id),
+            event: ConnectionRequest::CancelRequest { request_id },
         });
     }
 

@@ -65,7 +65,9 @@ impl RespMessage {
                 | ReqRespError::IncompleteStream
                 | ReqRespError::Anyhow(_)
                 | ReqRespError::IoError(_) => Some(ResponseCode::ServerError),
-                ReqRespError::InvalidData(_) => Some(ResponseCode::InvalidRequest),
+                ReqRespError::InvalidData(_) | ReqRespError::UnsupportedFork(_) => {
+                    Some(ResponseCode::InvalidRequest)
+                }
                 ReqRespError::RemoteError { code, .. } => Some(*code),
                 ReqRespError::Disconnected
                 | ReqRespError::StreamTimedOut(_)
@@ -590,6 +592,16 @@ impl ConnectionHandler for ReqRespConnectionHandler {
             ConnectionRequest::Response { stream_id, message } => {
                 self.response(stream_id, *message)
             }
+            ConnectionRequest::CancelRequest { request_id } => {
+                self.outbound_streams.retain(|stream_id, stream| {
+                    if stream.request_id == request_id {
+                        self.outbound_stream_timeouts.remove(stream_id);
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
             ConnectionRequest::Shutdown => self.shutdown(),
         }
     }
@@ -662,4 +674,41 @@ pub enum ConnectionState {
     Live,
     ShuttingDown,
     Closed,
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelling_one_request_removes_its_stream_and_timeout_only() {
+        let mut handler = ReqRespConnectionHandler::new(SubstreamProtocol::new(
+            InboundReqRespProtocol {
+                chain: crate::Chain::Beacon,
+            },
+            (),
+        ));
+        for id in [1, 2] {
+            handler.outbound_streams.insert(
+                id,
+                OutboundStream {
+                    // Cancellation drops the whole entry regardless of its current IO state.
+                    state: None,
+                    request_id: id + 10,
+                    content_type: String::new(),
+                    max_response_chunks: 32,
+                    response_chunks_received: 0,
+                },
+            );
+            handler.outbound_stream_timeouts.insert(id);
+        }
+        handler.on_behaviour_event(ConnectionRequest::CancelRequest { request_id: 11 });
+        assert!(!handler.outbound_streams.contains_key(&1));
+        assert!(!handler.outbound_stream_timeouts.contains_key(&1));
+        assert!(handler.outbound_streams.contains_key(&2));
+        assert!(handler.outbound_stream_timeouts.contains_key(&2));
+        // A late/duplicate cancellation is harmless and does not disconnect the peer.
+        handler.on_behaviour_event(ConnectionRequest::CancelRequest { request_id: 11 });
+        assert!(matches!(handler.connection_state, ConnectionState::Live));
+    }
 }
