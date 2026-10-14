@@ -270,6 +270,23 @@ impl PartialEq for StateCaches {
     }
 }
 
+/// What every validator's rewards and penalties for the previous epoch depend on.
+struct EpochRewards {
+    base_reward_per_increment: u64,
+    active_increments: u64,
+    is_in_inactivity_leak: bool,
+    /// For each participation flag: who took part, and their total in effective balance
+    /// increments.
+    flags: Vec<(Vec<bool>, u64)>,
+}
+
+/// Whether ``validator`` gets rewards and penalties for ``previous_epoch``, as in
+/// ``get_eligible_validator_indices``.
+fn is_eligible_for_rewards(validator: &Validator, previous_epoch: u64) -> bool {
+    validator.is_active_validator(previous_epoch)
+        || (validator.slashed && previous_epoch + 1 < validator.withdrawable_epoch)
+}
+
 /// Depth of the Merkle tree of a list whose limit is the power of two ``N``.
 #[cfg(not(feature = "zkvm"))]
 fn depth<N: ssz_types::typenum::Unsigned>() -> usize {
@@ -1051,13 +1068,65 @@ impl BeaconState {
         let previous_epoch = self.get_previous_epoch();
         let mut validator_indices = vec![];
         for (index, validator) in self.validators.iter().enumerate() {
-            if validator.is_active_validator(previous_epoch)
-                || (validator.slashed && previous_epoch + 1 < validator.withdrawable_epoch)
-            {
+            if is_eligible_for_rewards(validator, previous_epoch) {
                 validator_indices.push(index as u64)
             }
         }
         Ok(validator_indices)
+    }
+
+    /// What every validator's rewards and penalties for the previous epoch depend on.
+    fn epoch_rewards(&self) -> anyhow::Result<EpochRewards> {
+        let previous_epoch = self.get_previous_epoch();
+        let mut flags = Vec::with_capacity(PARTICIPATION_FLAG_WEIGHTS.len());
+        for flag_index in 0..PARTICIPATION_FLAG_WEIGHTS.len() {
+            let (participating, participating_balance) =
+                self.get_unslashed_participating_mask(flag_index as u8, previous_epoch)?;
+            flags.push((
+                participating,
+                participating_balance / EFFECTIVE_BALANCE_INCREMENT,
+            ));
+        }
+        Ok(EpochRewards {
+            base_reward_per_increment: self.get_base_reward_per_increment(),
+            active_increments: self.get_total_active_balance() / EFFECTIVE_BALANCE_INCREMENT,
+            is_in_inactivity_leak: self.is_in_inactivity_leak(),
+            flags,
+        })
+    }
+
+    /// One validator's ``(reward, penalty)`` in ``get_flag_index_deltas``.
+    fn flag_index_delta(
+        &self,
+        epoch_rewards: &EpochRewards,
+        index: usize,
+        flag_index: usize,
+    ) -> (u64, u64) {
+        let base_reward =
+            self.get_base_reward(index as u64, epoch_rewards.base_reward_per_increment);
+        let weight = PARTICIPATION_FLAG_WEIGHTS[flag_index];
+        let (participating, participating_increments) = &epoch_rewards.flags[flag_index];
+        if participating[index] {
+            if epoch_rewards.is_in_inactivity_leak {
+                return (0, 0);
+            }
+            let reward = base_reward * weight * participating_increments
+                / (epoch_rewards.active_increments * WEIGHT_DENOMINATOR);
+            (reward, 0)
+        } else if flag_index == TIMELY_HEAD_FLAG_INDEX as usize {
+            (0, 0)
+        } else {
+            (0, base_reward * weight / WEIGHT_DENOMINATOR)
+        }
+    }
+
+    /// One validator's penalty in ``get_inactivity_penalty_deltas``.
+    fn inactivity_penalty(&self, epoch_rewards: &EpochRewards, index: usize) -> u64 {
+        if epoch_rewards.flags[TIMELY_TARGET_FLAG_INDEX as usize].0[index] {
+            return 0;
+        }
+        self.validators[index].effective_balance * self.inactivity_scores[index]
+            / (INACTIVITY_SCORE_BIAS * INACTIVITY_PENALTY_QUOTIENT_BELLATRIX)
     }
 
     pub fn get_index_for_new_validator(&self) -> u64 {
@@ -1102,17 +1171,9 @@ impl BeaconState {
     pub fn get_inactivity_penalty_deltas(&self) -> anyhow::Result<(Vec<u64>, Vec<u64>)> {
         let rewards = vec![0; self.validators.len()];
         let mut penalties = vec![0; self.validators.len()];
-        let previous_epoch = self.get_previous_epoch();
-        let (matching_target, _) =
-            self.get_unslashed_participating_mask(TIMELY_TARGET_FLAG_INDEX, previous_epoch)?;
+        let epoch_rewards = self.epoch_rewards()?;
         for index in self.get_eligible_validator_indices()? {
-            if !matching_target[index as usize] {
-                let penalty_numerator = self.validators[index as usize].effective_balance
-                    * self.inactivity_scores[index as usize];
-                let penalty_denominator =
-                    INACTIVITY_SCORE_BIAS * INACTIVITY_PENALTY_QUOTIENT_BELLATRIX;
-                penalties[index as usize] += penalty_numerator / penalty_denominator;
-            }
+            penalties[index as usize] += self.inactivity_penalty(&epoch_rewards, index as usize);
         }
 
         Ok((rewards, penalties))
@@ -2896,30 +2957,12 @@ impl BeaconState {
     pub fn get_flag_index_deltas(&self, flag_index: u8) -> anyhow::Result<(Vec<u64>, Vec<u64>)> {
         let mut rewards = vec![0; self.validators.len()];
         let mut penalties = vec![0; self.validators.len()];
-
-        let previous_epoch = self.get_previous_epoch();
-        let (unslashed_participating, unslashed_participating_balance) =
-            self.get_unslashed_participating_mask(flag_index, previous_epoch)?;
-        let weight = PARTICIPATION_FLAG_WEIGHTS[flag_index as usize];
-        let unslashed_participating_increments =
-            unslashed_participating_balance / EFFECTIVE_BALANCE_INCREMENT;
-        let active_increments = self.get_total_active_balance() / EFFECTIVE_BALANCE_INCREMENT;
-
-        let base_reward_per_increment = self.get_base_reward_per_increment();
-        let is_in_inactivity_leak = self.is_in_inactivity_leak();
+        let epoch_rewards = self.epoch_rewards()?;
         for index in self.get_eligible_validator_indices()? {
-            let base_reward = self.get_base_reward(index, base_reward_per_increment);
-
-            if unslashed_participating[index as usize] {
-                if !is_in_inactivity_leak {
-                    let reward_numerator =
-                        base_reward * weight * unslashed_participating_increments;
-                    rewards[index as usize] +=
-                        reward_numerator / (active_increments * WEIGHT_DENOMINATOR);
-                }
-            } else if flag_index != TIMELY_HEAD_FLAG_INDEX {
-                penalties[index as usize] += base_reward * weight / WEIGHT_DENOMINATOR;
-            }
+            let (reward, penalty) =
+                self.flag_index_delta(&epoch_rewards, index as usize, flag_index as usize);
+            rewards[index as usize] += reward;
+            penalties[index as usize] += penalty;
         }
 
         Ok((rewards, penalties))
@@ -2936,55 +2979,22 @@ impl BeaconState {
             "failed to apply rewards and penalties: fewer balances than validators"
         );
 
-        // The deltas of `get_flag_index_deltas` for each flag and of
-        // `get_inactivity_penalty_deltas`, applied in that order, one validator at a time instead
-        // of as eight registry-sized vectors. A validator's deltas depend on its effective
-        // balance, participation and inactivity score but never on balances, so computing them
-        // while balances change gives the same result.
+        // The deltas of ``get_flag_index_deltas`` for each flag and then of
+        // ``get_inactivity_penalty_deltas``, applied one validator at a time. They depend on
+        // effective balances, participation and inactivity scores, never on balances, so the
+        // result is the same as applying each registry-sized list in turn.
+        let epoch_rewards = self.epoch_rewards()?;
         let previous_epoch = self.get_previous_epoch();
-        let mut flags = Vec::with_capacity(PARTICIPATION_FLAG_WEIGHTS.len());
-        for flag_index in 0..PARTICIPATION_FLAG_WEIGHTS.len() {
-            let (participating, participating_balance) =
-                self.get_unslashed_participating_mask(flag_index as u8, previous_epoch)?;
-            flags.push((
-                participating,
-                participating_balance / EFFECTIVE_BALANCE_INCREMENT,
-            ));
-        }
-        let active_increments = self.get_total_active_balance() / EFFECTIVE_BALANCE_INCREMENT;
-        let base_reward_per_increment = self.get_base_reward_per_increment();
-        let is_in_inactivity_leak = self.is_in_inactivity_leak();
-        let inactivity_penalty_denominator =
-            INACTIVITY_SCORE_BIAS * INACTIVITY_PENALTY_QUOTIENT_BELLATRIX;
-
         for index in 0..self.validators.len() {
-            let validator = &self.validators[index];
-            let is_eligible = validator.is_active_validator(previous_epoch)
-                || (validator.slashed && previous_epoch + 1 < validator.withdrawable_epoch);
-            if !is_eligible {
+            if !is_eligible_for_rewards(&self.validators[index], previous_epoch) {
                 continue;
             }
-            let base_reward = validator.effective_balance / EFFECTIVE_BALANCE_INCREMENT
-                * base_reward_per_increment;
-            let balance = &mut self.balances[index];
-            for (flag_index, (participating, participating_increments)) in flags.iter().enumerate()
-            {
-                let weight = PARTICIPATION_FLAG_WEIGHTS[flag_index];
-                if participating[index] {
-                    if !is_in_inactivity_leak {
-                        *balance += base_reward * weight * participating_increments
-                            / (active_increments * WEIGHT_DENOMINATOR);
-                    }
-                } else if flag_index != TIMELY_HEAD_FLAG_INDEX as usize {
-                    *balance = balance.saturating_sub(base_reward * weight / WEIGHT_DENOMINATOR);
-                }
+            for flag_index in 0..PARTICIPATION_FLAG_WEIGHTS.len() {
+                let (reward, penalty) = self.flag_index_delta(&epoch_rewards, index, flag_index);
+                self.balances[index] = (self.balances[index] + reward).saturating_sub(penalty);
             }
-            if !flags[TIMELY_TARGET_FLAG_INDEX as usize].0[index] {
-                *balance = balance.saturating_sub(
-                    validator.effective_balance * self.inactivity_scores[index]
-                        / inactivity_penalty_denominator,
-                );
-            }
+            let penalty = self.inactivity_penalty(&epoch_rewards, index);
+            self.balances[index] = self.balances[index].saturating_sub(penalty);
         }
 
         Ok(())
