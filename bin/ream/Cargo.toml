@@ -64,6 +64,7 @@ url.workspace = true
 ream-account-manager.workspace = true
 ream-api-types-beacon.workspace = true
 ream-api-types-common.workspace = true
+ream-bls.workspace = true
 ream-chain-beacon.workspace = true
 ream-chain-lean.workspace = true
 ream-checkpoint-sync-beacon.workspace = true
@@ -97,7 +98,6 @@ ream-validator-lean.workspace = true
 
 [dev-dependencies]
 libp2p.workspace = true
-ream-bls.workspace = true
 ream-mock-execution-engine.workspace = true
 ream-req-resp.workspace = true
 ream-syncer = { workspace = true, features = ["test-utils"] }

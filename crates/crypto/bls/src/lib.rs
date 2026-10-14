@@ -18,3 +18,12 @@ pub use signature::BLSSignature;
 pub mod supranational;
 #[cfg(feature = "zkcrypto")]
 pub mod zkcrypto;
+
+#[cfg(feature = "zkcrypto")]
+pub use zkcrypto::public_key::prewarm_public_keys;
+
+/// No-op: only the zkcrypto backend caches keys.
+#[cfg(not(feature = "zkcrypto"))]
+pub fn prewarm_public_keys(_public_keys: &[PublicKey]) -> usize {
+    0
+}

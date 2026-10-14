@@ -1,23 +1,22 @@
 use std::str::FromStr;
 
-use alloy_primitives::hex;
+use alloy_primitives::{FixedBytes, hex};
 use anyhow::anyhow;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use ssz::Encode;
 use ssz_derive::{Decode, Encode};
-use ssz_types::{FixedVector, typenum::U48};
 use tree_hash_derive::TreeHash;
 
 use crate::errors::BLSError;
 
+/// Compressed BLS public key, stored inline to avoid a heap allocation per key.
 #[derive(Debug, PartialEq, Clone, Encode, Decode, TreeHash, Default, Eq, Hash)]
 pub struct PublicKey {
-    pub inner: FixedVector<u8, U48>,
+    pub inner: FixedBytes<48>,
 }
 
 impl PublicKey {
     pub fn to_bytes(&self) -> &[u8] {
-        self.inner.iter().as_slice()
+        self.inner.as_slice()
     }
 }
 
@@ -26,7 +25,7 @@ impl Serialize for PublicKey {
     where
         S: Serializer,
     {
-        let val = format!("0x{}", hex::encode(self.inner.as_ssz_bytes()));
+        let val = format!("0x{}", hex::encode(self.inner));
         serializer.serialize_str(&val)
     }
 }
@@ -38,7 +37,7 @@ impl<'de> Deserialize<'de> for PublicKey {
     {
         let result: String = Deserialize::deserialize(deserializer)?;
         let result = hex::decode(&result).map_err(serde::de::Error::custom)?;
-        let key = FixedVector::try_from(result).map_err(serde::de::Error::custom)?;
+        let key = FixedBytes::try_from(result.as_slice()).map_err(serde::de::Error::custom)?;
         Ok(Self { inner: key })
     }
 }
@@ -57,11 +56,7 @@ impl FromStr for PublicKey {
         }
 
         Ok(PublicKey {
-            inner: FixedVector::try_from(bytes).map_err(|err| {
-                BLSError::InvalidPublicKey(anyhow!(
-                    "Failed to convert bytes to FixedVector {err:?}"
-                ))
-            })?,
+            inner: FixedBytes::from_slice(&bytes),
         })
     }
 }
