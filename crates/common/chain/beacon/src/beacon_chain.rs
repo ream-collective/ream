@@ -18,8 +18,8 @@ use ream_execution_rpc_types::forkchoice_update::ForkchoiceStateV1;
 use ream_fork_choice_beacon::{
     data_availability::PendingBlock,
     handlers::{
-        OnBlockOutcome, on_attestation, on_attester_slashing, on_block, on_block_attestations,
-        on_tick, process_available_block,
+        OnBlockOutcome, on_attestation, on_attester_slashing, on_block_attestations,
+        on_block_with_root, on_tick, process_available_block,
     },
     store::Store,
 };
@@ -187,9 +187,10 @@ impl BeaconChain {
                 network_spec.min_epochs_for_data_column_sidecars_requests,
             );
 
-        let outcome = on_block(
+        let outcome = on_block_with_root(
             &mut store,
             &signed_block,
+            block_root,
             &self.execution_engine,
             verify_data_availability,
         )
@@ -205,7 +206,7 @@ impl BeaconChain {
         self.process_block_attestations(&mut store, &signed_block);
         store.refresh_fork_choice();
         self.publish_cached_head(&store);
-        let block_event = self.build_block_event(&store, &signed_block);
+        let block_event = self.build_block_event(&store, &signed_block, block_root);
         drop(store);
 
         self.notify_block_imported(block_root);
@@ -329,11 +330,11 @@ impl BeaconChain {
     ) -> anyhow::Result<(B256, Option<BeaconEvent>)> {
         let signed_block = pending.signed_block.clone();
         let block_root = signed_block.message.tree_hash_root();
-        process_available_block(store, pending)?;
+        process_available_block(store, pending, block_root)?;
         self.process_block_attestations(store, &signed_block);
         store.refresh_fork_choice();
         self.publish_cached_head(store);
-        let block_event = self.build_block_event(store, &signed_block);
+        let block_event = self.build_block_event(store, &signed_block, block_root);
         Ok((block_root, block_event))
     }
 
@@ -429,12 +430,15 @@ impl BeaconChain {
         &self,
         store: &Store,
         signed_block: &SignedBeaconBlock,
+        block_root: B256,
     ) -> Option<BeaconEvent> {
-        let block_root = signed_block.message.tree_hash_root();
         let finalized_checkpoint = store.db.finalized_checkpoint_provider().get().ok();
-        match BlockEvent::from_block(signed_block, finalized_checkpoint, |block_root, epoch| {
-            store.get_checkpoint_block(block_root, epoch)
-        }) {
+        match BlockEvent::from_block(
+            signed_block,
+            block_root,
+            finalized_checkpoint,
+            |block_root, epoch| store.get_checkpoint_block(block_root, epoch),
+        ) {
             Ok(block_event) => Some(BeaconEvent::Block(block_event)),
             Err(err) => {
                 warn!("Failed to build block event after importing {block_root}: {err:?}");

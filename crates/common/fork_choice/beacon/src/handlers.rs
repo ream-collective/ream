@@ -12,8 +12,9 @@ use ream_consensus_beacon::{
     predicates::is_slashable_attestation_data,
 };
 use ream_consensus_misc::{
-    checkpoint::Checkpoint, constants::beacon::INTERVALS_PER_SLOT,
-    misc::compute_start_slot_at_epoch,
+    checkpoint::Checkpoint,
+    constants::beacon::INTERVALS_PER_SLOT,
+    misc::{compute_epoch_at_slot, compute_start_slot_at_epoch},
 };
 use ream_data_availability::PendingBlock;
 use ream_execution_engine::engine_trait::ExecutionApi;
@@ -43,10 +44,29 @@ pub async fn on_block(
     execution_engine: &Option<impl ExecutionApi>,
     verify_data_availability: bool,
 ) -> anyhow::Result<OnBlockOutcome> {
+    let block_root = signed_block.message.tree_hash_root();
+    on_block_with_root(
+        store,
+        signed_block,
+        block_root,
+        execution_engine,
+        verify_data_availability,
+    )
+    .await
+}
+
+/// ``on_block`` for a block whose root the caller already computed. Hashing a mainnet block
+/// hashes its whole execution payload, a few milliseconds each time.
+pub async fn on_block_with_root(
+    store: &mut Store,
+    signed_block: &SignedBeaconBlock,
+    block_root: B256,
+    execution_engine: &Option<impl ExecutionApi>,
+    verify_data_availability: bool,
+) -> anyhow::Result<OnBlockOutcome> {
     let block = &signed_block.message;
     let parent_root = block.parent_root;
     let block_slot = block.slot;
-    let block_root = block.tree_hash_root();
 
     // Parent block must be known
     ensure!(
@@ -96,8 +116,8 @@ pub async fn on_block(
         .message
         .state_root;
     let state_transition_timer = BEACON_BLOCK_STATE_TRANSITION_SECONDS.start_timer();
-    state
-        .state_transition_from_root(
+    let epoch_start_state = state
+        .state_transition_keeping_epoch_start(
             signed_block,
             true,
             execution_engine,
@@ -105,6 +125,15 @@ pub async fn on_block(
         )
         .await?;
     state_transition_timer.observe_duration();
+    if let Some(epoch_start_state) = epoch_start_state {
+        store.db.checkpoint_states_provider().insert_shared(
+            Checkpoint {
+                epoch: compute_epoch_at_slot(block_slot),
+                root: parent_root,
+            },
+            Arc::new(epoch_start_state),
+        );
+    }
 
     let pending = PendingBlock {
         signed_block: signed_block.clone(),
@@ -113,7 +142,7 @@ pub async fn on_block(
 
     // If no data availability check is required, process the block immediately.
     if !verify_data_availability {
-        process_available_block(store, pending)?;
+        process_available_block(store, pending, block_root)?;
         return Ok(OnBlockOutcome::Imported);
     }
 
@@ -133,16 +162,20 @@ pub async fn on_block(
 
     match available {
         Some(available) => {
-            process_available_block(store, available)?;
+            process_available_block(store, available, block_root)?;
             Ok(OnBlockOutcome::Imported)
         }
         None => Ok(OnBlockOutcome::PendingAvailability),
     }
 }
 
-pub fn process_available_block(store: &mut Store, pending: PendingBlock) -> anyhow::Result<()> {
+/// Imports `pending`, the block at `block_root`, once its data is available.
+pub fn process_available_block(
+    store: &mut Store,
+    pending: PendingBlock,
+    block_root: B256,
+) -> anyhow::Result<()> {
     let signed_block = pending.signed_block;
-    let block_root = signed_block.message.tree_hash_root();
     let block_slot = signed_block.message.slot;
     let parent_root = signed_block.message.parent_root;
     let state = Arc::new(pending.post_state);

@@ -3,7 +3,6 @@ use std::sync::Arc;
 use alloy_primitives::B256;
 use ream_consensus_beacon::electra::beacon_block::SignedBeaconBlock;
 use redb::{Database, Durability, ReadableDatabase, TableDefinition};
-use tree_hash::TreeHash;
 
 use super::parent_root_index::PARENT_ROOT_INDEX_MULTIMAP_TABLE;
 use crate::{
@@ -68,7 +67,9 @@ impl REDBTable for BeaconBlockTable {
     }
 
     fn insert(&self, key: Self::Key, value: Self::Value) -> Result<(), StoreError> {
-        let block_root = value.message.tree_hash_root();
+        // The key is the block root: indexing under it points every index entry at the key the
+        // block is stored under, and hashing the block again costs a few milliseconds.
+        let block_root = key;
 
         if let Some(cache) = &self.cache
             && let Ok(mut cache_lock) = cache.blocks.lock()

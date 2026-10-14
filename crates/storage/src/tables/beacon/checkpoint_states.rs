@@ -117,6 +117,11 @@ impl CheckpointStatesTable {
         Ok(Some(state))
     }
 
+    /// Records `state` as the state of `checkpoint`, sharing it with the caller.
+    pub fn insert_shared(&self, checkpoint: Checkpoint, state: Arc<BeaconState>) {
+        self.cache_state(checkpoint, state);
+    }
+
     /// Forgets the checkpoint states of epochs before `epoch`. Fork choice reads checkpoint states
     /// only for attestation targets, which are never older than the finalized epoch. Checkpoint
     /// states stored in redb by earlier versions are deleted too.
