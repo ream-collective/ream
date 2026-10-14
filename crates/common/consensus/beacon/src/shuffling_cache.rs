@@ -11,35 +11,36 @@ use crate::cache_lock;
 /// Most epochs kept. Block processing needs the previous, current and next epoch.
 const MAX_CACHED_EPOCHS: usize = 8;
 
-/// `(epoch, seed)` of one epoch's attester shuffling.
+/// An epoch and the root of the block that decides its attester shuffling.
 type ShufflingKey = (u64, B256);
 
 /// One epoch's shuffling, filled by the first caller while later callers wait for it.
 type ShufflingSlot = Arc<OnceLock<Arc<Vec<u64>>>>;
 
-/// Shuffled active validator indices per `(epoch, seed)`, shared by a state and its clones.
-/// Entries stay valid for descendants, since an epoch's seed and active set are fixed epochs ahead.
-/// Independently built states start empty, so they never share entries.
+/// Shuffled active validator indices per epoch and deciding block, shared by a state and its
+/// clones. States whose chains share the deciding block have the same shuffling, so sibling forks
+/// never read each other's entries. Independently built states start empty.
 #[derive(Clone, Default)]
 pub struct ShufflingCache(Arc<RwLock<HashMap<ShufflingKey, ShufflingSlot>>>);
 
 impl ShufflingCache {
-    /// The shuffling of `(epoch, seed)`. Only one caller runs `compute`, outside the cache's lock;
-    /// the others wait for its result. `compute` must not ask this cache for the same key.
+    /// The shuffling of `epoch` decided by the block `decision_root`. Only one caller runs
+    /// `compute`, outside the cache's lock; the others wait for its result. `compute` must not ask
+    /// this cache for the same key.
     pub fn get_or_insert_with(
         &self,
         epoch: u64,
-        seed: B256,
+        decision_root: B256,
         compute: impl FnOnce() -> Vec<u64>,
     ) -> Arc<Vec<u64>> {
-        self.slot((epoch, seed))
+        self.slot((epoch, decision_root))
             .get_or_init(|| Arc::new(compute()))
             .clone()
     }
 
-    /// Whether `(epoch, seed)` is cached or being computed.
-    pub fn contains(&self, epoch: u64, seed: B256) -> bool {
-        cache_lock::read(&self.0).contains_key(&(epoch, seed))
+    /// Whether the shuffling of `epoch` decided by `decision_root` is cached or being computed.
+    pub fn contains(&self, epoch: u64, decision_root: B256) -> bool {
+        cache_lock::read(&self.0).contains_key(&(epoch, decision_root))
     }
 
     fn slot(&self, key: ShufflingKey) -> ShufflingSlot {
@@ -86,7 +87,7 @@ mod tests {
             *clone.get_or_insert_with(5, seed, || unreachable!()),
             [3, 1, 2]
         );
-        // A different seed for the same epoch is a different shuffling.
+        // A different deciding block for the same epoch is a different shuffling.
         assert_eq!(*cache.get_or_insert_with(5, B256::ZERO, || vec![9]), [9]);
 
         for epoch in 10..10 + MAX_CACHED_EPOCHS as u64 {

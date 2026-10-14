@@ -448,22 +448,39 @@ impl BeaconState {
     }
 
     /// Active validator indices of ``epoch`` in committee order: the committees of the epoch are
-    /// consecutive slices of this list. It is computed once per epoch and seed and cached, because
+    /// consecutive slices of this list. It is cached per epoch and deciding block, because
     /// recomputing it costs a scan of the whole registry plus a shuffle.
     pub fn get_shuffled_active_validator_indices(&self, epoch: u64) -> Arc<Vec<u64>> {
-        let seed = self.get_seed(epoch, DOMAIN_BEACON_ATTESTER);
         let compute = || {
             BEACON_SHUFFLING_CACHE_MISSES_TOTAL.inc();
+            let seed = self.get_seed(epoch, DOMAIN_BEACON_ATTESTER);
             compute_shuffled_list(&self.get_active_validator_indices(epoch), seed)
         };
-        // Beyond the next epoch a descendant can still change the seed's mix or the active set, so
-        // the result must not be shared with it.
-        if epoch > self.get_current_epoch() + 1 {
-            return Arc::new(compute());
+        match self.shuffling_decision_root(epoch) {
+            Some(decision_root) => {
+                self.caches
+                    .shuffling
+                    .get_or_insert_with(epoch, decision_root, compute)
+            }
+            None => Arc::new(compute()),
         }
-        self.caches
-            .shuffling
-            .get_or_insert_with(epoch, seed, compute)
+    }
+
+    /// Root of the block that decides the attester shuffling of ``epoch``: the last block of epoch
+    /// ``epoch - 2`` on this state's chain. The seed uses that epoch's RANDAO mix, and activations
+    /// and exits take effect at least five epochs after they are processed, so states whose chains
+    /// share that block share the shuffling. ``None`` past the next epoch, whose deciding block
+    /// this state does not have yet.
+    fn shuffling_decision_root(&self, epoch: u64) -> Option<B256> {
+        if epoch > self.get_current_epoch() + 1 {
+            return None;
+        }
+        // Before epoch 2 the decision lies at genesis, which every chain shares.
+        if epoch < 2 {
+            return Some(B256::ZERO);
+        }
+        self.get_block_root_at_slot(compute_start_slot_at_epoch(epoch - 1) - 1)
+            .ok()
     }
 
     /// Computes the next epoch's attester shuffling on another thread, unless a state sharing this
@@ -475,8 +492,10 @@ impl BeaconState {
             return;
         }
         let next_epoch = self.get_current_epoch() + 1;
-        let seed = self.get_seed(next_epoch, DOMAIN_BEACON_ATTESTER);
-        if self.caches.shuffling.contains(next_epoch, seed) {
+        let Some(decision_root) = self.shuffling_decision_root(next_epoch) else {
+            return;
+        };
+        if self.caches.shuffling.contains(next_epoch, decision_root) {
             return;
         }
         let state = self.clone();
@@ -3743,6 +3762,44 @@ mod tests {
             .decompress_vec(&std::fs::read(path).unwrap())
             .unwrap();
         BeaconState::from_ssz_bytes(&bytes).unwrap()
+    }
+
+    /// Two sibling blocks from the same proposer carry the same RANDAO reveal. If one of them
+    /// schedules an exit, both chains keep the same seeds but the exit changes the active set of
+    /// the epoch it takes effect in. The two states share their caches, so the shuffling must be
+    /// keyed by the block that decides it, not by the seed.
+    #[test]
+    fn sibling_forks_with_the_same_seed_do_not_share_shufflings() {
+        let state = sepolia_state();
+        let current_epoch = state.get_current_epoch();
+        let exit_epoch = current_epoch + 5;
+        let exiting = (0..state.validators.len())
+            .find(|&index| state.validators[index].is_active_validator(exit_epoch))
+            .unwrap();
+        let mut sibling = state.clone();
+        let mut other_sibling = state.clone();
+        other_sibling.latest_block_header.body_root = B256::repeat_byte(1);
+        other_sibling.validators[exiting].exit_epoch = exit_epoch;
+
+        let start = compute_start_slot_at_epoch(exit_epoch - 1);
+        sibling.process_slots(start).unwrap();
+        other_sibling.process_slots(start).unwrap();
+        assert_eq!(
+            sibling.get_seed(exit_epoch, DOMAIN_BEACON_ATTESTER),
+            other_sibling.get_seed(exit_epoch, DOMAIN_BEACON_ATTESTER)
+        );
+
+        let exiting = exiting as u64;
+        assert!(
+            sibling
+                .get_shuffled_active_validator_indices(exit_epoch)
+                .contains(&exiting)
+        );
+        assert!(
+            !other_sibling
+                .get_shuffled_active_validator_indices(exit_epoch)
+                .contains(&exiting)
+        );
     }
 
     /// The cached state root must equal the derived ``hash_tree_root`` after changes, and for a
