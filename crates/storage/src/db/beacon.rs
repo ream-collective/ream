@@ -30,6 +30,8 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct BeaconDB {
     pub db: Arc<Database>,
+    /// Validators' latest messages, in a database of their own; see `VOTES_REDB_FILE`.
+    pub votes_db: Arc<Database>,
     pub data_dir: PathBuf,
     pub(crate) cache: Option<Arc<BeaconCacheDB>>,
     pub(crate) bootstrap_cache:
@@ -86,7 +88,7 @@ impl BeaconDB {
 
     pub fn latest_messages_provider(&self) -> LatestMessagesTable {
         LatestMessagesTable {
-            db: self.db.clone(),
+            db: self.votes_db.clone(),
             cache: self.cache.clone(),
         }
     }

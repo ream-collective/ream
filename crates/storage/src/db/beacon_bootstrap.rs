@@ -1,4 +1,7 @@
-use std::fs::{self, File};
+use std::{
+    fs::{self, File},
+    sync::Arc,
+};
 
 use alloy_primitives::B256;
 use anyhow::{bail, ensure};
@@ -15,6 +18,7 @@ use crate::{
             beacon_state::STATE_FOLDER_NAME,
             blobs_and_proofs::BLOB_FOLDER_NAME,
             column_sidecars::COLUMN_FOLDER_NAME,
+            latest_messages::LatestMessagesTable,
         },
         table::REDBTable,
     },
@@ -350,8 +354,14 @@ impl BeaconDB {
             write.delete_multimap_table(table)?;
         }
         write.commit()?;
+        // Fork choice votes live in a database of their own.
+        let write = self.votes_db.begin_write()?;
+        write.delete_table(LatestMessagesTable::TABLE_DEFINITION)?;
+        write.open_table(LatestMessagesTable::TABLE_DEFINITION)?;
+        write.commit()?;
         ReamDB {
             db: self.db.clone(),
+            votes_db: Arc::new(std::sync::Mutex::new(Some(self.votes_db.clone()))),
             data_dir: self.data_dir.clone(),
             bootstrap_cache: self.bootstrap_cache.clone(),
         }
