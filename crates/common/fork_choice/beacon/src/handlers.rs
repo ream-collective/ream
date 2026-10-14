@@ -1,3 +1,5 @@
+use std::collections::{HashMap, hash_map::Entry};
+
 use alloy_primitives::{B256, map::HashSet};
 use anyhow::{anyhow, ensure};
 use ream_consensus_beacon::{
@@ -7,7 +9,8 @@ use ream_consensus_beacon::{
     predicates::is_slashable_attestation_data,
 };
 use ream_consensus_misc::{
-    constants::beacon::INTERVALS_PER_SLOT, misc::compute_start_slot_at_epoch,
+    checkpoint::Checkpoint, constants::beacon::INTERVALS_PER_SLOT,
+    misc::compute_start_slot_at_epoch,
 };
 use ream_data_availability::PendingBlock;
 use ream_execution_engine::engine_trait::ExecutionApi;
@@ -193,6 +196,45 @@ pub fn process_available_block(store: &mut Store, pending: PendingBlock) -> anyh
     store.refresh_fork_choice();
 
     Ok(())
+}
+
+/// Runs ``on_attestation`` with ``is_from_block`` for the attestations of a block whose
+/// ``state_transition`` succeeded, returning one result per attestation.
+///
+/// ``state_transition`` already verified each attestation's signature against the same committees
+/// the target state yields, so the signature is not verified again here. Each target checkpoint
+/// state is read once per block: decoding it costs as much as the rest of the work for one
+/// attestation.
+pub fn on_block_attestations(
+    store: &mut Store,
+    attestations: &[Attestation],
+) -> Vec<anyhow::Result<()>> {
+    let mut target_states: HashMap<Checkpoint, BeaconState> = HashMap::new();
+    attestations
+        .iter()
+        .map(|attestation| {
+            store.validate_on_attestation(attestation, true)?;
+            let target = attestation.data.target;
+            let target_state = match target_states.entry(target) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    store.store_target_checkpoint_state(target)?;
+                    entry.insert(
+                        store
+                            .db
+                            .checkpoint_states_provider()
+                            .get(target)?
+                            .ok_or_else(|| anyhow!("checkpoint_states not found"))?,
+                    )
+                }
+            };
+            let indexed_attestation = target_state.get_indexed_attestation(attestation)?;
+            store.update_latest_messages(
+                indexed_attestation.attesting_indices.to_vec(),
+                attestation.clone(),
+            )
+        })
+        .collect()
 }
 
 /// Run ``on_attester_slashing`` immediately upon receiving a new ``AttesterSlashing``

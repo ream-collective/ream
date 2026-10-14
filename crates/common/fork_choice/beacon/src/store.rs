@@ -1085,7 +1085,7 @@ impl Store {
     }
 
     pub fn store_target_checkpoint_state(&mut self, target: Checkpoint) -> anyhow::Result<()> {
-        if self.db.checkpoint_states_provider().get(target)?.is_some() {
+        if self.db.checkpoint_states_provider().contains_key(target)? {
             return Ok(());
         }
 

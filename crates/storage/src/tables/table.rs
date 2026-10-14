@@ -34,6 +34,17 @@ where
         Ok(table.get(key)?.map(|result| result.value()))
     }
 
+    /// Whether `key` has a value. The value is not decoded, so this stays cheap for tables that
+    /// hold whole beacon states.
+    fn contains_key<'a>(
+        &self,
+        key: <Self::KeyTableDefinition as redb::Value>::SelfType<'a>,
+    ) -> Result<bool, StoreError> {
+        let read_txn = self.database().begin_read()?;
+        let table = read_txn.open_table(Self::TABLE_DEFINITION)?;
+        Ok(table.get(key)?.is_some())
+    }
+
     fn insert<'a>(
         &self,
         key: <Self::KeyTableDefinition as redb::Value>::SelfType<'a>,

@@ -18,8 +18,8 @@ use ream_execution_rpc_types::forkchoice_update::ForkchoiceStateV1;
 use ream_fork_choice_beacon::{
     data_availability::PendingBlock,
     handlers::{
-        OnBlockOutcome, on_attestation, on_attester_slashing, on_block, on_tick,
-        process_available_block,
+        OnBlockOutcome, on_attestation, on_attester_slashing, on_block, on_block_attestations,
+        on_tick, process_available_block,
     },
     store::Store,
 };
@@ -418,8 +418,8 @@ impl BeaconChain {
             .operation_pool
             .mark_attestations_included(&signed_block.message.body.attestations);
 
-        for attestation in signed_block.message.body.attestations.iter() {
-            if let Err(err) = on_attestation(store, attestation.clone(), true) {
+        for result in on_block_attestations(store, &signed_block.message.body.attestations) {
+            if let Err(err) = result {
                 warn!("Failed to process block attestation through fork choice: {err:?}");
             }
         }
