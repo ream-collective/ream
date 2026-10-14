@@ -293,8 +293,25 @@ fn depth<N: ssz_types::typenum::Unsigned>() -> usize {
     N::to_u64().trailing_zeros() as usize
 }
 
+/// Committee ``index`` at ``slot``, taken from ``shuffled``, the output of
+/// ``get_shuffled_active_validator_indices`` for the slot's epoch. The bounds are those of
+/// ``compute_committee``.
+pub fn committee_in_shuffling(shuffled: &[u64], slot: u64, index: u64) -> anyhow::Result<Vec<u64>> {
+    let committees_per_slot = committee_count_per_slot(shuffled.len());
+    let count = committees_per_slot * SLOTS_PER_EPOCH;
+    let committee = (slot % SLOTS_PER_EPOCH) * committees_per_slot + index;
+    ensure!(
+        committee < count,
+        "Committee index {index} is out of range for {committees_per_slot} committees per slot"
+    );
+    let length = shuffled.len() as u64;
+    let start = (length * committee / count) as usize;
+    let end = (length * (committee + 1) / count) as usize;
+    Ok(shuffled[start..end].to_vec())
+}
+
 /// Committees per slot for an epoch with ``active_validator_count`` active validators.
-fn committee_count_per_slot(active_validator_count: usize) -> u64 {
+pub fn committee_count_per_slot(active_validator_count: usize) -> u64 {
     (active_validator_count as u64 / SLOTS_PER_EPOCH / TARGET_COMMITTEE_SIZE)
         .clamp(1, MAX_COMMITTEES_PER_SLOT)
 }
@@ -672,18 +689,7 @@ impl BeaconState {
     /// Return the beacon committee at ``slot`` for ``index``.
     pub fn get_beacon_committee(&self, slot: u64, index: u64) -> anyhow::Result<Vec<u64>> {
         let shuffled = self.get_shuffled_active_validator_indices(compute_epoch_at_slot(slot));
-        let committees_per_slot = committee_count_per_slot(shuffled.len());
-        let count = committees_per_slot * SLOTS_PER_EPOCH;
-        let committee = (slot % SLOTS_PER_EPOCH) * committees_per_slot + index;
-        ensure!(
-            committee < count,
-            "Committee index {index} is out of range for {committees_per_slot} committees per slot"
-        );
-        // Same bounds as ``compute_committee``, taken from the already shuffled list.
-        let length = shuffled.len() as u64;
-        let start = (length * committee / count) as usize;
-        let end = (length * (committee + 1) / count) as usize;
-        Ok(shuffled[start..end].to_vec())
+        committee_in_shuffling(&shuffled, slot, index)
     }
 
     /// Return the committee assignment in the ``epoch`` for ``validator_index``.
@@ -1760,28 +1766,16 @@ impl BeaconState {
         &mut self,
         consolidation_request: &ConsolidationRequest,
     ) -> anyhow::Result<()> {
-        // Both validators are found in one pass over the registry.
-        let indices = self.find_validator_indices(&[
-            consolidation_request.source_public_key.clone(),
-            consolidation_request.target_public_key.clone(),
-        ]);
-        let source_index = indices
-            .get(&consolidation_request.source_public_key)
-            .copied();
-        let target_index = indices
-            .get(&consolidation_request.target_public_key)
-            .copied();
-
-        if self.is_valid_switch_with_source(consolidation_request, source_index) {
-            let Some(index) = source_index else {
-                bail!("Validator not found");
-            };
-            self.switch_to_compounding_validator(index as u64)?;
-            return Ok(());
-        }
-
-        // Verify that source != target, so a consolidation cannot be used as an exit
+        // A request with the same source and target can only switch the validator to compounding,
+        // and a consolidation cannot be used as an exit.
         if consolidation_request.source_public_key == consolidation_request.target_public_key {
+            let source_index = self.find_validator_index(&consolidation_request.source_public_key);
+            if self.is_valid_switch_with_source(consolidation_request, source_index) {
+                let Some(index) = source_index else {
+                    bail!("Validator not found");
+                };
+                self.switch_to_compounding_validator(index as u64)?;
+            }
             return Ok(());
         }
 
@@ -1796,7 +1790,15 @@ impl BeaconState {
             return Ok(());
         }
 
-        let (Some(source_index), Some(target_index)) = (source_index, target_index) else {
+        // Both validators are found in one pass over the registry.
+        let indices = self.find_validator_indices(&[
+            consolidation_request.source_public_key.clone(),
+            consolidation_request.target_public_key.clone(),
+        ]);
+        let (Some(&source_index), Some(&target_index)) = (
+            indices.get(&consolidation_request.source_public_key),
+            indices.get(&consolidation_request.target_public_key),
+        ) else {
             return Ok(());
         };
         let source_validator = &self.validators[source_index];
@@ -2704,11 +2706,22 @@ impl BeaconState {
         let mut deposits_to_postpone = vec![];
         let mut is_churn_limit_reached = false;
         let finalized_slot = compute_start_slot_at_epoch(self.finalized_checkpoint.epoch);
-        // Only the first MAX_PENDING_DEPOSITS_PER_EPOCH deposits can be processed, so their
-        // validators are looked up together in one registry pass.
+        // Fulu removes support for the former Eth1 bridge deposit transition. The network spec is
+        // read last, only when it matters.
+        let is_bridge_pending = !self.pending_deposits.is_empty()
+            && self.eth1_deposit_index < self.deposit_requests_start_index
+            && self.get_current_epoch() < beacon_network_spec().fulu_fork_epoch;
+        // Processing stops at the first deposit that is not finalized, or, while Eth1 bridge
+        // deposits are pending, at the first deposit request.
+        let stops_at = |deposit: &PendingDeposit| {
+            (is_bridge_pending && deposit.slot > GENESIS_SLOT) || deposit.slot > finalized_slot
+        };
+        // At most MAX_PENDING_DEPOSITS_PER_EPOCH deposits before the first stop are processed, so
+        // their validators are looked up together in one registry pass.
         let batch: Vec<PublicKey> = self
             .pending_deposits
             .iter()
+            .take_while(|deposit| !stops_at(deposit))
             .take(MAX_PENDING_DEPOSITS_PER_EPOCH as usize)
             .map(|deposit| deposit.public_key.clone())
             .collect();
@@ -2718,18 +2731,7 @@ impl BeaconState {
             let Some(deposit) = self.pending_deposits.get(index).cloned() else {
                 bail!("Pending deposit not found");
             };
-            // Fulu removes support for the former Eth1 bridge deposit transition.
-            let fulu_fork_epoch = beacon_network_spec().fulu_fork_epoch;
-            let is_fulu_or_later = self.get_current_epoch() >= fulu_fork_epoch;
-            if !is_fulu_or_later
-                && deposit.slot > GENESIS_SLOT
-                && self.eth1_deposit_index < self.deposit_requests_start_index
-            {
-                break;
-            }
-
-            // Check if deposit has been finalized, otherwise, stop processing.
-            if deposit.slot > finalized_slot {
+            if stops_at(&deposit) {
                 break;
             }
 
