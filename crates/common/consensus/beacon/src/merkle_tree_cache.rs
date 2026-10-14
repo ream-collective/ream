@@ -7,10 +7,14 @@ use std::{
 };
 
 use alloy_primitives::B256;
-use ethereum_hashing::hash32_concat;
+use ethereum_hashing::{ZERO_HASHES, ZERO_HASHES_MAX_INDEX, hash32_concat};
 use tree_hash::{TreeHash, mix_in_length};
 
-use crate::cache_lock;
+use crate::{
+    cache_lock, historical_summary::HistoricalSummary, pending_consolidation::PendingConsolidation,
+    pending_deposit::PendingDeposit, pending_partial_withdrawal::PendingPartialWithdrawal,
+    sync_committee::SyncCommittee,
+};
 
 /// Levels of a Merkle tree, leaves first. A missing right child is the zero subtree, as in SSZ.
 pub(crate) struct MerkleTree {
@@ -26,19 +30,19 @@ impl MerkleTree {
         tree
     }
 
-    /// Writes `leaf` at `index` (or appends it when `index` is the leaf count) and returns
-    /// whether the tree changed.
-    pub(crate) fn set_leaf(&mut self, index: usize, leaf: B256) -> bool {
+    pub(crate) fn leaf_count(&self) -> usize {
+        self.levels[0].len()
+    }
+
+    pub(crate) fn leaf(&self, index: usize) -> B256 {
+        self.levels[0][index]
+    }
+
+    /// Writes `leaf` at `index`, or appends it when `index` is the leaf count.
+    pub(crate) fn set_leaf(&mut self, index: usize, leaf: B256) {
         match self.levels[0].get_mut(index) {
-            Some(current) if *current == leaf => false,
-            Some(current) => {
-                *current = leaf;
-                true
-            }
-            None => {
-                self.levels[0].push(leaf);
-                true
-            }
+            Some(current) => *current = leaf,
+            None => self.levels[0].push(leaf),
         }
     }
 
@@ -71,8 +75,11 @@ impl MerkleTree {
             dirty.dedup();
             let width = self.levels[depth - 1].len().div_ceil(2);
             self.levels[depth].resize(width, B256::ZERO);
-            for &index in &dirty {
-                let node = parent(&self.levels[depth - 1], index, depth - 1);
+            let below = &self.levels[depth - 1];
+            let nodes = parallel_map(&dirty, PARALLEL_HASH_THRESHOLD, |&index| {
+                parent(below, index, depth - 1)
+            });
+            for (&index, node) in dirty.iter().zip(nodes) {
                 self.levels[depth][index] = node;
             }
         }
@@ -96,9 +103,10 @@ impl MerkleTree {
         self.levels.truncate(1);
         for depth in 1..levels_needed(self.levels[0].len()) {
             let below = &self.levels[depth - 1];
-            let level = (0..below.len().div_ceil(2))
-                .map(|index| parent(below, index, depth - 1))
-                .collect();
+            let indices: Vec<usize> = (0..below.len().div_ceil(2)).collect();
+            let level = parallel_map(&indices, PARALLEL_HASH_THRESHOLD, |&index| {
+                parent(below, index, depth - 1)
+            });
             self.levels.push(level);
         }
     }
@@ -120,11 +128,42 @@ fn parent(below: &[B256], index: usize, below_depth: usize) -> B256 {
 
 /// Root of a subtree of `2^depth` zero chunks.
 pub(crate) fn zero_hash(depth: usize) -> B256 {
-    let mut node = B256::ZERO;
-    for _ in 0..depth {
+    if depth <= ZERO_HASHES_MAX_INDEX {
+        return B256::from(ZERO_HASHES[depth]);
+    }
+    let mut node = B256::from(ZERO_HASHES[ZERO_HASHES_MAX_INDEX]);
+    for _ in ZERO_HASHES_MAX_INDEX..depth {
         node = B256::from(hash32_concat(node.as_slice(), node.as_slice()));
     }
     node
+}
+
+/// Below this many nodes, hashing stays on the calling thread.
+pub(crate) const PARALLEL_HASH_THRESHOLD: usize = 16_384;
+
+/// `items.iter().map(map).collect()`, in parallel when there are at least `threshold` items.
+pub(crate) fn parallel_map<T: Sync, R: Send>(
+    items: &[T],
+    threshold: usize,
+    map: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
+    // zkVM guests have no threads.
+    if cfg!(target_os = "zkvm") || items.len() < threshold {
+        return items.iter().map(map).collect();
+    }
+    let threads = std::thread::available_parallelism().map_or(1, |threads| threads.get());
+    let chunk_size = items.len().div_ceil(threads);
+    let map = &map;
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = items
+            .chunks(chunk_size)
+            .map(|chunk| scope.spawn(move || chunk.iter().map(map).collect::<Vec<R>>()))
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("map worker does not panic"))
+            .collect()
+    })
 }
 
 /// Root of an SSZ list or vector of basic values, shared by a state and its clones.
@@ -135,19 +174,28 @@ impl PackedListRootCache {
     /// Root of a `List[uint64, 2^(limit_depth + 2)]`.
     pub fn u64_list_root(&self, values: &[u64], limit_depth: usize) -> B256 {
         let chunk_count = values.len().div_ceil(4);
-        let chunk = |index: usize| {
-            let mut bytes = [0u8; 32];
-            for (slot, value) in values[index * 4..values.len().min(index * 4 + 4)]
-                .iter()
-                .enumerate()
-            {
-                bytes[slot * 8..slot * 8 + 8].copy_from_slice(&value.to_le_bytes());
-            }
-            B256::from(bytes)
-        };
         mix_in_length(
-            &self.chunks_root(chunk_count, chunk, limit_depth),
+            &self.chunks_root(chunk_count, |index| u64_chunk(values, index), limit_depth),
             values.len(),
+        )
+    }
+
+    /// Root of a `Vector[uint64, N]`, `N` being `values.len()`.
+    pub fn u64_vector_root(&self, values: &[u64]) -> B256 {
+        let chunk_count = values.len().div_ceil(4);
+        self.chunks_root(
+            chunk_count,
+            |index| u64_chunk(values, index),
+            vector_depth(chunk_count),
+        )
+    }
+
+    /// Root of a `Vector[Bytes32, N]`, `N` being `values.len()`.
+    pub fn b256_vector_root(&self, values: &[B256]) -> B256 {
+        self.chunks_root(
+            values.len(),
+            |index| values[index],
+            vector_depth(values.len()),
         )
     }
 
@@ -169,16 +217,36 @@ impl PackedListRootCache {
     fn chunks_root(
         &self,
         chunk_count: usize,
-        chunk: impl Fn(usize) -> B256,
+        chunk: impl Fn(usize) -> B256 + Sync,
         limit_depth: usize,
     ) -> B256 {
         let mut tree = cache_lock::lock(&self.0);
         match tree.as_mut() {
             Some(tree) => {
                 let last = tree.truncate(chunk_count);
-                let mut dirty: Vec<usize> = (0..chunk_count)
-                    .filter(|&index| tree.set_leaf(index, chunk(index)))
-                    .collect();
+                // About 600,000 chunks for mainnet balances, so compare in parallel.
+                let known = tree.leaf_count().min(chunk_count);
+                let ranges: Vec<usize> = (0..known).step_by(PARALLEL_HASH_THRESHOLD).collect();
+                let changed: Vec<(usize, B256)> = parallel_map(&ranges, 2, |&start| {
+                    (start..(start + PARALLEL_HASH_THRESHOLD).min(known))
+                        .filter_map(|index| {
+                            let leaf = chunk(index);
+                            (leaf != tree.leaf(index)).then_some((index, leaf))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .into_iter()
+                .flatten()
+                .collect();
+                let mut dirty = Vec::with_capacity(changed.len() + chunk_count - known + 1);
+                for (index, leaf) in changed {
+                    tree.set_leaf(index, leaf);
+                    dirty.push(index);
+                }
+                for index in known..chunk_count {
+                    tree.set_leaf(index, chunk(index));
+                    dirty.push(index);
+                }
                 dirty.extend(last);
                 dirty.sort_unstable();
                 dirty.dedup();
@@ -190,6 +258,23 @@ impl PackedListRootCache {
             .expect("the tree was built above")
             .root(limit_depth)
     }
+}
+
+/// Leaf chunk `index` of packed `u64` values: four values, little-endian, zero-padded.
+fn u64_chunk(values: &[u64], index: usize) -> B256 {
+    let mut bytes = [0u8; 32];
+    for (slot, value) in values[index * 4..values.len().min(index * 4 + 4)]
+        .iter()
+        .enumerate()
+    {
+        bytes[slot * 8..slot * 8 + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    B256::from(bytes)
+}
+
+/// Depth of the tree over a vector's `chunk_count` chunks, padded to a power of two.
+fn vector_depth(chunk_count: usize) -> usize {
+    chunk_count.max(1).next_power_of_two().trailing_zeros() as usize
 }
 
 /// Root of an SSZ list of containers, shared by a state and its clones. Only items that differ
@@ -244,14 +329,52 @@ impl<T: Clone + PartialEq + TreeHash> ContainerListRootCache<T> {
     }
 }
 
-/// Caches for the large state fields other than the validator registry.
+/// Sync committee roots by allocation. A state replaces its committees rather than editing them,
+/// so an allocation's root never changes.
+#[derive(Clone, Default)]
+pub struct SyncCommitteeRootCache(Arc<Mutex<Vec<CommitteeRoot>>>);
+
+/// A sync committee and its root.
+type CommitteeRoot = (Arc<SyncCommittee>, B256);
+
+/// Committees kept: current and next, plus those of a state a period apart.
+const MAX_CACHED_SYNC_COMMITTEES: usize = 4;
+
+impl SyncCommitteeRootCache {
+    pub fn root(&self, committee: &Arc<SyncCommittee>) -> B256 {
+        let mut committees = cache_lock::lock(&self.0);
+        if let Some((_, root)) = committees
+            .iter()
+            .find(|(cached, _)| Arc::ptr_eq(cached, committee))
+        {
+            return *root;
+        }
+        let root = committee.tree_hash_root();
+        if committees.len() >= MAX_CACHED_SYNC_COMMITTEES {
+            committees.remove(0);
+        }
+        committees.push((committee.clone(), root));
+        root
+    }
+}
+
+/// Root caches for the large state fields other than the validator registry.
 #[derive(Clone, Default)]
 pub struct StateFieldRootCaches {
+    pub block_roots: PackedListRootCache,
+    pub state_roots: PackedListRootCache,
+    pub historical_roots: ContainerListRootCache<B256>,
     pub balances: PackedListRootCache,
+    pub randao_mixes: PackedListRootCache,
+    pub slashings: PackedListRootCache,
     pub previous_epoch_participation: PackedListRootCache,
     pub current_epoch_participation: PackedListRootCache,
     pub inactivity_scores: PackedListRootCache,
-    pub pending_deposits: ContainerListRootCache<crate::pending_deposit::PendingDeposit>,
+    pub sync_committees: SyncCommitteeRootCache,
+    pub historical_summaries: ContainerListRootCache<HistoricalSummary>,
+    pub pending_deposits: ContainerListRootCache<PendingDeposit>,
+    pub pending_partial_withdrawals: ContainerListRootCache<PendingPartialWithdrawal>,
+    pub pending_consolidations: ContainerListRootCache<PendingConsolidation>,
 }
 
 /// The caches are derived data, so they never make two states differ.
@@ -270,8 +393,8 @@ impl fmt::Debug for StateFieldRootCaches {
 #[cfg(test)]
 mod tests {
     use ssz_types::{
-        VariableList,
-        typenum::{U16, U1099511627776},
+        FixedVector, VariableList,
+        typenum::{U16, U8192, U1099511627776},
     };
 
     use super::*;
@@ -319,6 +442,23 @@ mod tests {
         values[0] = 7;
         values[250] = 1;
         assert_eq!(cache.u8_list_root(&values, 35), expected(&values));
+    }
+
+    #[test]
+    fn vector_roots_match_ssz_through_changes() {
+        let cache = PackedListRootCache::default();
+        let mut roots = FixedVector::<B256, U8192>::from_elem(B256::ZERO);
+        assert_eq!(cache.b256_vector_root(&roots), roots.tree_hash_root());
+        roots[0] = B256::repeat_byte(1);
+        roots[8191] = B256::repeat_byte(2);
+        assert_eq!(cache.b256_vector_root(&roots), roots.tree_hash_root());
+
+        let cache = PackedListRootCache::default();
+        let mut values = FixedVector::<u64, U8192>::from_elem(0);
+        assert_eq!(cache.u64_vector_root(&values), values.tree_hash_root());
+        values[5] = 7;
+        values[8190] = u64::MAX;
+        assert_eq!(cache.u64_vector_root(&values), values.tree_hash_root());
     }
 
     #[test]

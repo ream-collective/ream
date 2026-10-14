@@ -274,6 +274,12 @@ pub struct BeaconState {
     pub sync_committee_indices_cache: SyncCommitteeIndicesCache,
 }
 
+/// Depth of the Merkle tree of a list whose limit is the power of two ``N``.
+#[cfg(not(feature = "zkvm"))]
+fn depth<N: Unsigned>() -> usize {
+    N::to_u64().trailing_zeros() as usize
+}
+
 /// Committees per slot for an epoch with ``active_validator_count`` active validators.
 fn committee_count_per_slot(active_validator_count: usize) -> u64 {
     (active_validator_count as u64 / SLOTS_PER_EPOCH / TARGET_COMMITTEE_SIZE)
@@ -3364,12 +3370,12 @@ impl BeaconState {
         .concat())
     }
 
-    /// ``hash_tree_root`` of the state. The roots of the validator registry and the other lists
-    /// sized by it come from caches that rehash only what changed, which is most of the cost on
-    /// mainnet.
+    /// ``hash_tree_root`` of the state. The roots of the validator registry, the lists sized by
+    /// it and the other large fields come from caches that rehash only what changed, which is
+    /// most of the cost on mainnet.
     #[cfg(not(feature = "zkvm"))]
     pub fn state_root(&self) -> B256 {
-        let limit_depth = ValidatorRegistryLimit::to_u64().trailing_zeros() as usize;
+        let limit_depth = depth::<ValidatorRegistryLimit>();
         // Leaf chunks hold four `u64`s or 32 `u8`s, so those lists' trees are 2 and 5 levels
         // shallower than the registry limit.
         let (u64_list_depth, u8_list_depth) = (limit_depth - 2, limit_depth - 5);
@@ -3380,9 +3386,11 @@ impl BeaconState {
             self.slot.tree_hash_root(),
             self.fork.tree_hash_root(),
             self.latest_block_header.tree_hash_root(),
-            self.block_roots.tree_hash_root(),
-            self.state_roots.tree_hash_root(),
-            self.historical_roots.tree_hash_root(),
+            caches.block_roots.b256_vector_root(&self.block_roots),
+            caches.state_roots.b256_vector_root(&self.state_roots),
+            caches
+                .historical_roots
+                .root(&self.historical_roots, depth::<U16777216>()),
             self.eth1_data.tree_hash_root(),
             self.eth1_data_votes.tree_hash_root(),
             self.eth1_deposit_index.tree_hash_root(),
@@ -3391,8 +3399,8 @@ impl BeaconState {
             caches
                 .balances
                 .u64_list_root(&self.balances, u64_list_depth),
-            self.randao_mixes.tree_hash_root(),
-            self.slashings.tree_hash_root(),
+            caches.randao_mixes.b256_vector_root(&self.randao_mixes),
+            caches.slashings.u64_vector_root(&self.slashings),
             caches
                 .previous_epoch_participation
                 .u8_list_root(&self.previous_epoch_participation, u8_list_depth),
@@ -3406,24 +3414,29 @@ impl BeaconState {
             caches
                 .inactivity_scores
                 .u64_list_root(&self.inactivity_scores, u64_list_depth),
-            self.current_sync_committee.tree_hash_root(),
-            self.next_sync_committee.tree_hash_root(),
+            caches.sync_committees.root(&self.current_sync_committee),
+            caches.sync_committees.root(&self.next_sync_committee),
             self.latest_execution_payload_header.tree_hash_root(),
             self.next_withdrawal_index.tree_hash_root(),
             self.next_withdrawal_validator_index.tree_hash_root(),
-            self.historical_summaries.tree_hash_root(),
+            caches
+                .historical_summaries
+                .root(&self.historical_summaries, depth::<U16777216>()),
             self.deposit_requests_start_index.tree_hash_root(),
             self.deposit_balance_to_consume.tree_hash_root(),
             self.exit_balance_to_consume.tree_hash_root(),
             self.earliest_exit_epoch.tree_hash_root(),
             self.consolidation_balance_to_consume.tree_hash_root(),
             self.earliest_consolidation_epoch.tree_hash_root(),
-            caches.pending_deposits.root(
-                &self.pending_deposits,
-                U134217728::to_u64().trailing_zeros() as usize,
-            ),
-            self.pending_partial_withdrawals.tree_hash_root(),
-            self.pending_consolidations.tree_hash_root(),
+            caches
+                .pending_deposits
+                .root(&self.pending_deposits, depth::<U134217728>()),
+            caches
+                .pending_partial_withdrawals
+                .root(&self.pending_partial_withdrawals, depth::<U134217728>()),
+            caches
+                .pending_consolidations
+                .root(&self.pending_consolidations, depth::<U262144>()),
             self.proposer_lookahead.tree_hash_root(),
         ];
         tree_hash::merkle_root(field_roots.concat().as_slice(), field_roots.len())

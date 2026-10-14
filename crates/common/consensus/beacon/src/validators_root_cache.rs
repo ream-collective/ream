@@ -11,7 +11,7 @@ use crate::{
     cache_lock,
     chunked_list::{CHUNK_SIZE, ChunkedList},
     electra::zkvm_types::ValidatorRegistryLimit,
-    merkle_tree_cache::MerkleTree,
+    merkle_tree_cache::{MerkleTree, parallel_map},
 };
 
 /// Validator registry, shared chunk by chunk between a state and its copies.
@@ -108,10 +108,16 @@ impl ValidatorsTree {
         Self {
             hashed: validators.clone(),
             tree: MerkleTree::new(
-                validators
-                    .iter()
-                    .map(|validator| validator.tree_hash_root())
-                    .collect(),
+                // Each chunk is 1,024 validators of about 8 hashes each.
+                parallel_map(validators.chunks(), 16, |chunk| {
+                    chunk
+                        .iter()
+                        .map(|validator| validator.tree_hash_root())
+                        .collect::<Vec<_>>()
+                })
+                .into_iter()
+                .flatten()
+                .collect(),
             ),
         }
     }
