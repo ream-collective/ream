@@ -1,6 +1,5 @@
 use anyhow::anyhow;
 use blst::min_pk::{AggregatePublicKey as BlstAggregatePublicKey, PublicKey as BlstPublicKey};
-use ssz_types::FixedVector;
 
 use crate::{
     errors::BLSError,
@@ -13,18 +12,15 @@ impl TryFrom<BlstPublicKey> for PublicKey {
 
     fn try_from(value: BlstPublicKey) -> Result<Self, Self::Error> {
         Ok(PublicKey {
-            inner: FixedVector::new(value.to_bytes().to_vec()).map_err(|err| {
-                BLSError::InvalidPublicKey(anyhow!(
-                    "Failed to construct PublicKey from bytes: {err:?}"
-                ))
-            })?,
+            inner: value.to_bytes().into(),
         })
     }
 }
 
 impl PublicKey {
     pub fn to_blst_public_key(&self) -> Result<BlstPublicKey, BLSError> {
-        BlstPublicKey::from_bytes(&self.inner).map_err(|err| BLSError::BlstError(err.into()))
+        BlstPublicKey::from_bytes(self.inner.as_slice())
+            .map_err(|err| BLSError::BlstError(err.into()))
     }
 }
 

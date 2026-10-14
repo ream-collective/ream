@@ -626,6 +626,27 @@ async fn run_beacon_node_inner(
     };
     let beacon_chain = Arc::new(beacon_chain);
 
+    // Attestations are verified against active validators' keys, so decompress those keys in the
+    // background now instead of one at a time during the first epoch of block imports.
+    if let Ok(head) = beacon_chain.head() {
+        tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            let epoch = head.state.get_current_epoch();
+            let public_keys: Vec<_> = head
+                .state
+                .validators
+                .iter()
+                .filter(|validator| validator.is_active_validator(epoch))
+                .map(|validator| validator.public_key.clone())
+                .collect();
+            let prepared = ream_bls::prewarm_public_keys(&public_keys);
+            info!(
+                "Prepared {prepared} validator public keys for verification in {:?}",
+                started.elapsed()
+            );
+        });
+    }
+
     beacon_chain.initialize_execution_forkchoice().await;
 
     // Create network manager
