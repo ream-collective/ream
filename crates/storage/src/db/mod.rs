@@ -22,7 +22,8 @@ use crate::{
             justified_checkpoint::JustifiedCheckpointField, latest_messages::LatestMessagesTable,
             parent_root_index::PARENT_ROOT_INDEX_MULTIMAP_TABLE,
             proposer_boost_root::ProposerBoostRootField, slot_index::BeaconSlotIndexTable,
-            state_root_index::BeaconStateRootIndexTable, time::TimeField,
+            state_root_index::BeaconStateRootIndexTable,
+            state_summaries::BeaconStateSummariesTable, time::TimeField,
             unrealized_finalized_checkpoint::UnrealizedFinalizedCheckpointField,
             unrealized_justifications::UnrealizedJustificationsTable,
             unrealized_justified_checkpoint::UnrealizedJustifiedCheckpointField,
@@ -97,6 +98,7 @@ impl ReamDB {
         write_txn.open_table(ProposerBoostRootField::FIELD_DEFINITION)?;
         write_txn.open_table(BeaconSlotIndexTable::TABLE_DEFINITION)?;
         write_txn.open_table(BeaconStateRootIndexTable::TABLE_DEFINITION)?;
+        write_txn.open_table(BeaconStateSummariesTable::TABLE_DEFINITION)?;
         write_txn.open_table(TimeField::FIELD_DEFINITION)?;
         write_txn.open_table(UnrealizedFinalizedCheckpointField::FIELD_DEFINITION)?;
         write_txn.open_table(UnrealizedJustificationsTable::TABLE_DEFINITION)?;

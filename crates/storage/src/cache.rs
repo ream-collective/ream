@@ -1,4 +1,8 @@
-use std::{num::NonZeroUsize, sync::Mutex};
+use std::{
+    collections::HashMap,
+    num::NonZeroUsize,
+    sync::{Arc, Mutex},
+};
 
 use alloy_primitives::{B256, FixedBytes};
 use lru::LruCache;
@@ -21,6 +25,9 @@ const LRU_CACHE_SIZE: usize = 64;
 const DATA_COLUMN_SIDECAR_CACHE_SIZE: usize = NUMBER_OF_COLUMNS as usize * SLOTS_PER_EPOCH as usize;
 const BLOCK_CACHE_SIZE: usize = 128;
 const STATE_CACHE_SIZE: usize = 8;
+// Fork choice reads the checkpoint states that blocks' attestations target, usually the current
+// and previous epoch, plus the justified and finalized ones.
+const CHECKPOINT_STATE_CACHE_SIZE: usize = 4;
 
 #[derive(Debug, Hash, PartialEq, Eq, Default, Clone)]
 pub struct AddressSlotIdentifier {
@@ -92,7 +99,12 @@ pub struct BeaconCacheDB {
     pub seen_aggregate_and_proof: RwLock<LruCache<AggregateAndProofKey, ()>>,
     // Beacon storage caches
     pub blocks: Mutex<LruCache<B256, SignedBeaconBlock>>,
-    pub states: Mutex<LruCache<B256, BeaconState>>,
+    pub states: Mutex<LruCache<B256, Arc<BeaconState>>>,
+    /// States being stored whole on another thread, readable here until the write commits.
+    pub pending_state_snapshots: Mutex<HashMap<B256, Arc<BeaconState>>>,
+    pub checkpoint_states: Mutex<LruCache<Checkpoint, Arc<BeaconState>>>,
+    /// Checkpoint states being written on another thread, readable here until the write commits.
+    pub pending_checkpoint_states: Mutex<HashMap<Checkpoint, Arc<BeaconState>>>,
 }
 
 impl BeaconCacheDB {
@@ -158,6 +170,11 @@ impl BeaconCacheDB {
             )),
             states: Mutex::new(LruCache::new(
                 NonZeroUsize::new(STATE_CACHE_SIZE).expect("Invalid cache size"),
+            )),
+            pending_state_snapshots: Mutex::default(),
+            pending_checkpoint_states: Mutex::default(),
+            checkpoint_states: Mutex::new(LruCache::new(
+                NonZeroUsize::new(CHECKPOINT_STATE_CACHE_SIZE).expect("Invalid cache size"),
             )),
         }
     }

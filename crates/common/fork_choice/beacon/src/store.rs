@@ -485,7 +485,7 @@ impl Store {
         let mut justified_state = self
             .db
             .checkpoint_states_provider()
-            .get(justified_checkpoint)?;
+            .get_shared(justified_checkpoint)?;
         if justified_state.is_none() {
             // A newly justified checkpoint's state is normally stored when an attestation targeting
             // it is processed, which can come after the block that justified it.
@@ -493,7 +493,7 @@ impl Store {
             justified_state = self
                 .db
                 .checkpoint_states_provider()
-                .get(justified_checkpoint)?;
+                .get_shared(justified_checkpoint)?;
         }
         let Some(state) = justified_state else {
             // Keep the previous balances; `balances_checkpoint` stays behind so the next refresh
@@ -532,7 +532,7 @@ impl Store {
         let realized = if compute_epoch_at_slot(block.slot) >= current_epoch {
             self.db
                 .state_provider()
-                .get(root)?
+                .get_shared(root)?
                 .map(|state| state.current_justified_checkpoint)
         } else {
             None
@@ -576,7 +576,11 @@ impl Store {
                 .insert(finalized_checkpoint)?;
             BEACON_FINALIZED_EPOCH.set(finalized_checkpoint.epoch as i64);
             // Clean operation pool
-            if let Some(state) = self.db.state_provider().get(finalized_checkpoint.root)? {
+            if let Some(state) = self
+                .db
+                .state_provider()
+                .get_shared(finalized_checkpoint.root)?
+            {
                 self.operation_pool.clean_signed_voluntary_exits(&state);
 
                 // Clean expired proposer preparations
@@ -607,6 +611,24 @@ impl Store {
                 Err(err) => {
                     tracing::error!("Failed to prune old blobs: {}", err);
                 }
+            }
+
+            // States before the finalized block can no longer be imported onto or voted for.
+            match self
+                .db
+                .state_provider()
+                .prune_finalized(finalized_checkpoint.root)
+            {
+                Ok(pruned) => debug!("Pruned {pruned} finalized states"),
+                Err(err) => warn!("Failed to prune finalized states: {err:?}"),
+            }
+            match self
+                .db
+                .checkpoint_states_provider()
+                .prune_before(finalized_checkpoint.epoch)
+            {
+                Ok(pruned) => debug!("Pruned {pruned} finalized checkpoint states"),
+                Err(err) => warn!("Failed to prune finalized checkpoint states: {err:?}"),
             }
         }
 
@@ -688,7 +710,7 @@ impl Store {
         let justified_checkpoint_state = self
             .db
             .checkpoint_states_provider()
-            .get(self.db.justified_checkpoint_provider().get()?)?
+            .get_shared(self.db.justified_checkpoint_provider().get()?)?
             .ok_or(anyhow!("Failed to find checkpoint in checkpoint states"))?;
         let committee_weight =
             get_total_active_balance(&justified_checkpoint_state) / SLOTS_PER_EPOCH;
@@ -700,7 +722,7 @@ impl Store {
         let state = &self
             .db
             .checkpoint_states_provider()
-            .get(self.db.justified_checkpoint_provider().get()?)?
+            .get_shared(self.db.justified_checkpoint_provider().get()?)?
             .ok_or_else(|| anyhow!("checkpoint_states not found"))?;
 
         let unslashed_and_active_indices: Vec<u64> = state
@@ -784,7 +806,7 @@ impl Store {
             let head_state = self
                 .db
                 .state_provider()
-                .get(block_root)?
+                .get_shared(block_root)?
                 .ok_or_else(|| anyhow!("state not found"))?;
             Ok(head_state.current_justified_checkpoint)
         }
@@ -805,7 +827,7 @@ impl Store {
         let justified_state = self
             .db
             .checkpoint_states_provider()
-            .get(self.db.justified_checkpoint_provider().get()?)?
+            .get_shared(self.db.justified_checkpoint_provider().get()?)?
             .ok_or(anyhow!("Justified checkpoint must exist in the store"))?;
 
         let reorg_threshold =
@@ -819,7 +841,7 @@ impl Store {
         let justified_state = self
             .db
             .checkpoint_states_provider()
-            .get(self.db.justified_checkpoint_provider().get()?)?
+            .get_shared(self.db.justified_checkpoint_provider().get()?)?
             .ok_or(anyhow!("Justified checkpoint must exist in the store"))?;
 
         let parent_threshold =
@@ -978,7 +1000,7 @@ impl Store {
         if current_slot > previous_slot && compute_slots_since_epoch_start(current_slot) == 0 {
             match self.get_head() {
                 Ok(head) => {
-                    if let Some(state) = self.db.state_provider().get(head)? {
+                    if let Some(state) = self.db.state_provider().get_shared(head)? {
                         let active_count = state
                             .get_active_validator_indices(state.get_current_epoch())
                             .len();

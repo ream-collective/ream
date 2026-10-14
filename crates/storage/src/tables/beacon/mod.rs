@@ -15,6 +15,7 @@ pub mod previous_justified_checkpoint;
 pub mod proposer_boost_root;
 pub mod slot_index;
 pub mod state_root_index;
+pub mod state_summaries;
 pub mod time;
 pub mod unrealized_finalized_checkpoint;
 pub mod unrealized_justifications;

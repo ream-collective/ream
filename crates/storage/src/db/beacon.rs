@@ -78,6 +78,7 @@ impl BeaconDB {
     pub fn checkpoint_states_provider(&self) -> CheckpointStatesTable {
         CheckpointStatesTable {
             db: self.db.clone(),
+            cache: self.cache.clone(),
         }
     }
 

@@ -1,4 +1,7 @@
-use std::collections::{HashMap, hash_map::Entry};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    sync::Arc,
+};
 
 use alloy_primitives::{B256, map::HashSet};
 use anyhow::{anyhow, ensure};
@@ -47,7 +50,7 @@ pub async fn on_block(
 
     // Parent block must be known
     ensure!(
-        store.db.state_provider().get(parent_root)?.is_some(),
+        store.db.state_provider().contains_key(parent_root)?,
         "Missing parent block state for parent_root: {parent_root:x}",
     );
 
@@ -76,12 +79,13 @@ pub async fn on_block(
     ensure!(store.db.finalized_checkpoint_provider().get()?.root == finalized_checkpoint_block);
     // Check the block is valid and compute the post-state
     // Make a copy of the state to avoid mutability issues
-    let mut state = store
-        .db
-        .state_provider()
-        .get(parent_root)?
-        .ok_or_else(|| anyhow!("beacon state not found"))?
-        .clone();
+    let mut state = Arc::unwrap_or_clone(
+        store
+            .db
+            .state_provider()
+            .get_shared(parent_root)?
+            .ok_or_else(|| anyhow!("beacon state not found"))?,
+    );
     // The parent state is the parent block's post-state, and the parent block commits to its root,
     // which was checked when the parent was imported.
     let parent_state_root = store
@@ -141,7 +145,7 @@ pub fn process_available_block(store: &mut Store, pending: PendingBlock) -> anyh
     let block_root = signed_block.message.tree_hash_root();
     let block_slot = signed_block.message.slot;
     let parent_root = signed_block.message.parent_root;
-    let state: BeaconState = pending.post_state;
+    let state = Arc::new(pending.post_state);
 
     BEACON_PROCESSED_DEPOSITS_TOTAL.set(state.eth1_deposit_index as i64);
 
@@ -152,7 +156,7 @@ pub fn process_available_block(store: &mut Store, pending: PendingBlock) -> anyh
     store
         .db
         .state_provider()
-        .insert(block_root, state.clone())?;
+        .insert_shared(block_root, state.clone())?;
     // The state cache keeps a clone that shares this state's caches, so its children reuse the
     // shuffling computed here.
     state.prepare_next_epoch_shuffling();
@@ -251,10 +255,10 @@ pub fn on_attester_slashing(
         &attestation_2.data
     ));
 
-    let state = &store
+    let state = store
         .db
         .state_provider()
-        .get(store.db.justified_checkpoint_provider().get()?.root)?
+        .get_shared(store.db.justified_checkpoint_provider().get()?.root)?
         .ok_or_else(|| anyhow!("beacon state not found"))?;
 
     ensure!(state.is_valid_indexed_attestation(&attestation_1)?);
