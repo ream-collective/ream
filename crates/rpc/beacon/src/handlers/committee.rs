@@ -9,7 +9,13 @@ use ream_api_types_beacon::{
     responses::BeaconResponse,
 };
 use ream_api_types_common::{error::ApiError, id::ID};
-use ream_consensus_misc::{constants::beacon::SLOTS_PER_EPOCH, misc::compute_start_slot_at_epoch};
+use ream_consensus_beacon::electra::beacon_state::{
+    committee_count_per_slot, committee_in_shuffling,
+};
+use ream_consensus_misc::{
+    constants::beacon::SLOTS_PER_EPOCH,
+    misc::{compute_epoch_at_slot, compute_start_slot_at_epoch},
+};
 use ream_storage::db::beacon::BeaconDB;
 use serde::Serialize;
 
@@ -47,7 +53,9 @@ pub async fn get_committees(
 ) -> Result<impl Responder, ApiError> {
     let state = get_state_from_id(state_id.into_inner(), &db).await?;
     let epoch = epoch.epoch.unwrap_or(state.get_current_epoch());
-    let committees_per_slot = state.get_committee_count_per_slot(epoch);
+    // Shuffle the epoch once for the whole request: epochs past the next one are not cached.
+    let shuffled = state.get_shuffled_active_validator_indices(epoch);
+    let committees_per_slot = committee_count_per_slot(shuffled.len());
 
     let slots: Vec<u64> = match slot.slot {
         Some(slot) => vec![slot],
@@ -66,7 +74,12 @@ pub async fn get_committees(
 
     for slot in &slots {
         for index in &indices {
-            let committee = state.get_beacon_committee(*slot, *index).map_err(|err| {
+            let committee = if compute_epoch_at_slot(*slot) == epoch {
+                committee_in_shuffling(&shuffled, *slot, *index)
+            } else {
+                state.get_beacon_committee(*slot, *index)
+            }
+            .map_err(|err| {
                 ApiError::NotFound(format!(
                     "Committee with slot: {slot} and index: {index} not found {err:?}"
                 ))
