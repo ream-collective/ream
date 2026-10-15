@@ -29,8 +29,10 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(384);
 /// writing them rewrites most of the table's pages. With a cache attached, new messages are kept
 /// in memory and written on another thread at most once per `FLUSH_INTERVAL`, in index order so
 /// each transaction touches only its own key range. Reads see the pending messages, so they
-/// always return the latest message. Shutdown writes everything still pending; a crash loses at
-/// most the last interval of votes, which fork choice relearns from later blocks.
+/// always return the latest message. Shutdown writes everything still pending. A write starts
+/// only from an insert, so a crash loses the votes received since the last write: about one
+/// interval while blocks keep arriving, more if inserts stop. Fork choice relearns them from
+/// later blocks.
 pub struct LatestMessagesTable {
     pub db: Arc<Database>,
     pub cache: Option<Arc<BeaconCacheDB>>,
