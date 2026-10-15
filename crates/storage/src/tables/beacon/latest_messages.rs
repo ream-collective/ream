@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use ream_consensus_beacon::fork_choice::latest_message::LatestMessage;
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
@@ -14,13 +18,19 @@ use crate::{
 /// block import write between them instead of waiting for the whole flush.
 const FLUSH_CHUNK_SIZE: usize = 16_384;
 
+/// Shortest time from the end of one background write to the start of the next: one mainnet
+/// epoch. A write costs about the same whether it carries one block's messages or an epoch's,
+/// because one block's messages already touch most of the table.
+const FLUSH_INTERVAL: Duration = Duration::from_secs(384);
+
 /// Latest messages of validators.
 ///
 /// A mainnet block carries votes from tens of thousands of validators at scattered indices, so
 /// writing them rewrites most of the table's pages. With a cache attached, new messages are kept
-/// in memory and written on another thread, which merges the messages of every block imported
-/// while the previous write ran. Reads see the pending messages, so they always return the
-/// latest message.
+/// in memory and written on another thread at most once per `FLUSH_INTERVAL`, in index order so
+/// each transaction touches only its own key range. Reads see the pending messages, so they
+/// always return the latest message. Shutdown writes everything still pending; a crash loses at
+/// most the last interval of votes, which fork choice relearns from later blocks.
 pub struct LatestMessagesTable {
     pub db: Arc<Database>,
     pub cache: Option<Arc<BeaconCacheDB>>,
@@ -91,13 +101,20 @@ impl LatestMessagesTable {
         let start_flush = {
             let mut pending = cache.pending_votes();
             pending.messages.extend(entries);
-            !std::mem::replace(&mut pending.flushing, true)
+            let due = pending
+                .last_flush
+                .is_none_or(|finished| finished.elapsed() >= FLUSH_INTERVAL);
+            let start = due && !pending.flushing;
+            if start {
+                pending.flushing = true;
+            }
+            start
         };
         if start_flush {
             let db = self.db.clone();
             let worker_cache = cache.clone();
             if let Err(err) = cache.spawn_storage_task(move || {
-                if let Err(err) = flush_pending_messages(&db, &worker_cache) {
+                if let Err(err) = flush_pending_messages(&db, &worker_cache, false) {
                     warn!("Failed to write latest messages: {err:?}");
                 }
             }) {
@@ -113,7 +130,7 @@ impl LatestMessagesTable {
     /// Flush any retained votes after background workers and producers have stopped.
     pub(crate) fn flush(&self) -> Result<(), StoreError> {
         if let Some(cache) = &self.cache {
-            flush_pending_messages(&self.db, cache)?;
+            flush_pending_messages(&self.db, cache, true)?;
         }
         Ok(())
     }
@@ -123,9 +140,14 @@ impl LatestMessagesTable {
     }
 }
 
-/// Writes pending messages until none are left. A message stays pending until a write of that
-/// same message commits, so a newer message that arrives during a write is written next.
-fn flush_pending_messages(db: &Database, cache: &BeaconCacheDB) -> Result<(), StoreError> {
+/// Writes the pending messages, then repeats while `drain` is set and messages are left. A
+/// message stays pending until a write of that same message commits, so a newer message that
+/// arrives during a write is written by a later one.
+fn flush_pending_messages(
+    db: &Database,
+    cache: &BeaconCacheDB,
+    drain: bool,
+) -> Result<(), StoreError> {
     // Order: write lock -> pending (released) -> DB write (released) -> pending.
     // Bulk readers hold pending across a read snapshot, which never takes the DB write lock.
     let _writer = cache
@@ -133,7 +155,7 @@ fn flush_pending_messages(db: &Database, cache: &BeaconCacheDB) -> Result<(), St
         .lock()
         .expect("latest messages write lock is not poisoned");
     loop {
-        let batch: Vec<(u64, LatestMessage)> = {
+        let mut batch: Vec<(u64, LatestMessage)> = {
             let mut pending = cache.pending_votes();
             if pending.messages.is_empty() {
                 pending.flushing = false;
@@ -145,6 +167,9 @@ fn flush_pending_messages(db: &Database, cache: &BeaconCacheDB) -> Result<(), St
                 .map(|(index, message)| (*index, message.clone()))
                 .collect()
         };
+        // Sorted chunks cover disjoint key ranges. In hash order every chunk would touch pages
+        // across the whole table, about five times the writes.
+        batch.sort_unstable_by_key(|(index, _)| *index);
 
         for (position, chunk) in batch.chunks(FLUSH_CHUNK_SIZE).enumerate() {
             // Only the last chunk waits for the disk; it makes the earlier ones durable too.
@@ -164,6 +189,11 @@ fn flush_pending_messages(db: &Database, cache: &BeaconCacheDB) -> Result<(), St
             if pending.messages.get(index) == Some(message) {
                 pending.messages.remove(index);
             }
+        }
+        pending.last_flush = Some(Instant::now());
+        if !drain {
+            pending.flushing = false;
+            return Ok(());
         }
     }
 }
@@ -432,7 +462,7 @@ mod tests {
                 Ok(())
             }))
         });
-        assert!(flush_pending_messages(&db.votes_db, &cache).is_err());
+        assert!(flush_pending_messages(&db.votes_db, &cache, false).is_err());
         BEFORE_WRITE.with(|hook| *hook.borrow_mut() = None);
         {
             let pending = cache.pending_latest_messages.lock().unwrap();
@@ -468,6 +498,39 @@ mod tests {
     }
 
     #[test]
+    fn a_vote_inserted_within_the_interval_waits_for_a_later_write() {
+        let dir = TempDir::new("ream_vote_interval").unwrap();
+        let cache = Arc::new(BeaconCacheDB::default());
+        let db = ReamDB::new(dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap()
+            .with_cache(cache.clone());
+        let table = db.latest_messages_provider();
+        table.insert(7, message(1)).unwrap();
+        cache.join_storage_tasks().unwrap();
+        table.insert(8, message(2)).unwrap();
+        {
+            let pending = cache.pending_latest_messages.lock().unwrap();
+            assert!(!pending.flushing);
+            assert_eq!(pending.messages.get(&8), Some(&message(2)));
+            assert!(!pending.messages.contains_key(&7));
+        }
+        assert_eq!(table.get(8).unwrap(), Some(message(2)));
+        db.shutdown_storage().unwrap();
+        drop(table);
+        drop(db);
+        let reopened = ReamDB::new(dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap();
+        assert_eq!(
+            reopened.latest_messages_provider().get(8).unwrap(),
+            Some(message(2))
+        );
+    }
+
+    #[test]
     fn a_successful_flush_does_not_remove_a_newer_pending_vote() {
         let dir = TempDir::new("ream_vote_newer_pending").unwrap();
         let db = ReamDB::new(dir.path().to_path_buf())
@@ -494,7 +557,7 @@ mod tests {
                 Ok(())
             }))
         });
-        flush_pending_messages(&db.votes_db, &cache).unwrap();
+        flush_pending_messages(&db.votes_db, &cache, true).unwrap();
         BEFORE_WRITE.with(|hook| *hook.borrow_mut() = None);
         assert!(
             cache
@@ -536,7 +599,7 @@ mod tests {
                     Ok(())
                 }))
             });
-            flush_pending_messages(&votes_db, &cache).unwrap();
+            flush_pending_messages(&votes_db, &cache, true).unwrap();
         });
         captured_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let table = db.latest_messages_provider();

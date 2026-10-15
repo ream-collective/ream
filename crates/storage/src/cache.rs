@@ -3,6 +3,7 @@ use std::{
     num::NonZeroUsize,
     sync::{Arc, Mutex, MutexGuard, RwLock as StorageRwLock, RwLockReadGuard, atomic::AtomicBool},
     thread::{self, JoinHandle},
+    time::Instant,
 };
 
 use alloy_primitives::{B256, FixedBytes};
@@ -78,11 +79,13 @@ pub struct ValidatedDataColumnHeader {
     pub finalized_checkpoint: Checkpoint,
 }
 
-/// Latest messages not yet written to the database, and whether a write is running.
+/// Latest messages not yet written to the database, whether a write is running, and when the
+/// last write finished.
 #[derive(Debug, Default)]
 pub struct PendingLatestMessages {
     pub messages: HashMap<u64, LatestMessage>,
     pub flushing: bool,
+    pub last_flush: Option<Instant>,
 }
 
 /// In-memory LRU cache for beacon node (gossip validation + beacon storage).
