@@ -24,6 +24,8 @@ impl ColumnSidecarsTable {
 
     pub fn insert_batch(&self, columns: Vec<DataColumnSidecar>) -> Result<(), StoreError> {
         use tree_hash::TreeHash;
+        let started = std::time::Instant::now();
+        let count = columns.len();
         let prepared = columns
             .into_iter()
             .map(|column| {
@@ -34,7 +36,15 @@ impl ColumnSidecarsTable {
                 self.prepare_insert(key, column)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        crate::tables::sidecar_file::PreparedSidecarFile::publish_batch(prepared)
+        let written = started.elapsed();
+        crate::tables::sidecar_file::PreparedSidecarFile::publish_batch(prepared)?;
+        tracing::info!(
+            columns = count,
+            write_ms = written.as_millis() as u64,
+            publish_ms = (started.elapsed() - written).as_millis() as u64,
+            "timing: column write"
+        );
+        Ok(())
     }
 
     fn column_file_path(&self, column_identifier: &ColumnIdentifier) -> PathBuf {

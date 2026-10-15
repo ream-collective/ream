@@ -175,15 +175,25 @@ fn write_messages(
 ) -> Result<(), StoreError> {
     #[cfg(test)]
     tests::before_write()?;
+    let started = std::time::Instant::now();
     let mut write_txn = db.begin_write()?;
     write_txn.set_durability(durability)?;
+    let mut written = 0usize;
     {
         let mut table = write_txn.open_table(LatestMessagesTable::TABLE_DEFINITION)?;
         for (index, message) in entries {
             table.insert(index, message)?;
+            written += 1;
         }
     }
+    let inserted = started.elapsed();
     write_txn.commit()?;
+    tracing::info!(
+        votes = written,
+        insert_ms = inserted.as_millis() as u64,
+        commit_ms = (started.elapsed() - inserted).as_millis() as u64,
+        "timing: vote write"
+    );
     Ok(())
 }
 

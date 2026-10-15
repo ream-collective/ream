@@ -1531,6 +1531,8 @@ impl BlockRangeSyncer {
             source_peer,
         } = bundle;
         let block_root = block.message.tree_hash_root();
+        let slot = block.message.slot;
+        let started = std::time::Instant::now();
         {
             let store = self.beacon_chain.store.lock().await;
             if store.db.block_provider().get(block_root)?.is_some()
@@ -1539,6 +1541,7 @@ impl BlockRangeSyncer {
                 return Ok(false);
             }
         }
+        let known_check = started.elapsed();
         let fulu_fork_epoch = beacon_network_spec().fulu_fork_epoch;
         info!("Processing block with slot {}", block.message.slot);
 
@@ -1599,9 +1602,12 @@ impl BlockRangeSyncer {
             .map_err(|err| anyhow!("Range-sync data-column task failed: {err}"))??
         };
 
+        let columns_ready = started.elapsed();
+        let column_count = columns.len();
         self.beacon_chain
             .import_data_column_sidecars_if(columns, |_| Ok(()))
             .await?;
+        let columns_imported = started.elapsed();
         match self.beacon_chain.process_block(block).await? {
             BlockProcessingOutcome::Imported { .. } => {}
             BlockProcessingOutcome::PendingAvailability { block_root } => {
@@ -1610,6 +1616,17 @@ impl BlockRangeSyncer {
                 );
             }
         }
+        let processed = started.elapsed();
+        info!(
+            slot,
+            columns = column_count,
+            known_check_ms = known_check.as_millis() as u64,
+            columns_ready_ms = (columns_ready - known_check).as_millis() as u64,
+            column_import_ms = (columns_imported - columns_ready).as_millis() as u64,
+            process_block_ms = (processed - columns_imported).as_millis() as u64,
+            total_ms = processed.as_millis() as u64,
+            "timing: range import"
+        );
         self.peer_manager.record_processed_blocks(&source_peer, 1);
         Ok(true)
     }

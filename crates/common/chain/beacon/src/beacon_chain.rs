@@ -36,7 +36,7 @@ use ream_storage::{
 };
 use ream_sync_committee_pool::SyncCommitteePool;
 use tokio::sync::{Mutex, broadcast};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use tree_hash::TreeHash;
 
 pub const BLOCK_IMPORT_EVENT_CHANNEL_CAPACITY: usize = 1024;
@@ -174,9 +174,11 @@ impl BeaconChain {
         let block_root = signed_block.message.tree_hash_root();
         let block_processing_timer = BEACON_BLOCK_PROCESSING_SECONDS.start_timer();
 
+        let started = std::time::Instant::now();
         let lock_wait_timer = BEACON_STORE_LOCK_WAIT_SECONDS.start_timer();
         let mut store = self.store.lock().await;
         lock_wait_timer.observe_duration();
+        let locked = started.elapsed();
 
         let network_spec = beacon_network_spec();
         let verify_data_availability = self.force_data_availability_checks
@@ -195,6 +197,7 @@ impl BeaconChain {
             verify_data_availability,
         )
         .await?;
+        let on_block_done = started.elapsed();
 
         if outcome == OnBlockOutcome::PendingAvailability {
             debug!("Block is pending data availability: root={}", block_root);
@@ -204,10 +207,12 @@ impl BeaconChain {
         }
 
         self.process_block_attestations(&mut store, &signed_block);
+        let attestations_done = started.elapsed();
         store.refresh_fork_choice();
         self.publish_cached_head(&store);
         let block_event = self.build_block_event(&store, &signed_block, block_root);
         drop(store);
+        let unlocked = started.elapsed();
 
         self.notify_block_imported(block_root);
         self.publish_block_event(block_event);
@@ -217,6 +222,16 @@ impl BeaconChain {
         forkchoice_update_timer.observe_duration();
 
         block_processing_timer.observe_duration();
+        let done = started.elapsed();
+        info!(
+            slot = signed_block.message.slot,
+            lock_wait_ms = locked.as_millis() as u64,
+            on_block_ms = (on_block_done - locked).as_millis() as u64,
+            attestations_ms = (attestations_done - on_block_done).as_millis() as u64,
+            head_ms = (unlocked - attestations_done).as_millis() as u64,
+            forkchoice_updated_ms = (done - unlocked).as_millis() as u64,
+            "timing: process block"
+        );
         Ok(BlockProcessingOutcome::Imported { block_root })
     }
 
