@@ -3154,7 +3154,13 @@ impl BeaconState {
                     execution_requests: body.execution_requests.clone(),
                 })
                 .await;
-            new_payload_timer.observe_duration();
+            let new_payload_seconds = new_payload_timer.stop_and_record();
+            tracing::debug!(
+                target: "ream::timing",
+                slot = self.slot,
+                new_payload_ms = (new_payload_seconds * 1000.0) as u64,
+                "timing: newPayload"
+            );
             ensure!(new_payload_result?);
         }
 
