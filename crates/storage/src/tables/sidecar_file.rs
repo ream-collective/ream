@@ -113,6 +113,24 @@ fn remove_and_sync(path: &Path) -> std::io::Result<()> {
     File::open(path.parent().expect("sidecar parent"))?.sync_all()
 }
 
+/// Hands the file's data to the drive. Publication ends with a directory `sync_all`, which on
+/// macOS is `F_FULLFSYNC` and flushes the drive cache for every file written before it. A
+/// `F_FULLFSYNC` per file costs a drive cache flush each, tens of milliseconds on an external
+/// drive, for each of the 128 columns of a block, so macOS uses a plain `fsync` here.
+fn write_to_drive(file: &File) -> std::io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `fsync` only reads the descriptor, which `file` keeps open for the call.
+        if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    file.sync_all()
+}
+
 pub struct PreparedSidecarFile {
     file: tempfile::NamedTempFile,
     destination: PathBuf,
@@ -126,7 +144,7 @@ impl PreparedSidecarFile {
             .prefix(TEMP_PREFIX)
             .tempfile_in(parent)?;
         file.write_all(bytes)?;
-        file.as_file().sync_all()?;
+        write_to_drive(file.as_file())?;
         Ok(Self { file, destination })
     }
     pub fn publish(self) -> Result<(), StoreError> {

@@ -7130,6 +7130,7 @@ dependencies = [
  "directories",
  "ethereum_ssz",
  "ethereum_ssz_derive",
+ "libc",
  "lru",
  "ream-bls",
  "ream-consensus-beacon",
