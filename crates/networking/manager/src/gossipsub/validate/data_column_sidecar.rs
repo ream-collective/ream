@@ -256,7 +256,7 @@ async fn validate_data_column_sidecar_full_inner(
             // The parent state's proposer lookahead covers this epoch and the next, so the 128
             // columns of a block need no advanced copy of it. Only a parent more than an epoch
             // older than the sidecar is advanced.
-            let expected = if state.fixes_duties_of_epoch(compute_epoch_at_slot(header.slot)) {
+            let expected = if state.determines_proposers_of(compute_epoch_at_slot(header.slot)) {
                 state.get_beacon_proposer_index(Some(header.slot))
             } else {
                 let mut state = Arc::unwrap_or_clone(state);

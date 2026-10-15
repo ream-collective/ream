@@ -55,7 +55,7 @@ pub async fn validate_beacon_attestation(
     // moves.
     if !head
         .state
-        .fixes_duties_of_epoch(compute_epoch_at_slot(attestation.data.slot))
+        .determines_committees_of(compute_epoch_at_slot(attestation.data.slot))
     {
         return Ok(ValidationResult::Ignore(
             "Head state is too far behind to compute the attestation's committee".to_string(),
