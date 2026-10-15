@@ -6,6 +6,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use alloy_primitives::{B256, FixedBytes};
@@ -84,11 +85,35 @@ pub struct ValidatedDataColumnHeader {
     pub finalized_checkpoint: Checkpoint,
 }
 
-/// Latest messages not yet written to the database, and whether a write is running.
-#[derive(Debug, Default)]
+/// Latest messages not yet written to the database, whether a write is running, when the last
+/// write finished, and the shortest time from the end of one write to the start of the next.
+#[derive(Debug)]
 pub struct PendingLatestMessages {
     pub messages: HashMap<u64, LatestMessage>,
     pub flushing: bool,
+    pub last_flush: Option<Instant>,
+    pub flush_interval: Duration,
+}
+
+impl Default for PendingLatestMessages {
+    /// One epoch of 12-second slots, the mainnet epoch, until `BeaconDB::start_vote_flush_timer`
+    /// sets the network's. A cache whose timer never starts, as in tests, keeps it.
+    fn default() -> Self {
+        Self {
+            messages: HashMap::new(),
+            flushing: false,
+            last_flush: None,
+            flush_interval: Duration::from_secs(12 * SLOTS_PER_EPOCH),
+        }
+    }
+}
+
+/// The vote flush timer's thread, which returns once `stop` is dropped or sent to.
+/// `BeaconCacheDB::stop_vote_flush_timer` drops `stop` and joins the thread.
+#[derive(Debug)]
+pub(crate) struct VoteFlushTimer {
+    pub(crate) stop: std::sync::mpsc::Sender<()>,
+    pub(crate) thread: JoinHandle<()>,
 }
 
 type StateSnapshotTask = Box<dyn FnOnce() -> bool + Send + 'static>;
@@ -260,6 +285,8 @@ pub struct BeaconCacheDB {
     pub pending_latest_messages: Mutex<PendingLatestMessages>,
     /// Serializes vote flushes and removals without blocking readers on a DB write.
     pub(crate) latest_messages_write_lock: Mutex<()>,
+    /// Writes pending votes once inserts stop; see `BeaconDB::start_vote_flush_timer`.
+    pub(crate) vote_flush_timer: Mutex<Option<VoteFlushTimer>>,
     storage_tasks: Mutex<Vec<JoinHandle<()>>>,
     state_snapshot_writer: Mutex<Option<StateSnapshotWriter>>,
     active_state_snapshot_tasks: Arc<AtomicUsize>,
@@ -368,6 +395,7 @@ impl BeaconCacheDB {
             pruning_states: AtomicBool::new(false),
             pending_latest_messages: Mutex::default(),
             latest_messages_write_lock: Mutex::default(),
+            vote_flush_timer: Mutex::default(),
             storage_tasks: Mutex::default(),
             state_snapshot_writer: Mutex::default(),
             active_state_snapshot_tasks: Arc::new(AtomicUsize::new(0)),
@@ -502,6 +530,22 @@ impl BeaconCacheDB {
             .accepting_storage_writes
             .write()
             .expect("storage write gate is not poisoned") = false;
+    }
+
+    /// Stops the vote flush timer and waits for its thread, which may be starting a write.
+    pub(crate) fn stop_vote_flush_timer(&self) -> Result<(), crate::errors::StoreError> {
+        let timer = self
+            .vote_flush_timer
+            .lock()
+            .expect("vote flush timer lock is not poisoned")
+            .take();
+        if let Some(VoteFlushTimer { stop, thread }) = timer {
+            drop(stop);
+            if thread.join().is_err() {
+                return Err(std::io::Error::other("vote flush timer panicked").into());
+            }
+        }
+        Ok(())
     }
 
     /// Call after stopping producers. Do not hold a pending/cache lock while joining workers.
