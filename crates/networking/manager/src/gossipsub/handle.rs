@@ -150,7 +150,7 @@ async fn import_gossip_attestation(
     // fixes its committee without being advanced.
     ensure!(
         head.state
-            .fixes_duties_of_epoch(compute_epoch_at_slot(single_attestation.data.slot)),
+            .determines_committees_of(compute_epoch_at_slot(single_attestation.data.slot)),
         "Head state is too far behind to compute the attestation's committee"
     );
     let attestation = single_attestation_to_attestation(single_attestation, &head.state)?;
