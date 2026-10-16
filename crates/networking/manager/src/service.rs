@@ -692,7 +692,6 @@ impl NetworkManagerService {
                                 message,
                                 &beacon_chain,
                                 &cached_db,
-                                &p2p_sender,
                                 &mut pending_item,
                                 &mut unknown_parent_block,
                             ).await;
