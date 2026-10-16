@@ -1,6 +1,7 @@
 use libp2p::{PeerId, swarm::ConnectionId};
 use ream_bls::traits::{Signable, Verifiable};
-use ream_consensus_misc::{constants::beacon::DOMAIN_BEACON_PROPOSER, misc::compute_signing_root};
+use ream_consensus_beacon::custody_group::PeerCustodyGroups;
+use ream_consensus_misc::{constants::beacon::{DOMAIN_BEACON_PROPOSER, NUM_CUSTODY_GROUPS}, misc::compute_signing_root};
 use ream_network_manager::{p2p_sender::P2PSender, req_resp::handle_req_resp_message};
 use ream_p2p::network::beacon::{channel::P2PMessage, network_state::NetworkState};
 use ream_req_resp::{
@@ -19,6 +20,11 @@ use tokio::{
 };
 
 use super::*;
+
+fn full_custody() -> PeerCustodyGroups {
+    PeerCustodyGroups::from_advertised(discv5::enr::NodeId::random(), NUM_CUSTODY_GROUPS)
+        .expect("full custody is a valid count")
+}
 
 #[tokio::test]
 async fn checkpoint_bootstrap_preserves_anchor_signature() {
@@ -518,7 +524,7 @@ async fn pending_anchor_recovers_from_partial_peer_responses_after_restart() {
         let chain = chain.clone();
         let sender = sender.clone();
         let fetch = tokio::spawn(async move {
-            fetch_missing_columns(&chain, &sender, root, PeerId::random()).await
+            fetch_missing_columns(&chain, &sender, root, PeerId::random(), &full_custody()).await
         });
         let P2PMessage::Request(P2PRequest::DataColumnIdentifiers {
             callback,
