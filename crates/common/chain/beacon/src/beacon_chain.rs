@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use alloy_primitives::B256;
 use anyhow::anyhow;
@@ -6,8 +6,9 @@ use parking_lot::RwLock;
 use ream_consensus_beacon::{
     attestation::Attestation,
     attester_slashing::AttesterSlashing,
-    data_column_sidecar::DataColumnSidecar,
+    data_column_sidecar::{ColumnIdentifier, DataColumnSidecar},
     electra::{beacon_block::SignedBeaconBlock, beacon_state::BeaconState},
+    matrix_entry::reconstruct_data_column_sidecars,
 };
 use ream_consensus_misc::{
     checkpoint::Checkpoint, constants::beacon::genesis_validators_root, misc::compute_epoch_at_slot,
@@ -32,7 +33,10 @@ use ream_operation_pool::OperationPool;
 use ream_req_resp::beacon::messages::status::Status;
 use ream_storage::{
     db::beacon::BeaconDB,
-    tables::{field::REDBField, table::REDBTable},
+    tables::{
+        field::REDBField,
+        table::{CustomTable, REDBTable},
+    },
 };
 use ream_sync_committee_pool::SyncCommitteePool;
 use tokio::sync::{Mutex, broadcast};
@@ -50,8 +54,17 @@ pub enum BlockProcessingOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockImportEvent {
-    Imported { block_root: B256 },
-    PendingAvailability { block_root: B256 },
+    Imported {
+        block_root: B256,
+    },
+    PendingAvailability {
+        block_root: B256,
+    },
+    /// A pending block has at least half of its columns: the subscriber should run
+    /// `reconstruct_data_columns`, which is too slow to run where the last column arrived.
+    ReconstructionReady {
+        block_root: B256,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +102,8 @@ pub struct BeaconChain {
     block_import_sender: broadcast::Sender<BlockImportEvent>,
     execution_forkchoice: Mutex<Option<ForkchoiceStateV1>>,
     force_data_availability_checks: bool,
+    /// Blocks with a reconstruction announced and not finished, so each is rebuilt once.
+    reconstructions: parking_lot::Mutex<HashSet<B256>>,
 }
 
 impl BeaconChain {
@@ -128,6 +143,7 @@ impl BeaconChain {
             event_sender,
             block_import_sender,
             execution_forkchoice: Mutex::new(None),
+            reconstructions: parking_lot::Mutex::new(HashSet::new()),
             force_data_availability_checks: false,
         }
     }
@@ -201,8 +217,13 @@ impl BeaconChain {
 
         if outcome == OnBlockOutcome::PendingAvailability {
             debug!("Block is pending data availability: root={}", block_root);
+            // Columns that arrived before the block may already be enough to rebuild the rest.
+            let reconstructable = store.data_availability_checker.can_reconstruct(&block_root);
             drop(store);
             self.notify_block_pending_availability(block_root);
+            if reconstructable {
+                self.notify_reconstruction_ready(block_root);
+            }
             return Ok(BlockProcessingOutcome::PendingAvailability { block_root });
         }
 
@@ -245,12 +266,16 @@ impl BeaconChain {
         let mut store = self.store.lock().await;
         let imported_block =
             self.process_data_column_sidecar_locked(&mut store, block_root, column_index, slot)?;
+        let reconstructable = store.data_availability_checker.can_reconstruct(&block_root);
         drop(store);
 
         if let Some((imported_block_root, block_event)) = imported_block {
             self.notify_block_imported(imported_block_root);
             self.publish_block_event(block_event);
             self.update_execution_forkchoice(true).await;
+        }
+        if reconstructable {
+            self.notify_reconstruction_ready(block_root);
         }
 
         Ok(())
@@ -300,18 +325,27 @@ impl BeaconChain {
         let mut store = self.store.lock().await;
         validate_release(&store)?;
         let mut imported = Vec::new();
+        let mut roots = HashSet::new();
         for (root, index, slot) in identifiers {
+            roots.insert(root);
             if let Some(block) =
                 self.process_data_column_sidecar_locked(&mut store, root, index, slot)?
             {
                 imported.push(block);
             }
         }
+        let reconstructable = roots
+            .into_iter()
+            .filter(|root| store.data_availability_checker.can_reconstruct(root))
+            .collect::<Vec<_>>();
         drop(store);
         for (root, event) in imported {
             self.notify_block_imported(root);
             self.publish_block_event(event);
             self.update_execution_forkchoice(true).await;
+        }
+        for root in reconstructable {
+            self.notify_reconstruction_ready(root);
         }
         Ok(())
     }
@@ -428,6 +462,81 @@ impl BeaconChain {
         let _ = self
             .block_import_sender
             .send(BlockImportEvent::PendingAvailability { block_root });
+    }
+
+    /// Announces a reconstruction once per block until `reconstruct_data_columns` finishes it.
+    fn notify_reconstruction_ready(&self, block_root: B256) {
+        if self.reconstructions.lock().insert(block_root) {
+            let _ = self
+                .block_import_sender
+                .send(BlockImportEvent::ReconstructionReady { block_root });
+        }
+    }
+
+    /// Rebuilds the missing columns of a pending block from the half or more already stored, and
+    /// imports them, which makes the block available. A supernode otherwise waits until every
+    /// one of the 128 columns has arrived by gossip or by request.
+    ///
+    /// The store lock is held only to read what is pending and, by the import, to add the
+    /// columns; reading 64 column files and recovering the rest run without it.
+    pub async fn reconstruct_data_columns(&self, block_root: B256) -> anyhow::Result<()> {
+        let result = self.reconstruct_data_columns_inner(block_root).await;
+        self.reconstructions.lock().remove(&block_root);
+        result
+    }
+
+    async fn reconstruct_data_columns_inner(&self, block_root: B256) -> anyhow::Result<()> {
+        let (header, received, missing) = {
+            let store = self.store.lock().await;
+            let checker = &store.data_availability_checker;
+            if !checker.can_reconstruct(&block_root) {
+                return Ok(());
+            }
+            let Some(pending) = checker.pending_block(&block_root) else {
+                return Ok(());
+            };
+            (
+                pending.signed_block.signed_header(),
+                checker.received_columns(&block_root),
+                checker.missing_columns(&block_root),
+            )
+        };
+
+        let provider = self.db.column_sidecars_provider();
+        let expected_header = header.clone();
+        let recovered = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let mut available = Vec::with_capacity(received.len());
+            for index in received {
+                if let Some(sidecar) = provider.get(ColumnIdentifier::new(block_root, index))?
+                    && sidecar.signed_block_header == expected_header
+                {
+                    available.push(sidecar);
+                }
+            }
+            let available = available.iter().collect::<Vec<_>>();
+            let reconstructed = reconstruct_data_column_sidecars(&available)?;
+            Ok(reconstructed
+                .into_iter()
+                .filter(|sidecar| missing.contains(&sidecar.index))
+                .collect::<Vec<_>>())
+        })
+        .await??;
+
+        let recovered_count = recovered.len();
+        self.import_data_column_sidecars_if(recovered, move |store| {
+            let pending = store
+                .data_availability_checker
+                .pending_block(&block_root)
+                .ok_or_else(|| anyhow!("block {block_root} is no longer pending"))?;
+            anyhow::ensure!(
+                pending.signed_block.signed_header() == header,
+                "block {block_root} changed while its columns were rebuilt"
+            );
+            Ok(())
+        })
+        .await?;
+        debug!(%block_root, recovered = recovered_count, "Reconstructed data columns");
+        Ok(())
     }
 
     fn process_block_attestations(
