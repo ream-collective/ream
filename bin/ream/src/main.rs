@@ -1198,6 +1198,7 @@ mod service_exit_tests {
 mod tests {
     mod block_lookup_tests;
     mod checkpoint_bootstrap_tests;
+    mod mainnet_import_bench;
 
     use std::{
         env::temp_dir,
