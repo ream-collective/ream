@@ -11,11 +11,21 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::debug;
 
 use super::handle::handle_gossipsub_message;
-use crate::p2p_sender::P2PSender;
+use crate::{block_lookup::PendingGossipItem, p2p_sender::P2PSender};
 
 /// Messages waiting for a worker. A full queue sheds new messages as IGNORE, which does not
 /// penalize their senders; mainnet sends thousands of attestations per slot.
 const GOSSIP_QUEUE_CAPACITY: usize = 16_384;
+
+/// Whether `topic` carries data column sidecars. They go to their own [`GossipWorkers`]: on
+/// mainnet a supernode gets 128 per block, and importing each one waits for the store lock, so
+/// handling them on the manager loop kept it busy for most of every slot.
+pub fn is_data_column(topic: &TopicHash) -> bool {
+    matches!(
+        GossipTopic::from_topic_hash(topic).map(|topic| topic.kind),
+        Ok(GossipTopicKind::DataColumnSidecar(_))
+    )
+}
 
 /// Whether a message on `topic` is handled by a [`GossipWorkers`] task. Blocks and their sidecars
 /// stay on the manager loop, which tracks their lookups and availability; every other topic is
@@ -47,10 +57,13 @@ pub struct GossipWorkers {
 
 impl GossipWorkers {
     /// Starts one task per runtime worker thread but two, which stay free for the network loops.
+    /// A column whose block waits on its parent's availability yields lookup work, which goes to
+    /// `pending_items` because the manager loop owns the lookups.
     pub fn start(
         beacon_chain: Arc<BeaconChain>,
         cached_db: Arc<BeaconCacheDB>,
         p2p_sender: P2PSender,
+        pending_items: mpsc::UnboundedSender<PendingGossipItem>,
     ) -> Self {
         let workers = tokio::runtime::Handle::current()
             .metrics()
@@ -64,6 +77,7 @@ impl GossipWorkers {
             let beacon_chain = beacon_chain.clone();
             let cached_db = cached_db.clone();
             let p2p_sender = p2p_sender.clone();
+            let pending_items = pending_items.clone();
             tokio::spawn(async move {
                 loop {
                     let Some(work) = receiver.lock().await.recv().await else {
@@ -79,8 +93,11 @@ impl GossipWorkers {
                         &mut unknown_parent_block,
                     )
                     .await;
-                    // Only blocks and sidecars produce lookup work, and they never come here.
-                    debug_assert!(pending_item.is_none() && unknown_parent_block.is_none());
+                    // Only blocks produce unknown-parent work, and they never come here.
+                    debug_assert!(unknown_parent_block.is_none());
+                    if let Some(item) = pending_item {
+                        let _ = pending_items.send(item);
+                    }
                     p2p_sender.report_gossip_validation(
                         work.message_id,
                         work.propagation_source,
@@ -121,7 +138,7 @@ mod tests {
     use libp2p::gossipsub::IdentTopic;
     use ream_p2p::gossipsub::beacon::topics::{GossipTopic, GossipTopicKind};
 
-    use super::is_handled_concurrently;
+    use super::{is_data_column, is_handled_concurrently};
 
     fn topic_hash(kind: GossipTopicKind) -> libp2p::gossipsub::TopicHash {
         IdentTopic::new(
@@ -155,5 +172,20 @@ mod tests {
             GossipTopicKind::SyncCommittee(1)
         )));
         assert!(!is_handled_concurrently(&IdentTopic::new("unknown").hash()));
+    }
+
+    #[test]
+    fn only_data_columns_go_to_the_column_workers() {
+        assert!(is_data_column(&topic_hash(
+            GossipTopicKind::DataColumnSidecar(3)
+        )));
+        assert!(!is_data_column(&topic_hash(GossipTopicKind::BeaconBlock)));
+        assert!(!is_data_column(&topic_hash(GossipTopicKind::BlobSidecar(
+            0
+        ))));
+        assert!(!is_data_column(&topic_hash(
+            GossipTopicKind::BeaconAttestation(5)
+        )));
+        assert!(!is_data_column(&IdentTopic::new("unknown").hash()));
     }
 }
