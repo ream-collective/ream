@@ -114,6 +114,26 @@ impl<State> DataAvailabilityChecker<State> {
         missing
     }
 
+    /// The received columns of `block_root`, sorted.
+    pub fn received_columns(&self, block_root: &B256) -> Vec<u64> {
+        let Some(entry) = self.entries.get(block_root) else {
+            return Vec::new();
+        };
+        let mut received = entry.received_columns.iter().copied().collect::<Vec<_>>();
+        received.sort_unstable();
+        received
+    }
+
+    /// Whether `block_root` is a pending block, still incomplete, with at least half of all
+    /// columns received: enough to rebuild the rest instead of waiting for them.
+    pub fn can_reconstruct(&self, block_root: &B256) -> bool {
+        self.entries.get(block_root).is_some_and(|entry| {
+            entry.pending_block.is_some()
+                && !self.is_complete(entry)
+                && entry.received_columns.len() as u64 >= NUMBER_OF_COLUMNS / 2
+        })
+    }
+
     pub fn pending_block_roots(&self) -> Vec<B256> {
         self.entries
             .iter()
@@ -202,6 +222,34 @@ mod tests {
         let available = checker.take_if_complete(root);
         assert!(available.is_some());
         assert!(checker.is_empty());
+    }
+
+    #[test]
+    fn a_pending_block_with_half_the_columns_can_be_reconstructed() {
+        let mut checker = DataAvailabilityChecker::<()>::supernode();
+        let root = B256::repeat_byte(9);
+        for index in 0..NUMBER_OF_COLUMNS / 2 - 1 {
+            checker.add_column(root, index, 1);
+        }
+        assert!(!checker.can_reconstruct(&root), "columns without a block");
+
+        checker.insert_pending(root, block_with_blobs(1), ());
+        assert!(!checker.can_reconstruct(&root), "one column short of half");
+
+        checker.add_column(root, NUMBER_OF_COLUMNS / 2 - 1, 1);
+        assert!(checker.can_reconstruct(&root));
+        assert_eq!(
+            checker.received_columns(&root).len() as u64,
+            NUMBER_OF_COLUMNS / 2
+        );
+
+        for index in NUMBER_OF_COLUMNS / 2..NUMBER_OF_COLUMNS {
+            checker.add_column(root, index, 1);
+        }
+        assert!(
+            !checker.can_reconstruct(&root),
+            "complete blocks need no reconstruction"
+        );
     }
 
     #[test]
