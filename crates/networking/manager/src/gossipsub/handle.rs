@@ -198,6 +198,8 @@ pub async fn handle_gossipsub_message(
     match GossipsubMessage::decode(&message.topic, &message.data) {
         Ok(gossip_message) => match gossip_message {
             GossipsubMessage::BeaconBlock(signed_block) => {
+                // The log timestamp minus the slot start is how long the block waited to be handled.
+                info!(slot = signed_block.message.slot, "timing: gossip block handling");
                 debug!(
                     "Beacon block received over gossipsub: slot: {}, root: {}",
                     signed_block.message.slot,
