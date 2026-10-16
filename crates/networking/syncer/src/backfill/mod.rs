@@ -429,7 +429,7 @@ impl BackfillSyncer {
                 };
                 let rooted = match rooted {
                     Ok(rooted) => rooted,
-                    Err(fault) => return Outcome::Fault(fault.to_string()),
+                    Err(err) => return Outcome::Fault(err.to_string()),
                 };
                 for block in &rooted {
                     // Blocking workers cannot be aborted once running. Stop cooperatively
@@ -437,13 +437,13 @@ impl BackfillSyncer {
                     if !*running.borrow() || running.has_changed().is_err() {
                         return Outcome::Unavailable;
                     }
-                    if let Err(fault) = verify_proposer_signatures(
+                    if let Err(err) = verify_proposer_signatures(
                         &beacon_network_spec(),
                         genesis_validators_root(),
                         &proposer_keys,
                         std::slice::from_ref(block),
                     ) {
-                        return Outcome::Fault(fault.to_string());
+                        return Outcome::Fault(err.to_string());
                     }
                 }
                 Outcome::Blocks(rooted)
