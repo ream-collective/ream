@@ -624,6 +624,7 @@ impl Network {
 
                     self.meta_data_requests
                         .retain(|_, sent_at| sent_at.elapsed() < REQUEST_TIMEOUT);
+                    self.request_missing_meta_data();
                     self.discover_custody_peers_if_uncovered();
                 }
             }
@@ -960,7 +961,7 @@ impl Network {
                             {
                                 trace!(
                                     ?peer_id,
-                                    "Ignored MetaData from an unknown peer or with a stale seq_number"
+                                    "Ignored MetaData from an unknown or disconnected peer, or with a stale seq_number"
                                 );
                             }
                         }
@@ -1090,6 +1091,26 @@ impl Network {
             BeaconRequestMessage::MetaData(self.network_state.meta_data.read().clone().into());
         if self.send_request(peer_id, meta_data_message).is_some() {
             self.meta_data_requests.insert(peer_id, Instant::now());
+        }
+    }
+
+    /// Re-requests MetaData from connected peers that have none cached. A peer is only asked
+    /// again on a Ping response otherwise, one `PING_INTERVAL_DURATION` later, so a timed-out or
+    /// failed request would leave its custody unknown, which counts as custodying nothing.
+    /// `request_meta_data_if_outdated` still allows one request per peer per `REQUEST_TIMEOUT`.
+    fn request_missing_meta_data(&mut self) {
+        let peers_without_meta_data: Vec<PeerId> = self
+            .network_state
+            .peer_table
+            .read()
+            .iter()
+            .filter(|(_, cached_peer)| {
+                cached_peer.state == ConnectionState::Connected && cached_peer.meta_data().is_none()
+            })
+            .map(|(peer_id, _)| *peer_id)
+            .collect();
+        for peer_id in peers_without_meta_data {
+            self.request_meta_data_if_outdated(peer_id, None);
         }
     }
 
@@ -1737,7 +1758,7 @@ mod tests {
                 vec![],
                 true,
                 vec![],
-                data_dir_2.path()
+                data_dir_2.path(),
             ))
             .unwrap();
         let peer_id_network_1 = network_1.peer_id();

@@ -1,7 +1,10 @@
 use libp2p::{PeerId, swarm::ConnectionId};
 use ream_bls::traits::{Signable, Verifiable};
 use ream_consensus_beacon::custody_group::PeerCustodyGroups;
-use ream_consensus_misc::{constants::beacon::{DOMAIN_BEACON_PROPOSER, NUM_CUSTODY_GROUPS}, misc::compute_signing_root};
+use ream_consensus_misc::{
+    constants::beacon::{DOMAIN_BEACON_PROPOSER, NUM_CUSTODY_GROUPS},
+    misc::compute_signing_root,
+};
 use ream_network_manager::{p2p_sender::P2PSender, req_resp::handle_req_resp_message};
 use ream_p2p::network::beacon::{channel::P2PMessage, network_state::NetworkState};
 use ream_req_resp::{

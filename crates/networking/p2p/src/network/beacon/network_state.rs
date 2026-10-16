@@ -77,7 +77,7 @@ impl NetworkState {
     }
 
     /// Stores MetaData received from `peer_id` and refreshes its custody. Returns `false` when
-    /// the peer is unknown or the MetaData is older than the cached one.
+    /// the peer is unknown or not connected, or the MetaData is older than the cached one.
     pub fn update_peer_meta_data(&self, peer_id: PeerId, meta_data: GetMetaDataV3) -> bool {
         self.peer_table
             .write()

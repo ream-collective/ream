@@ -16,7 +16,8 @@ use anyhow::ensure;
 use libp2p::PeerId;
 use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::{
-    custody_group::PeerCustodyGroups, data_column_sidecar::{ColumnIdentifier, DataColumnSidecar, NUMBER_OF_COLUMNS},
+    custody_group::PeerCustodyGroups,
+    data_column_sidecar::{ColumnIdentifier, DataColumnSidecar, NUMBER_OF_COLUMNS},
 };
 use ream_p2p::network::beacon::channel::{P2PCallbackResponse, P2PMessage, P2PRequest};
 use ream_polynomial_commitments::handlers::verify_data_column_sidecar_kzg_proofs;

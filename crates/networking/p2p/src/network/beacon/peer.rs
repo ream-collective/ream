@@ -103,9 +103,14 @@ impl CachedPeer {
         true
     }
 
-    /// Stores `meta_data` unless its sequence number is lower than the cached one, which means it
-    /// answered an older request. Returns whether it was stored.
+    /// Stores `meta_data` unless the peer is not connected, or its sequence number is lower than
+    /// the cached one, which means it answered an older request. A response that arrives after
+    /// disconnect must not repopulate what `clear_meta_data` dropped. Returns whether it was
+    /// stored.
     pub fn update_meta_data(&mut self, meta_data: GetMetaDataV3) -> bool {
+        if self.state != ConnectionState::Connected {
+            return false;
+        }
         if self
             .meta_data
             .as_ref()
@@ -226,6 +231,24 @@ mod tests {
         assert_eq!(
             custody_group_count(&peer),
             Some((CustodySource::MetaData, 64))
+        );
+    }
+
+    #[test]
+    fn meta_data_is_ignored_while_the_peer_is_not_connected() {
+        let key = CombinedKey::generate_secp256k1();
+        let mut peer = peer_for(&key, Some(enr(&key, 1, 4)));
+
+        peer.state = ConnectionState::Disconnected;
+        assert!(!peer.update_meta_data(meta_data(7, 128)));
+        assert!(peer.meta_data().is_none());
+        assert_eq!(custody_group_count(&peer), Some((CustodySource::Enr, 4)));
+
+        peer.state = ConnectionState::Connected;
+        assert!(peer.update_meta_data(meta_data(7, 128)));
+        assert_eq!(
+            custody_group_count(&peer),
+            Some((CustodySource::MetaData, 128))
         );
     }
 

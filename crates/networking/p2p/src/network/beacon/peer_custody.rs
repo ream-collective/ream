@@ -174,8 +174,15 @@ impl ColumnCoverage {
     }
 }
 
-/// Matches discovered ENRs on the given fork that advertise a TCP port and a valid `cgc` covering
-/// at least one of `custody_groups`. An ENR without `cgc` or with an invalid one never matches.
+/// Whether the ENR has an IP and TCP port of the same family, which is what dialing needs. An IP
+/// of one family with a TCP port of the other gives no dialable address.
+pub fn has_dialable_endpoint(enr: &Enr) -> bool {
+    (enr.ip4().is_some() && enr.tcp4().is_some()) || (enr.ip6().is_some() && enr.tcp6().is_some())
+}
+
+/// Matches discovered ENRs on the given fork that advertise a dialable endpoint and a valid `cgc`
+/// covering at least one of `custody_groups`. An ENR without `cgc` or with an invalid one never
+/// matches.
 pub fn custody_group_enr_predicate(
     fork_digest: B32,
     custody_groups: Vec<u64>,
@@ -185,7 +192,7 @@ pub fn custody_group_enr_predicate(
             .get_decodable::<EnrForkId>(ENR_ETH2_KEY)
             .and_then(Result::ok)
             .is_some_and(|fork_id| fork_id.fork_digest == fork_digest);
-        if !on_fork || (enr.tcp4().is_none() && enr.tcp6().is_none()) {
+        if !on_fork || !has_dialable_endpoint(enr) {
             return false;
         }
         PeerCustody::derive(Some(enr.node_id()), None, Some(enr))
@@ -200,7 +207,7 @@ pub fn custody_group_enr_predicate(
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     use discv5::enr::CombinedKey;
     use libp2p_identity::Keypair;
@@ -521,5 +528,63 @@ mod tests {
         assert!(!predicate(&enr_with(&key, Some(&full), FORK_DIGEST, false)));
         // cgc 0 is a valid advertisement that covers no group.
         assert!(!predicate(&enr_with(&key, Some(&[]), FORK_DIGEST, true)));
+    }
+
+    fn enr_with_endpoints(key: &CombinedKey, ip4: bool, tcp4: bool, ip6: bool, tcp6: bool) -> Enr {
+        let mut builder = Enr::builder();
+        if ip4 {
+            builder.ip4(Ipv4Addr::new(10, 0, 0, 1));
+        }
+        if tcp4 {
+            builder.tcp4(9000);
+        }
+        if ip6 {
+            builder.ip6(Ipv6Addr::LOCALHOST);
+        }
+        if tcp6 {
+            builder.tcp6(9000);
+        }
+        builder.add_value(
+            ENR_ETH2_KEY,
+            &EnrForkId {
+                fork_digest: FORK_DIGEST,
+                ..Default::default()
+            },
+        );
+        builder.add_value(
+            CUSTODY_GROUP_COUNT_ENR_KEY,
+            &CustodyGroupCount(NUM_CUSTODY_GROUPS),
+        );
+        builder.build(key).expect("valid enr")
+    }
+
+    #[test]
+    fn discovery_predicate_requires_an_ip_and_tcp_port_of_the_same_family() {
+        let key = CombinedKey::generate_secp256k1();
+        let predicate = custody_group_enr_predicate(FORK_DIGEST, vec![0]);
+
+        assert!(predicate(&enr_with_endpoints(
+            &key, true, true, false, false
+        )));
+        assert!(predicate(&enr_with_endpoints(
+            &key, false, false, true, true
+        )));
+        assert!(predicate(&enr_with_endpoints(
+            &key, true, true, true, false
+        )));
+        // ip4 with only a tcp6 port, ip6 with only a tcp4 port, a port with no IP, and an IP
+        // with no port all leave nothing to dial.
+        assert!(!predicate(&enr_with_endpoints(
+            &key, true, false, false, true
+        )));
+        assert!(!predicate(&enr_with_endpoints(
+            &key, false, true, true, false
+        )));
+        assert!(!predicate(&enr_with_endpoints(
+            &key, false, true, false, false
+        )));
+        assert!(!predicate(&enr_with_endpoints(
+            &key, true, false, false, false
+        )));
     }
 }
