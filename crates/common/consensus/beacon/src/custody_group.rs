@@ -94,6 +94,17 @@ pub fn compute_columns_for_custody_group(custody_group_index: u64) -> Result<Vec
     Ok(column_indices)
 }
 
+/// Returns the custody group that contains `column_index`. This inverts
+/// `compute_columns_for_custody_group`, which places group `g` at columns
+/// `NUMBER_OF_CUSTODY_GROUPS * i + g`.
+pub fn compute_custody_group_for_column(column_index: u64) -> Result<u64> {
+    ensure!(
+        column_index < NUMBER_OF_COLUMNS,
+        "Column index {column_index} is not below NUMBER_OF_COLUMNS {NUMBER_OF_COLUMNS}"
+    );
+    Ok(column_index % NUM_CUSTODY_GROUPS)
+}
+
 pub fn compute_subnet_for_data_column_sidecar(column_index: u64) -> u64 {
     column_index % DATA_COLUMN_SIDECAR_SUBNET_COUNT
 }
@@ -203,6 +214,39 @@ impl CustodyAssignment {
     }
 }
 
+/// The custody groups and columns a remote peer is expected to store and serve, derived from its
+/// node ID and the custody group count it advertises. Both lists are sorted and deduplicated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerCustodyGroups {
+    pub custody_group_count: u64,
+    pub custody_groups: Vec<u64>,
+    pub custody_columns: Vec<u64>,
+}
+
+impl PeerCustodyGroups {
+    /// Accepts any advertised count up to `NUMBER_OF_CUSTODY_GROUPS`, because
+    /// `get_custody_groups` asserts that bound. A count below `CUSTODY_REQUIREMENT` is kept as
+    /// advertised, so the peer is expected to serve only those groups. The Fulu p2p spec lets
+    /// clients reject such peers; that is peer policy and is left to the caller.
+    pub fn from_advertised(node_id: NodeId, custody_group_count: u64) -> Result<Self> {
+        let custody_groups = get_custody_group_indices(node_id, custody_group_count)?;
+        let custody_columns = compute_columns_for_custody_groups(&custody_groups)?;
+        Ok(Self {
+            custody_group_count,
+            custody_groups,
+            custody_columns,
+        })
+    }
+
+    pub fn custodies_column(&self, column_index: u64) -> bool {
+        self.custody_columns.binary_search(&column_index).is_ok()
+    }
+
+    pub fn custodies_group(&self, custody_group: u64) -> bool {
+        self.custody_groups.binary_search(&custody_group).is_ok()
+    }
+}
+
 fn compute_columns_for_custody_groups(custody_groups: &[u64]) -> Result<Vec<u64>> {
     let mut columns = Vec::new();
     for custody_group in custody_groups {
@@ -219,9 +263,9 @@ mod tests {
     use ream_network_spec::networks::beacon::{BeaconNetworkSpec, DEV, HOODI, MAINNET, SEPOLIA};
 
     use super::{
-        CustodyAssignment, CustodyConfig, compute_columns_for_custody_group,
-        compute_subnet_for_data_column_sidecar, compute_validators_custody_requirement,
-        get_custody_group_indices,
+        CustodyAssignment, CustodyConfig, PeerCustodyGroups, compute_columns_for_custody_group,
+        compute_custody_group_for_column, compute_subnet_for_data_column_sidecar,
+        compute_validators_custody_requirement, get_custody_group_indices,
     };
 
     const BALANCE_PER_ADDITIONAL_CUSTODY_GROUP: u64 = 32_000_000_000;
@@ -565,6 +609,77 @@ mod tests {
                         .windows(2)
                         .all(|pair| pair[0] < pair[1])
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn custody_group_for_column_inverts_columns_for_custody_group() {
+        for group in 0..128 {
+            for column in compute_columns_for_custody_group(group).expect("valid group") {
+                assert_eq!(
+                    compute_custody_group_for_column(column).expect("valid column"),
+                    group
+                );
+            }
+        }
+        assert!(compute_custody_group_for_column(128).is_err());
+    }
+
+    #[test]
+    fn peer_custody_accepts_advertised_counts_the_local_policy_rejects() {
+        let config = mainnet_config();
+        let node_id = ordinary_node_id();
+
+        // A remote count below CUSTODY_REQUIREMENT is honored exactly as advertised, while the
+        // local node may not use it.
+        assert!(CustodyAssignment::new(node_id, 2, &config).is_err());
+        let below_requirement = PeerCustodyGroups::from_advertised(node_id, 2).expect("cgc 2");
+        assert_eq!(below_requirement.custody_groups.len(), 2);
+        // Custody lists are nested: cgc 1 is [9] and cgc 4 is [9, 37, 48, 62] in the vectors.
+        assert!(below_requirement.custody_groups.contains(&9));
+        assert!(
+            below_requirement
+                .custody_groups
+                .iter()
+                .all(|group| [9, 37, 48, 62].contains(group))
+        );
+        assert_eq!(
+            below_requirement.custody_columns,
+            below_requirement.custody_groups
+        );
+
+        let zero = PeerCustodyGroups::from_advertised(node_id, 0).expect("cgc 0");
+        assert!(zero.custody_groups.is_empty());
+        assert!(zero.custody_columns.is_empty());
+        assert!(!zero.custodies_column(9));
+
+        assert!(PeerCustodyGroups::from_advertised(node_id, 129).is_err());
+        assert!(PeerCustodyGroups::from_advertised(node_id, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn peer_custody_matches_local_assignment_for_the_same_identity() {
+        let config = mainnet_config();
+        for node_id in [node_id(U256::ZERO), node_id(U256::MAX), ordinary_node_id()] {
+            for custody_group_count in [4, 8, 9, 64, 127, 128] {
+                let local = CustodyAssignment::new(node_id, custody_group_count, &config)
+                    .expect("valid local count");
+                let remote = PeerCustodyGroups::from_advertised(node_id, custody_group_count)
+                    .expect("valid remote count");
+                assert_eq!(remote.custody_group_count, custody_group_count);
+                assert_eq!(remote.custody_groups, local.custody_groups);
+                assert_eq!(remote.custody_columns, local.custody_columns);
+                for column in 0..128 {
+                    assert_eq!(
+                        remote.custodies_column(column),
+                        local.custody_columns.contains(&column)
+                    );
+                    assert_eq!(
+                        remote.custodies_group(column),
+                        local.custody_groups.contains(&column)
+                    );
+                }
             }
         }
     }
