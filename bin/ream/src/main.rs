@@ -1005,6 +1005,7 @@ pub async fn countdown_for_genesis() {
 
 #[cfg(test)]
 mod tests {
+    mod backfill_tests;
     mod block_lookup_tests;
     mod checkpoint_bootstrap_tests;
 
