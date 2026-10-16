@@ -8,6 +8,7 @@ use std::{
 use alloy_primitives::B256;
 use ream_chain_beacon::beacon_chain::{BeaconChain, BlockImportEvent, BlockProcessingOutcome};
 use ream_consensus_beacon::{
+    custody_group::PeerCustodyGroups,
     data_column_sidecar::{
         ColumnIdentifier, DataColumnSidecar, get_data_column_sidecars_from_block,
     },
@@ -18,7 +19,7 @@ use ream_consensus_beacon::{
     },
     matrix_entry::{compute_cells_and_kzg_proofs, das_context},
 };
-use ream_consensus_misc::checkpoint::Checkpoint;
+use ream_consensus_misc::{checkpoint::Checkpoint, constants::beacon::NUM_CUSTODY_GROUPS};
 use ream_execution_engine::ExecutionEngine;
 use ream_executor::ReamExecutor;
 use ream_fork_choice_beacon::data_availability::{
@@ -547,6 +548,12 @@ fn build_network_lookup_chain(
         None,
     ));
     (beacon_chain, beacon_db, cached_db, sync_committee_pool)
+}
+
+/// Custody of a peer that serves every column, so a fetch requests all missing columns.
+fn full_custody() -> PeerCustodyGroups {
+    PeerCustodyGroups::from_advertised(discv5::enr::NodeId::random(), NUM_CUSTODY_GROUPS)
+        .expect("full custody is a valid count")
 }
 
 fn available_tcp_port() -> u16 {
@@ -1330,7 +1337,14 @@ async fn test_unknown_parent_block_imports_after_parent_arrives() {
         let beacon_chain = harness.beacon_chain.clone();
         let p2p_sender = harness.p2p_sender.clone();
         let fetch = tokio::spawn(async move {
-            fetch_missing_columns(&beacon_chain, &p2p_sender, expected_root, source_peer).await
+            fetch_missing_columns(
+                &beacon_chain,
+                &p2p_sender,
+                expected_root,
+                source_peer,
+                &full_custody(),
+            )
+            .await
         });
         harness
             .respond_to_column_request(source_peer, expected_root, expected_column)
@@ -1658,7 +1672,14 @@ async fn test_rpc_column_fetch_rechecks_finality_before_import() {
     let beacon_chain = harness.beacon_chain.clone();
     let p2p_sender = harness.p2p_sender.clone();
     let fetch = tokio::spawn(async move {
-        fetch_missing_columns(&beacon_chain, &p2p_sender, block_root, source_peer).await
+        fetch_missing_columns(
+            &beacon_chain,
+            &p2p_sender,
+            block_root,
+            source_peer,
+            &full_custody(),
+        )
+        .await
     });
     harness
         .respond_to_column_request(source_peer, block_root, pending.column)

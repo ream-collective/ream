@@ -2,6 +2,7 @@ pub mod channel;
 pub mod identity;
 pub mod network_state;
 pub mod peer;
+pub mod peer_custody;
 pub mod utils;
 
 use std::{
@@ -35,6 +36,8 @@ use libp2p_identity::{Keypair, PublicKey};
 use network_state::NetworkState;
 use parking_lot::{Mutex, RwLock};
 use peer::CachedPeer;
+use peer_custody::custody_group_enr_predicate;
+use ream_consensus_beacon::custody_group::{CustodyAssignment, CustodyConfig};
 use ream_consensus_misc::{
     constants::beacon::{SLOTS_PER_EPOCH, genesis_validators_root},
     misc::{compute_epoch_at_slot, compute_start_slot_at_epoch},
@@ -81,7 +84,7 @@ use utils::read_meta_data_from_disk;
 
 use crate::{
     config::NetworkConfig,
-    constants::{PING_INTERVAL_DURATION, TARGET_PEER_COUNT},
+    constants::{CUSTODY_DISCOVERY_TARGET_PEERS, PING_INTERVAL_DURATION, TARGET_PEER_COUNT},
     gossipsub::{
         GossipsubBehaviour,
         beacon::topics::{GossipTopic, GossipTopicKind},
@@ -160,6 +163,31 @@ fn status_is_plausible(status: &Status, current_epoch: u64) -> bool {
                 .saturating_mul(SLOTS_PER_EPOCH)
 }
 
+/// Peers a custody query may still ask for given `active_peers` connected or connecting peers. It
+/// is `CUSTODY_DISCOVERY_TARGET_PEERS` at most, and zero once the active count is that many above
+/// `TARGET_PEER_COUNT`, so uncovered groups cannot grow the peer set without bound.
+fn custody_discovery_target(active_peers: usize) -> usize {
+    (TARGET_PEER_COUNT + CUSTODY_DISCOVERY_TARGET_PEERS)
+        .saturating_sub(active_peers)
+        .min(CUSTODY_DISCOVERY_TARGET_PEERS)
+}
+
+/// The columns the local node samples each slot (fulu das-core.md, "Custody sampling"). Returns
+/// no columns, which disables custody discovery, if the configured custody group count is not a
+/// valid local assignment.
+fn local_sampling_columns(local_enr: &Enr, config: &NetworkConfig) -> Vec<u64> {
+    let custody_group_count = config.discv5_config.custody_group_count.0;
+    match CustodyConfig::from_network_spec(&beacon_network_spec()).and_then(|custody_config| {
+        CustodyAssignment::new(local_enr.node_id(), custody_group_count, &custody_config)
+    }) {
+        Ok(assignment) => assignment.sampling_columns,
+        Err(err) => {
+            warn!("Custody discovery disabled, invalid local custody configuration: {err:?}");
+            Vec::new()
+        }
+    }
+}
+
 #[derive(NetworkBehaviour)]
 pub(crate) struct ReamBehaviour {
     pub identify: identify::Behaviour,
@@ -205,6 +233,11 @@ pub struct Network {
     network_state: Arc<NetworkState>,
     peers_to_ping: HashSetDelay<PeerId>,
     bootnodes: Vec<Enr>,
+    /// Columns this node samples each slot. Custody discovery looks for peers covering them.
+    sampling_columns: Vec<u64>,
+    /// When the outstanding MetaData request to each peer was sent, so a peer gets at most one
+    /// per `REQUEST_TIMEOUT`.
+    meta_data_requests: HashMap<PeerId, Instant>,
     genesis_time: u64,
     /// Backbone subnet topics joined by `sync_attestation_subnets`, which only leaves these
     backbone_topics: HashMap<u64, GossipTopic>,
@@ -276,6 +309,7 @@ impl Network {
         };
 
         let local_enr = discovery.local_enr();
+        let sampling_columns = local_sampling_columns(&local_enr, config);
         let behaviour = {
             ReamBehaviour {
                 discovery,
@@ -338,6 +372,8 @@ impl Network {
             bootnodes: config.discv5_config.bootnodes.clone(),
             genesis_time: config.genesis_time,
             backbone_topics: HashMap::new(),
+            sampling_columns,
+            meta_data_requests: HashMap::new(),
         };
 
         network.start_network_worker(config).await?;
@@ -553,7 +589,7 @@ impl Network {
                         if peer.status.is_some() {
                             status_is_some_count += 1;
                         }
-                        if peer.meta_data.is_some() {
+                        if peer.meta_data().is_some() {
                             meta_data_some_count += 1;
                         }
                     }
@@ -585,6 +621,11 @@ impl Network {
                             .discovery
                             .discover_peers(QueryType::Peers, 16);
                     }
+
+                    self.meta_data_requests
+                        .retain(|_, sent_at| sent_at.elapsed() < REQUEST_TIMEOUT);
+                    self.request_missing_meta_data();
+                    self.discover_custody_peers_if_uncovered();
                 }
             }
         }
@@ -684,8 +725,8 @@ impl Network {
                 ..
             } => {
                 if num_established == 0 {
-                    self.network_state
-                        .update_peer_state(peer_id, ConnectionState::Disconnected);
+                    self.network_state.peer_disconnected(peer_id);
+                    self.meta_data_requests.remove(&peer_id);
                     self.peers_to_ping.remove(&peer_id);
                     trace!("Peer {peer_id} connection closed. Removed from peers_to_ping.");
                     set_peer_count(self.network_state.connected_peers().len() as i64);
@@ -853,6 +894,7 @@ impl Network {
                                 self.network_state.meta_data.read().seq_number,
                             ));
                             self.send_response(peer_id, connection_id, stream_id, response);
+                            self.request_meta_data_if_outdated(peer_id, Some(ping.sequence_number));
                             None
                         }
                         BeaconRequestMessage::Goodbye(goodbye) => {
@@ -912,13 +954,16 @@ impl Network {
                                 meta_data.seq_number
                             );
 
-                            self.network_state
-                                .peer_table
-                                .write()
-                                .entry(peer_id)
-                                .and_modify(|cached_peer| {
-                                    cached_peer.meta_data = Some(meta_data.as_ref().clone());
-                                });
+                            self.meta_data_requests.remove(&peer_id);
+                            if !self
+                                .network_state
+                                .update_peer_meta_data(peer_id, meta_data.as_ref().clone())
+                            {
+                                trace!(
+                                    ?peer_id,
+                                    "Ignored MetaData from an unknown or disconnected peer, or with a stale seq_number"
+                                );
+                            }
                         }
                         BeaconResponseMessage::Ping(ping) => {
                             trace!(
@@ -928,21 +973,7 @@ impl Network {
                                 ping.sequence_number
                             );
 
-                            let cached_peer =
-                                self.network_state.peer_table.read().get(&peer_id).cloned();
-                            if let Some(cached_peer) = cached_peer
-                                && (cached_peer.meta_data.is_none()
-                                    || ping.sequence_number
-                                        != cached_peer
-                                            .meta_data
-                                            .as_ref()
-                                            .map_or(0, |meta_data| meta_data.seq_number))
-                            {
-                                let meta_data_message = BeaconRequestMessage::MetaData(
-                                    self.network_state.meta_data.read().clone().into(),
-                                );
-                                self.send_request(peer_id, meta_data_message);
-                            }
+                            self.request_meta_data_if_outdated(peer_id, Some(ping.sequence_number));
                         }
                         BeaconResponseMessage::Status(status) => {
                             trace!(
@@ -1017,10 +1048,119 @@ impl Network {
                         cached_peer.status = Some(status);
                     });
                 self.peers_to_ping.insert(peer_id);
+                // Ask for MetaData now so custody is known right after the handshake. An inbound
+                // peer would otherwise wait for our first Ping, one ping interval later.
+                self.request_meta_data_if_outdated(peer_id, None);
             }
             // A transport connection is only counted after a compatible Status exchange.
             set_peer_count(self.network_state.connected_peers().len() as i64);
         }
+    }
+
+    /// Requests the peer's MetaData when none is cached for this connection or `seq_number` from
+    /// a Ping differs from the cached one (phase0 p2p-interface, "Ping v1"). Only peers that
+    /// passed the Status check are asked.
+    fn request_meta_data_if_outdated(&mut self, peer_id: PeerId, seq_number: Option<u64>) {
+        let cached_seq_number = {
+            let peer_table = self.network_state.peer_table.read();
+            let Some(cached_peer) = peer_table
+                .get(&peer_id)
+                .filter(|cached_peer| cached_peer.state == ConnectionState::Connected)
+            else {
+                return;
+            };
+            cached_peer
+                .meta_data()
+                .map(|meta_data| meta_data.seq_number)
+        };
+        let outdated = match (cached_seq_number, seq_number) {
+            (None, _) => true,
+            (Some(cached), Some(advertised)) => cached != advertised,
+            (Some(_), None) => false,
+        };
+        if !outdated
+            || self
+                .meta_data_requests
+                .get(&peer_id)
+                .is_some_and(|sent_at| sent_at.elapsed() < REQUEST_TIMEOUT)
+        {
+            return;
+        }
+
+        let meta_data_message =
+            BeaconRequestMessage::MetaData(self.network_state.meta_data.read().clone().into());
+        if self.send_request(peer_id, meta_data_message).is_some() {
+            self.meta_data_requests.insert(peer_id, Instant::now());
+        }
+    }
+
+    /// Re-requests MetaData from connected peers that have none cached. A peer is only asked
+    /// again on a Ping response otherwise, one `PING_INTERVAL_DURATION` later, so a timed-out or
+    /// failed request would leave its custody unknown, which counts as custodying nothing.
+    /// `request_meta_data_if_outdated` still allows one request per peer per `REQUEST_TIMEOUT`.
+    fn request_missing_meta_data(&mut self) {
+        let peers_without_meta_data: Vec<PeerId> = self
+            .network_state
+            .peer_table
+            .read()
+            .iter()
+            .filter(|(_, cached_peer)| {
+                cached_peer.state == ConnectionState::Connected && cached_peer.meta_data().is_none()
+            })
+            .map(|(peer_id, _)| *peer_id)
+            .collect();
+        for peer_id in peers_without_meta_data {
+            self.request_meta_data_if_outdated(peer_id, None);
+        }
+    }
+
+    /// Starts a bounded discv5 query for peers custodying the groups of sampling columns that no
+    /// connected peer covers. Runs from the periodic maintenance tick, and `Discovery` keeps at
+    /// most one custody query in flight.
+    fn discover_custody_peers_if_uncovered(&mut self) {
+        if self.sampling_columns.is_empty()
+            || self.swarm.behaviour().discovery.custody_query_active()
+        {
+            return;
+        }
+        let active_peers = self
+            .network_state
+            .peer_table
+            .read()
+            .values()
+            .filter(|peer| {
+                matches!(
+                    peer.state,
+                    ConnectionState::Connected | ConnectionState::Connecting
+                )
+            })
+            .count();
+        let target_peers = custody_discovery_target(active_peers);
+        if target_peers == 0 {
+            return;
+        }
+        let uncovered_groups = self
+            .network_state
+            .column_coverage(&self.sampling_columns)
+            .uncovered_custody_groups();
+        if uncovered_groups.is_empty() {
+            return;
+        }
+
+        let fork_digest = beacon_network_spec().fork_digest(
+            beacon_network_spec().current_epoch(),
+            genesis_validators_root(),
+        );
+        info!(
+            "No connected peer custodies {} sampling custody groups, discovering peers for them",
+            uncovered_groups.len()
+        );
+        let predicate = custody_group_enr_predicate(fork_digest, uncovered_groups.clone());
+        self.swarm.behaviour_mut().discovery.discover_custody_peers(
+            uncovered_groups,
+            Box::new(predicate),
+            target_peers,
+        );
     }
 
     fn handle_gossipsub_event(&mut self, event: GossipsubEvent) -> Option<ReamNetworkEvent> {
@@ -1331,7 +1471,7 @@ mod tests {
         assert_eq!(cached_peer_snapshot.state, ConnectionState::Connecting);
         assert_eq!(cached_peer_snapshot.direction, Direction::Outbound);
         assert_eq!(cached_peer_snapshot.last_seen_p2p_address, Some(address));
-        assert!(cached_peer_snapshot.enr.is_none());
+        assert!(cached_peer_snapshot.enr().is_none());
     }
 
     #[test]
@@ -1575,6 +1715,162 @@ mod tests {
         assert_eq!(peer_from_network_2.direction, Direction::Outbound);
         assert_eq!(ream_metrics::BEACON_PEER_COUNT.get(), 1);
         assert_eq!(ream_metrics::LIBP2P_PEERS.get(), 1);
+    }
+
+    #[test]
+    fn custody_discovery_stops_above_the_target_peer_count() {
+        assert_eq!(custody_discovery_target(0), CUSTODY_DISCOVERY_TARGET_PEERS);
+        assert_eq!(
+            custody_discovery_target(TARGET_PEER_COUNT),
+            CUSTODY_DISCOVERY_TARGET_PEERS
+        );
+        assert_eq!(custody_discovery_target(TARGET_PEER_COUNT + 5), 3);
+        assert_eq!(
+            custody_discovery_target(TARGET_PEER_COUNT + CUSTODY_DISCOVERY_TARGET_PEERS),
+            0
+        );
+        assert_eq!(custody_discovery_target(usize::MAX), 0);
+    }
+
+    #[test]
+    fn inbound_peer_custody_comes_from_meta_data_and_is_dropped_on_disconnect() {
+        initialize_test_network_spec();
+
+        let data_dir_1 = TestDataDir::new();
+        let data_dir_2 = TestDataDir::new();
+        let tokio_runtime = Runtime::new().unwrap();
+        let mut network_1 = tokio_runtime
+            .block_on(create_network(
+                "127.0.0.1".parse().unwrap(),
+                9310,
+                9311,
+                vec![],
+                true,
+                vec![],
+                data_dir_1.path(),
+            ))
+            .unwrap();
+        let mut network_2 = tokio_runtime
+            .block_on(create_network(
+                "127.0.0.1".parse().unwrap(),
+                9312,
+                9313,
+                vec![],
+                true,
+                vec![],
+                data_dir_2.path(),
+            ))
+            .unwrap();
+        let peer_id_network_1 = network_1.peer_id();
+        let peer_id_network_2 = network_2.peer_id();
+        let all_columns = (0..128).collect::<Vec<_>>();
+
+        let inbound_custody = |network: &Network| {
+            network
+                .cached_peer(&peer_id_network_2)
+                .map(|peer| peer.custody().clone())
+        };
+
+        tokio_runtime.block_on(async {
+            network_2.handle_discovered_peers(HashMap::from([(network_1.enr(), None)]));
+
+            // network_1 sees network_2 as an inbound peer with no ENR, so custody can only come
+            // from the MetaData it requests once the Status exchange succeeds.
+            let network_1_task = async {
+                while let Some(event) = network_1.swarm.next().await {
+                    if let Some(ReamNetworkEvent::RequestMessage {
+                        peer_id,
+                        stream_id,
+                        connection_id,
+                        message: BeaconRequestMessage::Status(status),
+                    }) = network_1.parse_swarm_event(event).await
+                    {
+                        network_1.swarm.behaviour_mut().req_resp.send_response(
+                            peer_id,
+                            connection_id,
+                            stream_id,
+                            RespMessage::Response(Box::new(ResponseMessage::Beacon(
+                                BeaconResponseMessage::Status(status).into(),
+                            ))),
+                        );
+                    }
+                    if matches!(
+                        inbound_custody(&network_1),
+                        Some(peer_custody::PeerCustody::Advertised {
+                            source: peer_custody::CustodySource::MetaData,
+                            ..
+                        })
+                    ) {
+                        break;
+                    }
+                }
+            };
+            let network_2_task = async {
+                while let Some(event) = network_2.swarm.next().await {
+                    network_2.parse_swarm_event(event).await;
+                }
+            };
+            tokio::select! {
+                _ = network_1_task => {}
+                _ = network_2_task => {}
+                _ = sleep(Duration::from_secs(10)) => {}
+            }
+        });
+
+        let peer = network_1
+            .cached_peer(&peer_id_network_2)
+            .expect("network_1 tracks network_2");
+        assert_eq!(peer.direction, Direction::Inbound);
+        assert!(peer.enr().is_none());
+        assert_eq!(
+            peer.custody()
+                .groups()
+                .expect("custody from MetaData")
+                .custody_group_count,
+            NUM_CUSTODY_GROUPS
+        );
+        let coverage = network_1.network_state.column_coverage(&all_columns);
+        assert!(coverage.uncovered_columns.is_empty());
+        assert_eq!(coverage.eligible_peers(), [peer_id_network_2]);
+
+        tokio_runtime.block_on(async {
+            let _ = network_2.swarm.disconnect_peer_id(peer_id_network_1);
+            let network_1_task = async {
+                while let Some(event) = network_1.swarm.next().await {
+                    network_1.parse_swarm_event(event).await;
+                    if network_1
+                        .cached_peer(&peer_id_network_2)
+                        .is_some_and(|peer| peer.state == ConnectionState::Disconnected)
+                    {
+                        break;
+                    }
+                }
+            };
+            let network_2_task = async {
+                while let Some(event) = network_2.swarm.next().await {
+                    network_2.parse_swarm_event(event).await;
+                }
+            };
+            tokio::select! {
+                _ = network_1_task => {}
+                _ = network_2_task => {}
+                _ = sleep(Duration::from_secs(10)) => {}
+            }
+        });
+
+        let peer = network_1
+            .cached_peer(&peer_id_network_2)
+            .expect("disconnected peers stay cached until pruned");
+        assert_eq!(peer.state, ConnectionState::Disconnected);
+        assert!(peer.meta_data().is_none());
+        assert_eq!(peer.custody(), &peer_custody::PeerCustody::NotAdvertised);
+        assert_eq!(
+            network_1
+                .network_state
+                .column_coverage(&all_columns)
+                .uncovered_columns,
+            all_columns
+        );
     }
 
     fn create_local_network(runtime: &Runtime, data_dir: &Path) -> anyhow::Result<Network> {
