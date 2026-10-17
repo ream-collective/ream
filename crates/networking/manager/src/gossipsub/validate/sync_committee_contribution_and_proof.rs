@@ -70,9 +70,9 @@ pub async fn validate_sync_committee_contribution_and_proof(
         .ok_or_else(|| anyhow!("invalid aggregator_index"))?
         .public_key;
 
-    let is_valid_committee_member =
-        get_sync_subcommittee_pubkeys(state, contribution.subcommittee_index)
-            .contains(validator_pubkey);
+    let subcommittee_pubkeys =
+        get_sync_subcommittee_pubkeys(state, contribution.subcommittee_index);
+    let is_valid_committee_member = subcommittee_pubkeys.contains(validator_pubkey);
 
     if !is_valid_committee_member {
         return Ok(ValidationResult::Reject(
@@ -121,13 +121,16 @@ pub async fn validate_sync_committee_contribution_and_proof(
         slot: contribution.slot,
         subcommittee_index: contribution.subcommittee_index,
     };
-    let current_epoch = state.get_current_epoch();
+    let contribution_epoch = compute_epoch_at_slot(contribution.slot);
 
     let is_selection_proof_valid = contribution_and_proof.selection_proof.verify(
         validator_pubkey,
         compute_signing_root(
             selection_data,
-            state.get_domain(DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, Some(current_epoch)),
+            state.get_domain(
+                DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+                Some(contribution_epoch),
+            ),
         )
         .as_slice(),
     )?;
@@ -139,18 +142,18 @@ pub async fn validate_sync_committee_contribution_and_proof(
     }
 
     // [REJECT] if aggregate signature is not valid for the message beacon_block_root and aggregate
-    // pubkey
-
-    let sync_committee_validators =
-        get_sync_subcommittee_pubkeys(state, contribution.subcommittee_index);
+    // pubkey derived from the participation info in aggregation_bits for the subcommittee
+    let participant_pubkeys = subcommittee_pubkeys
+        .iter()
+        .zip(contribution.aggregation_bits.iter())
+        .filter_map(|(public_key, participated)| participated.then_some(public_key))
+        .collect::<Vec<&PublicKey>>();
 
     let is_sync_committee_valid = contribution.signature.fast_aggregate_verify(
-        sync_committee_validators
-            .iter()
-            .collect::<Vec<&PublicKey>>(),
+        participant_pubkeys,
         compute_signing_root(
             contribution.beacon_block_root,
-            state.get_domain(DOMAIN_SYNC_COMMITTEE, Some(current_epoch)),
+            state.get_domain(DOMAIN_SYNC_COMMITTEE, Some(contribution_epoch)),
         )
         .as_slice(),
     )?;
@@ -166,7 +169,7 @@ pub async fn validate_sync_committee_contribution_and_proof(
         validator_pubkey,
         compute_signing_root(
             contribution_and_proof,
-            state.get_domain(DOMAIN_CONTRIBUTION_AND_PROOF, Some(current_epoch)),
+            state.get_domain(DOMAIN_CONTRIBUTION_AND_PROOF, Some(contribution_epoch)),
         )
         .as_slice(),
     )?;

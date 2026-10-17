@@ -1112,12 +1112,16 @@ fn validate_signed_contribution_and_proof(
         return Err("The selection proof is not a valid signature".to_string());
     }
 
+    let participant_pubkeys = sync_committee_validators
+        .iter()
+        .zip(contribution.aggregation_bits.iter())
+        .filter_map(|(public_key, participated)| participated.then_some(public_key))
+        .collect::<Vec<&PublicKey>>();
+
     let sync_committee_valid = contribution
         .signature
         .fast_aggregate_verify(
-            sync_committee_validators
-                .iter()
-                .collect::<Vec<&PublicKey>>(),
+            participant_pubkeys,
             compute_signing_root(
                 contribution.beacon_block_root,
                 state.get_domain(DOMAIN_SYNC_COMMITTEE, Some(epoch)),
