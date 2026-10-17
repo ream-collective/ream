@@ -35,9 +35,7 @@ fn reconstruction_pool() -> &'static ThreadPool {
         let available_threads = std::thread::available_parallelism()
             .map(|count| count.get())
             .unwrap_or(1);
-        let thread_count = (available_threads / 2)
-            .max(1)
-            .min(MAX_RECONSTRUCTION_THREADS);
+        let thread_count = (available_threads / 2).clamp(1, MAX_RECONSTRUCTION_THREADS);
         ThreadPoolBuilder::new()
             .num_threads(thread_count)
             .thread_name(|index| format!("da-reconstruction-{index}"))
@@ -465,18 +463,18 @@ mod tests {
             }
             samples.sort_unstable();
 
+            let block = block_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("<unknown>");
+            let samples_ms = samples
+                .iter()
+                .map(|duration| duration.as_secs_f64() * 1_000.0)
+                .collect::<Vec<_>>();
+            let median_ms = samples[SAMPLE_COUNT / 2].as_secs_f64() * 1_000.0;
             eprintln!(
-                "reconstruction block={} blobs={} samples_ms={:?} median_ms={:.3}",
-                block_dir
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("<unknown>"),
-                blob_count,
-                samples
-                    .iter()
-                    .map(|duration| duration.as_secs_f64() * 1_000.0)
-                    .collect::<Vec<_>>(),
-                samples[SAMPLE_COUNT / 2].as_secs_f64() * 1_000.0,
+                "reconstruction block={block} blobs={blob_count} samples_ms={samples_ms:?} \
+                 median_ms={median_ms:.3}"
             );
         }
 

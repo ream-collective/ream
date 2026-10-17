@@ -13,7 +13,7 @@ use ream_consensus_beacon::{
 };
 use ream_consensus_misc::{
     checkpoint::Checkpoint,
-    constants::beacon::INTERVALS_PER_SLOT,
+    constants::beacon::MIN_SEED_LOOKAHEAD,
     misc::{compute_epoch_at_slot, compute_start_slot_at_epoch},
 };
 use ream_data_availability::PendingBlock;
@@ -33,7 +33,10 @@ use ream_storage::{
 };
 use tree_hash::TreeHash;
 
-use crate::store::{Store, StoreCheckpoints};
+use crate::store::{
+    Store, StoreCheckpoints, get_slot_component_duration_ms, get_slots_since_genesis_at,
+    get_time_at_slot, seconds_to_milliseconds,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnBlockOutcome {
@@ -194,15 +197,28 @@ pub fn process_available_block(
     let state = Arc::new(pending.post_state);
 
     // Complete every fallible read and consensus calculation before publishing the import.
-    let time_into_slot = (store.db.time_provider().get()?
-        - store.db.genesis_time_provider().get()?)
-        % beacon_network_spec().seconds_per_slot();
-    let is_before_attesting_interval =
-        time_into_slot < beacon_network_spec().seconds_per_slot() / INTERVALS_PER_SLOT;
+    let seconds_since_genesis = store
+        .db
+        .time_provider()
+        .get()?
+        .saturating_sub(store.db.genesis_time_provider().get()?);
+    let time_into_slot_ms =
+        seconds_to_milliseconds(seconds_since_genesis) % beacon_network_spec().slot_duration_ms;
+    let attestation_threshold_ms =
+        get_slot_component_duration_ms(beacon_network_spec().attestation_due_bps);
+    let is_before_attesting_interval = time_into_slot_ms < attestation_threshold_ms;
     let is_timely = store.get_current_slot()? == block_slot && is_before_attesting_interval;
-    let proposer_boost_root = (is_timely
-        && store.db.proposer_boost_root_provider().get()? == B256::ZERO)
-        .then_some(block_root);
+    // The spec computes the head after the state transition and data-availability check, but
+    // before publishing this block to fork choice.
+    let head_root = store.get_head()?;
+    let proposer_boost_root = get_proposer_boost_root(
+        store,
+        head_root,
+        block_root,
+        block_slot,
+        parent_root,
+        is_timely,
+    )?;
     let pulled_up = state.compute_justification_and_finalization()?;
     let current_epoch = store.get_current_store_epoch()?;
 
@@ -266,6 +282,54 @@ pub fn process_available_block(
     store.refresh_fork_choice();
 
     Ok(())
+}
+
+fn get_dependent_root(store: &Store, root: B256) -> anyhow::Result<B256> {
+    let epoch = store.get_current_store_epoch()?;
+    if epoch <= MIN_SEED_LOOKAHEAD {
+        return Ok(B256::ZERO);
+    }
+
+    let dependent_slot = compute_start_slot_at_epoch(epoch - MIN_SEED_LOOKAHEAD) - 1;
+    store.get_ancestor(root, dependent_slot)
+}
+
+/// Computes the candidate block's dependent root before the block is committed. This is
+/// equivalent to inserting the block and calling `get_dependent_root`: if the block is newer than
+/// the dependent slot, the lookup immediately continues from its already-stored parent.
+fn get_candidate_dependent_root(
+    store: &Store,
+    block_root: B256,
+    block_slot: u64,
+    parent_root: B256,
+) -> anyhow::Result<B256> {
+    let epoch = store.get_current_store_epoch()?;
+    if epoch <= MIN_SEED_LOOKAHEAD {
+        return Ok(B256::ZERO);
+    }
+
+    let dependent_slot = compute_start_slot_at_epoch(epoch - MIN_SEED_LOOKAHEAD) - 1;
+    if block_slot > dependent_slot {
+        store.get_ancestor(parent_root, dependent_slot)
+    } else {
+        Ok(block_root)
+    }
+}
+
+fn get_proposer_boost_root(
+    store: &Store,
+    head_root: B256,
+    block_root: B256,
+    block_slot: u64,
+    parent_root: B256,
+    is_timely: bool,
+) -> anyhow::Result<Option<B256>> {
+    let is_first_block = store.db.proposer_boost_root_provider().get()? == B256::ZERO;
+    let is_same_dependent_root =
+        get_candidate_dependent_root(store, block_root, block_slot, parent_root)?
+            == get_dependent_root(store, head_root)?;
+
+    Ok((is_timely && is_first_block && is_same_dependent_root).then_some(block_root))
 }
 
 /// Runs ``on_attestation`` with ``is_from_block`` for the attestations of a block whose
@@ -384,10 +448,9 @@ pub fn on_tick(store: &mut Store, time: u64) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let tick_slot = (time - genesis_time) / beacon_network_spec().seconds_per_slot();
+    let tick_slot = get_slots_since_genesis_at(time, genesis_time);
     while store.get_current_slot()? < tick_slot {
-        let previous_time = store.db.genesis_time_provider().get()?
-            + (store.get_current_slot()? + 1) * beacon_network_spec().seconds_per_slot();
+        let previous_time = get_time_at_slot(genesis_time, store.get_current_slot()? + 1);
         store.on_tick_per_slot(previous_time)?;
     }
     store.on_tick_per_slot(time)?;
@@ -455,7 +518,19 @@ fn ensure_only_attester(attesting_indices: &[u64], verified_attester: u64) -> an
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_only_attester;
+    use std::sync::Arc;
+
+    use alloy_primitives::B256;
+    use ream_consensus_beacon::electra::beacon_block::{BeaconBlock, SignedBeaconBlock};
+    use ream_network_spec::networks::initialize_test_network_spec;
+    use ream_operation_pool::OperationPool;
+    use ream_storage::{
+        db::ReamDB,
+        tables::{field::REDBField, table::REDBTable},
+    };
+    use tempdir::TempDir;
+
+    use super::{Store, ensure_only_attester, get_proposer_boost_root, get_time_at_slot};
 
     #[test]
     fn a_gossip_vote_counts_only_for_the_verified_attester() {
@@ -463,5 +538,80 @@ mod tests {
         assert!(ensure_only_attester(&[8], 7).is_err());
         assert!(ensure_only_attester(&[7, 8], 7).is_err());
         assert!(ensure_only_attester(&[], 7).is_err());
+    }
+
+    fn block(slot: u64, parent_root: B256) -> SignedBeaconBlock {
+        SignedBeaconBlock {
+            message: BeaconBlock {
+                slot,
+                parent_root,
+                ..Default::default()
+            },
+            signature: Default::default(),
+        }
+    }
+
+    #[test]
+    fn proposer_boost_is_withheld_for_a_different_dependent_root() {
+        initialize_test_network_spec();
+        let temp_dir = TempDir::new("ream_proposer_boost_dependent_root").unwrap();
+        let db = ReamDB::new(temp_dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap();
+        let genesis_time = 1_000;
+        let current_slot = 2 * ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH;
+        db.genesis_time_provider().insert(genesis_time).unwrap();
+        db.time_provider()
+            .insert(get_time_at_slot(genesis_time, current_slot))
+            .unwrap();
+        db.proposer_boost_root_provider()
+            .insert(B256::ZERO)
+            .unwrap();
+
+        let head_dependent_root = B256::repeat_byte(0x11);
+        let head_root = B256::repeat_byte(0x12);
+        let candidate_dependent_root = B256::repeat_byte(0x21);
+        let candidate_parent_root = B256::repeat_byte(0x22);
+        let candidate_root = B256::repeat_byte(0x23);
+        let dependent_slot = ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH - 1;
+
+        for (root, signed_block) in [
+            (head_dependent_root, block(dependent_slot, B256::ZERO)),
+            (head_root, block(current_slot - 1, head_dependent_root)),
+            (candidate_dependent_root, block(dependent_slot, B256::ZERO)),
+            (
+                candidate_parent_root,
+                block(current_slot - 1, candidate_dependent_root),
+            ),
+        ] {
+            db.block_provider().insert(root, signed_block).unwrap();
+        }
+
+        let store = Store::new(db, Arc::new(OperationPool::default()), None);
+        assert_eq!(
+            get_proposer_boost_root(
+                &store,
+                head_root,
+                candidate_root,
+                current_slot,
+                candidate_parent_root,
+                true,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            get_proposer_boost_root(
+                &store,
+                head_root,
+                candidate_root,
+                current_slot,
+                head_root,
+                true,
+            )
+            .unwrap(),
+            Some(candidate_root)
+        );
     }
 }

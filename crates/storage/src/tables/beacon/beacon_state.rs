@@ -406,6 +406,21 @@ impl BeaconStateTable {
         block_root: B256,
         summary: Option<StateSummary>,
     ) -> Result<Option<Arc<BeaconState>>, StoreError> {
+        // A checkpoint at its block's slot shares the block's post-state. It may still be
+        // cached after the smaller block-state LRU evicted it. Advanced checkpoint states
+        // cannot be used here: their skipped slots have already changed the state.
+        if let (Some(summary), Some(cache)) = (summary, &self.cache) {
+            let state = cache.checkpoint_states.lock().ok().and_then(|states| {
+                states.iter().find_map(|(checkpoint, state)| {
+                    (checkpoint.root == block_root && state.slot == summary.slot)
+                        .then(|| state.clone())
+                })
+            });
+            if let Some(state) = state {
+                self.cache_state(block_root, state.clone());
+                return Ok(Some(state));
+            }
+        }
         let state = match summary {
             Some(summary) if summary.stored_whole => {
                 Some(read_state_file(&self.data_dir, block_root)?)
@@ -728,6 +743,43 @@ mod tests {
         let shared = db.state_provider().get_shared(root).unwrap().unwrap();
         assert!(Arc::ptr_eq(&shared, &anchor));
         assert!(cache.pending_state_snapshots.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn evicted_block_state_reuses_only_an_unadvanced_checkpoint_state() {
+        let dir = TempDir::new("ream_checkpoint_block_state").unwrap();
+        let cache = Arc::new(BeaconCacheDB::default());
+        let db = ReamDB::new(dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap()
+            .with_cache(cache.clone());
+        let state = sepolia_state();
+        let root = B256::repeat_byte(1);
+        db.state_provider()
+            .insert_shared(root, state.clone())
+            .unwrap();
+        let checkpoint = ream_consensus_misc::checkpoint::Checkpoint {
+            epoch: state.get_current_epoch(),
+            root,
+        };
+        db.checkpoint_states_provider()
+            .insert_shared(checkpoint, state.clone());
+        cache.states.lock().unwrap().clear();
+
+        let reused = db.state_provider().get_shared(root).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&reused, &state));
+        assert!(cache.states.lock().unwrap().contains(&root));
+
+        let mut advanced = (*state).clone();
+        advanced.process_slots(state.slot + 1).unwrap();
+        db.checkpoint_states_provider()
+            .insert_shared(checkpoint, Arc::new(advanced));
+        cache.states.lock().unwrap().clear();
+
+        let loaded = db.state_provider().get_shared(root).unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&loaded, &state));
+        assert_eq!(loaded.as_ref(), state.as_ref());
     }
 
     /// State write errors propagate, a failed anchor never becomes visible, and a failed
