@@ -23,6 +23,21 @@ impl ColumnSidecarsTable {
     }
 
     pub fn insert_batch(&self, columns: Vec<DataColumnSidecar>) -> Result<(), StoreError> {
+        self.insert_batch_inner(columns, false)
+    }
+
+    pub fn insert_batch_if_missing(
+        &self,
+        columns: Vec<DataColumnSidecar>,
+    ) -> Result<(), StoreError> {
+        self.insert_batch_inner(columns, true)
+    }
+
+    fn insert_batch_inner(
+        &self,
+        columns: Vec<DataColumnSidecar>,
+        only_if_missing: bool,
+    ) -> Result<(), StoreError> {
         use tree_hash::TreeHash;
         let started = std::time::Instant::now();
         let count = columns.len();
@@ -37,7 +52,11 @@ impl ColumnSidecarsTable {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let written = started.elapsed();
-        crate::tables::sidecar_file::PreparedSidecarFile::publish_batch(prepared)?;
+        if only_if_missing {
+            crate::tables::sidecar_file::PreparedSidecarFile::publish_batch_if_missing(prepared)?;
+        } else {
+            crate::tables::sidecar_file::PreparedSidecarFile::publish_batch(prepared)?;
+        }
         tracing::debug!(
             target: "ream::timing",
             columns = count,

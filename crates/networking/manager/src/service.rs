@@ -42,7 +42,7 @@ use tokio::{
     sync::mpsc,
     time::{interval, sleep},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use tree_hash::TreeHash;
 
 use crate::{
@@ -221,13 +221,13 @@ fn spawn_queued_column_fetches(
     }
 }
 
-/// Rebuilds a pending block's missing columns on its own task: reading the stored columns and
-/// recovering the rest takes too long for the event loop.
+/// Rebuilds a block's missing columns on its own task: reading the stored columns and recovering
+/// the rest takes too long for the event loop.
 fn spawn_column_reconstruction(beacon_chain: &Arc<BeaconChain>, block_root: B256) {
     let beacon_chain = beacon_chain.clone();
     tokio::spawn(async move {
         if let Err(err) = beacon_chain.reconstruct_data_columns(block_root).await {
-            debug!(%block_root, "Column reconstruction did not import: {err:#}");
+            error!(%block_root, "Column reconstruction failed: {err:#}");
         }
     });
 }
