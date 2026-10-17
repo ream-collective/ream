@@ -220,7 +220,8 @@ fn write_messages(
     }
     let inserted = started.elapsed();
     write_txn.commit()?;
-    tracing::info!(
+    tracing::debug!(
+        target: "ream::timing",
         votes = written,
         insert_ms = inserted.as_millis() as u64,
         commit_ms = (started.elapsed() - inserted).as_millis() as u64,

@@ -41,7 +41,7 @@ use ream_storage::{
 };
 use ream_sync_committee_pool::SyncCommitteePool;
 use tokio::sync::{Mutex, broadcast};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use tree_hash::TreeHash;
 
 pub const BLOCK_IMPORT_EVENT_CHANNEL_CAPACITY: usize = 1024;
@@ -261,7 +261,8 @@ impl BeaconChain {
 
         block_processing_timer.observe_duration();
         let done = started.elapsed();
-        info!(
+        debug!(
+            target: "ream::timing",
             slot = signed_block.message.slot,
             lock_wait_ms = locked.as_millis() as u64,
             on_block_ms = (on_block_done - locked).as_millis() as u64,

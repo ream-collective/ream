@@ -135,7 +135,8 @@ pub async fn on_block_with_root(
         .await?;
     state_transition_timer.observe_duration();
     let transitioned = started.elapsed();
-    tracing::info!(
+    tracing::debug!(
+        target: "ream::timing",
         slot = block_slot,
         checks_and_state_load_ms = state_loaded.as_millis() as u64,
         state_transition_ms = (transitioned - state_loaded).as_millis() as u64,
@@ -254,7 +255,8 @@ pub fn process_available_block(
             checkpoints: writes,
         },
     })?;
-    tracing::info!(
+    tracing::debug!(
+        target: "ream::timing",
         slot = block_slot,
         commit_ms = commit_started.elapsed().as_millis() as u64,
         "timing: block commit"

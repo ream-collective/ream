@@ -67,7 +67,8 @@ impl ColumnSidecarsTable {
             crate::tables::sidecar_file::PreparedSidecarFile::publish_batch(prepared)?;
             vec![true; count]
         };
-        tracing::info!(
+        tracing::debug!(
+            target: "ream::timing",
             columns = count,
             write_ms = written.as_millis() as u64,
             publish_ms = (started.elapsed() - written).as_millis() as u64,

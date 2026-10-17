@@ -54,7 +54,7 @@ use recovery::{
     RecoveryOutcome, is_processable_connection_point,
 };
 use tokio::{sync::mpsc::UnboundedSender, task::JoinHandle, time::sleep};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use tree_hash::TreeHash;
 
 use crate::block_range::peer_range_downloader::{PeerRangeDownloader, Range};
@@ -1624,7 +1624,8 @@ impl BlockRangeSyncer {
             }
         }
         let processed = started.elapsed();
-        info!(
+        debug!(
+            target: "ream::timing",
             slot,
             columns = column_count,
             known_check_ms = known_check.as_millis() as u64,

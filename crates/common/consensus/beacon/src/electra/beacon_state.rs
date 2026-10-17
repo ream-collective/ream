@@ -3155,7 +3155,8 @@ impl BeaconState {
                 })
                 .await;
             let new_payload_seconds = new_payload_timer.stop_and_record();
-            tracing::info!(
+            tracing::debug!(
+                target: "ream::timing",
                 slot = self.slot,
                 new_payload_ms = (new_payload_seconds * 1000.0) as u64,
                 "timing: newPayload"
