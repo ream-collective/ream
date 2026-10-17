@@ -479,14 +479,23 @@ impl BeaconChain {
         }
     }
 
-    /// Rebuilds and stores columns for an available block in the background.
-    pub async fn reconstruct_data_columns(&self, block_root: B256) -> anyhow::Result<()> {
+    /// Rebuilds and stores columns for an available block in the background. Returns the columns
+    /// this call stored; columns already stored, including any that arrived while it ran, are
+    /// left out. das-core requires a node to send columns it obtained through reconstruction to
+    /// its subnet mesh, so a caller on the gossip path must publish the returned columns.
+    pub async fn reconstruct_data_columns(
+        &self,
+        block_root: B256,
+    ) -> anyhow::Result<Vec<DataColumnSidecar>> {
         let result = self.reconstruct_data_columns_inner(block_root).await;
         self.reconstructions.lock().remove(&block_root);
         result
     }
 
-    async fn reconstruct_data_columns_inner(&self, block_root: B256) -> anyhow::Result<()> {
+    async fn reconstruct_data_columns_inner(
+        &self,
+        block_root: B256,
+    ) -> anyhow::Result<Vec<DataColumnSidecar>> {
         // The 64th column announces reconstruction while its caller still holds the store lock
         // and has not stored the block yet. Taking the lock first waits for that import, so the
         // block read below finds the block.
@@ -498,7 +507,7 @@ impl BeaconChain {
             .required_columns()
             .clone();
         let Some(block) = self.db.block_provider().get(block_root)? else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         let header = block.signed_header();
         let provider = self.db.column_sidecars_provider();
@@ -533,9 +542,16 @@ impl BeaconChain {
 
         let recovered_count = recovered.len();
         let provider = self.db.column_sidecars_provider();
-        tokio::task::spawn_blocking(move || provider.insert_batch_if_missing(recovered)).await??;
-        debug!(%block_root, recovered = recovered_count, "Reconstructed data columns");
-        Ok(())
+        let stored =
+            tokio::task::spawn_blocking(move || provider.insert_batch_if_missing(recovered))
+                .await??;
+        debug!(
+            %block_root,
+            recovered = recovered_count,
+            stored = stored.len(),
+            "Reconstructed data columns"
+        );
+        Ok(stored)
     }
 
     fn process_block_attestations(&self, store: &mut Store, signed_block: &SignedBeaconBlock) {
@@ -838,7 +854,14 @@ mod tests {
             Err(broadcast::error::TryRecvError::Empty)
         ));
 
-        chain.reconstruct_data_columns(root).await.unwrap();
+        let stored = chain.reconstruct_data_columns(root).await.unwrap();
+        assert_eq!(
+            stored
+                .iter()
+                .map(|sidecar| sidecar.index)
+                .collect::<Vec<_>>(),
+            (NUMBER_OF_COLUMNS / 2..NUMBER_OF_COLUMNS).collect::<Vec<_>>()
+        );
         for index in 0..NUMBER_OF_COLUMNS {
             assert!(
                 provider
@@ -847,6 +870,13 @@ mod tests {
                     .is_some()
             );
         }
+        assert!(
+            chain
+                .reconstruct_data_columns(root)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(matches!(
             events.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
@@ -898,6 +928,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconstruction_does_not_return_columns_that_were_already_stored() {
+        let (path, chain) = test_chain();
+        let block = empty_block();
+        let root = block.message.tree_hash_root();
+        chain
+            .db
+            .block_provider()
+            .insert(root, block.clone())
+            .unwrap();
+        let columns = empty_block_columns(&block);
+        let provider = chain.db.column_sidecars_provider();
+        let arrived = [NUMBER_OF_COLUMNS / 2, NUMBER_OF_COLUMNS - 1];
+        provider
+            .insert_batch(
+                columns
+                    .iter()
+                    .filter(|sidecar| {
+                        sidecar.index < NUMBER_OF_COLUMNS / 2 || arrived.contains(&sidecar.index)
+                    })
+                    .cloned()
+                    .collect(),
+            )
+            .unwrap();
+
+        let stored = chain.reconstruct_data_columns(root).await.unwrap();
+
+        assert_eq!(
+            stored
+                .iter()
+                .map(|sidecar| sidecar.index)
+                .collect::<Vec<_>>(),
+            (NUMBER_OF_COLUMNS / 2 + 1..NUMBER_OF_COLUMNS - 1).collect::<Vec<_>>()
+        );
+        drop(chain);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn late_column_is_stored_after_block_import() {
         let (path, chain) = test_chain();
         let block = empty_block();
@@ -944,8 +1012,15 @@ mod tests {
             .insert_batch(columns[..(NUMBER_OF_COLUMNS / 2) as usize].to_vec())
             .unwrap();
 
-        chain.reconstruct_data_columns(root).await.unwrap();
+        let stored = chain.reconstruct_data_columns(root).await.unwrap();
 
+        assert_eq!(
+            stored
+                .iter()
+                .map(|sidecar| sidecar.index)
+                .collect::<Vec<_>>(),
+            vec![NUMBER_OF_COLUMNS / 2]
+        );
         assert!(
             provider
                 .get(ColumnIdentifier::new(root, NUMBER_OF_COLUMNS / 2))
