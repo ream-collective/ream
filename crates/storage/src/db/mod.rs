@@ -4,7 +4,7 @@ pub mod lean;
 
 use std::{
     fs, io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -144,6 +144,14 @@ impl ReamDB {
     /// The votes database, opened on first use. Latest messages that earlier versions kept in
     /// `REDB_FILE` are moved into it once.
     fn votes_db(&self) -> Result<Arc<Database>, StoreError> {
+        self.votes_db_with(|data_dir| fs::File::open(data_dir)?.sync_all())
+    }
+
+    /// `votes_db` with the data directory sync passed in, so tests can fail it.
+    fn votes_db_with(
+        &self,
+        sync_data_dir: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> Result<Arc<Database>, StoreError> {
         let mut votes_db = self
             .votes_db
             .lock()
@@ -159,17 +167,27 @@ impl ReamDB {
         let write_txn = opened.begin_write()?;
         write_txn.open_table(LatestMessagesTable::TABLE_DEFINITION)?;
         write_txn.commit()?;
-        self.move_votes_from_main_database(&opened)?;
+        self.move_votes_from_main_database(&opened, sync_data_dir)?;
         *votes_db = Some(opened.clone());
         Ok(opened)
     }
 
-    fn move_votes_from_main_database(&self, votes_db: &Database) -> Result<(), StoreError> {
+    /// Copies the legacy votes into `votes_db` and then deletes them from `REDB_FILE`. A commit
+    /// syncs the file's contents but not its directory entry, so the data directory is synced
+    /// before the delete. Otherwise a power loss could keep the delete and lose the new file.
+    fn move_votes_from_main_database(
+        &self,
+        votes_db: &Database,
+        sync_data_dir: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> Result<(), StoreError> {
         let messages = {
             let read_txn = self.db.begin_read()?;
             let table = match read_txn.open_table(LatestMessagesTable::TABLE_DEFINITION) {
                 Ok(table) => table,
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+                Err(redb::TableError::TableDoesNotExist(_)) => {
+                    sync_data_dir(&self.data_dir)?;
+                    return Ok(());
+                }
                 Err(err) => return Err(err.into()),
             };
             let mut messages = Vec::new();
@@ -187,6 +205,7 @@ impl ReamDB {
             }
         }
         write_txn.commit()?;
+        sync_data_dir(&self.data_dir)?;
         let write_txn = self.db.begin_write()?;
         write_txn.delete_table(LatestMessagesTable::TABLE_DEFINITION)?;
         write_txn.commit()?;
@@ -347,5 +366,63 @@ mod tests {
             .init_beacon_db()
             .unwrap();
         assert_eq!(db.latest_messages_provider().get_all().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn failed_directory_sync_keeps_the_legacy_votes_for_a_retry() {
+        let dir = TempDir::new("ream_vote_migration_sync").unwrap();
+        let message = LatestMessage {
+            epoch: 7,
+            root: B256::repeat_byte(3),
+        };
+        {
+            let ream_db = ReamDB::new(dir.path().to_path_buf()).unwrap();
+            let write_txn = ream_db.db.begin_write().unwrap();
+            write_txn
+                .open_table(LatestMessagesTable::TABLE_DEFINITION)
+                .unwrap()
+                .insert(5, message.clone())
+                .unwrap();
+            write_txn.commit().unwrap();
+
+            let error = ream_db
+                .votes_db_with(|_| Err(io::Error::other("injected directory sync failure")))
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected directory sync failure")
+            );
+            assert!(ream_db.votes_db.lock().unwrap().is_none());
+            // The legacy table is still the source of truth.
+            let read_txn = ream_db.db.begin_read().unwrap();
+            assert_eq!(
+                read_txn
+                    .open_table(LatestMessagesTable::TABLE_DEFINITION)
+                    .unwrap()
+                    .get(5)
+                    .unwrap()
+                    .map(|message| message.value()),
+                Some(message.clone())
+            );
+        }
+
+        // Model a power loss that dropped the unsynced directory entry of the votes database.
+        fs::remove_file(dir.path().join(VOTES_REDB_FILE)).unwrap();
+
+        let ream_db = ReamDB::new(dir.path().to_path_buf()).unwrap();
+        let db = ream_db.init_beacon_db().unwrap();
+        assert_eq!(
+            db.latest_messages_provider().get_all().unwrap(),
+            vec![(5, message)]
+        );
+        assert!(matches!(
+            ream_db
+                .db
+                .begin_read()
+                .unwrap()
+                .open_table(LatestMessagesTable::TABLE_DEFINITION),
+            Err(redb::TableError::TableDoesNotExist(_))
+        ));
     }
 }
