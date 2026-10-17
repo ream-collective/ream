@@ -338,7 +338,17 @@ where
             if replacement.is_none() && entry.peers.len() <= 1 {
                 return;
             }
-            entry.peers.retain(|known| known != peer);
+            if let Some(position) = entry.peers.iter().position(|known| known == peer) {
+                // `next_peer` indexes the peer asked next. Removing a peer before it shifts that
+                // peer down one place, so the cursor moves with it and no peer is skipped.
+                let cursor = entry.next_peer % entry.peers.len();
+                entry.peers.remove(position);
+                entry.next_peer = if position < cursor {
+                    cursor - 1
+                } else {
+                    cursor
+                };
+            }
             if let Some(replacement) = replacement {
                 entry.add_peer(replacement, max_peers);
             }
@@ -942,6 +952,27 @@ mod tests {
         assert!(coordinator.download_failed(action_id, root(1)));
         let (_, requested, peer) = request_action(&mut coordinator);
         assert_eq!((requested, peer), (root(1), 9));
+    }
+
+    #[test]
+    fn replacing_a_peer_does_not_skip_the_next_one() {
+        let mut coordinator = UnknownParentLookupCoordinator::new(config());
+        for peer in [7, 8, 9, 10] {
+            coordinator.insert_gossip_block(meta(2, 1, 2), 20, peer);
+        }
+        let (action_id, requested, peer) = request_action(&mut coordinator);
+        assert_eq!((requested, peer), (root(1), 7));
+
+        coordinator.replace_peer(root(1), &7, None);
+        assert!(coordinator.download_failed(action_id, root(1)));
+        let (action_id, _, peer) = request_action(&mut coordinator);
+        assert_eq!(peer, 8);
+
+        // Removing a peer after the cursor leaves it in place.
+        coordinator.replace_peer(root(1), &10, None);
+        assert!(coordinator.download_failed(action_id, root(1)));
+        let (_, _, peer) = request_action(&mut coordinator);
+        assert_eq!(peer, 9);
     }
 
     #[test]
