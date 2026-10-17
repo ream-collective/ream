@@ -16,6 +16,7 @@ use ream_api_types_beacon::{
 };
 use ream_api_types_common::{error::ApiError, id::ID};
 use ream_bls::{BLSSignature, PublicKey, traits::Verifiable};
+use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::{
     attestation::Attestation,
     attester_slashing::AttesterSlashing,
@@ -512,10 +513,17 @@ fn check_validator_participation(
     }
 }
 
+fn validator_api_is_syncing(current_slot: u64, head_slot: u64) -> bool {
+    const SYNC_TOLERANCE_EPOCHS: u64 = 2;
+
+    current_slot.saturating_sub(head_slot) > SYNC_TOLERANCE_EPOCHS * SLOTS_PER_EPOCH
+}
+
 #[get("/validator/attestation_data")]
 pub async fn get_attestation_data(
     db: Data<BeaconDB>,
     opertation_pool: Data<Arc<OperationPool>>,
+    beacon_chain: Data<Arc<BeaconChain>>,
     query: Query<AttestationQuery>,
 ) -> Result<impl Responder, ApiError> {
     let store = Store::new(
@@ -524,17 +532,15 @@ pub async fn get_attestation_data(
         None,
     );
 
-    if store.is_syncing_for_validator_api().map_err(|err| {
-        ApiError::InternalError(format!("Failed to check syncing status, err: {err:?}"))
-    })? {
+    let head = beacon_chain
+        .head()
+        .map_err(|err| ApiError::InternalError(format!("Failed to get head root: {err:?}")))?;
+    if validator_api_is_syncing(head.current_slot, head.head_slot) {
         return Err(ApiError::UnderSyncing);
     }
 
     let slot = query.slot;
-
-    let current_slot = store.get_current_slot().map_err(|err| {
-        ApiError::InternalError(format!("Failed to get current slot, err: {err:?}"))
-    })?;
+    let current_slot = head.current_slot;
 
     if slot > current_slot + 1 {
         return Err(ApiError::InvalidParameter(format!(
@@ -542,15 +548,8 @@ pub async fn get_attestation_data(
         )));
     }
 
-    let head_root = store
-        .get_head()
-        .map_err(|err| ApiError::InternalError(format!("Failed to get head root: {err:?}")))?;
-
-    let state = db
-        .state_provider()
-        .get(head_root)
-        .map_err(|err| ApiError::InternalError(format!("Failed to get state, error: {err:?}")))?
-        .ok_or_else(|| ApiError::NotFound(format!("Failed to find state for root {head_root}")))?;
+    let head_root = head.head_root;
+    let state = head.state.as_ref().clone();
 
     let beacon_block_root = if slot >= state.slot {
         head_root
@@ -1414,6 +1413,7 @@ pub async fn get_blocks_v3(
     query: Query<BlockQuery>,
     db: Data<BeaconDB>,
     operation_pool: Data<Arc<OperationPool>>,
+    beacon_chain: Data<Arc<BeaconChain>>,
     execution_engine: Data<Option<ExecutionEngine>>,
     builder_client: Data<Option<Arc<BuilderClient>>>,
 ) -> Result<impl Responder, ApiError> {
@@ -1424,15 +1424,10 @@ pub async fn get_blocks_v3(
     let skip_randao_verification = query_params.skip_randao_verification.unwrap_or(false);
     let builder_boost_factor = query_params.builder_boost_factor.unwrap_or(100);
 
-    let store = Store::new(db.get_ref().clone(), operation_pool.get_ref().clone(), None);
-    let head_root = store
-        .get_head()
+    let head = beacon_chain
+        .head()
         .map_err(|err| ApiError::InternalError(format!("Failed to get head root: {err:?}")))?;
-    let mut state = db
-        .state_provider()
-        .get(head_root)
-        .map_err(|err| ApiError::InternalError(format!("Failed to get state, error: {err:?}")))?
-        .ok_or_else(|| ApiError::NotFound(format!("Failed to find state for root {head_root}")))?;
+    let mut state = head.state.as_ref().clone();
 
     let current_slot = state.slot;
 
@@ -1762,4 +1757,16 @@ pub async fn get_aggregate_attestation(
     })?;
 
     Ok(HttpResponse::Ok().json(DataVersionedResponse::new(aggregated_attestation)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validator_api_is_syncing;
+
+    #[test]
+    fn cached_head_sync_check_preserves_the_two_epoch_tolerance() {
+        assert!(!validator_api_is_syncing(100, 36));
+        assert!(validator_api_is_syncing(101, 36));
+        assert!(!validator_api_is_syncing(36, 100));
+    }
 }

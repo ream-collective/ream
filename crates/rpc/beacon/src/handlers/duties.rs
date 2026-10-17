@@ -10,6 +10,7 @@ use ream_api_types_beacon::{
     responses::DutiesResponse,
 };
 use ream_api_types_common::error::ApiError;
+use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::electra::beacon_state::BeaconState;
 use ream_consensus_misc::{
     constants::beacon::{MIN_SEED_LOOKAHEAD, SLOTS_PER_EPOCH},
@@ -49,15 +50,6 @@ fn validate_proposer_duties_epoch(epoch: u64, current_epoch: u64) -> Result<(), 
     Ok(())
 }
 
-/// Reads the current epoch so future requests can be rejected before epoch-to-slot conversion.
-fn current_epoch(store: &Store) -> Result<u64, ApiError> {
-    let slot = store
-        .get_current_slot()
-        .map_err(|err| ApiError::InternalError(format!("Failed to get current slot: {err:?}")))?;
-
-    Ok(compute_epoch_at_slot(slot))
-}
-
 /// Selects the dependent-root semantics returned by v1 and v2.
 enum DependentRoot {
     Legacy,
@@ -65,13 +57,19 @@ enum DependentRoot {
 }
 
 async fn proposer_duties(
-    db: &BeaconDB,
+    beacon_chain: &BeaconChain,
     epoch: u64,
     dependent_root_kind: DependentRoot,
 ) -> Result<HttpResponse, ApiError> {
-    let store = Store::new(db.clone(), Arc::new(OperationPool::default()), None);
-    let current_epoch = current_epoch(&store)?;
-    validate_proposer_duties_epoch(epoch, current_epoch)?;
+    let head = beacon_chain
+        .head()
+        .map_err(|err| ApiError::InternalError(format!("Failed to get head root: {err:?}")))?;
+    let store = Store::new(
+        beacon_chain.db().clone(),
+        Arc::new(OperationPool::default()),
+        None,
+    );
+    validate_proposer_duties_epoch(epoch, compute_epoch_at_slot(head.current_slot))?;
 
     // Convert only after the guard because epoch-to-slot multiplication is unchecked.
     let decision_slot = match dependent_root_kind {
@@ -82,7 +80,8 @@ async fn proposer_duties(
     };
     let start_slot = compute_start_slot_at_epoch(epoch);
     let (state, state_block_root) =
-        get_canonical_state_and_block_root_at_or_before_slot(&store, start_slot).await?;
+        get_canonical_state_and_block_root_at_or_before_slot(&store, head.head_root, start_slot)
+            .await?;
     let dependent_root = if state.slot <= decision_slot {
         state_block_root
     } else {
@@ -113,21 +112,21 @@ async fn proposer_duties(
 /// Serves v1 proposer duties with the legacy end-of-`N - 1` dependent root.
 #[get("/validator/duties/proposer/{epoch}")]
 pub async fn get_proposer_duties(
-    db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<BeaconChain>>,
     epoch: Path<u64>,
 ) -> Result<impl Responder, ApiError> {
     let epoch = epoch.into_inner();
-    proposer_duties(&db, epoch, DependentRoot::Legacy).await
+    proposer_duties(&beacon_chain, epoch, DependentRoot::Legacy).await
 }
 
 /// Serves v2 proposer duties with the fork-aware dependent root.
 #[get("/validator/duties/proposer/{epoch}")]
 pub async fn get_proposer_duties_v2(
-    db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<BeaconChain>>,
     epoch: Path<u64>,
 ) -> Result<impl Responder, ApiError> {
     let epoch = epoch.into_inner();
-    proposer_duties(&db, epoch, DependentRoot::ForkAware).await
+    proposer_duties(&beacon_chain, epoch, DependentRoot::ForkAware).await
 }
 
 #[post("/validator/duties/attester/{epoch}")]
@@ -245,11 +244,9 @@ fn parse_validator_indices(
 /// Resolves from fork-choice head so an overwritten slot index cannot select a side fork.
 async fn get_canonical_state_and_block_root_at_or_before_slot(
     store: &Store,
+    head_root: B256,
     slot: u64,
 ) -> Result<(BeaconState, B256), ApiError> {
-    let head_root = store
-        .get_head()
-        .map_err(|err| ApiError::InternalError(format!("Failed to get head root: {err:?}")))?;
     let block_root = get_block_root_at_or_before_slot_from_head(store, head_root, slot)?;
 
     get_state_and_block_root(&store.db, block_root, slot).await
