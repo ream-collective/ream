@@ -1,6 +1,7 @@
 use std::{
     cmp::Ordering,
     collections::VecDeque,
+    ops::RangeInclusive,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -485,6 +486,43 @@ impl Store {
 
     pub fn is_fork_choice_tree_enabled(&self) -> bool {
         self.fork_choice.is_some()
+    }
+
+    /// Returns all recent fork-choice roots. The parent index fallback keeps every branch
+    /// discoverable when startup could not rebuild the in-memory tree.
+    pub fn block_roots_in_slot_range(
+        &self,
+        slots: RangeInclusive<u64>,
+    ) -> anyhow::Result<Vec<(u64, B256)>> {
+        match &self.fork_choice {
+            Some(tree) => Ok(tree.roots_in_slot_range(slots)),
+            None => {
+                let finalized_root = self.db.finalized_checkpoint_provider().get()?.root;
+                let mut pending = VecDeque::from([finalized_root]);
+                let mut roots = Vec::new();
+                while let Some(parent_root) = pending.pop_front() {
+                    let children = self
+                        .db
+                        .parent_root_index_multimap_provider()
+                        .get(parent_root)?
+                        .unwrap_or_default();
+                    for child_root in children {
+                        let Some(block) = self.db.block_provider().get(child_root)? else {
+                            continue;
+                        };
+                        let slot = block.message.slot;
+                        if slot <= *slots.end() {
+                            pending.push_back(child_root);
+                        }
+                        if slots.contains(&slot) {
+                            roots.push((slot, child_root));
+                        }
+                    }
+                }
+                roots.sort_unstable();
+                Ok(roots)
+            }
+        }
     }
 
     /// Brings the fork choice tree in line with the checkpoints, time and proposer boost stored in

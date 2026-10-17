@@ -112,6 +112,41 @@ fn update_lookup_gauges<BlockPayload>(
     );
 }
 
+fn spawn_reconstruction(
+    beacon_chain: Arc<BeaconChain>,
+    cached_db: Arc<BeaconCacheDB>,
+    p2p_sender: P2PSender,
+    block_root: B256,
+) {
+    tokio::spawn(async move {
+        if let Err(err) =
+            reconstruct_and_cross_seed(&beacon_chain, &cached_db, &p2p_sender, block_root).await
+        {
+            error!(%block_root, "Column reconstruction failed: {err:#}");
+        }
+    });
+}
+
+async fn schedule_incomplete_reconstructions(
+    beacon_chain: &Arc<BeaconChain>,
+    cached_db: &Arc<BeaconCacheDB>,
+    p2p_sender: &P2PSender,
+) {
+    match beacon_chain.incomplete_recent_block_roots().await {
+        Ok(roots) => {
+            for block_root in roots {
+                spawn_reconstruction(
+                    beacon_chain.clone(),
+                    cached_db.clone(),
+                    p2p_sender.clone(),
+                    block_root,
+                );
+            }
+        }
+        Err(err) => warn!("Failed to scan for incomplete data-column reconstruction: {err:#}"),
+    }
+}
+
 pub struct NetworkManagerService {
     pub beacon_chain: Arc<BeaconChain>,
     manager_receiver: mpsc::UnboundedReceiver<ReamNetworkEvent>,
@@ -384,6 +419,14 @@ impl NetworkManagerService {
         let mut interval = interval(Duration::from_secs(
             beacon_network_spec().seconds_per_slot(),
         ));
+        let reconstruction_scan_period =
+            Duration::from_secs(SLOTS_PER_EPOCH * beacon_network_spec().seconds_per_slot());
+        let mut reconstruction_scan_interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + reconstruction_scan_period,
+            reconstruction_scan_period,
+        );
+        reconstruction_scan_interval
+            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut block_import_receiver = beacon_chain.subscribe_block_imports();
         let mut block_import_receiver_active = true;
         let mut block_lookup_coordinator =
@@ -422,6 +465,7 @@ impl NetworkManagerService {
         let mut syncer_active = true;
         // Kept alive (not dropped) once synced, so the periodic re-check can restart it later.
         let mut idle_syncer: Option<BlockRangeSyncer> = None;
+        schedule_incomplete_reconstructions(&beacon_chain, &cached_db, &p2p_sender).await;
         loop {
             tokio::select! {
                 // Drive unknown-parent lookup actions and results.
@@ -547,21 +591,12 @@ impl NetworkManagerService {
                                     );
                                 }
                                 ream_chain_beacon::beacon_chain::BlockImportEvent::ReconstructionReady { block_root } => {
-                                    let beacon_chain = beacon_chain.clone();
-                                    let cached_db = cached_db.clone();
-                                    let p2p_sender = p2p_sender.clone();
-                                    tokio::spawn(async move {
-                                        if let Err(err) = reconstruct_and_cross_seed(
-                                            &beacon_chain,
-                                            &cached_db,
-                                            &p2p_sender,
-                                            block_root,
-                                        )
-                                        .await
-                                        {
-                                            error!(%block_root, "Column reconstruction failed: {err:#}");
-                                        }
-                                    });
+                                    spawn_reconstruction(
+                                        beacon_chain.clone(),
+                                        cached_db.clone(),
+                                        p2p_sender.clone(),
+                                        block_root,
+                                    );
                                 }
                             }
                             record_removed_lookup_entries(
@@ -578,7 +613,7 @@ impl NetworkManagerService {
                             );
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                            warn!(skipped, "Block import notifications lagged; reconciling pending parents");
+                            warn!(skipped, "Block import notifications lagged; reconciling pending work");
                             let mut roots = block_lookup_coordinator.reconciliation_roots();
                             roots.extend(unknown_parent_lookups.reconciliation_roots());
                             roots.sort_unstable();
@@ -607,6 +642,12 @@ impl NetworkManagerService {
                                 &network_state,
                                 &column_fetch_done_sender,
                             );
+                            schedule_incomplete_reconstructions(
+                                &beacon_chain,
+                                &cached_db,
+                                &p2p_sender,
+                            )
+                            .await;
                             record_removed_lookup_entries(
                                 PENDING_AVAILABILITY_LOOKUP,
                                 "completed",
@@ -694,6 +735,16 @@ impl NetworkManagerService {
                         syncer_handle = block_range_syncer.start();
                         syncer_active = true;
                     }
+                }
+                // Retry incomplete reconstruction once per epoch. This bounds disk scans and
+                // supplies backoff after reconstruction or sidecar publication fails.
+                _ = reconstruction_scan_interval.tick() => {
+                    schedule_incomplete_reconstructions(
+                        &beacon_chain,
+                        &cached_db,
+                        &p2p_sender,
+                    )
+                    .await;
                 }
                 // Advance the chain clock and prune stale lookup state.
                 _ = interval.tick() => {

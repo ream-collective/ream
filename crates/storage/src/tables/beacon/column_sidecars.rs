@@ -1,4 +1,8 @@
-use std::{io::Read, path::PathBuf};
+use std::{
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 use ream_consensus_beacon::data_column_sidecar::{ColumnIdentifier, DataColumnSidecar};
 use snap::raw::{Decoder, Encoder};
@@ -62,7 +66,10 @@ impl ColumnSidecarsTable {
             .collect::<Result<Vec<_>, _>>()?;
         let written = started.elapsed();
         let published = if only_if_missing {
-            crate::tables::sidecar_file::PreparedSidecarFile::publish_batch_if_missing(prepared)?
+            crate::tables::sidecar_file::PreparedSidecarFile::publish_batch_if_missing(
+                prepared,
+                |index, path| Self::matches_column(path, &columns[index]),
+            )?
         } else {
             crate::tables::sidecar_file::PreparedSidecarFile::publish_batch(prepared)?;
             vec![true; count]
@@ -82,6 +89,21 @@ impl ColumnSidecarsTable {
             "{}_{}.ssz_snappy",
             column_identifier.block_root, column_identifier.index
         ))
+    }
+
+    fn matches_column(path: &Path, expected: &DataColumnSidecar) -> Result<bool, StoreError> {
+        let mut bytes = Vec::new();
+        File::open(path)?.read_to_end(&mut bytes)?;
+        let decoded = match Decoder::new().decompress_vec(&bytes) {
+            Ok(decoded) => decoded,
+            Err(_) => return Ok(false),
+        };
+        let stored = match DataColumnSidecar::from_ssz_bytes(&decoded) {
+            Ok(stored) => stored,
+            Err(_) => return Ok(false),
+        };
+        Ok(stored.index == expected.index
+            && stored.signed_block_header == expected.signed_block_header)
     }
 }
 
@@ -118,6 +140,7 @@ mod tests {
 
     use ream_consensus_beacon::data_column_sidecar::{ColumnIdentifier, DataColumnSidecar};
     use tempdir::TempDir;
+    use tree_hash::TreeHash;
 
     use crate::{
         errors::StoreError,
@@ -168,6 +191,38 @@ mod tests {
 
         assert_eq!(stored, vec![column(0), column(2)]);
         assert!(table.insert_batch_if_missing(vec![column(0)])?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn insert_if_missing_repairs_an_undecodable_column() -> Result<(), StoreError> {
+        let tmp_dir = TempDir::new("test_column_sidecar_repair")?;
+        fs::create_dir_all(tmp_dir.path().join(COLUMN_FOLDER_NAME))?;
+        let table = ColumnSidecarsTable {
+            data_dir: tmp_dir.path().to_path_buf(),
+        };
+        let column = DataColumnSidecar {
+            index: 0,
+            column: Default::default(),
+            kzg_commitments: Default::default(),
+            kzg_proofs: Default::default(),
+            signed_block_header: Default::default(),
+            kzg_commitments_inclusion_proof: Default::default(),
+        };
+        let key = ColumnIdentifier::new(column.signed_block_header.message.tree_hash_root(), 0);
+        table.insert(key, column.clone())?;
+        fs::write(table.column_file_path(&key), b"truncated")?;
+
+        assert_eq!(
+            table
+                .insert_batch_if_missing(vec![column.clone()])
+                .expect("truncated column should be replaced"),
+            vec![column.clone()]
+        );
+        assert_eq!(
+            table.get(key).expect("replacement should decode"),
+            Some(column)
+        );
         Ok(())
     }
 }
