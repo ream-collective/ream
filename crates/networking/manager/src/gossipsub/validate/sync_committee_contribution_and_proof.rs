@@ -108,7 +108,12 @@ pub async fn validate_sync_committee_contribution_and_proof(
         validator_index: contribution_and_proof.aggregator_index,
     };
 
-    if !insert_if_unseen(&cached_db.seen_sync_messages, sync_committee_key).await {
+    if !insert_if_unseen(
+        &cached_db.seen_sync_contribution_aggregators,
+        sync_committee_key,
+    )
+    .await
+    {
         return Ok(ValidationResult::Ignore(
             "A valid sync committee contribution for this aggregator, slot and subcommittee index has already been seen".to_string(),
         ));
