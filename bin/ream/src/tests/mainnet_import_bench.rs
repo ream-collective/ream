@@ -6,9 +6,9 @@
 //!
 //! 1. Run a beacon node on mainnet until it has imported a few blocks, then stop it.
 //! 2. `REAM_BENCH_SOURCE_DATA_DIR=<its --data-dir> REAM_BENCH_FIXTURE_DIR=<out> cargo test
-//!    --release -p ream --bin ream extract_mainnet_import_fixture -- --ignored --nocapture`. The
-//!    fixture starts at the node's finalized block; set `REAM_BENCH_MAX_BLOCKS` to keep only that
-//!    many blocks after it.
+//!    --release -p ream --bin ream extract_mainnet_import_fixture -- --ignored --nocapture`, with
+//!    `<out>` missing or empty. The fixture starts at the node's finalized block; set
+//!    `REAM_BENCH_MAX_BLOCKS` to keep only that many blocks after it.
 //! 3. `REAM_BENCH_FIXTURE_DIR=<out> cargo test --release -p ream --bin ream
 //!    mainnet_block_import_bench -- --ignored --nocapture`. Set `REAM_BENCH_MAX_AVG_MS` to fail
 //!    when the average import time per block exceeds a budget. Set `REAM_BENCH_KEEP_DATA` to retain
@@ -68,9 +68,16 @@ fn block_dir(fixture_dir: &Path, position: usize, slot: u64) -> PathBuf {
 #[test]
 #[ignore = "needs REAM_BENCH_SOURCE_DATA_DIR from a node that imported mainnet blocks"]
 fn extract_mainnet_import_fixture() {
-    let source = open_db(&env_path("REAM_BENCH_SOURCE_DATA_DIR"));
     let fixture_dir = env_path("REAM_BENCH_FIXTURE_DIR");
     fs::create_dir_all(&fixture_dir).expect("fixture dir should be creatable");
+    // The replay reads every block directory it finds, so blocks left by an earlier extraction
+    // would be replayed against the new anchor.
+    assert!(
+        fs::read_dir(&fixture_dir).unwrap().next().is_none(),
+        "{} must be empty",
+        fixture_dir.display()
+    );
+    let source = open_db(&env_path("REAM_BENCH_SOURCE_DATA_DIR"));
 
     // The node deletes states before the finalized block, so the finalized block is the oldest
     // anchor whose state is still available.
