@@ -196,6 +196,18 @@ impl BeaconChain {
         lock_wait_timer.observe_duration();
         let locked = started.elapsed();
 
+        // A block can reach this point after it was imported. Range sync stores a block's
+        // columns before processing the block, and those columns can complete the same block
+        // left pending by gossip. Two callers can also wait on the store lock with the same block.
+        // Importing it again would repeat the state transition and announce the block twice.
+        if store.db.block_provider().contains_key(block_root)?
+            && store.db.state_provider().contains_key(block_root)?
+        {
+            block_processing_timer.stop_and_discard();
+            debug!(%block_root, "Block is already imported");
+            return Ok(BlockProcessingOutcome::Imported { block_root });
+        }
+
         let network_spec = beacon_network_spec();
         let verify_data_availability = self.force_data_availability_checks
             || is_data_availability_check_required(
@@ -961,6 +973,52 @@ mod tests {
                 .collect::<Vec<_>>(),
             (NUMBER_OF_COLUMNS / 2 + 1..NUMBER_OF_COLUMNS - 1).collect::<Vec<_>>()
         );
+        drop(chain);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    fn fixture_state() -> BeaconState {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../../../testing/gossip-validation/tests/assets/sepolia/states/grandparent_state_9552074.ssz_snappy",
+        );
+        let bytes = snap::raw::Decoder::new()
+            .decompress_vec(&fs::read(path).unwrap())
+            .unwrap();
+        <BeaconState as ssz::Decode>::from_ssz_bytes(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn already_imported_block_is_not_imported_again() {
+        let (path, mut chain) = test_chain();
+        let (event_sender, mut beacon_events) = broadcast::channel(16);
+        chain.event_sender = Some(event_sender);
+        let block = empty_block();
+        let root = block.message.tree_hash_root();
+        chain
+            .db
+            .block_provider()
+            .insert(root, block.clone())
+            .unwrap();
+        chain
+            .db
+            .state_provider()
+            .insert(root, fixture_state())
+            .unwrap();
+        let mut import_events = chain.subscribe_block_imports();
+
+        // The parent state is not stored, so importing the block again would fail.
+        assert_eq!(
+            chain.process_block(block).await.unwrap(),
+            BlockProcessingOutcome::Imported { block_root: root }
+        );
+        assert!(matches!(
+            import_events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            beacon_events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
         drop(chain);
         fs::remove_dir_all(path).unwrap();
     }
