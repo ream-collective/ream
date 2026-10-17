@@ -133,7 +133,7 @@ pub async fn validate_beacon_attestation(
         .contains(&attestation_key)
     {
         return Ok(ValidationResult::Ignore(
-            "There has been no other valid attestation seen".to_string(),
+            "An attestation from this validator for this subnet and target epoch has already been seen".to_string(),
         ));
     }
 
@@ -205,7 +205,7 @@ pub async fn validate_beacon_attestation(
 
     if !insert_if_unseen(&cached_db.seen_attestations, attestation_key).await {
         return Ok(ValidationResult::Ignore(
-            "There has been no other valid attestation seen".to_string(),
+            "An attestation from this validator for this subnet and target epoch has already been seen".to_string(),
         ));
     }
     Ok(ValidationResult::Accept)
