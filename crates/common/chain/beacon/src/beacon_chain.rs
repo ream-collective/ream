@@ -25,8 +25,9 @@ use ream_fork_choice_beacon::{
     store::Store,
 };
 use ream_metrics::{
-    BEACON_BLOCK_PROCESSING_SECONDS, BEACON_EXECUTION_FORKCHOICE_UPDATE_SECONDS,
-    BEACON_STORE_LOCK_WAIT_SECONDS,
+    BEACON_BLOCK_PROCESSING_SECONDS, BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_RUN_TOTAL,
+    BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_SKIPPED_COMPLETE_TOTAL,
+    BEACON_EXECUTION_FORKCHOICE_UPDATE_SECONDS, BEACON_STORE_LOCK_WAIT_SECONDS,
 };
 use ream_network_spec::networks::beacon_network_spec;
 use ream_operation_pool::OperationPool;
@@ -539,11 +540,14 @@ impl BeaconChain {
                 .iter()
                 .map(|sidecar| sidecar.index)
                 .collect::<HashSet<_>>();
-            if available.len() < (NUMBER_OF_COLUMNS / 2) as usize
-                || required_columns.is_subset(&stored)
-            {
+            if required_columns.is_subset(&stored) {
+                BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_SKIPPED_COMPLETE_TOTAL.inc();
                 return Ok(Vec::new());
             }
+            if available.len() < (NUMBER_OF_COLUMNS / 2) as usize {
+                return Ok(Vec::new());
+            }
+            BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_RUN_TOTAL.inc();
             let available = available.iter().collect::<Vec<_>>();
             Ok(reconstruct_data_column_sidecars(&available)?
                 .into_iter()

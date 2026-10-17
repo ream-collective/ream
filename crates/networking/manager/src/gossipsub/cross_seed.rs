@@ -8,6 +8,7 @@ use ream_consensus_beacon::data_column_sidecar::DataColumnSidecar;
 use ream_consensus_misc::{
     constants::beacon::genesis_validators_root, misc::compute_start_slot_at_epoch,
 };
+use ream_metrics::BEACON_DATA_AVAILABILITY_CROSS_SEEDED_COLUMNS_TOTAL;
 use ream_network_spec::networks::beacon_network_spec;
 use ream_p2p::{
     gossipsub::beacon::topics::{GossipTopic, GossipTopicKind},
@@ -88,6 +89,7 @@ async fn publish_reconstructed_columns(
             data: sidecar.as_ssz_bytes(),
         });
     }
+    BEACON_DATA_AVAILABILITY_CROSS_SEEDED_COLUMNS_TOTAL.inc_by(columns.len() as u64);
     columns.len()
 }
 
@@ -100,6 +102,10 @@ mod tests {
         electra::beacon_block::SignedBeaconBlock,
     };
     use ream_consensus_misc::checkpoint::Checkpoint;
+    use ream_metrics::{
+        BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_RUN_TOTAL,
+        BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_SKIPPED_COMPLETE_TOTAL,
+    };
     use ream_network_spec::networks::initialize_test_network_spec;
     use ream_operation_pool::OperationPool;
     use ream_p2p::network::beacon::channel::P2PMessage;
@@ -235,16 +241,26 @@ mod tests {
     async fn rebuilt_columns_are_published_once() {
         let mut harness = Harness::new(1, 0);
         harness.store_columns(|index| index < NUMBER_OF_COLUMNS / 2);
+        // Other tests share these counters and only add to them, so the checks are lower bounds.
+        let runs = BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_RUN_TOTAL.get();
+        let skipped = BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_SKIPPED_COMPLETE_TOTAL.get();
+        let cross_seeded = BEACON_DATA_AVAILABILITY_CROSS_SEEDED_COLUMNS_TOTAL.get();
 
         assert_eq!(harness.cross_seed().await, (NUMBER_OF_COLUMNS / 2) as usize);
         assert_eq!(
             harness.published_indices(),
             (NUMBER_OF_COLUMNS / 2..NUMBER_OF_COLUMNS).collect::<Vec<_>>()
         );
+        assert!(BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_RUN_TOTAL.get() > runs);
+        assert!(
+            BEACON_DATA_AVAILABILITY_CROSS_SEEDED_COLUMNS_TOTAL.get()
+                >= cross_seeded + NUMBER_OF_COLUMNS / 2
+        );
 
         // Everything is stored now, so a repeated reconstruction has nothing to publish.
         assert_eq!(harness.cross_seed().await, 0);
         assert!(harness.published_indices().is_empty());
+        assert!(BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_SKIPPED_COMPLETE_TOTAL.get() > skipped);
     }
 
     #[tokio::test]
