@@ -24,7 +24,6 @@ use crate::{
     tables::{
         beacon::{
             beacon_block::BeaconBlockTable,
-            slot_index::BeaconSlotIndexTable,
             state_summaries::{BeaconStateSummariesTable, StateSummary},
         },
         ssz_encoder::SSZEncoding,
@@ -324,15 +323,19 @@ impl BeaconStateTable {
                 summaries.remove(*root)?;
             }
 
-            // States stored in redb before whole states moved to files have no summary. Their
-            // blocks are in the slot index, which holds small values and is cheap to scan.
+            // States stored in redb before whole states moved to files have no summary. Scan the
+            // block table because it retains every fork root, unlike the one-root-per-slot index.
+            // The legacy state values are large, so never iterate that table directly.
             let mut legacy_states = write_txn.open_table(Self::TABLE_DEFINITION)?;
             if !legacy_states.is_empty()? {
-                let slot_index = write_txn.open_table(BeaconSlotIndexTable::TABLE_DEFINITION)?;
-                for entry in slot_index.range(..finalized.slot)? {
-                    let root = entry?.1.value();
-                    if legacy_states.remove(root)?.is_some() {
-                        old_roots.insert(root);
+                let blocks = write_txn.open_table(BeaconBlockTable::TABLE_DEFINITION)?;
+                for entry in blocks.iter()? {
+                    let (root, block) = entry?;
+                    if block.value().message.slot < finalized.slot {
+                        let root = root.value();
+                        if legacy_states.remove(root)?.is_some() {
+                            old_roots.insert(root);
+                        }
                     }
                 }
             }
@@ -1056,5 +1059,50 @@ mod tests {
                 .iter()
                 .all(|(root, _)| states.is_stored_whole(*root).unwrap())
         );
+    }
+
+    #[test]
+    fn prunes_all_legacy_states_at_a_duplicate_slot() {
+        let dir = TempDir::new("ream_legacy_fork_state_pruning").unwrap();
+        let db = ReamDB::new(dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap();
+        let states = db.state_provider();
+        let state = sepolia_state();
+        let first_root = B256::repeat_byte(0x91);
+        let second_root = B256::repeat_byte(0x92);
+        let finalized_root = B256::repeat_byte(0x93);
+
+        insert_block_for_state(&db, first_root, &state);
+        insert_block_for_state(&db, second_root, &state);
+        assert_eq!(
+            db.slot_index_provider().get(state.slot).unwrap(),
+            Some(second_root)
+        );
+
+        let write = db.db.begin_write().unwrap();
+        {
+            let mut legacy = write
+                .open_table(BeaconStateTable::TABLE_DEFINITION)
+                .unwrap();
+            legacy.insert(first_root, state.as_ref().clone()).unwrap();
+            legacy.insert(second_root, state.as_ref().clone()).unwrap();
+        }
+        write.commit().unwrap();
+        states
+            .summaries()
+            .insert(
+                finalized_root,
+                StateSummary {
+                    slot: state.slot + 1,
+                    stored_whole: true,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(states.prune_finalized(finalized_root).unwrap(), 2);
+        assert!(!states.contains_key(first_root).unwrap());
+        assert!(!states.contains_key(second_root).unwrap());
     }
 }
