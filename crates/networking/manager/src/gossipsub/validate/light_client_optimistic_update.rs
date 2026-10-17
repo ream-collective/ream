@@ -1,34 +1,40 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_light_client::optimistic_update::LightClientOptimisticUpdate;
-use ream_network_spec::networks::{beacon_network_spec, lean_network_spec};
 use ream_storage::cache::BeaconCacheDB;
 
-use crate::gossipsub::validate::result::ValidationResult;
+use crate::gossipsub::validate::{
+    light_client_finality_update::{sync_message_due_has_passed, unix_time_ms},
+    result::ValidationResult,
+};
 
 pub async fn validate_light_client_optimistic_update(
     light_client_optimistic_update: &LightClientOptimisticUpdate,
     beacon_chain: &BeaconChain,
     cached_db: &BeaconCacheDB,
 ) -> anyhow::Result<ValidationResult> {
-    // The head state is not needed, but an available head is still a precondition for validating.
-    let _head = beacon_chain.head()?;
+    let genesis_time = beacon_chain.head()?.state.genesis_time;
+    validate_optimistic_update(
+        light_client_optimistic_update,
+        genesis_time,
+        unix_time_ms(),
+        cached_db,
+    )
+    .await
+}
 
-    let signature_slot_start_time = lean_network_spec().genesis_time
-        + (light_client_optimistic_update
-            .signature_slot
-            .saturating_mul(lean_network_spec().seconds_per_slot));
-    let current_time = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("Error getting current time")
-        .as_secs();
-
+async fn validate_optimistic_update(
+    light_client_optimistic_update: &LightClientOptimisticUpdate,
+    genesis_time: u64,
+    now_ms: u64,
+    cached_db: &BeaconCacheDB,
+) -> anyhow::Result<ValidationResult> {
     // [IGNORE] The optimistic_update is received after the block at signature_slot was given enough
     // time to propagate through the network
-    if current_time
-        < signature_slot_start_time - beacon_network_spec().maximum_gossip_clock_disparity
-    {
+    if !sync_message_due_has_passed(
+        genesis_time,
+        light_client_optimistic_update.signature_slot,
+        now_ms,
+    ) {
         return Ok(ValidationResult::Ignore("Too early".to_string()));
     };
 
