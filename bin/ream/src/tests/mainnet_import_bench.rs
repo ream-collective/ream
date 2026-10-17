@@ -298,4 +298,3 @@ async fn mainnet_block_import_bench() {
         );
     }
 }
-
