@@ -1,7 +1,10 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     num::NonZeroUsize,
-    sync::{Arc, Mutex, MutexGuard, RwLock as StorageRwLock, RwLockReadGuard, atomic::AtomicBool},
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard, RwLock as StorageRwLock, RwLockReadGuard,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     thread::{self, JoinHandle},
 };
 
@@ -27,6 +30,8 @@ const LRU_CACHE_SIZE: usize = 64;
 const DATA_COLUMN_SIDECAR_CACHE_SIZE: usize = NUMBER_OF_COLUMNS as usize * SLOTS_PER_EPOCH as usize;
 const BLOCK_CACHE_SIZE: usize = 128;
 const STATE_CACHE_SIZE: usize = 8;
+/// Includes the state being written and every queued state.
+pub(crate) const STATE_SNAPSHOT_PENDING_LIMIT: usize = 3;
 // Fork choice reads the checkpoint states that blocks' attestations target, usually the current
 // and previous epoch, plus the justified and finalized ones.
 const CHECKPOINT_STATE_CACHE_SIZE: usize = 4;
@@ -85,6 +90,139 @@ pub struct PendingLatestMessages {
     pub flushing: bool,
 }
 
+type StateSnapshotTask = Box<dyn FnOnce() -> bool + Send + 'static>;
+
+struct StateSnapshotQueueState {
+    tasks: VecDeque<StateSnapshotTask>,
+    in_flight: usize,
+    accepting: bool,
+}
+
+struct StateSnapshotQueue {
+    state: Mutex<StateSnapshotQueueState>,
+    changed: Condvar,
+}
+
+impl StateSnapshotQueue {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(StateSnapshotQueueState {
+                tasks: VecDeque::new(),
+                in_flight: 0,
+                accepting: true,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn enqueue(
+        &self,
+        before_enqueue: impl FnOnce(),
+        task: StateSnapshotTask,
+    ) -> std::io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("state snapshot queue lock is not poisoned");
+        while state.accepting && state.in_flight == STATE_SNAPSHOT_PENDING_LIMIT {
+            state = self
+                .changed
+                .wait(state)
+                .expect("state snapshot queue lock is not poisoned");
+        }
+        if !state.accepting {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "state snapshot writer is shutting down",
+            ));
+        }
+
+        // The task cannot be observed until this lock is released, so publish the in-memory
+        // state before making its write runnable.
+        before_enqueue();
+        state.in_flight += 1;
+        state.tasks.push_back(task);
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    fn next(&self) -> Option<StateSnapshotTask> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("state snapshot queue lock is not poisoned");
+        while state.accepting && state.tasks.is_empty() {
+            state = self
+                .changed
+                .wait(state)
+                .expect("state snapshot queue lock is not poisoned");
+        }
+        state.tasks.pop_front()
+    }
+
+    fn complete(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("state snapshot queue lock is not poisoned");
+        state.in_flight -= 1;
+        self.changed.notify_all();
+    }
+
+    fn close(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("state snapshot queue lock is not poisoned");
+        state.accepting = false;
+        self.changed.notify_all();
+    }
+}
+
+struct ActiveStateSnapshotTask(Arc<AtomicUsize>);
+
+impl Drop for ActiveStateSnapshotTask {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct StateSnapshotWriter {
+    queue: Arc<StateSnapshotQueue>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl StateSnapshotWriter {
+    fn is_finished(&self) -> bool {
+        self.worker.as_ref().is_some_and(JoinHandle::is_finished)
+    }
+
+    fn join(mut self) -> thread::Result<()> {
+        self.queue.close();
+        self.worker
+            .take()
+            .expect("state snapshot worker exists")
+            .join()
+    }
+}
+
+impl Drop for StateSnapshotWriter {
+    fn drop(&mut self) {
+        // A cache can be dropped without an explicit storage shutdown. Wake the worker so its
+        // detached handle cannot leave a persistent thread blocked on an empty queue.
+        self.queue.close();
+    }
+}
+
+impl std::fmt::Debug for StateSnapshotWriter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StateSnapshotWriter")
+            .field("worker", &self.worker)
+            .finish_non_exhaustive()
+    }
+}
+
 /// In-memory LRU cache for beacon node (gossip validation + beacon storage).
 #[derive(Debug)]
 pub struct BeaconCacheDB {
@@ -116,9 +254,13 @@ pub struct BeaconCacheDB {
     /// Serializes vote flushes and removals without blocking readers on a DB write.
     pub(crate) latest_messages_write_lock: Mutex<()>,
     storage_tasks: Mutex<Vec<JoinHandle<()>>>,
+    state_snapshot_writer: Mutex<Option<StateSnapshotWriter>>,
+    active_state_snapshot_tasks: Arc<AtomicUsize>,
     accepting_storage_writes: StorageRwLock<bool>,
     /// Whether finalized states are being pruned on another thread.
     pub pruning_states: AtomicBool,
+    #[cfg(test)]
+    state_snapshot_test_gate: Arc<(Mutex<bool>, Condvar)>,
 }
 
 /// Records `key` in `seen` and returns whether it was not there yet. Gossip messages are
@@ -205,11 +347,71 @@ impl BeaconCacheDB {
             pending_latest_messages: Mutex::default(),
             latest_messages_write_lock: Mutex::default(),
             storage_tasks: Mutex::default(),
+            state_snapshot_writer: Mutex::default(),
+            active_state_snapshot_tasks: Arc::new(AtomicUsize::new(0)),
             accepting_storage_writes: StorageRwLock::new(true),
             checkpoint_states: Mutex::new(LruCache::new(
                 NonZeroUsize::new(CHECKPOINT_STATE_CACHE_SIZE).expect("Invalid cache size"),
             )),
+            #[cfg(test)]
+            state_snapshot_test_gate: Arc::new((Mutex::new(false), Condvar::new())),
         }
+    }
+
+    fn start_state_snapshot_writer(&self) -> std::io::Result<Arc<StateSnapshotQueue>> {
+        let mut writer = self
+            .state_snapshot_writer
+            .lock()
+            .expect("state snapshot writer lock is not poisoned");
+        if writer
+            .as_ref()
+            .is_some_and(StateSnapshotWriter::is_finished)
+        {
+            let finished = writer.take().expect("finished writer exists");
+            finished
+                .join()
+                .map_err(|_| std::io::Error::other("state snapshot worker panicked"))?;
+        }
+        if let Some(writer) = writer.as_ref() {
+            return Ok(writer.queue.clone());
+        }
+
+        let queue = Arc::new(StateSnapshotQueue::new());
+        let worker_queue = queue.clone();
+        let active = self.active_state_snapshot_tasks.clone();
+        let worker = thread::Builder::new()
+            .name("state-snapshot-writer".to_string())
+            .spawn(move || {
+                while let Some(task) = worker_queue.next() {
+                    active.fetch_add(1, Ordering::AcqRel);
+                    let _active = ActiveStateSnapshotTask(active.clone());
+                    if task() {
+                        worker_queue.complete();
+                    }
+                }
+            })?;
+        *writer = Some(StateSnapshotWriter {
+            queue: queue.clone(),
+            worker: Some(worker),
+        });
+        Ok(queue)
+    }
+
+    /// Enqueues one state snapshot with backpressure. `before_enqueue` publishes the state to the
+    /// pending overlay while the queue is locked, before the worker can start the task.
+    pub(crate) fn enqueue_state_snapshot(
+        &self,
+        before_enqueue: impl FnOnce(),
+        task: impl FnOnce() -> bool + Send + 'static,
+    ) -> std::io::Result<()> {
+        let queue = match self.start_state_snapshot_writer() {
+            Ok(queue) => queue,
+            Err(err) => {
+                before_enqueue();
+                return Err(err);
+            }
+        };
+        queue.enqueue(before_enqueue, Box::new(task))
     }
 
     pub(crate) fn spawn_storage_task(
@@ -282,13 +484,21 @@ impl BeaconCacheDB {
 
     /// Call after stopping producers. Do not hold a pending/cache lock while joining workers.
     pub(crate) fn join_storage_tasks(&self) -> Result<(), crate::errors::StoreError> {
+        let snapshot_writer = self
+            .state_snapshot_writer
+            .lock()
+            .expect("state snapshot writer lock is not poisoned")
+            .take();
+        let mut panicked = false;
+        if let Some(writer) = snapshot_writer {
+            panicked |= writer.join().is_err();
+        }
         let tasks = std::mem::take(
             &mut *self
                 .storage_tasks
                 .lock()
                 .expect("storage tasks lock is not poisoned"),
         );
-        let mut panicked = false;
         for task in tasks {
             panicked |= task.join().is_err();
         }
@@ -296,6 +506,42 @@ impl BeaconCacheDB {
             return Err(std::io::Error::other("storage worker panicked").into());
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_state_snapshot_writes(&self) {
+        *self
+            .state_snapshot_test_gate
+            .0
+            .lock()
+            .expect("state snapshot test gate is not poisoned") = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_state_snapshot_writes(&self) {
+        let (blocked, changed) = &*self.state_snapshot_test_gate;
+        *blocked
+            .lock()
+            .expect("state snapshot test gate is not poisoned") = false;
+        changed.notify_all();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_state_snapshot_test_gate(&self) {
+        let (blocked, changed) = &*self.state_snapshot_test_gate;
+        let mut blocked = blocked
+            .lock()
+            .expect("state snapshot test gate is not poisoned");
+        while *blocked {
+            blocked = changed
+                .wait(blocked)
+                .expect("state snapshot test gate is not poisoned");
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_state_snapshot_tasks(&self) -> usize {
+        self.active_state_snapshot_tasks.load(Ordering::Acquire)
     }
 }
 

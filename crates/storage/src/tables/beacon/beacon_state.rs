@@ -604,21 +604,37 @@ impl BeaconStateTable {
         let Some(cache) = self.cache.clone() else {
             return self.store_whole_if_recorded(block_root, &state);
         };
-        self.set_pending(block_root, &state);
         let table = Self {
             db: self.db.clone(),
             data_dir: self.data_dir.clone(),
             cache: Some(cache.clone()),
         };
-        if let Err(err) = cache.spawn_storage_task(move || {
-            if let Err(err) = table.store_whole_if_recorded(block_root, &state) {
-                warn!("Failed to store state {block_root}: {err:?}");
-                return;
-            }
-            table.clear_pending(block_root, &state);
-        }) {
-            // Its summary and pending snapshot already make the accepted state readable.
-            warn!("Failed to start state writer {block_root}: {err:?}");
+        let pending_cache = cache.clone();
+        let pending_state = state.clone();
+        #[cfg(test)]
+        let worker_cache = cache.clone();
+        if let Err(err) = cache.enqueue_state_snapshot(
+            move || {
+                pending_cache
+                    .pending_state_snapshots
+                    .lock()
+                    .expect("pending state snapshots lock is not poisoned")
+                    .insert(block_root, pending_state);
+            },
+            move || {
+                #[cfg(test)]
+                worker_cache.wait_for_state_snapshot_test_gate();
+                if let Err(err) = table.store_whole_if_recorded(block_root, &state) {
+                    warn!("Failed to store state {block_root}: {err:?}");
+                    return false;
+                }
+                table.clear_pending(block_root, &state);
+                true
+            },
+        ) {
+            // The committed summary remains replayable if shutdown closed the queue before this
+            // state was admitted. A writer-start failure retains the state in the pending overlay.
+            warn!("Failed to enqueue state snapshot {block_root}: {err:?}");
         }
         Ok(())
     }
@@ -700,7 +716,11 @@ pub(crate) fn drop_state_in_background(state: Arc<BeaconState>) {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        path::PathBuf,
+        thread,
+        time::{Duration, Instant},
+    };
 
     use ream_consensus_beacon::electra::beacon_block::{BeaconBlock, SignedBeaconBlock};
     use ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH;
@@ -709,7 +729,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        cache::BeaconCacheDB,
+        cache::{BeaconCacheDB, STATE_SNAPSHOT_PENDING_LIMIT},
         db::{ReamDB, beacon::BeaconDB},
         test_utils::sepolia_state,
     };
@@ -954,5 +974,87 @@ mod tests {
         let err = db.state_provider().get_shared(parent_root).unwrap_err();
         assert!(matches!(err, StoreError::StateCorruption(_)));
         assert!(err.to_string().contains("replayed state"));
+    }
+
+    #[test]
+    fn snapshot_writer_bounds_workers_and_pending_states() {
+        let dir = TempDir::new("ream_bounded_state_snapshots").unwrap();
+        let cache = Arc::new(BeaconCacheDB::new());
+        cache.block_state_snapshot_writes();
+        let db = ReamDB::new(dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap()
+            .with_cache(cache.clone());
+        let states = db.state_provider();
+        let state_count = STATE_SNAPSHOT_PENDING_LIMIT + 3;
+        let mut expected = Vec::with_capacity(state_count);
+        let mut schedulers = Vec::with_capacity(state_count);
+
+        for index in 0..state_count {
+            let root = B256::repeat_byte(index as u8 + 1);
+            let mut state = Arc::unwrap_or_clone(sepolia_state());
+            state.slot += index as u64;
+            let state = Arc::new(state);
+            states
+                .summaries()
+                .insert(
+                    root,
+                    StateSummary {
+                        slot: state.slot,
+                        stored_whole: false,
+                    },
+                )
+                .unwrap();
+            states.cache_state(root, state.clone());
+            expected.push((root, state.clone()));
+
+            let table = BeaconStateTable {
+                db: states.db.clone(),
+                data_dir: states.data_dir.clone(),
+                cache: states.cache.clone(),
+            };
+            schedulers.push(thread::spawn(move || {
+                table.store_whole_in_background(root, state)
+            }));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline
+            && (cache.active_state_snapshot_tasks() != 1
+                || cache.pending_state_snapshots.lock().unwrap().len()
+                    != STATE_SNAPSHOT_PENDING_LIMIT)
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let active = cache.active_state_snapshot_tasks();
+        let pending = cache.pending_state_snapshots.lock().unwrap().len();
+        let all_replayable = expected
+            .iter()
+            .all(|(root, _)| !states.is_stored_whole(*root).unwrap());
+        let all_readable = expected.iter().all(|(root, expected_state)| {
+            states
+                .get_shared(*root)
+                .is_ok_and(|state| state.is_some_and(|state| Arc::ptr_eq(&state, expected_state)))
+        });
+
+        cache.release_state_snapshot_writes();
+        let all_scheduled = schedulers
+            .into_iter()
+            .all(|scheduler| scheduler.join().is_ok_and(|result| result.is_ok()));
+        db.flush_pending_writes().unwrap();
+
+        assert_eq!(active, 1);
+        assert_eq!(pending, STATE_SNAPSHOT_PENDING_LIMIT);
+        assert!(all_replayable);
+        assert!(all_readable);
+        assert!(all_scheduled);
+        assert_eq!(cache.active_state_snapshot_tasks(), 0);
+        assert!(cache.pending_state_snapshots.lock().unwrap().is_empty());
+        assert!(
+            expected
+                .iter()
+                .all(|(root, _)| states.is_stored_whole(*root).unwrap())
+        );
     }
 }
