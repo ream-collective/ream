@@ -124,9 +124,26 @@ impl<State> DataAvailabilityChecker<State> {
         received
     }
 
+    /// Whether a block is available once half of all columns are verified and stored. Any half
+    /// determines every blob, so a custody set larger than half rebuilds the rest after import.
+    pub fn completes_at_half(&self) -> bool {
+        self.required_columns.len() as u64 > NUMBER_OF_COLUMNS / 2
+    }
+
+    /// Whether importing `block_root` now would leave required columns to rebuild: the block
+    /// completes at half the columns and this checker has not counted every required one. Columns
+    /// on disk that it has not counted are unknown here, so an absent entry counts as lacking.
+    pub fn lacks_required_columns(&self, block_root: &B256) -> bool {
+        self.completes_at_half()
+            && self
+                .entries
+                .get(block_root)
+                .is_none_or(|entry| !self.required_columns.is_subset(&entry.received_columns))
+    }
+
     /// Whether at least half of all columns are stored for `block_root` and can seed recovery.
     pub fn can_reconstruct(&self, block_root: &B256) -> bool {
-        self.required_columns.len() as u64 > NUMBER_OF_COLUMNS / 2
+        self.completes_at_half()
             && self.entries.get(block_root).is_some_and(|entry| {
                 entry.received_columns.len() as u64 >= NUMBER_OF_COLUMNS / 2
                     && !self.required_columns.is_subset(&entry.received_columns)
@@ -183,7 +200,7 @@ impl<State> DataAvailabilityChecker<State> {
             return true;
         }
 
-        if self.required_columns.len() as u64 > NUMBER_OF_COLUMNS / 2 {
+        if self.completes_at_half() {
             entry.received_columns.len() as u64 >= NUMBER_OF_COLUMNS / 2
         } else {
             self.required_columns.is_subset(&entry.received_columns)
@@ -387,6 +404,30 @@ mod tests {
         assert_eq!(checker.status(&root), AvailabilityEntryStatus::Complete);
         assert!(checker.can_reconstruct(&root));
         assert!(checker.take_if_complete(root).is_some());
+    }
+
+    #[test]
+    fn only_a_block_completing_at_half_with_uncounted_columns_lacks_required_columns() {
+        let mut supernode = DataAvailabilityChecker::<()>::supernode();
+        let root = B256::repeat_byte(18);
+        assert!(
+            supernode.lacks_required_columns(&root),
+            "columns on disk are not counted without an entry"
+        );
+        for index in 0..NUMBER_OF_COLUMNS / 2 {
+            supernode.add_column(root, index, 10);
+        }
+        assert!(supernode.lacks_required_columns(&root));
+        for index in NUMBER_OF_COLUMNS / 2..NUMBER_OF_COLUMNS {
+            supernode.add_column(root, index, 10);
+        }
+        assert!(!supernode.lacks_required_columns(&root));
+
+        let small = checker(&[0, 1, 2]);
+        assert!(
+            !small.lacks_required_columns(&root),
+            "a small custody set imports only with every required column"
+        );
     }
 
     #[test]

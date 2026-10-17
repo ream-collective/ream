@@ -187,6 +187,22 @@ async fn insert_pending_gossip_item<BlockPayload>(
             if is_block && retained {
                 unknown_parent_lookups.block_deferred_elsewhere(block_root);
             }
+            if !is_block && retained {
+                // The block event may have been handled while this column was still validating.
+                // Reconcile after insertion so an earlier event cannot leave it waiting forever.
+                let reconciliation =
+                    reconcile_block_lookup_state(beacon_chain, vec![block_root]).await;
+                if reconciliation.imported_roots.contains(&block_root) {
+                    block_lookup_coordinator.parent_imported(block_root);
+                    unknown_parent_lookups.block_imported(block_root);
+                } else if reconciliation
+                    .pending_availability_roots
+                    .contains(&block_root)
+                {
+                    block_lookup_coordinator.mark_block_pending_availability(block_root);
+                    unknown_parent_lookups.block_pending_availability(block_root);
+                }
+            }
         }
         Err(err) => {
             error!("Failed to read current slot for pending gossip: {err}")
