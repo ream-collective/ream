@@ -504,10 +504,9 @@ impl BeaconChain {
     }
 
     async fn reconstruct_data_columns_inner(&self, block_root: B256) -> anyhow::Result<()> {
-        let Some(block) = self.db.block_provider().get(block_root)? else {
-            return Ok(());
-        };
-        let header = block.signed_header();
+        // The 64th column announces reconstruction while its caller still holds the store lock
+        // and has not stored the block yet. Taking the lock first waits for that import, so the
+        // block read below finds the block.
         let required_columns = self
             .store
             .lock()
@@ -515,6 +514,10 @@ impl BeaconChain {
             .data_availability_checker
             .required_columns()
             .clone();
+        let Some(block) = self.db.block_provider().get(block_root)? else {
+            return Ok(());
+        };
+        let header = block.signed_header();
         let provider = self.db.column_sidecars_provider();
         let expected_header = header.clone();
         let recovered = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -526,7 +529,15 @@ impl BeaconChain {
                     available.push(sidecar);
                 }
             }
-            if available.len() < (NUMBER_OF_COLUMNS / 2) as usize {
+            // Gossip often delivers every column before this runs; then there is nothing to
+            // rebuild.
+            let stored = available
+                .iter()
+                .map(|sidecar| sidecar.index)
+                .collect::<HashSet<_>>();
+            if available.len() < (NUMBER_OF_COLUMNS / 2) as usize
+                || required_columns.is_subset(&stored)
+            {
                 return Ok(Vec::new());
             }
             let available = available.iter().collect::<Vec<_>>();
@@ -889,6 +900,45 @@ mod tests {
             events.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn reconstruction_announced_before_the_block_is_stored_still_runs() {
+        let (_data_dir, chain) = test_chain();
+        let chain = Arc::new(chain);
+        let block = empty_block();
+        let root = block.message.tree_hash_root();
+        let columns = empty_block_columns(&block);
+        let provider = chain.db.column_sidecars_provider();
+        provider
+            .insert_batch(columns[..(NUMBER_OF_COLUMNS / 2) as usize].to_vec())
+            .unwrap();
+
+        // The 64th column's import holds the store lock, announces reconstruction, then stores
+        // the block. The reconstruction must not run before that block is stored.
+        let store = chain.store.lock().await;
+        let task = tokio::spawn({
+            let chain = chain.clone();
+            async move { chain.reconstruct_data_columns(root).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        chain
+            .db
+            .block_provider()
+            .insert(root, block.clone())
+            .unwrap();
+        drop(store);
+        task.await.unwrap().unwrap();
+
+        for index in 0..NUMBER_OF_COLUMNS {
+            assert!(
+                provider
+                    .get(ColumnIdentifier::new(root, index))
+                    .unwrap()
+                    .is_some(),
+                "column {index} was not rebuilt"
+            );
+        }
     }
 
     #[tokio::test]
