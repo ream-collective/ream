@@ -10,7 +10,7 @@ use ream_consensus_misc::{
 };
 use ream_fork_choice_beacon::store::get_checkpoint_block_from_db;
 use ream_storage::{
-    cache::{AtestationKey, BeaconCacheDB},
+    cache::{AtestationKey, BeaconCacheDB, insert_if_unseen},
     tables::table::REDBTable,
 };
 use ream_validator_beacon::attestation::compute_subnet_for_attestation;
@@ -49,16 +49,19 @@ pub async fn validate_beacon_attestation(
         ));
     }
 
-    // Only clone the state when it has to be advanced to the attestation's slot.
-    let advanced_state: BeaconState;
-    let state: &BeaconState = if head.state.slot < attestation.data.slot {
-        let mut advanced = BeaconState::clone(&head.state);
-        advanced.process_slots(attestation.data.slot)?;
-        advanced_state = advanced;
-        &advanced_state
-    } else {
-        &head.state
-    };
+    // The head state fixes committees up to one epoch past its own. Advancing a copy further
+    // costs an epoch transition, about a second on mainnet, for every message, which stalls the
+    // network loop while the node catches up; such attestations are ignored until the head
+    // moves.
+    if !head
+        .state
+        .determines_committees_of(compute_epoch_at_slot(attestation.data.slot))
+    {
+        return Ok(ValidationResult::Ignore(
+            "Head state is too far behind to compute the attestation's committee".to_string(),
+        ));
+    }
+    let state: &BeaconState = &head.state;
 
     let committee_index = attestation.committee_index;
     let committees_per_slot = state.get_committee_count_per_slot(attestation.data.target.epoch);
@@ -130,29 +133,15 @@ pub async fn validate_beacon_attestation(
         .contains(&attestation_key)
     {
         return Ok(ValidationResult::Ignore(
-            "There has been no other valid attestation seen".to_string(),
+            "An attestation from this validator for this subnet and target epoch has already been seen".to_string(),
         ));
     }
 
-    // [REJECT] The signature of attestation is valid.
-    let validator = state
-        .validators
-        .get(attestation.attester_index as usize)
-        .ok_or_else(|| anyhow!("Could not get validator"))?;
-
-    let domain = state.get_domain(DOMAIN_BEACON_ATTESTER, Some(attestation.data.target.epoch));
-    let signing_root = compute_signing_root(&attestation.data, domain);
-
-    let signature_valid = attestation
-        .signature
-        .verify(&validator.public_key, signing_root.as_slice())?;
-
-    if !signature_valid {
-        return Ok(ValidationResult::Reject(
-            "Invalid attestation signature".to_string(),
-        ));
-    }
-
+    // The database checks below are far cheaper than a BLS verification, so they run first:
+    // a node that is behind ignores most attestations for unseen blocks. The spec lists the
+    // signature check first, so an invalid signature for an unseen block is ignored here rather
+    // than rejected. Lighthouse v8.2.0 does the same: `verify_early_checks` requires a known head
+    // block before `verify_slashable` checks the signature.
     // [IGNORE] The block being voted for (aggregate.data.beacon_block_root) has been seen (via
     // gossip or non-gossip sources) (a client MAY queue aggregates for processing once block is
     // retrieved).
@@ -195,11 +184,30 @@ pub async fn validate_beacon_attestation(
         ));
     }
 
-    cached_db
-        .seen_attestations
-        .write()
-        .await
-        .put(attestation_key, ());
+    // [REJECT] The signature of attestation is valid.
+    let validator = state
+        .validators
+        .get(attestation.attester_index as usize)
+        .ok_or_else(|| anyhow!("Could not get validator"))?;
+
+    let domain = state.get_domain(DOMAIN_BEACON_ATTESTER, Some(attestation.data.target.epoch));
+    let signing_root = compute_signing_root(&attestation.data, domain);
+
+    let signature_valid = attestation
+        .signature
+        .verify(&validator.public_key, signing_root.as_slice())?;
+
+    if !signature_valid {
+        return Ok(ValidationResult::Reject(
+            "Invalid attestation signature".to_string(),
+        ));
+    }
+
+    if !insert_if_unseen(&cached_db.seen_attestations, attestation_key).await {
+        return Ok(ValidationResult::Ignore(
+            "An attestation from this validator for this subnet and target epoch has already been seen".to_string(),
+        ));
+    }
     Ok(ValidationResult::Accept)
 }
 

@@ -4,7 +4,10 @@ use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::{
     data_column_sidecar::DataColumnSidecar, electra::beacon_state::BeaconState,
 };
-use ream_consensus_misc::{constants::beacon::GENESIS_SLOT, misc::compute_start_slot_at_epoch};
+use ream_consensus_misc::{
+    constants::beacon::GENESIS_SLOT,
+    misc::{compute_epoch_at_slot, compute_start_slot_at_epoch},
+};
 #[cfg(not(feature = "disable_ancestor_validation"))]
 use ream_fork_choice_beacon::store::get_checkpoint_block_from_db;
 use ream_metrics::{
@@ -250,14 +253,22 @@ async fn validate_data_column_sidecar_full_inner(
 
     let pending_availability = match proposer_check {
         Some((state, pending_availability)) => {
-            let mut state = Arc::unwrap_or_clone(state);
-            if let Err(err) = state.process_slots(header.slot) {
-                return Ok(ValidationResult::Ignore(format!(
-                    "Could not advance parent state to sidecar slot: {err:?}"
-                )));
-            }
+            // The parent state's proposer lookahead covers this epoch and the next, so the 128
+            // columns of a block need no advanced copy of it. Only a parent more than an epoch
+            // older than the sidecar is advanced.
+            let expected = if state.determines_proposers_of(compute_epoch_at_slot(header.slot)) {
+                state.get_beacon_proposer_index(Some(header.slot))
+            } else {
+                let mut state = Arc::unwrap_or_clone(state);
+                if let Err(err) = state.process_slots(header.slot) {
+                    return Ok(ValidationResult::Ignore(format!(
+                        "Could not advance parent state to sidecar slot: {err:?}"
+                    )));
+                }
+                state.get_beacon_proposer_index(None)
+            };
 
-            match state.get_beacon_proposer_index(None) {
+            match expected {
                 Ok(expected_index) if expected_index == header.proposer_index => {}
                 Ok(expected_index) => {
                     return Ok(ValidationResult::Reject(format!(

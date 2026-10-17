@@ -1,13 +1,15 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use anyhow::ensure;
 pub use libp2p::gossipsub::{Message, MessageAcceptance};
 use ream_chain_beacon::beacon_chain::{BeaconChain, BlockProcessingOutcome};
 use ream_consensus_beacon::{
     blob_sidecar::BlobIdentifier, data_column_sidecar::DATA_COLUMN_SIDECAR_SUBNET_COUNT,
-    electra::beacon_state::BeaconState, single_attestation::SingleAttestation,
+    single_attestation::SingleAttestation,
 };
-use ream_consensus_misc::constants::beacon::{
-    MIN_ATTESTATION_INCLUSION_DELAY, genesis_validators_root,
+use ream_consensus_misc::{
+    constants::beacon::{MIN_ATTESTATION_INCLUSION_DELAY, genesis_validators_root},
+    misc::compute_epoch_at_slot,
 };
 use ream_execution_rpc_types::get_blobs::BlobAndProofV1;
 use ream_network_spec::networks::beacon_network_spec;
@@ -144,13 +146,14 @@ async fn import_gossip_attestation(
     // Nothing here needs the store lock: the head snapshot is published by the writers and the
     // operation pool is independently synchronized.
     let head = beacon_chain.head()?;
-    let attestation = if head.state.slot < single_attestation.data.slot {
-        let mut state = BeaconState::clone(&head.state);
-        state.process_slots(single_attestation.data.slot)?;
-        single_attestation_to_attestation(single_attestation, &state)?
-    } else {
-        single_attestation_to_attestation(single_attestation, &head.state)?
-    };
+    // Validation accepted the attestation against a head at most this old, so the head state
+    // fixes its committee without being advanced.
+    ensure!(
+        head.state
+            .determines_committees_of(compute_epoch_at_slot(single_attestation.data.slot)),
+        "Head state is too far behind to compute the attestation's committee"
+    );
+    let attestation = single_attestation_to_attestation(single_attestation, &head.state)?;
 
     beacon_chain
         .operation_pool()
@@ -160,7 +163,9 @@ async fn import_gossip_attestation(
         head.current_slot >= single_attestation.data.slot + MIN_ATTESTATION_INCLUSION_DELAY;
 
     if should_process_attestation {
-        beacon_chain.process_attestation(attestation, false).await?;
+        beacon_chain
+            .process_gossip_attestation(attestation, single_attestation.attester_index)
+            .await?;
     }
 
     Ok(())
@@ -640,6 +645,7 @@ pub async fn handle_gossipsub_message(
 
                 match validate_light_client_finality_update(
                     &light_client_finality_update,
+                    beacon_chain,
                     cached_db,
                 )
                 .await
@@ -685,9 +691,6 @@ pub async fn handle_gossipsub_message(
                                 p2p_sender,
                                 light_client_optimistic_update.as_ssz_bytes(),
                             );
-
-                            *cached_db.forwarded_optimistic_update_slot.write().await =
-                                Some(light_client_optimistic_update.attested_header.beacon.slot);
                         }
                         ValidationResult::Ignore(reason) => {
                             info!("Light client optimistic update ignored: {reason}");

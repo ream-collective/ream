@@ -1,6 +1,6 @@
 use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::voluntary_exit::SignedVoluntaryExit;
-use ream_storage::cache::BeaconCacheDB;
+use ream_storage::cache::{BeaconCacheDB, insert_if_unseen};
 
 use super::result::ValidationResult;
 
@@ -33,11 +33,16 @@ pub async fn validate_voluntary_exit(
         )));
     }
 
-    cached_db
-        .seen_voluntary_exit
-        .write()
-        .await
-        .put(voluntary_exit.message.validator_index, ());
+    if !insert_if_unseen(
+        &cached_db.seen_voluntary_exit,
+        voluntary_exit.message.validator_index,
+    )
+    .await
+    {
+        return Ok(ValidationResult::Ignore(
+            "A voluntary exit for this validator has already been seen".to_string(),
+        ));
+    }
 
     Ok(ValidationResult::Accept)
 }

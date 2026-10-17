@@ -6820,6 +6820,7 @@ dependencies = [
  "ream-sync-committee-pool",
  "ream-syncer",
  "ream-validator-beacon",
+ "snap",
  "ssz_types",
  "tempfile",
  "tokio",

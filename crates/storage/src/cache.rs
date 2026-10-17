@@ -23,6 +23,7 @@ use ream_consensus_misc::{
     constants::beacon::{SLOTS_PER_EPOCH, SYNC_COMMITTEE_SIZE},
 };
 use ream_light_client::finality_update::LightClientFinalityUpdate;
+use ssz_types::{BitVector, typenum::U128};
 use tokio::sync::RwLock;
 const LRU_CACHE_SIZE: usize = 64;
 // Every block carries a sidecar per column, so the seen set must hold at least a full block's
@@ -236,7 +237,13 @@ pub struct BeaconCacheDB {
     pub seen_attestations: RwLock<LruCache<AtestationKey, ()>>,
     pub seen_bls_to_execution_change: RwLock<LruCache<AddressValidaterIndexIdentifier, ()>>,
     pub seen_sync_messages: RwLock<LruCache<SyncCommitteeKey, ()>>,
-    pub seen_sync_committee_contributions: RwLock<LruCache<CacheSyncCommitteeContribution, ()>>,
+    /// Aggregation bits of the valid contributions seen per slot, block root and subcommittee.
+    pub seen_sync_committee_contributions:
+        RwLock<LruCache<CacheSyncCommitteeContribution, Vec<BitVector<U128>>>>,
+    /// Aggregators whose contribution was accepted, keyed by subcommittee, slot and aggregator.
+    /// Kept apart from `seen_sync_messages` because an aggregator also sends its own sync
+    /// committee message on the same subnet and slot.
+    pub seen_sync_contribution_aggregators: RwLock<LruCache<SyncCommitteeKey, ()>>,
     pub seen_forwarded_finality_update_slot: RwLock<Option<(u64, bool)>>,
     pub seen_voluntary_exit: RwLock<LruCache<u64, ()>>,
     pub seen_proposer_slashings: RwLock<LruCache<u64, ()>>,
@@ -276,6 +283,17 @@ pub async fn insert_if_unseen<K: std::hash::Hash + Eq>(
     }
     seen.put(key, ());
     true
+}
+
+/// Whether a bitfield in `seen` has every bit of `bits` set: the spec's `is_non_strict_superset`.
+pub fn is_non_strict_superset(seen: &[BitVector<U128>], bits: &BitVector<U128>) -> bool {
+    seen.iter().any(|prior| bits.is_subset(prior))
+}
+
+/// Adds `bits` to `seen`, dropping the bitfields it covers since `bits` now answers for them.
+pub fn record_aggregation_bits(seen: &mut Vec<BitVector<U128>>, bits: &BitVector<U128>) {
+    seen.retain(|prior| !prior.is_subset(bits));
+    seen.push(bits.clone());
 }
 
 impl BeaconCacheDB {
@@ -326,6 +344,10 @@ impl BeaconCacheDB {
             )
             .into(),
             seen_sync_committee_contributions: LruCache::new(
+                NonZeroUsize::new(SYNC_COMMITTEE_SIZE as usize).expect("Invalid cache size"),
+            )
+            .into(),
+            seen_sync_contribution_aggregators: LruCache::new(
                 NonZeroUsize::new(SYNC_COMMITTEE_SIZE as usize).expect("Invalid cache size"),
             )
             .into(),
