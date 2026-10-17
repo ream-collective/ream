@@ -79,6 +79,9 @@ pub struct ReamDB {
     db: Arc<Database>,
     /// The votes database, opened by the first `init_beacon_db`.
     votes_db: Arc<Mutex<Option<Arc<Database>>>>,
+    /// Whether `init_beacon_db` has deleted the state files a crash left behind. Clones share it,
+    /// because a later call can run while a clone's writers have state files in flight.
+    state_files_checked: Arc<Mutex<bool>>,
     data_dir: PathBuf,
     bootstrap_cache: Arc<std::sync::Mutex<Option<crate::tables::beacon::backfill::BackfillMode>>>,
 }
@@ -99,6 +102,7 @@ impl ReamDB {
         Ok(ReamDB {
             db: Arc::new(db),
             votes_db: Arc::default(),
+            state_files_checked: Arc::default(),
             data_dir,
             bootstrap_cache: Default::default(),
         })
@@ -131,6 +135,7 @@ impl ReamDB {
         fs::create_dir_all(self.data_dir.join(COLUMN_FOLDER_NAME))?;
         fs::create_dir_all(self.data_dir.join(STATE_FOLDER_NAME))?;
         fs::File::open(&self.data_dir)?.sync_all()?;
+        self.remove_unrecorded_state_files()?;
 
         Ok(BeaconDB {
             db: self.db.clone(),
@@ -139,6 +144,27 @@ impl ReamDB {
             cache: None,
             bootstrap_cache: self.bootstrap_cache.clone(),
         })
+    }
+
+    /// Deletes the state files that a crash left behind: temporary files and files whose summary
+    /// was never committed. This runs once, before any writer of this database has started, so no
+    /// file can belong to a running write.
+    fn remove_unrecorded_state_files(&self) -> Result<(), StoreError> {
+        let mut checked = self
+            .state_files_checked
+            .lock()
+            .expect("state files lock is not poisoned");
+        if *checked {
+            return Ok(());
+        }
+        BeaconStateTable {
+            db: self.db.clone(),
+            data_dir: self.data_dir.clone(),
+            cache: None,
+        }
+        .remove_unrecorded_state_files()?;
+        *checked = true;
+        Ok(())
     }
 
     /// The votes database, opened on first use. Latest messages that earlier versions kept in
@@ -277,6 +303,63 @@ mod tests {
     use tempdir::TempDir;
 
     use super::*;
+    use crate::test_utils::sepolia_state;
+
+    /// Stores one recorded state file, then adds `leftover`, a file a crash left in the state
+    /// directory, and reopens the database. Checks that only the recorded file is left.
+    fn reopen_with_leftover_state_file(dir: &Path, leftover: &str) -> (ReamDB, BeaconDB) {
+        let recorded_root = B256::repeat_byte(1);
+        {
+            let db = ReamDB::new(dir.to_path_buf())
+                .unwrap()
+                .init_beacon_db()
+                .unwrap();
+            db.state_provider()
+                .insert_shared(recorded_root, sepolia_state())
+                .unwrap();
+        }
+        let states = dir.join(STATE_FOLDER_NAME);
+        let recorded = states.join(format!("{recorded_root}.ssz_snappy"));
+        fs::copy(&recorded, states.join(leftover)).unwrap();
+
+        let ream_db = ReamDB::new(dir.to_path_buf()).unwrap();
+        let db = ream_db.init_beacon_db().unwrap();
+        assert!(!states.join(leftover).exists());
+        assert!(recorded.exists());
+        // Reading the state back would also check it against its block, which this test does not
+        // store; the summary still marking it whole is what the cleanup must preserve.
+        assert!(db.state_provider().is_stored_whole(recorded_root).unwrap());
+        (ream_db, db)
+    }
+
+    #[test]
+    fn reopening_deletes_a_stale_temporary_state_file() {
+        let dir = TempDir::new("ream_stale_state_temp").unwrap();
+        // A crash while writing a state leaves its temporary file.
+        let (ream_db, _db) = reopen_with_leftover_state_file(dir.path(), ".tmpA1b2C3");
+
+        // Only the first `init_beacon_db` scans: a later one can run while writers have a
+        // temporary file in flight.
+        let in_flight = dir.path().join(STATE_FOLDER_NAME).join(".tmpD4e5F6");
+        fs::write(&in_flight, b"in flight").unwrap();
+        ream_db.clone().init_beacon_db().unwrap();
+        assert!(in_flight.exists());
+    }
+
+    #[test]
+    fn reopening_deletes_an_unrecorded_state_file() {
+        let dir = TempDir::new("ream_unrecorded_state").unwrap();
+        // A crash after a state file's rename but before its summary commit leaves a final
+        // filename that no summary records.
+        let unrecorded_root = B256::repeat_byte(2);
+        let (_ream_db, db) =
+            reopen_with_leftover_state_file(dir.path(), &format!("{unrecorded_root}.ssz_snappy"));
+        assert!(
+            !db.state_provider()
+                .is_stored_whole(unrecorded_root)
+                .unwrap()
+        );
+    }
 
     #[test]
     fn votes_in_the_main_database_move_to_their_own() {

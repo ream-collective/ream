@@ -362,6 +362,8 @@ impl BeaconDB {
         ReamDB {
             db: self.db.clone(),
             votes_db: Arc::new(std::sync::Mutex::new(Some(self.votes_db.clone()))),
+            // The state folder was emptied above.
+            state_files_checked: Arc::new(std::sync::Mutex::new(true)),
             data_dir: self.data_dir.clone(),
             bootstrap_cache: self.bootstrap_cache.clone(),
         }

@@ -355,7 +355,11 @@ impl BeaconStateTable {
     /// recording it, so each file is checked and deleted with the pending states locked: a
     /// temporary file found while nothing is pending, or a state file that is neither pending nor
     /// recorded, belongs to no running write.
-    fn remove_unrecorded_state_files(&self) -> Result<(), StoreError> {
+    ///
+    /// The state directory is synced at the end even when nothing was deleted here, so the
+    /// deletions `prune_finalized` makes just before calling this are durable too. Without the
+    /// sync a power loss could bring deleted files back.
+    pub(crate) fn remove_unrecorded_state_files(&self) -> Result<(), StoreError> {
         let no_pending = Mutex::default();
         let pending = self
             .cache
@@ -380,6 +384,7 @@ impl BeaconStateTable {
                 fs::remove_file(&path)?;
             }
         }
+        fs::File::open(self.data_dir.join(STATE_FOLDER_NAME))?.sync_all()?;
         Ok(())
     }
 
