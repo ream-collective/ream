@@ -24,6 +24,10 @@ use ream_executor::ReamExecutor;
 use ream_fork_choice_beacon::data_availability::{
     AvailabilityEntryStatus, DataAvailabilityChecker,
 };
+use ream_light_client::{
+    finality_update::LightClientFinalityUpdate, header::LightClientHeader,
+    optimistic_update::LightClientOptimisticUpdate,
+};
 use ream_mock_execution_engine::block_generator::{
     genesis_execution_payload, sample_blob_and_commitment,
 };
@@ -1717,5 +1721,55 @@ async fn test_rpc_column_fetch_rechecks_finality_before_import() {
             .expect("column lookup should succeed")
             .is_none(),
         "a column rejected at release must not enter served storage"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_a_valid_light_client_update_is_accepted_for_forwarding() {
+    let (mut harness, _genesis_state, _genesis_block) =
+        GossipLookupHarness::new("light_client_update_acceptance").await;
+    let mut attested_header = LightClientHeader::default();
+    attested_header.beacon.slot = 1;
+    *harness
+        .cached_db
+        .forwarded_light_client_finality_update
+        .write()
+        .await = Some(LightClientFinalityUpdate {
+        attested_header: attested_header.clone(),
+        finalized_header: LightClientHeader::default(),
+        finality_branch: Default::default(),
+        sync_aggregate: Default::default(),
+        signature_slot: 0,
+    });
+    let update = LightClientOptimisticUpdate {
+        attested_header,
+        sync_aggregate: Default::default(),
+        signature_slot: 0,
+    };
+
+    // Gossipsub forwards only what the handler reports as ACCEPT; the handler publishes nothing.
+    let (acceptance, _) = harness
+        .deliver(
+            GossipTopicKind::LightClientOptimisticUpdate,
+            update.as_ssz_bytes(),
+        )
+        .await;
+    assert!(
+        matches!(acceptance, MessageAcceptance::Accept),
+        "expected Accept, got {acceptance:?}"
+    );
+    assert!(harness.p2p_receiver.try_recv().is_err());
+
+    // A copy for an already forwarded slot is not forwarded again.
+    let (acceptance, _) = harness
+        .deliver(
+            GossipTopicKind::LightClientOptimisticUpdate,
+            update.as_ssz_bytes(),
+        )
+        .await;
+    assert!(
+        matches!(acceptance, MessageAcceptance::Ignore),
+        "expected Ignore, got {acceptance:?}"
     );
 }

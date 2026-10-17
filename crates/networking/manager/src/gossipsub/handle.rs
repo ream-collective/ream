@@ -174,6 +174,17 @@ fn message_acceptance(validation_result: &ValidationResult) -> MessageAcceptance
     }
 }
 
+/// Acceptance for the topics whose handler only reports a validation result. Gossipsub forwards a
+/// message only when it is reported as ACCEPT, so a valid message must be reported as ACCEPT.
+/// Rejections are still reported as IGNORE on these topics, so a validation bug here cannot get
+/// honest peers penalized.
+fn accepted_message_acceptance(validation_result: &ValidationResult) -> MessageAcceptance {
+    match validation_result {
+        ValidationResult::Accept => MessageAcceptance::Accept,
+        ValidationResult::Reject(_) | ValidationResult::Ignore(_) => MessageAcceptance::Ignore,
+    }
+}
+
 fn dependency_message_acceptance(
     validation_result: &DependencyValidationResult<impl Sized>,
 ) -> MessageAcceptance {
@@ -313,20 +324,24 @@ pub async fn handle_gossipsub_message(
                 )
                 .await
                 {
-                    Ok(validation_result) => match validation_result {
-                        ValidationResult::Accept => {}
-                        ValidationResult::Reject(reason) => {
-                            info!("BLS to Execution Change rejected: {reason}");
+                    Ok(validation_result) => {
+                        let acceptance = accepted_message_acceptance(&validation_result);
+                        match validation_result {
+                            ValidationResult::Accept => {}
+                            ValidationResult::Reject(reason) => {
+                                info!("BLS to Execution Change rejected: {reason}");
+                            }
+                            ValidationResult::Ignore(reason) => {
+                                debug!("BLS to Execution Change ignored: {reason}");
+                            }
                         }
-                        ValidationResult::Ignore(reason) => {
-                            debug!("BLS to Execution Change ignored: {reason}");
-                        }
-                    },
+                        acceptance
+                    }
                     Err(err) => {
                         error!("Could not validate BLS to Execution Change: {err}");
+                        MessageAcceptance::Ignore
                     }
                 }
-                MessageAcceptance::Ignore
             }
             GossipsubMessage::AggregateAndProof(aggregate_and_proof) => {
                 debug!(
@@ -337,20 +352,24 @@ pub async fn handle_gossipsub_message(
                 match validate_aggregate_and_proof(&aggregate_and_proof, beacon_chain, cached_db)
                     .await
                 {
-                    Ok(validation_result) => match validation_result {
-                        ValidationResult::Accept => {}
-                        ValidationResult::Reject(reason) => {
-                            info!("Aggregate and proof rejected: {reason}");
+                    Ok(validation_result) => {
+                        let acceptance = accepted_message_acceptance(&validation_result);
+                        match validation_result {
+                            ValidationResult::Accept => {}
+                            ValidationResult::Reject(reason) => {
+                                info!("Aggregate and proof rejected: {reason}");
+                            }
+                            ValidationResult::Ignore(reason) => {
+                                debug!("Aggregate and proof ignored: {reason}");
+                            }
                         }
-                        ValidationResult::Ignore(reason) => {
-                            debug!("Aggregate and proof ignored: {reason}");
-                        }
-                    },
+                        acceptance
+                    }
                     Err(err) => {
                         error!("Could not validate aggregate and proof: {err}");
+                        MessageAcceptance::Ignore
                     }
                 }
-                MessageAcceptance::Ignore
             }
             GossipsubMessage::SyncCommittee((sync_committee, subnet_id)) => {
                 trace!(
@@ -361,20 +380,24 @@ pub async fn handle_gossipsub_message(
                 match validate_sync_committee(&sync_committee, beacon_chain, subnet_id, cached_db)
                     .await
                 {
-                    Ok(validation_result) => match validation_result {
-                        ValidationResult::Accept => {}
-                        ValidationResult::Reject(reason) => {
-                            info!("Sync committee message rejected: {reason}");
+                    Ok(validation_result) => {
+                        let acceptance = accepted_message_acceptance(&validation_result);
+                        match validation_result {
+                            ValidationResult::Accept => {}
+                            ValidationResult::Reject(reason) => {
+                                info!("Sync committee message rejected: {reason}");
+                            }
+                            ValidationResult::Ignore(reason) => {
+                                trace!("Sync committee message ignored: {reason}");
+                            }
                         }
-                        ValidationResult::Ignore(reason) => {
-                            trace!("Sync committee message ignored: {reason}");
-                        }
-                    },
+                        acceptance
+                    }
                     Err(err) => {
                         error!("Could not validate sync committee message: {err}");
+                        MessageAcceptance::Ignore
                     }
                 }
-                MessageAcceptance::Ignore
             }
             GossipsubMessage::SyncCommitteeContributionAndProof(signed_contribution_and_proof) => {
                 debug!(
@@ -389,21 +412,25 @@ pub async fn handle_gossipsub_message(
                 )
                 .await
                 {
-                    Ok(validation_result) => match validation_result {
-                        ValidationResult::Accept => {}
+                    Ok(validation_result) => {
+                        let acceptance = accepted_message_acceptance(&validation_result);
+                        match validation_result {
+                            ValidationResult::Accept => {}
 
-                        ValidationResult::Reject(reason) => {
-                            info!("Sync committee contribution and proof rejected: {reason}");
+                            ValidationResult::Reject(reason) => {
+                                info!("Sync committee contribution and proof rejected: {reason}");
+                            }
+                            ValidationResult::Ignore(reason) => {
+                                debug!("Sync committee contribution and proof ignored: {reason}");
+                            }
                         }
-                        ValidationResult::Ignore(reason) => {
-                            debug!("Sync committee contribution and proof ignored: {reason}");
-                        }
-                    },
+                        acceptance
+                    }
                     Err(err) => {
                         error!("Could not validate sync committee contribution and proof: {err}");
+                        MessageAcceptance::Ignore
                     }
                 }
-                MessageAcceptance::Ignore
             }
             GossipsubMessage::AttesterSlashing(attester_slashing) => {
                 debug!(
@@ -413,27 +440,31 @@ pub async fn handle_gossipsub_message(
 
                 match validate_attester_slashing(&attester_slashing, beacon_chain, cached_db).await
                 {
-                    Ok(validation_result) => match validation_result {
-                        ValidationResult::Accept => {
-                            if let Err(err) = beacon_chain
-                                .process_attester_slashing(*attester_slashing)
-                                .await
-                            {
-                                error!("Failed to process gossipsub attester slashing: {err}");
+                    Ok(validation_result) => {
+                        let acceptance = accepted_message_acceptance(&validation_result);
+                        match validation_result {
+                            ValidationResult::Accept => {
+                                if let Err(err) = beacon_chain
+                                    .process_attester_slashing(*attester_slashing)
+                                    .await
+                                {
+                                    error!("Failed to process gossipsub attester slashing: {err}");
+                                }
+                            }
+                            ValidationResult::Reject(reason) => {
+                                info!("Attester slashing rejected: {reason}");
+                            }
+                            ValidationResult::Ignore(reason) => {
+                                debug!("Attester slashing ignored: {reason}");
                             }
                         }
-                        ValidationResult::Reject(reason) => {
-                            info!("Attester slashing rejected: {reason}");
-                        }
-                        ValidationResult::Ignore(reason) => {
-                            debug!("Attester slashing ignored: {reason}");
-                        }
-                    },
+                        acceptance
+                    }
                     Err(err) => {
                         error!("Could not validate attester slashing: {err}");
+                        MessageAcceptance::Ignore
                     }
                 }
-                MessageAcceptance::Ignore
             }
             GossipsubMessage::ProposerSlashing(proposer_slashing) => {
                 debug!(
@@ -443,20 +474,24 @@ pub async fn handle_gossipsub_message(
 
                 match validate_proposer_slashing(&proposer_slashing, beacon_chain, cached_db).await
                 {
-                    Ok(validation_result) => match validation_result {
-                        ValidationResult::Accept => {}
-                        ValidationResult::Reject(reason) => {
-                            info!("Proposer slashing rejected: {reason}");
+                    Ok(validation_result) => {
+                        let acceptance = accepted_message_acceptance(&validation_result);
+                        match validation_result {
+                            ValidationResult::Accept => {}
+                            ValidationResult::Reject(reason) => {
+                                info!("Proposer slashing rejected: {reason}");
+                            }
+                            ValidationResult::Ignore(reason) => {
+                                debug!("Proposer slashing ignored: {reason}");
+                            }
                         }
-                        ValidationResult::Ignore(reason) => {
-                            debug!("Proposer slashing ignored: {reason}");
-                        }
-                    },
+                        acceptance
+                    }
                     Err(err) => {
                         error!("Could not validate proposer slashing: {err}");
+                        MessageAcceptance::Ignore
                     }
                 }
-                MessageAcceptance::Ignore
             }
             GossipsubMessage::BlobSidecar(blob_sidecar) => {
                 debug!(
@@ -471,40 +506,47 @@ pub async fn handle_gossipsub_message(
                 )
                 .await
                 {
-                    Ok(validation_result) => match validation_result {
-                        ValidationResult::Accept => {
-                            let provider = beacon_chain.db().blobs_and_proofs_provider();
-                            let insert_result = tokio::task::spawn_blocking(move || {
-                                provider.insert(
-                                    BlobIdentifier::new(
-                                        blob_sidecar.signed_block_header.message.tree_hash_root(),
-                                        blob_sidecar.index,
-                                    ),
-                                    BlobAndProofV1 {
-                                        blob: blob_sidecar.blob,
-                                        proof: blob_sidecar.kzg_proof,
-                                    },
-                                )
-                            })
-                            .await;
-                            match insert_result {
-                                Ok(Ok(())) => {}
-                                Ok(Err(err)) => error!("Failed to insert blob_sidecar: {err}"),
-                                Err(err) => error!("Blob persistence task failed: {err}"),
+                    Ok(validation_result) => {
+                        let acceptance = accepted_message_acceptance(&validation_result);
+                        match validation_result {
+                            ValidationResult::Accept => {
+                                let provider = beacon_chain.db().blobs_and_proofs_provider();
+                                let insert_result = tokio::task::spawn_blocking(move || {
+                                    provider.insert(
+                                        BlobIdentifier::new(
+                                            blob_sidecar
+                                                .signed_block_header
+                                                .message
+                                                .tree_hash_root(),
+                                            blob_sidecar.index,
+                                        ),
+                                        BlobAndProofV1 {
+                                            blob: blob_sidecar.blob,
+                                            proof: blob_sidecar.kzg_proof,
+                                        },
+                                    )
+                                })
+                                .await;
+                                match insert_result {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(err)) => error!("Failed to insert blob_sidecar: {err}"),
+                                    Err(err) => error!("Blob persistence task failed: {err}"),
+                                }
+                            }
+                            ValidationResult::Reject(reason) => {
+                                info!("Blob_sidecar rejected: {reason}");
+                            }
+                            ValidationResult::Ignore(reason) => {
+                                debug!("Blob_sidecar ignored: {reason}");
                             }
                         }
-                        ValidationResult::Reject(reason) => {
-                            info!("Blob_sidecar rejected: {reason}");
-                        }
-                        ValidationResult::Ignore(reason) => {
-                            debug!("Blob_sidecar ignored: {reason}");
-                        }
-                    },
+                        acceptance
+                    }
                     Err(err) => {
                         error!("Could not validate blob_sidecar: {err}");
+                        MessageAcceptance::Ignore
                     }
                 }
-                MessageAcceptance::Ignore
             }
             GossipsubMessage::DataColumnSidecar(data_column_sidecar) => {
                 debug!(
@@ -595,20 +637,24 @@ pub async fn handle_gossipsub_message(
                 )
                 .await
                 {
-                    Ok(validation_result) => match validation_result {
-                        ValidationResult::Accept => {}
-                        ValidationResult::Reject(reason) => {
-                            info!("Light client finality update rejected: {reason}");
+                    Ok(validation_result) => {
+                        let acceptance = accepted_message_acceptance(&validation_result);
+                        match validation_result {
+                            ValidationResult::Accept => {}
+                            ValidationResult::Reject(reason) => {
+                                info!("Light client finality update rejected: {reason}");
+                            }
+                            ValidationResult::Ignore(reason) => {
+                                debug!("Light client finality update ignored: {reason}");
+                            }
                         }
-                        ValidationResult::Ignore(reason) => {
-                            debug!("Light client finality update ignored: {reason}");
-                        }
-                    },
+                        acceptance
+                    }
                     Err(err) => {
                         error!("Could not validate light client finality update: {err}");
+                        MessageAcceptance::Ignore
                     }
                 }
-                MessageAcceptance::Ignore
             }
             GossipsubMessage::LightClientOptimisticUpdate(light_client_optimistic_update) => {
                 debug!(
@@ -623,20 +669,24 @@ pub async fn handle_gossipsub_message(
                 )
                 .await
                 {
-                    Ok(validation_result) => match validation_result {
-                        ValidationResult::Accept => {}
-                        ValidationResult::Ignore(reason) => {
-                            debug!("Light client optimistic update ignored: {reason}");
+                    Ok(validation_result) => {
+                        let acceptance = accepted_message_acceptance(&validation_result);
+                        match validation_result {
+                            ValidationResult::Accept => {}
+                            ValidationResult::Ignore(reason) => {
+                                debug!("Light client optimistic update ignored: {reason}");
+                            }
+                            ValidationResult::Reject(reason) => {
+                                info!("Light client optimistic update rejected: {reason}");
+                            }
                         }
-                        ValidationResult::Reject(reason) => {
-                            info!("Light client optimistic update rejected: {reason}");
-                        }
-                    },
+                        acceptance
+                    }
                     Err(err) => {
                         error!("Could not validate light client optimistic update: {err}");
+                        MessageAcceptance::Ignore
                     }
                 }
-                MessageAcceptance::Ignore
             }
             GossipsubMessage::VoluntaryExit(voluntary_exit) => {
                 debug!(
@@ -645,20 +695,24 @@ pub async fn handle_gossipsub_message(
                 );
 
                 match validate_voluntary_exit(&voluntary_exit, beacon_chain, cached_db).await {
-                    Ok(validation_result) => match validation_result {
-                        ValidationResult::Accept => {}
-                        ValidationResult::Reject(reason) => {
-                            info!("voluntary_exit rejected: {reason}");
+                    Ok(validation_result) => {
+                        let acceptance = accepted_message_acceptance(&validation_result);
+                        match validation_result {
+                            ValidationResult::Accept => {}
+                            ValidationResult::Reject(reason) => {
+                                info!("voluntary_exit rejected: {reason}");
+                            }
+                            ValidationResult::Ignore(reason) => {
+                                debug!("voluntary_exit ignored: {reason}");
+                            }
                         }
-                        ValidationResult::Ignore(reason) => {
-                            debug!("voluntary_exit ignored: {reason}");
-                        }
-                    },
+                        acceptance
+                    }
                     Err(err) => {
                         error!("Could not validate voluntary_exit: {err}");
+                        MessageAcceptance::Ignore
                     }
                 }
-                MessageAcceptance::Ignore
             }
         },
         Err(err) => {
@@ -754,5 +808,21 @@ mod tests {
             matches!(acceptance, MessageAcceptance::Reject),
             "expected Reject, got {acceptance:?}"
         );
+    }
+
+    #[test]
+    fn only_a_passed_validation_is_forwarded_on_report_only_topics() {
+        assert!(matches!(
+            accepted_message_acceptance(&ValidationResult::Accept),
+            MessageAcceptance::Accept
+        ));
+        assert!(matches!(
+            accepted_message_acceptance(&ValidationResult::Ignore("seen".to_string())),
+            MessageAcceptance::Ignore
+        ));
+        assert!(matches!(
+            accepted_message_acceptance(&ValidationResult::Reject("invalid".to_string())),
+            MessageAcceptance::Ignore
+        ));
     }
 }
