@@ -257,6 +257,15 @@ impl Store {
     }
 
     pub fn get_ancestor(&self, root: B256, slot: u64) -> anyhow::Result<B256> {
+        // Unfinalized blocks are in the fork choice tree, so their ancestry is resolved without
+        // reading and decoding each block from the database.
+        if let Some(ancestor) = self
+            .fork_choice
+            .as_ref()
+            .and_then(|tree| tree.ancestor(root, slot))
+        {
+            return Ok(ancestor);
+        }
         let block = self
             .db
             .block_provider()
