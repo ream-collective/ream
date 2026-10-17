@@ -9,6 +9,7 @@ use std::{
 };
 
 use alloy_primitives::hex;
+use anyhow::{anyhow, bail};
 use bip39::Mnemonic;
 use libp2p_identity::secp256k1;
 use ream::{
@@ -49,7 +50,7 @@ use ream_consensus_misc::{
 };
 use ream_events_beacon::BeaconEvent;
 use ream_execution_engine::ExecutionEngine;
-use ream_executor::ReamExecutor;
+use ream_executor::{ReamExecutor, TaskCancelled};
 use ream_fork_choice_lean::{
     genesis::setup_genesis,
     store::{Store, compute_subnet_id},
@@ -99,6 +100,7 @@ use ream_validator_lean::{
 use ssz_types::VariableList;
 use tokio::{
     sync::{broadcast, mpsc::unbounded_channel},
+    task::JoinError,
     time::{self, Instant},
 };
 use tracing::{Instrument, error, info};
@@ -122,9 +124,60 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
+/// How a task spawned with `ReamExecutor::spawn` ended: a panic or abort, the executor's
+/// cancellation, or the task's own result.
+type JoinedTask = Result<anyhow::Result<anyhow::Result<()>>, JoinError>;
+
+/// The node's result once one of its services has stopped. Services run until shutdown, so the
+/// cancellation sent by `shutdown_signal` is the only clean stop.
+fn service_stopped(service: &str, joined: JoinedTask) -> anyhow::Result<()> {
+    match joined {
+        Ok(Err(err)) if err.is::<TaskCancelled>() => {
+            info!("{service} service stopped for shutdown");
+            Ok(())
+        }
+        Ok(Ok(Err(err)) | Err(err)) => Err(err.context(format!("{service} service failed"))),
+        Ok(Ok(Ok(()))) => bail!("{service} service stopped unexpectedly"),
+        Err(err) if err.is_panic() => bail!("{service} service panicked: {err}"),
+        Err(err) => bail!("{service} service was aborted: {err}"),
+    }
+}
+
+/// The result of the command `main` ran. A node returns only after `service_stopped` has judged
+/// a stopped service, and the other commands return `Ok` when they are done. The command's own
+/// cancellation by `shutdown_signal` is a clean stop.
+fn command_result(joined: JoinedTask) -> anyhow::Result<()> {
+    match joined {
+        Ok(Ok(result)) => result,
+        Ok(Err(err)) if err.is::<TaskCancelled>() => Ok(()),
+        Ok(Err(err)) => Err(err),
+        Err(err) if err.is_panic() => Err(anyhow!("service panicked: {err}")),
+        Err(err) => Err(anyhow!("service was aborted: {err}")),
+    }
+}
+
+/// Waits for an explicit shutdown request, SIGINT or, on Unix, SIGTERM, and returns its name.
+async fn shutdown_requested() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate = signal(SignalKind::terminate()).expect("unable to listen for SIGTERM");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => "SIGINT",
+            _ = terminate.recv() => "SIGTERM",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "Ctrl-C"
+    }
+}
+
 /// Entry point for the Ream client. Initializes logging, parses CLI arguments, and runs the
 /// appropriate node type (beacon node, validator node, or account manager) based on the command
-/// line arguments. Handles graceful shutdown on Ctrl-C.
+/// line arguments. Handles graceful shutdown on SIGINT and SIGTERM.
 fn main() {
     let cli = Cli::parse_validated();
 
@@ -174,25 +227,28 @@ fn main() {
         Commands::ValidatorNode(config) => {
             executor_clone.spawn(async move { run_validator_node(*config, executor).await })
         }
-        Commands::AccountManager(config) => {
-            executor_clone.spawn(async move { run_account_manager(*config, ream_directory).await })
-        }
-        Commands::VoluntaryExit(config) => {
-            executor_clone.spawn(async move { run_voluntary_exit(*config).await })
-        }
-        Commands::GeneratePrivateKey(config) => {
-            executor_clone.spawn(async move { run_generate_private_key(*config).await })
-        }
+        Commands::AccountManager(config) => executor_clone.spawn(async move {
+            run_account_manager(*config, ream_directory).await;
+            Ok(())
+        }),
+        Commands::VoluntaryExit(config) => executor_clone.spawn(async move {
+            run_voluntary_exit(*config).await;
+            Ok(())
+        }),
+        Commands::GeneratePrivateKey(config) => executor_clone.spawn(async move {
+            run_generate_private_key(*config).await;
+            Ok(())
+        }),
         Commands::GenerateKeystore(config) => {
             run_generate_validator_registry(*config).expect("failed to generate hash-sig keystore");
             process::exit(0);
         }
     };
 
-    let service_failed = executor_clone.runtime().block_on(async {
-        let service_result = tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                info!("Ctrl-C received, shutting down...");
+    let service_result = executor_clone.runtime().block_on(async {
+        let joined = tokio::select! {
+            signal = shutdown_requested() => {
+                info!("{signal} received, shutting down...");
                 None
             }
             result = &mut task_handle => {
@@ -202,12 +258,12 @@ fn main() {
         };
 
         executor_clone.shutdown_signal();
-        match service_result {
-            // Ctrl-C: a clean cancellation is fine, a service panic is not.
-            None => task_handle.await.is_err(),
-            // A panicking service must not look like a clean exit to supervisors.
-            Some(result) => result.is_err(),
-        }
+        // A shutdown request does not make the command's result clean: a panic or a failed
+        // service racing with the signal still fails the process.
+        command_result(match joined {
+            None => task_handle.await,
+            Some(result) => result,
+        })
     });
 
     executor_clone.shutdown_runtime();
@@ -219,8 +275,8 @@ fn main() {
         process::exit(1);
     }
 
-    if service_failed {
-        error!("Service failed; exiting with an error");
+    if let Err(err) = service_result {
+        error!("Service failed; exiting with an error: {err:?}");
         process::exit(1);
     }
     process::exit(0);
@@ -235,7 +291,14 @@ fn main() {
 /// is used by all services.
 ///
 /// Besides the shared state, each service holds the channels to communicate with each other.
-pub async fn run_lean_node(config: LeanNodeConfig, executor: ReamExecutor, ream_db: ReamDB) {
+///
+/// Returns only when a service stops: `Ok` for the cancellation sent by `shutdown_signal`, an
+/// error for anything else.
+pub async fn run_lean_node(
+    config: LeanNodeConfig,
+    executor: ReamExecutor,
+    ream_db: ReamDB,
+) -> anyhow::Result<()> {
     info!("starting up lean node...");
 
     // Shadow sim only: install the fake-XMSS / sim-cost backend before any
@@ -386,9 +449,8 @@ pub async fn run_lean_node(config: LeanNodeConfig, executor: ReamExecutor, ream_
             network_state,
             aggregator_state,
         )
-        .await
-        .expect("Lean test-driver RPC service stopped unexpectedly");
-        return;
+        .await?;
+        bail!("Lean test-driver RPC service stopped unexpectedly");
     }
 
     // Initialize the lean network service
@@ -497,6 +559,7 @@ pub async fn run_lean_node(config: LeanNodeConfig, executor: ReamExecutor, ream_
                     aggregator_state,
                 )
                 .await
+                .map_err(anyhow::Error::from)
             }
             .in_current_span(),
         ),
@@ -507,18 +570,10 @@ pub async fn run_lean_node(config: LeanNodeConfig, executor: ReamExecutor, ream_
     });
 
     tokio::select! {
-        result = &mut chain_task.0 => {
-            error!("Chain service has stopped unexpectedly: {result:?}");
-        },
-        result = &mut network_task.0 => {
-            error!("Network service has stopped unexpectedly: {result:?}");
-        },
-        result = &mut validator_task.0 => {
-            error!("Validator service has stopped unexpectedly: {result:?}");
-        },
-        result = &mut http_task.0 => {
-            error!("RPC service has stopped unexpectedly: {result:?}");
-        }
+        result = &mut chain_task.0 => service_stopped("Chain", result),
+        result = &mut network_task.0 => service_stopped("Network", result),
+        result = &mut validator_task.0 => service_stopped("Validator", result),
+        result = &mut http_task.0 => service_stopped("RPC", result),
     }
 }
 
@@ -532,12 +587,15 @@ pub async fn run_lean_node(config: LeanNodeConfig, executor: ReamExecutor, ream_
 /// 2. The P2P network that handles peer discovery (discv5), gossiping (gossipsub) and Req/Resp API.
 ///
 /// The initialized database is sent on `storage_sender`, so `main` can drain its writes at exit.
+///
+/// Returns only when a service stops: `Ok` for the cancellation sent by `shutdown_signal`, an
+/// error for anything else.
 pub async fn run_beacon_node(
     config: BeaconNodeConfig,
     executor: ReamExecutor,
     ream_db: ReamDB,
     storage_sender: std::sync::mpsc::Sender<BeaconDB>,
-) {
+) -> anyhow::Result<()> {
     run_beacon_node_inner(
         config,
         executor,
@@ -547,7 +605,7 @@ pub async fn run_beacon_node(
         None,
         Some(storage_sender),
     )
-    .await;
+    .await
 }
 
 // `initialize_globals` is `false` only in tests, which set the globals themselves beforehand.
@@ -559,7 +617,7 @@ async fn run_beacon_node_inner(
     force_data_availability_checks: bool,
     gossipsub_history_length: Option<usize>,
     storage_sender: Option<std::sync::mpsc::Sender<BeaconDB>>,
-) {
+) -> anyhow::Result<()> {
     info!("starting up beacon node...");
 
     if config.enable_metrics {
@@ -711,6 +769,7 @@ async fn run_beacon_node_inner(
 
     let mut network_task = AbortOnDrop(executor.spawn(async move {
         network_manager.start().await;
+        anyhow::Ok(())
     }));
 
     let mut http_task = AbortOnDrop(executor.spawn(async move {
@@ -728,15 +787,12 @@ async fn run_beacon_node_inner(
             cache,
         )
         .await
+        .map_err(anyhow::Error::from)
     }));
 
     tokio::select! {
-        _ = &mut http_task.0 => {
-            info!("HTTP server stopped!");
-        },
-        _ = &mut network_task.0 => {
-            info!("Network future completed!");
-        },
+        result = &mut http_task.0 => service_stopped("HTTP", result),
+        result = &mut network_task.0 => service_stopped("Network", result),
     }
 }
 
@@ -747,7 +803,7 @@ async fn run_beacon_node_for_test(
     ream_db: ReamDB,
     force_data_availability_checks: bool,
     gossipsub_history_length: Option<usize>,
-) {
+) -> anyhow::Result<()> {
     run_beacon_node_inner(
         config,
         executor,
@@ -757,7 +813,7 @@ async fn run_beacon_node_for_test(
         gossipsub_history_length,
         None,
     )
-    .await;
+    .await
 }
 
 /// Runs the validator node.
@@ -765,15 +821,20 @@ async fn run_beacon_node_for_test(
 /// This function initializes the validator node by setting up the network specification,
 /// loading the keystores, and creating a validator service.
 /// It also starts the validator service.
-pub async fn run_validator_node(config: ValidatorNodeConfig, executor: ReamExecutor) {
-    run_validator_node_inner(config, executor, true).await;
+///
+/// The service runs until `shutdown_signal` cancels this task, so returning is always an error.
+pub async fn run_validator_node(
+    config: ValidatorNodeConfig,
+    executor: ReamExecutor,
+) -> anyhow::Result<()> {
+    run_validator_node_inner(config, executor, true).await
 }
 
 async fn run_validator_node_inner(
     config: ValidatorNodeConfig,
     executor: ReamExecutor,
     initialize_globals: bool,
-) {
+) -> anyhow::Result<()> {
     info!("starting up validator node...");
 
     if initialize_globals {
@@ -805,11 +866,15 @@ async fn run_validator_node_inner(
     .expect("Failed to create validator service");
 
     validator_service.start().await;
+    bail!("Validator service stopped unexpectedly")
 }
 
 #[cfg(test)]
-async fn run_validator_node_for_test(config: ValidatorNodeConfig, executor: ReamExecutor) {
-    run_validator_node_inner(config, executor, false).await;
+async fn run_validator_node_for_test(
+    config: ValidatorNodeConfig,
+    executor: ReamExecutor,
+) -> anyhow::Result<()> {
+    run_validator_node_inner(config, executor, false).await
 }
 
 /// Runs the account manager.
@@ -1048,6 +1113,85 @@ pub async fn countdown_for_genesis() {
 }
 
 #[cfg(test)]
+mod service_exit_tests {
+    use std::future::pending;
+
+    use super::*;
+
+    fn injected_panic() -> anyhow::Result<()> {
+        panic!("injected child panic")
+    }
+
+    /// Runs `child` next to a service that never stops, the way a node supervises its services,
+    /// and returns what `main` makes of the node's task.
+    fn node_with_child(
+        executor: &ReamExecutor,
+        child: impl Future<Output = anyhow::Result<()>> + Send + 'static,
+        shutdown: bool,
+    ) -> anyhow::Result<()> {
+        let node_executor = executor.clone();
+        let node = executor.spawn(async move {
+            let mut idle_task = AbortOnDrop(node_executor.spawn(pending::<anyhow::Result<()>>()));
+            let mut child_task = AbortOnDrop(node_executor.spawn(child));
+            tokio::select! {
+                result = &mut idle_task.0 => service_stopped("Idle", result),
+                result = &mut child_task.0 => service_stopped("Child", result),
+            }
+        });
+        executor.runtime().block_on(async {
+            if shutdown {
+                time::sleep(Duration::from_millis(50)).await;
+                executor.shutdown_signal();
+            }
+            command_result(node.await)
+        })
+    }
+
+    #[test]
+    fn a_child_service_error_fails_the_node() {
+        let executor = ReamExecutor::new().unwrap();
+        let error =
+            node_with_child(&executor, async { bail!("injected child error") }, false).unwrap_err();
+        assert!(format!("{error:#}").contains("Child service failed: injected child error"));
+    }
+
+    #[test]
+    fn a_child_service_panic_fails_the_node() {
+        let executor = ReamExecutor::new().unwrap();
+        let error = node_with_child(&executor, async { injected_panic() }, false).unwrap_err();
+        assert!(error.to_string().contains("Child service panicked"));
+    }
+
+    #[test]
+    fn a_child_service_that_returns_fails_the_node() {
+        let executor = ReamExecutor::new().unwrap();
+        let error = node_with_child(&executor, async { Ok(()) }, false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Child service stopped unexpectedly")
+        );
+    }
+
+    #[test]
+    fn shutdown_cancellation_is_a_clean_stop() {
+        let executor = ReamExecutor::new().unwrap();
+        node_with_child(&executor, pending(), true).unwrap();
+    }
+
+    #[test]
+    fn a_failed_command_is_not_hidden_by_shutdown() {
+        let executor = ReamExecutor::new().unwrap();
+        let command = executor.runtime().spawn(async { Ok(injected_panic()) });
+        let joined = executor.runtime().block_on(async {
+            executor.shutdown_signal();
+            command.await
+        });
+        assert!(command_result(joined).is_err());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     mod block_lookup_tests;
     mod checkpoint_bootstrap_tests;
@@ -1249,7 +1393,9 @@ mod tests {
         let span = info_span!("lean_node", node_id = %config.node_id);
         tokio::spawn(
             async move {
-                run_lean_node(config, executor, db).await;
+                if let Err(err) = run_lean_node(config, executor, db).await {
+                    warn!("Lean node stopped: {err:?}");
+                }
             }
             .instrument(span),
         )
@@ -1297,14 +1443,17 @@ mod tests {
         );
         tokio::spawn(
             async move {
-                run_beacon_node_for_test(
+                if let Err(err) = run_beacon_node_for_test(
                     config,
                     executor,
                     db,
                     force_data_availability_checks,
                     gossipsub_history_length,
                 )
-                .await;
+                .await
+                {
+                    warn!("Beacon node stopped: {err:?}");
+                }
             }
             .instrument(span),
         )
@@ -1768,7 +1917,9 @@ mod tests {
         let executor_for_task = executor.clone();
         executor.spawn(
             async move {
-                run_validator_node_for_test(config, executor_for_task).await;
+                if let Err(err) = run_validator_node_for_test(config, executor_for_task).await {
+                    warn!("Validator node stopped: {err:?}");
+                }
             }
             .instrument(span),
         )
@@ -3698,7 +3849,9 @@ mod tests {
 
         executor.runtime().block_on(async move {
             let handle = tokio::spawn(async move {
-                run_lean_node(*config, executor_handle, db).await;
+                if let Err(err) = run_lean_node(*config, executor_handle, db).await {
+                    warn!("Lean node stopped: {err:?}");
+                }
             });
 
             let result = timeout(Duration::from_secs(10), async {
@@ -3755,7 +3908,9 @@ mod tests {
         let cloned_db = db.clone();
         executor.runtime().block_on(async move {
             let handle = tokio::spawn(async move {
-                run_lean_node(*config, executor_handle, cloned_db).await;
+                if let Err(err) = run_lean_node(*config, executor_handle, cloned_db).await {
+                    warn!("Lean node stopped: {err:?}");
+                }
             });
 
             let result = timeout(Duration::from_secs(120), async {
@@ -3954,7 +4109,9 @@ mod tests {
                 let node_executor = executor.clone();
                 let db = db_instances[i].clone();
                 let handle = tokio::spawn(async move {
-                    run_lean_node(*config, node_executor, db).await;
+                    if let Err(err) = run_lean_node(*config, node_executor, db).await {
+                        warn!("Lean node stopped: {err:?}");
+                    }
                 });
                 node_handles.push(handle);
 
@@ -4188,7 +4345,9 @@ mod tests {
 
                 let handle = tokio::spawn(
                     async move {
-                        run_lean_node(config, node_executor, db).await;
+                        if let Err(err) = run_lean_node(config, node_executor, db).await {
+                            warn!("Lean node stopped: {err:?}");
+                        }
                     }
                     .instrument(span),
                 );
@@ -4224,7 +4383,9 @@ mod tests {
 
                     let handle = tokio::spawn(
                         async move {
-                            run_lean_node(config, node_executor, db).await;
+                            if let Err(err) = run_lean_node(config, node_executor, db).await {
+                                warn!("Lean node stopped: {err:?}");
+                            }
                         }
                         .instrument(span),
                     );
@@ -4528,12 +4689,14 @@ mod tests {
             );
             let node_2_handle = tokio::spawn(
                 async move {
-                    run_lean_node(
+                    if let Err(err) = run_lean_node(
                         node_2_configuration,
                         node_2_executor,
                         node_2_ream_database_for_task,
                     )
-                    .await;
+                    .await {
+                        warn!("Lean node stopped: {err:?}");
+                    }
                 }
                 .instrument(node_2_span),
             );

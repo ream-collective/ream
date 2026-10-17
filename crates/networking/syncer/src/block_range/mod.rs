@@ -2769,8 +2769,12 @@ mod tests {
         initialize_test_network_spec();
         let (_data_dir, beacon_chain) = test_beacon_chain();
 
+        // Stored whole states are checked against their block's state root.
         let common_block = SignedBeaconBlock {
-            message: BeaconBlock::default(),
+            message: BeaconBlock {
+                state_root: test_beacon_state().tree_hash_root(),
+                ..Default::default()
+            },
             signature: Default::default(),
         };
         let common_root = common_block.message.tree_hash_root();
@@ -4314,7 +4318,9 @@ mod tests {
         let (_dir, chain) = test_beacon_chain();
         let peer = PeerId::random();
         let parent = B256::repeat_byte(1);
-        let known = block(parent, 131);
+        let mut known = block(parent, 131);
+        // Stored whole states are checked against their block's state root.
+        known.message.state_root = test_beacon_state().tree_hash_root();
         let root = known.message.tree_hash_root();
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         let mut syncer = BlockRangeSyncer::new(

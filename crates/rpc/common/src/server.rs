@@ -83,6 +83,9 @@ impl RpcServerBuilder {
                 .configure(configure_all.clone())
         })
         .bind(self.http_socket_address)?
+        // The node handles SIGINT and SIGTERM and stops this server by cancelling its task, so
+        // the server ending on its own is always a failure.
+        .disable_signals()
         .run();
 
         server.await

@@ -425,6 +425,7 @@ thread_local! {
 mod tests {
     use ream_consensus_beacon::electra::beacon_block::BeaconBlock;
     use tempdir::TempDir;
+    use tree_hash::TreeHash;
 
     use super::*;
     use crate::{
@@ -563,7 +564,12 @@ mod tests {
             .join(format!("{root}.ssz_snappy"));
         let import = || BlockImportData {
             block_root: root,
-            block: signed_block(),
+            block: {
+                let mut block = signed_block();
+                block.message.slot = state.slot;
+                block.message.state_root = state.tree_hash_root();
+                block
+            },
             state: state.clone(),
             record: ForkChoiceRecord {
                 is_timely: true,

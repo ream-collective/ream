@@ -16,6 +16,7 @@ use redb::{
 use snap::raw::{Decoder, Encoder};
 use ssz::{Decode, Encode};
 use tracing::{info, warn};
+use tree_hash::TreeHash;
 
 use crate::{
     cache::BeaconCacheDB,
@@ -23,7 +24,6 @@ use crate::{
     tables::{
         beacon::{
             beacon_block::BeaconBlockTable,
-            slot_index::BeaconSlotIndexTable,
             state_summaries::{BeaconStateSummariesTable, StateSummary},
         },
         ssz_encoder::SSZEncoding,
@@ -323,15 +323,19 @@ impl BeaconStateTable {
                 summaries.remove(*root)?;
             }
 
-            // States stored in redb before whole states moved to files have no summary. Their
-            // blocks are in the slot index, which holds small values and is cheap to scan.
+            // States stored in redb before whole states moved to files have no summary. Scan the
+            // block table because it retains every fork root, unlike the one-root-per-slot index.
+            // The legacy state values are large, so never iterate that table directly.
             let mut legacy_states = write_txn.open_table(Self::TABLE_DEFINITION)?;
             if !legacy_states.is_empty()? {
-                let slot_index = write_txn.open_table(BeaconSlotIndexTable::TABLE_DEFINITION)?;
-                for entry in slot_index.range(..finalized.slot)? {
-                    let root = entry?.1.value();
-                    if legacy_states.remove(root)?.is_some() {
-                        old_roots.insert(root);
+                let blocks = write_txn.open_table(BeaconBlockTable::TABLE_DEFINITION)?;
+                for entry in blocks.iter()? {
+                    let (root, block) = entry?;
+                    if block.value().message.slot < finalized.slot {
+                        let root = root.value();
+                        if legacy_states.remove(root)?.is_some() {
+                            old_roots.insert(root);
+                        }
                     }
                 }
             }
@@ -351,7 +355,11 @@ impl BeaconStateTable {
     /// recording it, so each file is checked and deleted with the pending states locked: a
     /// temporary file found while nothing is pending, or a state file that is neither pending nor
     /// recorded, belongs to no running write.
-    fn remove_unrecorded_state_files(&self) -> Result<(), StoreError> {
+    ///
+    /// The state directory is synced at the end even when nothing was deleted here, so the
+    /// deletions `prune_finalized` makes just before calling this are durable too. Without the
+    /// sync a power loss could bring deleted files back.
+    pub(crate) fn remove_unrecorded_state_files(&self) -> Result<(), StoreError> {
         let no_pending = Mutex::default();
         let pending = self
             .cache
@@ -376,6 +384,7 @@ impl BeaconStateTable {
                 fs::remove_file(&path)?;
             }
         }
+        fs::File::open(self.data_dir.join(STATE_FOLDER_NAME))?.sync_all()?;
         Ok(())
     }
 
@@ -410,7 +419,9 @@ impl BeaconStateTable {
     ) -> Result<Option<Arc<BeaconState>>, StoreError> {
         let state = match summary {
             Some(summary) if summary.stored_whole => {
-                Some(read_state_file(&self.data_dir, block_root)?)
+                let state = read_state_file(&self.data_dir, block_root)?;
+                self.verify_state_root(block_root, &state)?;
+                Some(state)
             }
             Some(_) => None,
             None => {
@@ -493,7 +504,39 @@ impl BeaconStateTable {
             })?;
             pre_state_root = Some(block.message.state_root);
         }
+        let expected = to_replay
+            .first()
+            .expect("a rebuild always has at least the requested block")
+            .message
+            .state_root;
+        let actual = state.tree_hash_root();
+        if actual != expected {
+            return Err(StoreError::StateCorruption(format!(
+                "replayed state {block_root} has root {actual}, expected {expected}"
+            )));
+        }
         Ok(Some(state))
+    }
+
+    fn verify_state_root(&self, block_root: B256, state: &BeaconState) -> Result<(), StoreError> {
+        let block = BeaconBlockTable {
+            db: self.db.clone(),
+            cache: self.cache.clone(),
+        }
+        .get(block_root)?
+        .ok_or_else(|| {
+            StoreError::StateCorruption(format!(
+                "whole state {block_root} has no corresponding block"
+            ))
+        })?;
+        let expected = block.message.state_root;
+        let actual = state.tree_hash_root();
+        if actual != expected {
+            return Err(StoreError::StateCorruption(format!(
+                "whole state {block_root} has root {actual}, expected {expected}"
+            )));
+        }
+        Ok(())
     }
 
     /// Stores `state` whole and records it in its summary. While the write runs the state is
@@ -569,21 +612,37 @@ impl BeaconStateTable {
         let Some(cache) = self.cache.clone() else {
             return self.store_whole_if_recorded(block_root, &state);
         };
-        self.set_pending(block_root, &state);
         let table = Self {
             db: self.db.clone(),
             data_dir: self.data_dir.clone(),
             cache: Some(cache.clone()),
         };
-        if let Err(err) = cache.spawn_storage_task(move || {
-            if let Err(err) = table.store_whole_if_recorded(block_root, &state) {
-                warn!("Failed to store state {block_root}: {err:?}");
-                return;
-            }
-            table.clear_pending(block_root, &state);
-        }) {
-            // Its summary and pending snapshot already make the accepted state readable.
-            warn!("Failed to start state writer {block_root}: {err:?}");
+        let pending_cache = cache.clone();
+        let pending_state = state.clone();
+        #[cfg(test)]
+        let worker_cache = cache.clone();
+        if let Err(err) = cache.enqueue_state_snapshot(
+            move || {
+                pending_cache
+                    .pending_state_snapshots
+                    .lock()
+                    .expect("pending state snapshots lock is not poisoned")
+                    .insert(block_root, pending_state);
+            },
+            move || {
+                #[cfg(test)]
+                worker_cache.wait_for_state_snapshot_test_gate();
+                if let Err(err) = table.store_whole_if_recorded(block_root, &state) {
+                    warn!("Failed to store state {block_root}: {err:?}");
+                    return false;
+                }
+                table.clear_pending(block_root, &state);
+                true
+            },
+        ) {
+            // The committed summary remains replayable if shutdown closed the queue before this
+            // state was admitted. A writer-start failure retains the state in the pending overlay.
+            warn!("Failed to enqueue state snapshot {block_root}: {err:?}");
         }
         Ok(())
     }
@@ -665,17 +724,66 @@ pub(crate) fn drop_state_in_background(state: Arc<BeaconState>) {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        path::PathBuf,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use ream_consensus_beacon::electra::beacon_block::{BeaconBlock, SignedBeaconBlock};
     use ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH;
+    use ream_network_spec::networks::{SEPOLIA, set_beacon_network_spec};
     use tempdir::TempDir;
 
     use super::*;
-    use crate::{cache::BeaconCacheDB, db::ReamDB, test_utils::sepolia_state};
+    use crate::{
+        cache::{BeaconCacheDB, STATE_SNAPSHOT_PENDING_LIMIT},
+        db::{ReamDB, beacon::BeaconDB},
+        test_utils::sepolia_state,
+    };
 
     fn child_of(parent_root: B256, parent: &BeaconState, slot: u64) -> Arc<BeaconState> {
         let mut state = parent.clone();
         state.latest_block_header.parent_root = parent_root;
         state.slot = slot;
         Arc::new(state)
+    }
+
+    fn insert_block_for_state(db: &BeaconDB, root: B256, state: &BeaconState) {
+        db.block_provider()
+            .insert(
+                root,
+                SignedBeaconBlock {
+                    message: BeaconBlock {
+                        slot: state.slot,
+                        parent_root: state.latest_block_header.parent_root,
+                        state_root: state.tree_hash_root(),
+                        ..Default::default()
+                    },
+                    signature: Default::default(),
+                },
+            )
+            .unwrap();
+    }
+
+    fn sepolia_block(name: &str) -> SignedBeaconBlock {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../testing/gossip-validation/tests/assets/sepolia/blocks/{name}.ssz_snappy"
+        ));
+        let bytes = Decoder::new()
+            .decompress_vec(&fs::read(path).unwrap())
+            .unwrap();
+        SignedBeaconBlock::from_ssz_bytes(&bytes).unwrap()
+    }
+
+    fn sepolia_state_file(name: &str) -> Arc<BeaconState> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../testing/gossip-validation/tests/assets/sepolia/states/{name}.ssz_snappy"
+        ));
+        let bytes = Decoder::new()
+            .decompress_vec(&fs::read(path).unwrap())
+            .unwrap();
+        Arc::new(BeaconState::from_ssz_bytes(&bytes).unwrap())
     }
 
     /// The anchor has nothing to replay from and is stored whole; a child in the same epoch only
@@ -694,16 +802,19 @@ mod tests {
         let next_epoch_root = B256::repeat_byte(3);
         let file = |root: B256| state_file_path(dir.path(), root);
 
+        insert_block_for_state(&db, anchor_root, &anchor);
         states.insert_shared(anchor_root, anchor.clone()).unwrap();
         assert!(states.is_stored_whole(anchor_root).unwrap());
         assert!(file(anchor_root).exists());
 
         let same_epoch = child_of(anchor_root, &anchor, anchor.slot + 1);
+        insert_block_for_state(&db, same_epoch_root, &same_epoch);
         states.insert_shared(same_epoch_root, same_epoch).unwrap();
         assert!(!states.is_stored_whole(same_epoch_root).unwrap());
         assert!(!file(same_epoch_root).exists());
 
         let next_epoch = child_of(anchor_root, &anchor, anchor.slot + SLOTS_PER_EPOCH);
+        insert_block_for_state(&db, next_epoch_root, &next_epoch);
         states.insert_shared(next_epoch_root, next_epoch).unwrap();
         assert!(states.is_stored_whole(next_epoch_root).unwrap());
         assert!(file(next_epoch_root).exists());
@@ -727,6 +838,7 @@ mod tests {
         let anchor = sepolia_state();
         let root = B256::repeat_byte(1);
 
+        insert_block_for_state(&db, root, &anchor);
         db.state_provider()
             .insert_shared(root, anchor.clone())
             .unwrap();
@@ -774,6 +886,7 @@ mod tests {
             .unwrap();
         state.latest_block_header.parent_root = parent;
         let child = Arc::new(state);
+        insert_block_for_state(&db, root, &child);
 
         // Without a cache, the epoch snapshot is written synchronously and its error returned.
         let mut uncached = bad_db.state_provider();
@@ -802,5 +915,199 @@ mod tests {
             .unwrap();
         let stored = reopened.state_provider().get_shared(root).unwrap().unwrap();
         assert_eq!(stored.slot, 32);
+    }
+
+    #[test]
+    fn rejects_ssz_valid_state_file_with_the_wrong_root() {
+        let dir = TempDir::new("ream_corrupt_state_file").unwrap();
+        let db = ReamDB::new(dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap();
+        let root = B256::repeat_byte(0x81);
+        let state = sepolia_state();
+        insert_block_for_state(&db, root, &state);
+        db.state_provider()
+            .insert_shared(root, state.clone())
+            .unwrap();
+
+        let mut altered = Arc::unwrap_or_clone(state);
+        altered.genesis_time += 1;
+        write_state_file(dir.path(), root, &altered).unwrap();
+
+        let err = db.state_provider().get_shared(root).unwrap_err();
+        assert!(matches!(err, StoreError::StateCorruption(_)));
+        assert!(err.to_string().contains("whole state"));
+    }
+
+    #[test]
+    fn rejects_replay_result_with_the_wrong_root() {
+        set_beacon_network_spec(SEPOLIA.clone());
+        let dir = TempDir::new("ream_corrupt_state_replay").unwrap();
+        let db = ReamDB::new(dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap();
+        let grandparent_state = sepolia_state();
+        let parent_state = sepolia_state_file("parent_state_9552075");
+        let grandparent_block = sepolia_block("grandparent_9552074");
+        let grandparent_root = grandparent_block.message.tree_hash_root();
+        assert_eq!(
+            grandparent_block.message.state_root,
+            grandparent_state.tree_hash_root()
+        );
+
+        db.block_provider()
+            .insert(grandparent_root, grandparent_block)
+            .unwrap();
+        db.state_provider()
+            .insert_shared(grandparent_root, grandparent_state)
+            .unwrap();
+
+        let mut parent_block = sepolia_block("parent_9552075");
+        assert_eq!(parent_block.message.parent_root, grandparent_root);
+        assert_eq!(
+            parent_block.message.state_root,
+            parent_state.tree_hash_root()
+        );
+        parent_block.message.state_root = B256::repeat_byte(0x82);
+        let parent_root = parent_block.message.tree_hash_root();
+        db.block_provider()
+            .insert(parent_root, parent_block)
+            .unwrap();
+        db.state_provider()
+            .insert_shared(parent_root, parent_state)
+            .unwrap();
+
+        let err = db.state_provider().get_shared(parent_root).unwrap_err();
+        assert!(matches!(err, StoreError::StateCorruption(_)));
+        assert!(err.to_string().contains("replayed state"));
+    }
+
+    #[test]
+    fn snapshot_writer_bounds_workers_and_pending_states() {
+        let dir = TempDir::new("ream_bounded_state_snapshots").unwrap();
+        let cache = Arc::new(BeaconCacheDB::new());
+        cache.block_state_snapshot_writes();
+        let db = ReamDB::new(dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap()
+            .with_cache(cache.clone());
+        let states = db.state_provider();
+        let state_count = STATE_SNAPSHOT_PENDING_LIMIT + 3;
+        let mut expected = Vec::with_capacity(state_count);
+        let mut schedulers = Vec::with_capacity(state_count);
+
+        for index in 0..state_count {
+            let root = B256::repeat_byte(index as u8 + 1);
+            let mut state = Arc::unwrap_or_clone(sepolia_state());
+            state.slot += index as u64;
+            let state = Arc::new(state);
+            states
+                .summaries()
+                .insert(
+                    root,
+                    StateSummary {
+                        slot: state.slot,
+                        stored_whole: false,
+                    },
+                )
+                .unwrap();
+            states.cache_state(root, state.clone());
+            expected.push((root, state.clone()));
+
+            let table = BeaconStateTable {
+                db: states.db.clone(),
+                data_dir: states.data_dir.clone(),
+                cache: states.cache.clone(),
+            };
+            schedulers.push(thread::spawn(move || {
+                table.store_whole_in_background(root, state)
+            }));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline
+            && (cache.active_state_snapshot_tasks() != 1
+                || cache.pending_state_snapshots.lock().unwrap().len()
+                    != STATE_SNAPSHOT_PENDING_LIMIT)
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let active = cache.active_state_snapshot_tasks();
+        let pending = cache.pending_state_snapshots.lock().unwrap().len();
+        let all_replayable = expected
+            .iter()
+            .all(|(root, _)| !states.is_stored_whole(*root).unwrap());
+        let all_readable = expected.iter().all(|(root, expected_state)| {
+            states
+                .get_shared(*root)
+                .is_ok_and(|state| state.is_some_and(|state| Arc::ptr_eq(&state, expected_state)))
+        });
+
+        cache.release_state_snapshot_writes();
+        let all_scheduled = schedulers
+            .into_iter()
+            .all(|scheduler| scheduler.join().is_ok_and(|result| result.is_ok()));
+        db.flush_pending_writes().unwrap();
+
+        assert_eq!(active, 1);
+        assert_eq!(pending, STATE_SNAPSHOT_PENDING_LIMIT);
+        assert!(all_replayable);
+        assert!(all_readable);
+        assert!(all_scheduled);
+        assert_eq!(cache.active_state_snapshot_tasks(), 0);
+        assert!(cache.pending_state_snapshots.lock().unwrap().is_empty());
+        assert!(
+            expected
+                .iter()
+                .all(|(root, _)| states.is_stored_whole(*root).unwrap())
+        );
+    }
+
+    #[test]
+    fn prunes_all_legacy_states_at_a_duplicate_slot() {
+        let dir = TempDir::new("ream_legacy_fork_state_pruning").unwrap();
+        let db = ReamDB::new(dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap();
+        let states = db.state_provider();
+        let state = sepolia_state();
+        let first_root = B256::repeat_byte(0x91);
+        let second_root = B256::repeat_byte(0x92);
+        let finalized_root = B256::repeat_byte(0x93);
+
+        insert_block_for_state(&db, first_root, &state);
+        insert_block_for_state(&db, second_root, &state);
+        assert_eq!(
+            db.slot_index_provider().get(state.slot).unwrap(),
+            Some(second_root)
+        );
+
+        let write = db.db.begin_write().unwrap();
+        {
+            let mut legacy = write
+                .open_table(BeaconStateTable::TABLE_DEFINITION)
+                .unwrap();
+            legacy.insert(first_root, state.as_ref().clone()).unwrap();
+            legacy.insert(second_root, state.as_ref().clone()).unwrap();
+        }
+        write.commit().unwrap();
+        states
+            .summaries()
+            .insert(
+                finalized_root,
+                StateSummary {
+                    slot: state.slot + 1,
+                    stored_whole: true,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(states.prune_finalized(finalized_root).unwrap(), 2);
+        assert!(!states.contains_key(first_root).unwrap());
+        assert!(!states.contains_key(second_root).unwrap());
     }
 }
