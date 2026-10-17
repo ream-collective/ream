@@ -42,7 +42,7 @@ use tokio::{
     sync::mpsc,
     time::{interval, sleep},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use tree_hash::TreeHash;
 
 use crate::{
@@ -585,7 +585,7 @@ impl NetworkManagerService {
                                     let beacon_chain = beacon_chain.clone();
                                     tokio::spawn(async move {
                                         if let Err(err) = beacon_chain.reconstruct_data_columns(block_root).await {
-                                            debug!(%block_root, "Column reconstruction did not import: {err:#}");
+                                            error!(%block_root, "Column reconstruction failed: {err:#}");
                                         }
                                     });
                                 }
