@@ -138,7 +138,10 @@ pub async fn validate_beacon_attestation(
     }
 
     // The database checks below are far cheaper than a BLS verification, so they run first:
-    // a node that is behind ignores most attestations for unseen blocks.
+    // a node that is behind ignores most attestations for unseen blocks. The spec lists the
+    // signature check first, so an invalid signature for an unseen block is ignored here rather
+    // than rejected. Lighthouse v8.2.0 does the same: `verify_early_checks` requires a known head
+    // block before `verify_slashable` checks the signature.
     // [IGNORE] The block being voted for (aggregate.data.beacon_block_root) has been seen (via
     // gossip or non-gossip sources) (a client MAY queue aggregates for processing once block is
     // retrieved).

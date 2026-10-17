@@ -3,7 +3,7 @@ use std::{
     num::NonZeroUsize,
     sync::{Arc, Mutex, MutexGuard, RwLock as StorageRwLock, RwLockReadGuard, atomic::AtomicBool},
     thread::{self, JoinHandle},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use alloy_primitives::{B256, FixedBytes};
@@ -21,6 +21,7 @@ use ream_consensus_misc::{
     constants::beacon::{SLOTS_PER_EPOCH, SYNC_COMMITTEE_SIZE},
 };
 use ream_light_client::finality_update::LightClientFinalityUpdate;
+use ssz_types::{BitVector, typenum::U128};
 use tokio::sync::RwLock;
 const LRU_CACHE_SIZE: usize = 64;
 // Every block carries a sidecar per column, so the seen set must hold at least a full block's
@@ -79,13 +80,33 @@ pub struct ValidatedDataColumnHeader {
     pub finalized_checkpoint: Checkpoint,
 }
 
-/// Latest messages not yet written to the database, whether a write is running, and when the
-/// last write finished.
-#[derive(Debug, Default)]
+/// Latest messages not yet written to the database, whether a write is running, when the last
+/// write finished, and the shortest time from the end of one write to the start of the next.
+#[derive(Debug)]
 pub struct PendingLatestMessages {
     pub messages: HashMap<u64, LatestMessage>,
     pub flushing: bool,
     pub last_flush: Option<Instant>,
+    pub flush_interval: Duration,
+}
+
+impl Default for PendingLatestMessages {
+    /// One epoch of 12-second slots, until `BeaconDB::start_vote_flush_timer` sets the network's.
+    fn default() -> Self {
+        Self {
+            messages: HashMap::new(),
+            flushing: false,
+            last_flush: None,
+            flush_interval: Duration::from_secs(12 * SLOTS_PER_EPOCH),
+        }
+    }
+}
+
+/// Stops the vote flush timer when dropped or sent to, and joins its thread.
+#[derive(Debug)]
+pub(crate) struct VoteFlushTimer {
+    pub(crate) stop: std::sync::mpsc::Sender<()>,
+    pub(crate) thread: JoinHandle<()>,
 }
 
 /// In-memory LRU cache for beacon node (gossip validation + beacon storage).
@@ -101,7 +122,13 @@ pub struct BeaconCacheDB {
     pub seen_attestations: RwLock<LruCache<AtestationKey, ()>>,
     pub seen_bls_to_execution_change: RwLock<LruCache<AddressValidaterIndexIdentifier, ()>>,
     pub seen_sync_messages: RwLock<LruCache<SyncCommitteeKey, ()>>,
-    pub seen_sync_committee_contributions: RwLock<LruCache<CacheSyncCommitteeContribution, ()>>,
+    /// Aggregation bits of the valid contributions seen per slot, block root and subcommittee.
+    pub seen_sync_committee_contributions:
+        RwLock<LruCache<CacheSyncCommitteeContribution, Vec<BitVector<U128>>>>,
+    /// Aggregators whose contribution was accepted, keyed by subcommittee, slot and aggregator.
+    /// Kept apart from `seen_sync_messages` because an aggregator also sends its own sync
+    /// committee message on the same subnet and slot.
+    pub seen_sync_contribution_aggregators: RwLock<LruCache<SyncCommitteeKey, ()>>,
     pub seen_forwarded_finality_update_slot: RwLock<Option<(u64, bool)>>,
     pub seen_voluntary_exit: RwLock<LruCache<u64, ()>>,
     pub seen_proposer_slashings: RwLock<LruCache<u64, ()>>,
@@ -118,6 +145,8 @@ pub struct BeaconCacheDB {
     pub pending_latest_messages: Mutex<PendingLatestMessages>,
     /// Serializes vote flushes and removals without blocking readers on a DB write.
     pub(crate) latest_messages_write_lock: Mutex<()>,
+    /// Writes pending votes once inserts stop; see `BeaconDB::start_vote_flush_timer`.
+    pub(crate) vote_flush_timer: Mutex<Option<VoteFlushTimer>>,
     storage_tasks: Mutex<Vec<JoinHandle<()>>>,
     accepting_storage_writes: StorageRwLock<bool>,
     /// Whether finalized states are being pruned on another thread.
@@ -137,6 +166,17 @@ pub async fn insert_if_unseen<K: std::hash::Hash + Eq>(
     }
     seen.put(key, ());
     true
+}
+
+/// Whether a bitfield in `seen` has every bit of `bits` set: the spec's `is_non_strict_superset`.
+pub fn is_non_strict_superset(seen: &[BitVector<U128>], bits: &BitVector<U128>) -> bool {
+    seen.iter().any(|prior| bits.is_subset(prior))
+}
+
+/// Adds `bits` to `seen`, dropping the bitfields it covers since `bits` now answers for them.
+pub fn record_aggregation_bits(seen: &mut Vec<BitVector<U128>>, bits: &BitVector<U128>) {
+    seen.retain(|prior| !prior.is_subset(bits));
+    seen.push(bits.clone());
 }
 
 impl BeaconCacheDB {
@@ -190,6 +230,10 @@ impl BeaconCacheDB {
                 NonZeroUsize::new(SYNC_COMMITTEE_SIZE as usize).expect("Invalid cache size"),
             )
             .into(),
+            seen_sync_contribution_aggregators: LruCache::new(
+                NonZeroUsize::new(SYNC_COMMITTEE_SIZE as usize).expect("Invalid cache size"),
+            )
+            .into(),
             seen_forwarded_finality_update_slot: RwLock::new(None),
             forwarded_optimistic_update_slot: None.into(),
             forwarded_light_client_finality_update: None.into(),
@@ -207,6 +251,7 @@ impl BeaconCacheDB {
             pruning_states: AtomicBool::new(false),
             pending_latest_messages: Mutex::default(),
             latest_messages_write_lock: Mutex::default(),
+            vote_flush_timer: Mutex::default(),
             storage_tasks: Mutex::default(),
             accepting_storage_writes: StorageRwLock::new(true),
             checkpoint_states: Mutex::new(LruCache::new(
@@ -281,6 +326,22 @@ impl BeaconCacheDB {
             .accepting_storage_writes
             .write()
             .expect("storage write gate is not poisoned") = false;
+    }
+
+    /// Stops the vote flush timer and waits for its thread, which may be starting a write.
+    pub(crate) fn stop_vote_flush_timer(&self) -> Result<(), crate::errors::StoreError> {
+        let timer = self
+            .vote_flush_timer
+            .lock()
+            .expect("vote flush timer lock is not poisoned")
+            .take();
+        if let Some(VoteFlushTimer { stop, thread }) = timer {
+            drop(stop);
+            if thread.join().is_err() {
+                return Err(std::io::Error::other("vote flush timer panicked").into());
+            }
+        }
+        Ok(())
     }
 
     /// Call after stopping producers. Do not hold a pending/cache lock while joining workers.

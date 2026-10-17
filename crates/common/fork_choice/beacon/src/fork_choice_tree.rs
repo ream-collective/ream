@@ -129,6 +129,17 @@ impl ForkChoiceTree {
         self.nodes.is_empty()
     }
 
+    /// Returns roots in deterministic slot and root order.
+    pub fn roots_in_slot_range(&self, slots: std::ops::RangeInclusive<u64>) -> Vec<(u64, B256)> {
+        let mut roots = self
+            .nodes
+            .iter()
+            .filter_map(|(root, node)| slots.contains(&node.slot).then_some((node.slot, *root)))
+            .collect::<Vec<_>>();
+        roots.sort_unstable();
+        roots
+    }
+
     pub fn context(&self) -> &ViabilityContext {
         &self.context
     }

@@ -113,17 +113,10 @@ fn remove_and_sync(path: &Path) -> std::io::Result<()> {
     File::open(path.parent().expect("sidecar parent"))?.sync_all()
 }
 
-/// Hands the file's data, or a directory's entries, to the drive. On macOS `sync_all` is
-/// `F_FULLFSYNC`, which also flushes the drive cache and costs tens of milliseconds on an
-/// external drive; at the chain head columns arrive one gossip message at a time, so a full
-/// flush per publication meant about 128 drive cache flushes per block, which also stalled the
-/// execution client's writes on the same drive. macOS therefore uses a plain `fsync`.
-///
-/// The drive cache is flushed by the next database commit: redb commits with
-/// `Durability::Immediate` use `F_FULLFSYNC`, and a block import commits after its columns are
-/// published, with the next block about a slot later. A power loss before that commit can lose
-/// sidecar files published since the last one, never part of a file, since each file is written
-/// under a temporary name and renamed into place; a lost file reads as a missing sidecar.
+/// Hands the file's data to the drive. Publication ends with a directory `sync_all`, which on
+/// macOS is `F_FULLFSYNC` and flushes the drive cache for every file written before it. A
+/// `F_FULLFSYNC` per file costs a drive cache flush each, tens of milliseconds on an external
+/// drive, for each of the 128 columns of a block, so macOS uses a plain `fsync` here.
 fn write_to_drive(file: &File) -> std::io::Result<()> {
     #[cfg(target_vendor = "apple")]
     {
@@ -165,13 +158,17 @@ impl PreparedSidecarFile {
         Self::publish_batch_locked(files)
     }
 
-    /// Publish only files whose destination is still absent, atomically with respect to writers.
-    /// Returns one flag per input file, in order: true when this call published it.
-    pub fn publish_batch_if_missing(files: Vec<Self>) -> Result<Vec<bool>, StoreError> {
+    /// Publish files whose destination is absent or fails `existing_is_valid`, atomically with
+    /// respect to writers. Returns one flag per input file, in order: true when this call
+    /// published it.
+    pub fn publish_batch_if_missing(
+        files: Vec<Self>,
+        mut existing_is_valid: impl FnMut(usize, &Path) -> Result<bool, StoreError>,
+    ) -> Result<Vec<bool>, StoreError> {
         let _writer = WRITER.lock().unwrap_or_else(|err| err.into_inner());
         let mut missing = Vec::new();
         let mut published = Vec::with_capacity(files.len());
-        for file in files {
+        for (index, file) in files.into_iter().enumerate() {
             let failed = PENDING
                 .lock()
                 .unwrap_or_else(|err| err.into_inner())
@@ -181,7 +178,7 @@ impl PreparedSidecarFile {
             // A failed rollback leaves a file readers refuse, so it counts as absent.
             let absent = failed
                 || match fs::metadata(&file.destination) {
-                    Ok(_) => false,
+                    Ok(_) => !existing_is_valid(index, &file.destination)?,
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
                     Err(err) => return Err(err.into()),
                 };
@@ -258,7 +255,7 @@ impl PreparedSidecarFile {
             directories.insert(parent);
         }
         for directory in directories {
-            write_to_drive(&File::open(directory)?)?;
+            File::open(directory)?.sync_all()?;
         }
         publication.durable = true;
         Ok(())
@@ -328,10 +325,13 @@ mod tests {
         fs::write(&path, b"late column").unwrap();
 
         let missing = dir.path().join("missing");
-        let published = PreparedSidecarFile::publish_batch_if_missing(vec![
-            PreparedSidecarFile::new(path.clone(), b"reconstructed column").unwrap(),
-            PreparedSidecarFile::new(missing.clone(), b"reconstructed column").unwrap(),
-        ])
+        let published = PreparedSidecarFile::publish_batch_if_missing(
+            vec![
+                PreparedSidecarFile::new(path.clone(), b"reconstructed column").unwrap(),
+                PreparedSidecarFile::new(missing.clone(), b"reconstructed column").unwrap(),
+            ],
+            |_, _| Ok(true),
+        )
         .unwrap();
 
         assert_eq!(published, vec![false, true]);

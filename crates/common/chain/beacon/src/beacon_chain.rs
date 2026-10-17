@@ -11,7 +11,9 @@ use ream_consensus_beacon::{
     matrix_entry::reconstruct_data_column_sidecars,
 };
 use ream_consensus_misc::{
-    checkpoint::Checkpoint, constants::beacon::genesis_validators_root, misc::compute_epoch_at_slot,
+    checkpoint::Checkpoint,
+    constants::beacon::{SLOTS_PER_EPOCH, genesis_validators_root},
+    misc::{compute_epoch_at_slot, compute_start_slot_at_epoch},
 };
 use ream_events_beacon::{BeaconEvent, BeaconEventSender, event::chain::BlockEvent};
 use ream_execution_engine::ExecutionEngine;
@@ -41,7 +43,7 @@ use ream_storage::{
 };
 use ream_sync_committee_pool::SyncCommitteePool;
 use tokio::sync::{Mutex, broadcast};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use tree_hash::TreeHash;
 
 pub const BLOCK_IMPORT_EVENT_CHANNEL_CAPACITY: usize = 1024;
@@ -106,6 +108,9 @@ pub struct BeaconChain {
     /// Blocks with a reconstruction announced and not finished, so each is rebuilt once.
     reconstructions: parking_lot::Mutex<HashSet<B256>>,
 }
+
+/// How far back the incomplete-reconstruction scan looks: two epochs.
+const RECOVERY_SCAN_SLOTS: u64 = 2 * SLOTS_PER_EPOCH;
 
 impl BeaconChain {
     /// Creates a new instance of `BeaconChain`.
@@ -241,7 +246,7 @@ impl BeaconChain {
             return Ok(BlockProcessingOutcome::PendingAvailability { block_root });
         }
 
-        self.process_block_attestations(&mut store, &signed_block);
+        self.process_block_attestations(&mut store, &signed_block, block_root);
         let attestations_done = started.elapsed();
         store.refresh_fork_choice();
         self.publish_cached_head(&store);
@@ -261,7 +266,8 @@ impl BeaconChain {
 
         block_processing_timer.observe_duration();
         let done = started.elapsed();
-        info!(
+        debug!(
+            target: "ream::timing",
             slot = signed_block.message.slot,
             lock_wait_ms = locked.as_millis() as u64,
             on_block_ms = (on_block_done - locked).as_millis() as u64,
@@ -400,7 +406,7 @@ impl BeaconChain {
         let signed_block = pending.signed_block.clone();
         let block_root = signed_block.message.tree_hash_root();
         process_available_block(store, pending, block_root)?;
-        self.process_block_attestations(store, &signed_block);
+        self.process_block_attestations(store, &signed_block, block_root);
         store.refresh_fork_choice();
         self.publish_cached_head(store);
         let block_event = self.build_block_event(store, &signed_block, block_root);
@@ -485,11 +491,95 @@ impl BeaconChain {
 
     /// Announces a reconstruction once per block until `reconstruct_data_columns` finishes it.
     fn notify_reconstruction_ready(&self, block_root: B256) {
-        if self.reconstructions.lock().insert(block_root) {
-            let _ = self
+        let announced = self.reconstructions.lock().insert(block_root);
+        if announced
+            && self
                 .block_import_sender
-                .send(BlockImportEvent::ReconstructionReady { block_root });
+                .send(BlockImportEvent::ReconstructionReady { block_root })
+                .is_err()
+        {
+            self.reconstructions.lock().remove(&block_root);
+            debug!(
+                %block_root,
+                "No block import receivers; the reconstruction recovery scan will retry"
+            );
         }
+    }
+
+    /// Finds imported, reconstructable blocks among the last `RECOVERY_SCAN_SLOTS` slots that are
+    /// after the finalized checkpoint and inside the sidecar retention window. Each candidate
+    /// reads all of its column files, so the scan is limited to recent slots: if finality stalls,
+    /// the slots after the finalized checkpoint can grow to thousands of epochs. Starting after
+    /// the finalized checkpoint avoids rebuilding columns that peers no longer accept over gossip.
+    pub async fn incomplete_recent_block_roots(&self) -> anyhow::Result<Vec<B256>> {
+        let (required_columns, roots) = {
+            let store = self.store.lock().await;
+            let current_slot = store.get_current_slot()?;
+            let finalized_epoch = store.db.finalized_checkpoint_provider().get()?.epoch;
+            let current_epoch = compute_epoch_at_slot(current_slot);
+            let retention_start = compute_start_slot_at_epoch(current_epoch.saturating_sub(
+                beacon_network_spec().min_epochs_for_data_column_sidecars_requests,
+            ));
+            let first_slot = compute_start_slot_at_epoch(finalized_epoch)
+                .saturating_add(1)
+                .max(retention_start)
+                .max(current_slot.saturating_sub(RECOVERY_SCAN_SLOTS));
+            let roots = if first_slot <= current_slot {
+                store.block_roots_in_slot_range(first_slot..=current_slot)?
+            } else {
+                Vec::new()
+            };
+            (
+                store.data_availability_checker.required_columns().clone(),
+                roots,
+            )
+        };
+        if roots.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<B256>> {
+            let block_provider = db.block_provider();
+            let column_provider = db.column_sidecars_provider();
+            let mut incomplete = Vec::new();
+            for (_, block_root) in roots {
+                let Some(block) = block_provider.get(block_root)? else {
+                    continue;
+                };
+                let expected_header = block.signed_header();
+                let mut available = 0;
+                let mut stored_required = HashSet::new();
+                for index in 0..NUMBER_OF_COLUMNS {
+                    match column_provider.get(ColumnIdentifier::new(block_root, index)) {
+                        Ok(Some(sidecar))
+                            if sidecar.index == index
+                                && sidecar.signed_block_header == expected_header =>
+                        {
+                            available += 1;
+                            if required_columns.contains(&index) {
+                                stored_required.insert(index);
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(
+                            ream_storage::errors::StoreError::DecodeError(_)
+                            | ream_storage::errors::StoreError::SnappyError(_),
+                        ) => {
+                            debug!(%block_root, index, "Treating undecodable data column as missing");
+                        }
+                        Err(err) => return Err(err.into()),
+                    }
+                }
+                if available >= NUMBER_OF_COLUMNS / 2
+                    && !required_columns.is_subset(&stored_required)
+                {
+                    incomplete.push(block_root);
+                }
+            }
+            Ok(incomplete)
+        })
+        .await?
     }
 
     /// Rebuilds and stores columns for an available block in the background. Returns the columns
@@ -528,10 +618,21 @@ impl BeaconChain {
         let recovered = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let mut available = Vec::with_capacity(NUMBER_OF_COLUMNS as usize);
             for index in 0..NUMBER_OF_COLUMNS {
-                if let Some(sidecar) = provider.get(ColumnIdentifier::new(block_root, index))?
-                    && sidecar.signed_block_header == expected_header
-                {
-                    available.push(sidecar);
+                match provider.get(ColumnIdentifier::new(block_root, index)) {
+                    Ok(Some(sidecar))
+                        if sidecar.index == index
+                            && sidecar.signed_block_header == expected_header =>
+                    {
+                        available.push(sidecar);
+                    }
+                    Ok(_) => {}
+                    Err(
+                        ream_storage::errors::StoreError::DecodeError(_)
+                        | ream_storage::errors::StoreError::SnappyError(_),
+                    ) => {
+                        debug!(%block_root, index, "Treating undecodable data column as missing");
+                    }
+                    Err(err) => return Err(err.into()),
                 }
             }
             // Gossip often delivers every column before this runs; then there is nothing to
@@ -570,12 +671,19 @@ impl BeaconChain {
         Ok(stored)
     }
 
-    fn process_block_attestations(&self, store: &mut Store, signed_block: &SignedBeaconBlock) {
+    fn process_block_attestations(
+        &self,
+        store: &mut Store,
+        signed_block: &SignedBeaconBlock,
+        block_root: B256,
+    ) {
         store
             .operation_pool
             .mark_attestations_included(&signed_block.message.body.attestations);
 
-        for result in on_block_attestations(store, &signed_block.message.body.attestations) {
+        for result in
+            on_block_attestations(store, block_root, &signed_block.message.body.attestations)
+        {
             if let Err(err) = result {
                 warn!("Failed to process block attestation through fork choice: {err:?}");
             }
@@ -764,12 +872,21 @@ mod tests {
     };
 
     use ream_consensus_beacon::data_column_sidecar::get_data_column_sidecars;
+    use ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH;
     use ream_fork_choice_beacon::data_availability::DataAvailabilityChecker;
-    use ream_storage::{db::ReamDB, tables::table::REDBTable};
+    use ream_network_spec::networks::initialize_test_network_spec;
+    use ream_storage::{
+        db::ReamDB,
+        tables::{
+            field::REDBField,
+            table::{CustomTable, REDBTable},
+        },
+    };
 
     use super::*;
 
     fn test_chain() -> (PathBuf, BeaconChain) {
+        initialize_test_network_spec();
         // The clock alone can repeat across parallel tests (macOS reports microseconds), and two
         // tests sharing a directory fail with `DatabaseAlreadyOpen`.
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
@@ -808,6 +925,44 @@ mod tests {
             message: Default::default(),
             signature: Default::default(),
         }
+    }
+
+    fn empty_block_at_slot(slot: u64) -> SignedBeaconBlock {
+        let mut block = empty_block();
+        block.message.slot = slot;
+        block
+    }
+
+    fn set_scan_window(chain: &BeaconChain, current_slot: u64, finalized_epoch: u64) {
+        chain.db.genesis_time_provider().insert(0).unwrap();
+        chain
+            .db
+            .time_provider()
+            .insert(current_slot * beacon_network_spec().seconds_per_slot())
+            .unwrap();
+        chain
+            .db
+            .finalized_checkpoint_provider()
+            .insert(Checkpoint {
+                epoch: finalized_epoch,
+                root: B256::ZERO,
+            })
+            .unwrap();
+    }
+
+    fn store_reconstructable_block(chain: &BeaconChain, block: &SignedBeaconBlock) -> B256 {
+        let root = block.message.tree_hash_root();
+        chain
+            .db
+            .block_provider()
+            .insert(root, block.clone())
+            .unwrap();
+        chain
+            .db
+            .column_sidecars_provider()
+            .insert_batch(empty_block_columns(block)[..(NUMBER_OF_COLUMNS / 2) as usize].to_vec())
+            .unwrap();
+        root
     }
 
     #[test]
@@ -898,6 +1053,237 @@ mod tests {
             Err(broadcast::error::TryRecvError::Empty)
         ));
 
+        drop(chain);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_scan_recovers_an_imported_block_without_an_event() {
+        let (path, chain) = test_chain();
+        let block = empty_block_at_slot(1);
+        let root = block.message.tree_hash_root();
+        chain
+            .db
+            .block_provider()
+            .insert(root, block.clone())
+            .unwrap();
+        let columns = empty_block_columns(&block);
+        chain
+            .db
+            .column_sidecars_provider()
+            .insert_batch(columns[..=(NUMBER_OF_COLUMNS / 2) as usize].to_vec())
+            .unwrap();
+        set_scan_window(&chain, 1, 0);
+
+        let db = chain.db.clone();
+        drop(chain);
+        let restarted = BeaconChain::new(
+            db,
+            Arc::new(OperationPool::default()),
+            Arc::new(SyncCommitteePool::default()),
+            None,
+            None,
+        );
+        assert_eq!(
+            restarted.incomplete_recent_block_roots().await.unwrap(),
+            vec![root]
+        );
+        restarted.reconstruct_data_columns(root).await.unwrap();
+
+        let provider = restarted.db.column_sidecars_provider();
+        for index in 0..NUMBER_OF_COLUMNS {
+            assert!(
+                provider
+                    .get(ColumnIdentifier::new(root, index))
+                    .unwrap()
+                    .is_some(),
+                "column {index} was not recovered after restart"
+            );
+        }
+        drop(restarted);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn lagged_receiver_scan_rediscovers_incomplete_reconstruction() {
+        let (path, chain) = test_chain();
+        let block = empty_block_at_slot(1);
+        let root = store_reconstructable_block(&chain, &block);
+        set_scan_window(&chain, 1, 0);
+        let mut events = chain.subscribe_block_imports();
+        for index in 0..=BLOCK_IMPORT_EVENT_CHANNEL_CAPACITY {
+            chain.notify_block_imported(B256::with_last_byte(index as u8));
+        }
+        assert!(matches!(
+            events.recv().await,
+            Err(broadcast::error::RecvError::Lagged(_))
+        ));
+
+        assert_eq!(
+            chain.incomplete_recent_block_roots().await.unwrap(),
+            vec![root]
+        );
+        drop(chain);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn incomplete_scan_retries_after_an_attempt_cannot_reconstruct() {
+        let (path, chain) = test_chain();
+        let block = empty_block_at_slot(1);
+        let root = store_reconstructable_block(&chain, &block);
+        set_scan_window(&chain, 1, 0);
+        assert_eq!(
+            chain.incomplete_recent_block_roots().await.unwrap(),
+            vec![root]
+        );
+
+        let provider = chain.db.column_sidecars_provider();
+        let removed = provider
+            .remove(ColumnIdentifier::new(root, 0))
+            .unwrap()
+            .unwrap();
+        assert!(
+            chain
+                .reconstruct_data_columns(root)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        provider
+            .insert(ColumnIdentifier::new(root, 0), removed)
+            .unwrap();
+
+        assert_eq!(
+            chain.incomplete_recent_block_roots().await.unwrap(),
+            vec![root]
+        );
+        chain.reconstruct_data_columns(root).await.unwrap();
+        assert!(
+            chain
+                .incomplete_recent_block_roots()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        drop(chain);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconstruction_repairs_a_truncated_stored_column() {
+        let (path, chain) = test_chain();
+        let block = empty_block_at_slot(1);
+        let root = block.message.tree_hash_root();
+        chain
+            .db
+            .block_provider()
+            .insert(root, block.clone())
+            .unwrap();
+        let columns = empty_block_columns(&block);
+        chain
+            .db
+            .column_sidecars_provider()
+            .insert_batch(columns[..=(NUMBER_OF_COLUMNS / 2) as usize].to_vec())
+            .unwrap();
+        let truncated_index = NUMBER_OF_COLUMNS / 2;
+        fs::write(
+            path.join("beacon_columns")
+                .join(format!("{root}_{truncated_index}.ssz_snappy")),
+            b"truncated",
+        )
+        .unwrap();
+        set_scan_window(&chain, 1, 0);
+
+        assert_eq!(
+            chain.incomplete_recent_block_roots().await.unwrap(),
+            vec![root]
+        );
+        chain.reconstruct_data_columns(root).await.unwrap();
+
+        let provider = chain.db.column_sidecars_provider();
+        assert_eq!(
+            provider
+                .get(ColumnIdentifier::new(root, truncated_index))
+                .unwrap(),
+            Some(columns[truncated_index as usize].clone())
+        );
+        for index in 0..NUMBER_OF_COLUMNS {
+            assert!(
+                provider
+                    .get(ColumnIdentifier::new(root, index))
+                    .unwrap()
+                    .is_some(),
+                "column {index} was not stored"
+            );
+        }
+        drop(chain);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn incomplete_scan_excludes_finalized_and_retention_old_blocks() {
+        let (path, chain) = test_chain();
+        let finalized_root =
+            store_reconstructable_block(&chain, &empty_block_at_slot(SLOTS_PER_EPOCH));
+        let recent_root =
+            store_reconstructable_block(&chain, &empty_block_at_slot(SLOTS_PER_EPOCH + 1));
+        set_scan_window(&chain, SLOTS_PER_EPOCH + 1, 1);
+        assert_eq!(
+            chain.incomplete_recent_block_roots().await.unwrap(),
+            vec![recent_root]
+        );
+        assert_ne!(finalized_root, recent_root);
+
+        let retention_epochs = beacon_network_spec().min_epochs_for_data_column_sidecars_requests;
+        let current_slot = (retention_epochs + 2) * SLOTS_PER_EPOCH;
+        let old_root = store_reconstructable_block(&chain, &empty_block_at_slot(1));
+        let retained_root = store_reconstructable_block(&chain, &empty_block_at_slot(current_slot));
+        set_scan_window(&chain, current_slot, 0);
+        assert_eq!(
+            chain.incomplete_recent_block_roots().await.unwrap(),
+            vec![retained_root]
+        );
+        assert_ne!(old_root, retained_root);
+
+        drop(chain);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn incomplete_scan_looks_back_two_epochs_when_finality_stalls() {
+        let (path, chain) = test_chain();
+        let current_slot = 10 * SLOTS_PER_EPOCH;
+        let too_old_root = store_reconstructable_block(
+            &chain,
+            &empty_block_at_slot(current_slot - RECOVERY_SCAN_SLOTS - 1),
+        );
+        let recent_root =
+            store_reconstructable_block(&chain, &empty_block_at_slot(current_slot - 1));
+        // Nothing is finalized after genesis, so only the scan bound limits the window.
+        set_scan_window(&chain, current_slot, 0);
+        assert_eq!(
+            chain.incomplete_recent_block_roots().await.unwrap(),
+            vec![recent_root]
+        );
+        assert_ne!(too_old_root, recent_root);
+
+        drop(chain);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconstruction_send_without_a_receiver_can_be_rearmed() {
+        let (path, chain) = test_chain();
+        let root = B256::with_last_byte(1);
+        chain.notify_reconstruction_ready(root);
+        let mut events = chain.subscribe_block_imports();
+        chain.notify_reconstruction_ready(root);
+
+        assert_eq!(
+            events.recv().await.unwrap(),
+            BlockImportEvent::ReconstructionReady { block_root: root }
+        );
         drop(chain);
         fs::remove_dir_all(path).unwrap();
     }

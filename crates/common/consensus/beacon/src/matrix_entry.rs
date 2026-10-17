@@ -425,13 +425,15 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "reads the frozen mainnet fixture and reports reconstruction timings"]
+    #[ignore = "needs REAM_BENCH_FIXTURE_DIR, the frozen mainnet fixture; reports timings"]
     fn benchmark_mainnet_data_column_reconstruction() -> Result<()> {
-        const FIXTURE_ROOT: &str = "/Volumes/RETH/bench-env/fixture-mainnet-20261016";
         const BLOCK_COUNT: usize = 3;
         const SAMPLE_COUNT: usize = 5;
 
-        let mut blocks = fixture_blocks_by_blob_count(Path::new(FIXTURE_ROOT))?;
+        // The fixture written by the `mainnet_import_bench` tests in `bin/ream`.
+        let fixture_root = std::env::var_os("REAM_BENCH_FIXTURE_DIR")
+            .ok_or_else(|| anyhow!("REAM_BENCH_FIXTURE_DIR must be set"))?;
+        let mut blocks = fixture_blocks_by_blob_count(Path::new(&fixture_root))?;
         ensure!(
             blocks.len() >= BLOCK_COUNT,
             "fixture has {} complete blocks, expected at least {BLOCK_COUNT}",

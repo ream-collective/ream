@@ -203,10 +203,8 @@ fn main() {
 
         executor_clone.shutdown_signal();
         match service_result {
-            None => {
-                let _ = task_handle.await;
-                false
-            }
+            // Ctrl-C: a clean cancellation is fine, a service panic is not.
+            None => task_handle.await.is_err(),
             // A panicking service must not look like a clean exit to supervisors.
             Some(result) => result.is_err(),
         }
@@ -585,6 +583,9 @@ async fn run_beacon_node_inner(
         .init_beacon_db()
         .expect("unable to init Ream Beacon Database")
         .with_cache(cache.clone());
+    beacon_db
+        .start_vote_flush_timer(config.network.epoch_duration())
+        .expect("unable to start the vote flush timer");
 
     if let Some(storage_sender) = storage_sender {
         let _ = storage_sender.send(beacon_db.clone());
