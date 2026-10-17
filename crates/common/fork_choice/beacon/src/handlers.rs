@@ -262,6 +262,7 @@ pub fn process_available_block(
 /// attestation.
 pub fn on_block_attestations(
     store: &mut Store,
+    block_root: B256,
     attestations: &[Attestation],
 ) -> Vec<anyhow::Result<()>> {
     let mut target_states: HashMap<Checkpoint, Arc<BeaconState>> = HashMap::new();
@@ -281,11 +282,21 @@ pub fn on_block_attestations(
                         .ok_or_else(|| anyhow!("checkpoint_states not found"))?,
                 ),
             };
-            anyhow::Ok(
-                target_state
-                    .get_indexed_attestation(attestation)?
-                    .attesting_indices,
-            )
+            let indexed_attestation = target_state.get_indexed_attestation(attestation)?;
+            // The spec verifies the signature against the target state. state_transition already
+            // verified it with the committees of the block's own chain, which are the target
+            // state's committees when the target is that chain's checkpoint. A target on another
+            // fork can have a different shuffling, so the same bits name other validators.
+            let target_on_block_chain = store
+                .get_ancestor(block_root, compute_start_slot_at_epoch(target.epoch))?
+                == target.root;
+            if !target_on_block_chain {
+                ensure!(
+                    target_state.is_valid_indexed_attestation(&indexed_attestation)?,
+                    "Attestation signature must be valid for the target state"
+                );
+            }
+            anyhow::Ok(indexed_attestation.attesting_indices)
         })();
         results.push(attesting_indices.map(|indices| {
             votes.push((indices.to_vec(), attestation.clone()));
