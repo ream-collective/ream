@@ -73,6 +73,14 @@ pub async fn validate_aggregate_and_proof(
         attestation.data.index
     };
 
+    // The head state fixes committees up to one epoch past its own. Further out it has no cached
+    // shuffling and would shuffle the whole registry for every aggregate while the node syncs.
+    if !state.determines_committees_of(attestation.data.target.epoch) {
+        return Ok(ValidationResult::Ignore(
+            "Head state is too far behind to compute the aggregate's committee".to_string(),
+        ));
+    }
+
     // [REJECT] The committee index is within the expected range
     let committee_count = state.get_committee_count_per_slot(attestation.data.target.epoch);
     if committee_index >= committee_count {

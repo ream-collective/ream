@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use alloy_primitives::B256;
 use libp2p::PeerId;
 use ream_consensus_beacon::{
@@ -17,6 +19,7 @@ use ream_req_resp::{
 use tokio::{
     sync::mpsc::{self, UnboundedSender},
     task::JoinHandle,
+    time::timeout,
 };
 use tracing::info;
 
@@ -54,7 +57,32 @@ fn classify_req_resp_error(err: ReqRespError) -> DownloadFailure {
     }
 }
 
+/// Longest a range-sync request may run. The network layer times out only a silent stream, so a
+/// peer that trickles responses holds a request, and the segment waiting on it, for minutes.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
+
 async fn drain_responses<T>(
+    rx: mpsc::Receiver<Result<P2PCallbackResponse, P2PCallbackError>>,
+    extract: impl FnMut(BeaconResponseMessage) -> Result<T, DownloadFailure>,
+) -> StreamOutcome<T> {
+    drain_responses_within(rx, extract, REQUEST_DEADLINE).await
+}
+
+async fn drain_responses_within<T>(
+    rx: mpsc::Receiver<Result<P2PCallbackResponse, P2PCallbackError>>,
+    extract: impl FnMut(BeaconResponseMessage) -> Result<T, DownloadFailure>,
+    deadline: Duration,
+) -> StreamOutcome<T> {
+    timeout(deadline, drain(rx, extract))
+        .await
+        .unwrap_or_else(|_| {
+            StreamOutcome::Failed(DownloadFailure::Transport(format!(
+                "request did not finish within {deadline:?}"
+            )))
+        })
+}
+
+async fn drain<T>(
     mut rx: mpsc::Receiver<Result<P2PCallbackResponse, P2PCallbackError>>,
     mut extract: impl FnMut(BeaconResponseMessage) -> Result<T, DownloadFailure>,
 ) -> StreamOutcome<T> {
@@ -376,6 +404,28 @@ mod tests {
             ))),
         })
         .await;
+
+        assert!(matches!(
+            outcome,
+            StreamOutcome::Failed(DownloadFailure::Transport(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn drain_responses_fails_a_stream_that_outlives_the_deadline() {
+        let (tx, rx) = mpsc::channel(10);
+        let outcome = drain_responses_within(
+            rx,
+            |message| match message {
+                BeaconResponseMessage::BeaconBlocksByRange(block) => Ok(block),
+                other => Err(DownloadFailure::InvalidData(format!(
+                    "unexpected: {other:?}"
+                ))),
+            },
+            Duration::from_millis(50),
+        )
+        .await;
+        drop(tx);
 
         assert!(matches!(
             outcome,

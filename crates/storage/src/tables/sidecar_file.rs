@@ -113,6 +113,31 @@ fn remove_and_sync(path: &Path) -> std::io::Result<()> {
     File::open(path.parent().expect("sidecar parent"))?.sync_all()
 }
 
+/// Hands the file's data, or a directory's entries, to the drive. On macOS `sync_all` is
+/// `F_FULLFSYNC`, which also flushes the drive cache and costs tens of milliseconds on an
+/// external drive; at the chain head columns arrive one gossip message at a time, so a full
+/// flush per publication meant about 128 drive cache flushes per block, which also stalled the
+/// execution client's writes on the same drive. macOS therefore uses a plain `fsync`.
+///
+/// The drive cache is flushed by the next database commit: redb commits with
+/// `Durability::Immediate` use `F_FULLFSYNC`, and a block import commits after its columns are
+/// published, with the next block about a slot later. A power loss before that commit can lose
+/// sidecar files published since the last one, never part of a file, since each file is written
+/// under a temporary name and renamed into place; a lost file reads as a missing sidecar.
+fn write_to_drive(file: &File) -> std::io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `fsync` only reads the descriptor, which `file` keeps open for the call.
+        if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    file.sync_all()
+}
+
 pub struct PreparedSidecarFile {
     file: tempfile::NamedTempFile,
     destination: PathBuf,
@@ -126,7 +151,7 @@ impl PreparedSidecarFile {
             .prefix(TEMP_PREFIX)
             .tempfile_in(parent)?;
         file.write_all(bytes)?;
-        file.as_file().sync_all()?;
+        write_to_drive(file.as_file())?;
         Ok(Self { file, destination })
     }
     pub fn publish(self) -> Result<(), StoreError> {
@@ -200,7 +225,7 @@ impl PreparedSidecarFile {
             directories.insert(parent);
         }
         for directory in directories {
-            File::open(directory)?.sync_all()?;
+            write_to_drive(&File::open(directory)?)?;
         }
         publication.durable = true;
         Ok(())

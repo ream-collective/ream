@@ -12,7 +12,9 @@ use ream_metrics::{
 use rust_eth_kzg::{Cell as KZGCell, DASContext, KZGProof as Proof, TrustedSetup, UsePrecomp};
 use ssz_types::FixedVector;
 
-use crate::data_column_sidecar::Cell;
+use crate::data_column_sidecar::{
+    Cell, DataColumnSidecar, NUMBER_OF_COLUMNS, get_data_column_sidecars_from_column_sidecar,
+};
 
 pub fn das_context() -> &'static DASContext {
     static DAS_CONTEXT: OnceLock<DASContext> = OnceLock::new();
@@ -146,6 +148,75 @@ pub fn recover_cells_and_kzg_proofs(
     Ok((cells, proofs))
 }
 
+/// Rebuilds all `NUMBER_OF_COLUMNS` sidecars of a block from at least half of them.
+///
+/// The inputs must be verified sidecars of one block. Cells verified against the block's
+/// commitments fix each blob polynomial, so the recovered cells and proofs match those
+/// commitments as well; the header, commitments and inclusion proof are copied from an input.
+pub fn reconstruct_data_column_sidecars(
+    available: &[&DataColumnSidecar],
+) -> Result<Vec<DataColumnSidecar>> {
+    ensure!(
+        available.len() as u64 >= NUMBER_OF_COLUMNS / 2,
+        "reconstruction needs {} columns, got {}",
+        NUMBER_OF_COLUMNS / 2,
+        available.len()
+    );
+    let base = available[0];
+    let mut seen = std::collections::HashSet::new();
+    for sidecar in available {
+        ensure!(
+            sidecar.signed_block_header == base.signed_block_header,
+            "column {} belongs to another block",
+            sidecar.index
+        );
+        ensure!(
+            seen.insert(sidecar.index),
+            "column {} is given twice",
+            sidecar.index
+        );
+        ensure!(
+            sidecar.column.len() == base.kzg_commitments.len(),
+            "column {} has {} cells for {} blobs",
+            sidecar.index,
+            sidecar.column.len(),
+            base.kzg_commitments.len()
+        );
+    }
+
+    let timer = BEACON_DATA_AVAILABILITY_RECONSTRUCTION_TIME_SECONDS.start_timer();
+    let mut cells_and_kzg_proofs = Vec::with_capacity(base.kzg_commitments.len());
+    for blob_index in 0..base.kzg_commitments.len() {
+        let column_indices = available.iter().map(|sidecar| sidecar.index).collect();
+        let cells = available
+            .iter()
+            .map(|sidecar| sidecar.column[blob_index].clone())
+            .collect();
+        cells_and_kzg_proofs.push(recover_cells_and_kzg_proofs(
+            column_indices,
+            cells,
+            das_context(),
+        )?);
+    }
+    let reconstructed =
+        get_data_column_sidecars_from_column_sidecar(base.clone(), cells_and_kzg_proofs)
+            .map_err(|err| anyhow!("failed to assemble reconstructed columns: {err}"))?;
+    timer.observe_duration();
+
+    // Recovery keeps the cells it was given; a mismatch means the inputs disagree with each
+    // other, so nothing reconstructed from them can be trusted.
+    for sidecar in available {
+        ensure!(
+            reconstructed[sidecar.index as usize].column == sidecar.column,
+            "recovered column {} differs from the column it was rebuilt from",
+            sidecar.index
+        );
+    }
+    BEACON_DATA_AVAILABILITY_RECONSTRUCTED_COLUMNS_TOTAL
+        .inc_by((reconstructed.len() - available.len()) as u64);
+    Ok(reconstructed)
+}
+
 fn convert_cell(kzg_cell: KZGCell) -> Cell {
     FixedVector::try_from(kzg_cell.to_vec()).expect("Cell conversion failed")
 }
@@ -264,6 +335,58 @@ mod tests {
 
         assert_eq!(recovered_matrix, matrix);
 
+        Ok(())
+    }
+
+    fn sample_sidecars(rng: &mut StdRng, blob_count: usize) -> Result<Vec<DataColumnSidecar>> {
+        let cells_and_kzg_proofs = (0..blob_count)
+            .map(|_| compute_cells_and_kzg_proofs(&get_sample_blob(rng), das_context()))
+            .collect::<Result<Vec<_>>>()?;
+        let commitments = vec![
+            ream_consensus_misc::polynomial_commitments::kzg_commitment::KZGCommitment([0u8; 48]);
+            blob_count
+        ];
+        crate::data_column_sidecar::get_data_column_sidecars(
+            Default::default(),
+            ssz_types::VariableList::new(commitments).expect("commitments fit"),
+            FixedVector::default(),
+            cells_and_kzg_proofs,
+        )
+        .map_err(|err| anyhow!("{err}"))
+    }
+
+    #[test]
+    fn half_the_columns_rebuild_every_column() -> Result<()> {
+        let mut rng = StdRng::seed_from_u64(7788);
+        let sidecars = sample_sidecars(&mut rng, 2)?;
+        let mut indices: Vec<usize> = (0..sidecars.len()).collect();
+        indices.shuffle(&mut rng);
+        let half = indices[..(NUMBER_OF_COLUMNS / 2) as usize]
+            .iter()
+            .map(|index| &sidecars[*index])
+            .collect::<Vec<_>>();
+
+        let rebuilt = reconstruct_data_column_sidecars(&half)?;
+        assert_eq!(rebuilt, sidecars);
+        Ok(())
+    }
+
+    #[test]
+    fn reconstruction_rejects_too_few_or_mixed_columns() -> Result<()> {
+        let mut rng = StdRng::seed_from_u64(7789);
+        let sidecars = sample_sidecars(&mut rng, 1)?;
+        let short = sidecars[..(NUMBER_OF_COLUMNS / 2 - 1) as usize]
+            .iter()
+            .collect::<Vec<_>>();
+        assert!(reconstruct_data_column_sidecars(&short).is_err());
+
+        let mut other_block = sidecars[0].clone();
+        other_block.signed_block_header.message.slot = 1;
+        let mut mixed = sidecars[1..(NUMBER_OF_COLUMNS / 2) as usize]
+            .iter()
+            .collect::<Vec<_>>();
+        mixed.push(&other_block);
+        assert!(reconstruct_data_column_sidecars(&mixed).is_err());
         Ok(())
     }
 }

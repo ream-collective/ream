@@ -292,7 +292,6 @@ impl GossipLookupHarness {
             },
             &self.beacon_chain,
             &self.cached_db,
-            &self.p2p_sender,
             &mut pending_item,
             &mut unknown_parent_block,
         )
@@ -1224,7 +1223,6 @@ async fn test_unknown_parent_block_imports_after_parent_arrives() {
         },
         &harness.beacon_chain,
         &harness.cached_db,
-        &harness.p2p_sender,
         &mut pending_item,
         &mut unknown_parent_block,
     )
@@ -1655,10 +1653,8 @@ async fn test_rpc_column_fetch_rechecks_finality_before_import() {
         harness.deliver_block(&pending.signed_block).await.0,
         MessageAcceptance::Accept
     ));
-    assert!(matches!(
-        harness.p2p_receiver.try_recv(),
-        Ok(P2PMessage::Gossip(_))
-    ));
+    // Gossipsub forwards an accepted message itself, so the handler sends nothing.
+    assert!(harness.p2p_receiver.try_recv().is_err());
     assert_eq!(
         harness
             .beacon_chain

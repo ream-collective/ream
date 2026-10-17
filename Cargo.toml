@@ -109,6 +109,7 @@ lazy_static = "1.5.0"
 lean-multisig = { git = "https://github.com/leanEthereum/leanVM.git", rev = "2498896ca4d32a545a98a1b1cf1ca78f7f13f553" }
 lean-multisig-type2 = { package = "lean-multisig", git = "https://github.com/leanEthereum/leanMultisig.git", rev = "e2592df4e30fdddbbf8ae26a333116c68cec7026" }
 leansig = { git = "https://github.com/leanEthereum//leanSig.git", branch = "devnet4" }
+libc = "0.2.184"
 libp2p = { version = "0.56", default-features = false, features = [
     "identify",
     "yamux",

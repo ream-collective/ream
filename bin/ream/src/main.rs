@@ -1053,6 +1053,7 @@ pub async fn countdown_for_genesis() {
 mod tests {
     mod block_lookup_tests;
     mod checkpoint_bootstrap_tests;
+    mod mainnet_import_bench;
 
     use std::{
         env::temp_dir,

@@ -42,7 +42,7 @@ use tokio::{
     sync::mpsc,
     time::{interval, sleep},
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tree_hash::TreeHash;
 
 use crate::{
@@ -461,6 +461,14 @@ impl NetworkManagerService {
                                         &column_fetch_done_sender,
                                     );
                                 }
+                                ream_chain_beacon::beacon_chain::BlockImportEvent::ReconstructionReady { block_root } => {
+                                    let beacon_chain = beacon_chain.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(err) = beacon_chain.reconstruct_data_columns(block_root).await {
+                                            debug!(%block_root, "Column reconstruction did not import: {err:#}");
+                                        }
+                                    });
+                                }
                             }
                             record_removed_lookup_entries(
                                 PENDING_AVAILABILITY_LOOKUP,
@@ -692,7 +700,6 @@ impl NetworkManagerService {
                                 message,
                                 &beacon_chain,
                                 &cached_db,
-                                &p2p_sender,
                                 &mut pending_item,
                                 &mut unknown_parent_block,
                             ).await;
