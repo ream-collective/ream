@@ -155,34 +155,6 @@ impl PreparedSidecarFile {
     /// Byte-identical duplicates remain readable; different bytes are atomically replaced.
     pub fn publish_batch(files: Vec<Self>) -> Result<(), StoreError> {
         let _writer = WRITER.lock().unwrap_or_else(|err| err.into_inner());
-        Self::publish_batch_locked(files)
-    }
-
-    /// Publish only files whose destination is still absent, atomically with respect to writers.
-    pub fn publish_batch_if_missing(files: Vec<Self>) -> Result<(), StoreError> {
-        let _writer = WRITER.lock().unwrap_or_else(|err| err.into_inner());
-        let mut missing = Vec::new();
-        for file in files {
-            let failed = PENDING
-                .lock()
-                .unwrap_or_else(|err| err.into_inner())
-                .get(&file.destination)
-                .copied()
-                == Some(true);
-            if failed {
-                missing.push(file);
-                continue;
-            }
-            match fs::metadata(&file.destination) {
-                Ok(_) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => missing.push(file),
-                Err(err) => return Err(err.into()),
-            }
-        }
-        Self::publish_batch_locked(missing)
-    }
-
-    fn publish_batch_locked(files: Vec<Self>) -> Result<(), StoreError> {
         let mut publication = Publication::default();
         let mut directories = HashSet::new();
         for prepared in files {
@@ -308,21 +280,6 @@ pub(crate) fn cleanup_temporary_sidecars(directory: &Path) -> Result<(), StoreEr
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn conditional_publication_preserves_an_existing_sidecar() {
-        let dir = tempdir::TempDir::new("sidecar_publish_if_missing").unwrap();
-        let path = dir.path().join("existing");
-        fs::write(&path, b"late column").unwrap();
-
-        PreparedSidecarFile::publish_batch_if_missing(vec![
-            PreparedSidecarFile::new(path.clone(), b"reconstructed column").unwrap(),
-        ])
-        .unwrap();
-
-        assert_eq!(fs::read(path).unwrap(), b"late column");
-    }
-
     #[test]
     fn reader_rejects_file_opened_during_rolled_back_publication() {
         let dir = tempdir::TempDir::new("sidecar_reader_rollback").unwrap();
