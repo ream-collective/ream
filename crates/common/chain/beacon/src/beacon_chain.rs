@@ -246,7 +246,7 @@ impl BeaconChain {
             return Ok(BlockProcessingOutcome::PendingAvailability { block_root });
         }
 
-        self.process_block_attestations(&mut store, &signed_block);
+        self.process_block_attestations(&mut store, &signed_block, block_root);
         let attestations_done = started.elapsed();
         store.refresh_fork_choice();
         self.publish_cached_head(&store);
@@ -406,7 +406,7 @@ impl BeaconChain {
         let signed_block = pending.signed_block.clone();
         let block_root = signed_block.message.tree_hash_root();
         process_available_block(store, pending, block_root)?;
-        self.process_block_attestations(store, &signed_block);
+        self.process_block_attestations(store, &signed_block, block_root);
         store.refresh_fork_choice();
         self.publish_cached_head(store);
         let block_event = self.build_block_event(store, &signed_block, block_root);
@@ -671,12 +671,19 @@ impl BeaconChain {
         Ok(stored)
     }
 
-    fn process_block_attestations(&self, store: &mut Store, signed_block: &SignedBeaconBlock) {
+    fn process_block_attestations(
+        &self,
+        store: &mut Store,
+        signed_block: &SignedBeaconBlock,
+        block_root: B256,
+    ) {
         store
             .operation_pool
             .mark_attestations_included(&signed_block.message.body.attestations);
 
-        for result in on_block_attestations(store, &signed_block.message.body.attestations) {
+        for result in
+            on_block_attestations(store, block_root, &signed_block.message.body.attestations)
+        {
             if let Err(err) = result {
                 warn!("Failed to process block attestation through fork choice: {err:?}");
             }

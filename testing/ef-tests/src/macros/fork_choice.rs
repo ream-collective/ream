@@ -199,7 +199,7 @@ macro_rules! test_fork_choice {
                                     // The spec's test helper feeds an imported block's attestations to
                                     // `on_attestation` with `is_from_block` and expects them all to apply.
                                     if block_imported {
-                                        for result in on_block_attestations(&mut store, &block.message.body.attestations) {
+                                        for result in on_block_attestations(&mut store, block.message.tree_hash_root(), &block.message.body.attestations) {
                                             assert!(result.is_ok(), "Block attestation rejected by fork choice: {result:?}");
                                         }
                                     }
