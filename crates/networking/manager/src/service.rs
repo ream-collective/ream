@@ -42,7 +42,7 @@ use tokio::{
     sync::mpsc,
     time::{interval, sleep},
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tree_hash::TreeHash;
 
 use crate::{
@@ -153,6 +153,17 @@ fn spawn_queued_column_fetches(
             let _ = done_sender.send((block_root, peer, outcome));
         });
     }
+}
+
+/// Rebuilds a pending block's missing columns on its own task: reading the stored columns and
+/// recovering the rest takes too long for the event loop.
+fn spawn_column_reconstruction(beacon_chain: &Arc<BeaconChain>, block_root: B256) {
+    let beacon_chain = beacon_chain.clone();
+    tokio::spawn(async move {
+        if let Err(err) = beacon_chain.reconstruct_data_columns(block_root).await {
+            debug!(%block_root, "Column reconstruction did not import: {err:#}");
+        }
+    });
 }
 
 async fn reconcile_block_lookup_state(
@@ -461,6 +472,9 @@ impl NetworkManagerService {
                                         &column_fetch_done_sender,
                                     );
                                 }
+                                ream_chain_beacon::beacon_chain::BlockImportEvent::ReconstructionReady { block_root } => {
+                                    spawn_column_reconstruction(&beacon_chain, block_root);
+                                }
                             }
                             record_removed_lookup_entries(
                                 PENDING_AVAILABILITY_LOOKUP,
@@ -505,6 +519,11 @@ impl NetworkManagerService {
                                 &network_state,
                                 &column_fetch_done_sender,
                             );
+                            // Skipped events may include a ReconstructionReady, which is sent
+                            // once per block.
+                            for block_root in beacon_chain.reconstructable_pending_blocks().await {
+                                spawn_column_reconstruction(&beacon_chain, block_root);
+                            }
                             record_removed_lookup_entries(
                                 PENDING_AVAILABILITY_LOOKUP,
                                 "completed",
@@ -701,7 +720,6 @@ impl NetworkManagerService {
                                 message,
                                 &beacon_chain,
                                 &cached_db,
-                                &p2p_sender,
                                 &mut pending_item,
                                 &mut unknown_parent_block,
                             ).await;

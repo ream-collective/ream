@@ -331,6 +331,14 @@ impl BeaconNetworkSpec {
     pub fn seconds_per_slot(&self) -> u64 {
         self.slot_duration_ms / 1000
     }
+
+    /// Wall-clock length of one epoch on this network.
+    pub fn epoch_duration(&self) -> Duration {
+        Duration::from_millis(
+            self.slot_duration_ms
+                .saturating_mul(ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH),
+        )
+    }
 }
 
 pub static MAINNET: LazyLock<Arc<BeaconNetworkSpec>> = LazyLock::new(|| {
@@ -691,6 +699,17 @@ mod backfill_tests {
         assert_eq!(spec.oldest_supported_block_slot(), 3 * SLOTS_PER_EPOCH);
         spec.electra_fork_epoch = u64::MAX;
         assert_eq!(spec.oldest_supported_block_slot(), u64::MAX);
+    }
+
+    #[test]
+    fn epoch_duration_follows_the_slot_duration() {
+        assert_eq!(MAINNET.epoch_duration(), Duration::from_secs(384));
+        let mut spec = (**DEV).clone();
+        spec.slot_duration_ms = 6_000;
+        assert_eq!(
+            spec.epoch_duration(),
+            Duration::from_secs(6 * SLOTS_PER_EPOCH)
+        );
     }
 }
 

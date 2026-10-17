@@ -1,4 +1,4 @@
-use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::anyhow;
 use ream_consensus_beacon::electra::{beacon_block::SignedBeaconBlock, beacon_state::BeaconState};
@@ -231,8 +231,57 @@ impl BeaconDB {
     pub fn shutdown_storage(&self) -> Result<(), crate::errors::StoreError> {
         if let Some(cache) = &self.cache {
             cache.stop_storage_writes();
+            cache.stop_vote_flush_timer()?;
         }
         self.flush_pending_writes()
+    }
+
+    /// Writes pending votes at least once per `flush_interval` while any are pending, even when
+    /// no inserts arrive to start the write. Inserts write at most once per `flush_interval` too.
+    /// Pass one epoch of the network: a write costs about the same whether it carries one
+    /// block's votes or an epoch's. `shutdown_storage` stops the timer. Without a cache, every
+    /// insert is written immediately and no timer is needed.
+    pub fn start_vote_flush_timer(
+        &self,
+        flush_interval: Duration,
+    ) -> Result<(), crate::errors::StoreError> {
+        let Some(cache) = &self.cache else {
+            return Ok(());
+        };
+        cache.pending_votes().flush_interval = flush_interval;
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        // Weak handles: the cache owns the timer, which must not keep the cache or database open.
+        let votes_db = Arc::downgrade(&self.votes_db);
+        let weak_cache = Arc::downgrade(cache);
+        let thread = std::thread::Builder::new()
+            .name("vote-flush-timer".to_string())
+            .spawn(move || {
+                let mut wait = flush_interval;
+                loop {
+                    match stopped.recv_timeout(wait) {
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                    let (Some(db), Some(cache)) = (votes_db.upgrade(), weak_cache.upgrade()) else {
+                        return;
+                    };
+                    wait = LatestMessagesTable {
+                        db,
+                        cache: Some(cache),
+                    }
+                    .flush_if_due();
+                }
+            })?;
+        let previous = cache
+            .vote_flush_timer
+            .lock()
+            .expect("vote flush timer lock is not poisoned")
+            .replace(crate::cache::VoteFlushTimer { stop, thread });
+        if let Some(previous) = previous {
+            drop(previous.stop);
+            let _ = previous.thread.join();
+        }
+        Ok(())
     }
 
     pub fn block_provider(&self) -> BeaconBlockTable {

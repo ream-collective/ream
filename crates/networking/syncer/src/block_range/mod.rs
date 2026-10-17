@@ -54,7 +54,7 @@ use recovery::{
     RecoveryOutcome, is_processable_connection_point,
 };
 use tokio::{sync::mpsc::UnboundedSender, task::JoinHandle, time::sleep};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use tree_hash::TreeHash;
 
 use crate::block_range::peer_range_downloader::{PeerRangeDownloader, Range};
@@ -62,6 +62,8 @@ use crate::block_range::peer_range_downloader::{PeerRangeDownloader, Range};
 const MAX_BLOBS_PER_REQUEST: usize = 6;
 const MAX_BLOCKS_PER_REQUEST: u64 = 10;
 const SLEEP_DURATION: Duration = Duration::from_secs(5);
+/// How often a wait for downloads checks whether one has finished.
+const DOWNLOAD_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Max slots behind wall-clock to still count as synced (like Lighthouse's
 /// `SLOT_IMPORT_TOLERANCE`). A thin/early peer sample can be fooled; the clock can't.
@@ -1070,7 +1072,7 @@ impl BlockRangeSyncer {
                         self.peer_manager.update_peer_set();
                         info!("No idle peers available for block range sync.");
                         block_cache.push_retry_range(range);
-                        sleep(SLEEP_DURATION).await;
+                        wait_for_download(task_handles, SLEEP_DURATION).await;
                         continue;
                     };
 
@@ -1115,7 +1117,7 @@ impl BlockRangeSyncer {
                         self.peer_manager.update_peer_set();
                         info!("No idle peers available for data column range sync.");
                         block_cache.push_column_range(range);
-                        sleep(SLEEP_DURATION).await;
+                        wait_for_download(task_handles, SLEEP_DURATION).await;
                         continue;
                     };
 
@@ -1143,6 +1145,10 @@ impl BlockRangeSyncer {
                         .collect();
 
                     block_cache.mark_column_range_in_progress(range);
+                    // The range already asks for these columns, so requests by root skip them
+                    // until it finishes.
+                    block_cache
+                        .extend_data_column_identifiers_in_progress(&expected_known_identifiers);
                     task_handles.push(DownloadTask::new_data_column_range(
                         PeerDataColumnRangeDownloader::start(
                             peer.peer_id,
@@ -1217,7 +1223,7 @@ impl BlockRangeSyncer {
                         else {
                             self.peer_manager.update_peer_set();
                             info!("No idle peers available for block roots sync.");
-                            sleep(SLEEP_DURATION).await;
+                            wait_for_download(task_handles, SLEEP_DURATION).await;
                             break;
                         };
 
@@ -1274,7 +1280,7 @@ impl BlockRangeSyncer {
                                 "No idle peers available for blob sync. {}",
                                 self.peer_manager.peer_counts()
                             );
-                            sleep(SLEEP_DURATION).await;
+                            wait_for_download(task_handles, SLEEP_DURATION).await;
                             break;
                         };
 
@@ -1328,7 +1334,7 @@ impl BlockRangeSyncer {
                         else {
                             self.peer_manager.update_peer_set();
                             info!("No idle peers available for data column sync.");
-                            sleep(SLEEP_DURATION).await;
+                            wait_for_download(task_handles, SLEEP_DURATION).await;
                             break;
                         };
 
@@ -1376,7 +1382,8 @@ impl BlockRangeSyncer {
                         "Waiting for ongoing downloads to complete... {}",
                         self.peer_manager.peer_counts()
                     );
-                    sleep(range_sync_delay(Duration::from_secs(10))).await;
+                    wait_for_download(task_handles, range_sync_delay(Duration::from_secs(10)))
+                        .await;
                 }
                 DataToFetch::ParentsExhausted => {
                     pending_conclusions.observe(
@@ -1531,6 +1538,8 @@ impl BlockRangeSyncer {
             source_peer,
         } = bundle;
         let block_root = block.message.tree_hash_root();
+        let slot = block.message.slot;
+        let started = std::time::Instant::now();
         {
             let store = self.beacon_chain.store.lock().await;
             if store.db.block_provider().get(block_root)?.is_some()
@@ -1539,6 +1548,7 @@ impl BlockRangeSyncer {
                 return Ok(false);
             }
         }
+        let known_check = started.elapsed();
         let fulu_fork_epoch = beacon_network_spec().fulu_fork_epoch;
         info!("Processing block with slot {}", block.message.slot);
 
@@ -1599,9 +1609,12 @@ impl BlockRangeSyncer {
             .map_err(|err| anyhow!("Range-sync data-column task failed: {err}"))??
         };
 
+        let columns_ready = started.elapsed();
+        let column_count = columns.len();
         self.beacon_chain
             .import_data_column_sidecars_if(columns, |_| Ok(()))
             .await?;
+        let columns_imported = started.elapsed();
         match self.beacon_chain.process_block(block).await? {
             BlockProcessingOutcome::Imported { .. } => {}
             BlockProcessingOutcome::PendingAvailability { block_root } => {
@@ -1610,6 +1623,18 @@ impl BlockRangeSyncer {
                 );
             }
         }
+        let processed = started.elapsed();
+        debug!(
+            target: "ream::timing",
+            slot,
+            columns = column_count,
+            known_check_ms = known_check.as_millis() as u64,
+            columns_ready_ms = (columns_ready - known_check).as_millis() as u64,
+            column_import_ms = (columns_imported - columns_ready).as_millis() as u64,
+            process_block_ms = (processed - columns_imported).as_millis() as u64,
+            total_ms = processed.as_millis() as u64,
+            "timing: range import"
+        );
         self.peer_manager.record_processed_blocks(&source_peer, 1);
         Ok(true)
     }
@@ -1701,7 +1726,29 @@ impl Drop for DownloadTask {
     }
 }
 
+/// Waits until a download in `tasks` has finished, or `max` has passed. Finished downloads are
+/// only collected at the top of the sync loop, so a fixed sleep there delays every next request
+/// by the whole sleep even when the data arrived long before.
+async fn wait_for_download(tasks: &[DownloadTask], max: Duration) {
+    let deadline = Instant::now() + max;
+    while Instant::now() < deadline && !tasks.iter().any(DownloadTask::is_finished) {
+        sleep(DOWNLOAD_POLL_INTERVAL).await;
+    }
+}
+
 impl DownloadTask {
+    fn is_finished(&self) -> bool {
+        match self {
+            Self::BlockRange { handle, .. } | Self::BlockRoots { handle, .. } => {
+                handle.is_finished()
+            }
+            Self::DataColumnRange { handle, .. } | Self::DataColumnIdentifiers { handle, .. } => {
+                handle.is_finished()
+            }
+            Self::BlobIdentifiers { handle, .. } => handle.is_finished(),
+        }
+    }
+
     fn peer_id(&self) -> PeerId {
         match self {
             Self::BlockRange { peer_id, .. }
@@ -2039,6 +2086,8 @@ fn poll_ready_tasks(
                     Poll::Ready(result) => {
                         indexes_to_remove.push(index);
                         block_cache.remove_column_range_in_progress(range);
+                        block_cache
+                            .remove_data_column_identifiers_in_progress(expected_known_identifiers);
                         peer_manager.mark_peer_as_idle(peer_id);
                         let key = RequestKey::ColumnRange(*range);
 

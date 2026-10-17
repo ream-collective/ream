@@ -98,6 +98,7 @@ ream-validator-lean.workspace = true
 
 [dev-dependencies]
 libp2p.workspace = true
+ream-light-client.workspace = true
 ream-mock-execution-engine.workspace = true
 ream-req-resp.workspace = true
 ream-syncer = { workspace = true, features = ["test-utils"] }

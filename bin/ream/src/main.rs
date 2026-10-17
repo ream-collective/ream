@@ -641,6 +641,9 @@ async fn run_beacon_node_inner(
         .init_beacon_db()
         .expect("unable to init Ream Beacon Database")
         .with_cache(cache.clone());
+    beacon_db
+        .start_vote_flush_timer(config.network.epoch_duration())
+        .expect("unable to start the vote flush timer");
 
     if let Some(storage_sender) = storage_sender {
         let _ = storage_sender.send(beacon_db.clone());
@@ -1195,6 +1198,7 @@ mod service_exit_tests {
 mod tests {
     mod block_lookup_tests;
     mod checkpoint_bootstrap_tests;
+    mod mainnet_import_bench;
 
     use std::{
         env::temp_dir,

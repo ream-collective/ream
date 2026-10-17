@@ -9,6 +9,9 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[target.'cfg(target_vendor = "apple")'.dependencies]
+libc.workspace = true
+
 [features]
 default = ["devnet5"]
 devnet5 = ["ream-consensus-lean/devnet5"]

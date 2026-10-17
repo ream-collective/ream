@@ -71,6 +71,7 @@ pub async fn on_block_with_root(
     let block = &signed_block.message;
     let parent_root = block.parent_root;
     let block_slot = block.slot;
+    let started = std::time::Instant::now();
 
     // Parent block must be known
     ensure!(
@@ -119,6 +120,7 @@ pub async fn on_block_with_root(
         .ok_or_else(|| anyhow!("parent block not found"))?
         .message
         .state_root;
+    let state_loaded = started.elapsed();
     let state_transition_timer = BEACON_BLOCK_STATE_TRANSITION_SECONDS.start_timer();
     let epoch_start_state = state
         .state_transition_keeping_epoch_start(
@@ -129,6 +131,14 @@ pub async fn on_block_with_root(
         )
         .await?;
     state_transition_timer.observe_duration();
+    let transitioned = started.elapsed();
+    tracing::debug!(
+        target: "ream::timing",
+        slot = block_slot,
+        checks_and_state_load_ms = state_loaded.as_millis() as u64,
+        state_transition_ms = (transitioned - state_loaded).as_millis() as u64,
+        "timing: on_block"
+    );
     if let Some(epoch_start_state) = epoch_start_state {
         store.db.checkpoint_states_provider().insert_shared(
             Checkpoint {
@@ -217,6 +227,7 @@ pub fn process_available_block(
     }
     let writes = checkpoints.writes();
 
+    let commit_started = std::time::Instant::now();
     store.db.commit_block_import(BlockImportData {
         block_root,
         block: signed_block,
@@ -228,6 +239,12 @@ pub fn process_available_block(
             checkpoints: writes,
         },
     })?;
+    tracing::debug!(
+        target: "ream::timing",
+        slot = block_slot,
+        commit_ms = commit_started.elapsed().as_millis() as u64,
+        "timing: block commit"
+    );
 
     BEACON_PROCESSED_DEPOSITS_TOTAL.set(state.eth1_deposit_index as i64);
     BEACON_CURRENT_ACTIVE_VALIDATORS.set(
