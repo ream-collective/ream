@@ -155,6 +155,17 @@ fn spawn_queued_column_fetches(
     }
 }
 
+/// Rebuilds a pending block's missing columns on its own task: reading the stored columns and
+/// recovering the rest takes too long for the event loop.
+fn spawn_column_reconstruction(beacon_chain: &Arc<BeaconChain>, block_root: B256) {
+    let beacon_chain = beacon_chain.clone();
+    tokio::spawn(async move {
+        if let Err(err) = beacon_chain.reconstruct_data_columns(block_root).await {
+            debug!(%block_root, "Column reconstruction did not import: {err:#}");
+        }
+    });
+}
+
 async fn reconcile_block_lookup_state(
     beacon_chain: &BeaconChain,
     roots: Vec<alloy_primitives::B256>,
@@ -462,12 +473,7 @@ impl NetworkManagerService {
                                     );
                                 }
                                 ream_chain_beacon::beacon_chain::BlockImportEvent::ReconstructionReady { block_root } => {
-                                    let beacon_chain = beacon_chain.clone();
-                                    tokio::spawn(async move {
-                                        if let Err(err) = beacon_chain.reconstruct_data_columns(block_root).await {
-                                            debug!(%block_root, "Column reconstruction did not import: {err:#}");
-                                        }
-                                    });
+                                    spawn_column_reconstruction(&beacon_chain, block_root);
                                 }
                             }
                             record_removed_lookup_entries(
@@ -513,6 +519,11 @@ impl NetworkManagerService {
                                 &network_state,
                                 &column_fetch_done_sender,
                             );
+                            // Skipped events may include a ReconstructionReady, which is sent
+                            // once per block.
+                            for block_root in beacon_chain.reconstructable_pending_blocks().await {
+                                spawn_column_reconstruction(&beacon_chain, block_root);
+                            }
                             record_removed_lookup_entries(
                                 PENDING_AVAILABILITY_LOOKUP,
                                 "completed",

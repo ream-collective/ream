@@ -102,7 +102,7 @@ pub struct BeaconChain {
     block_import_sender: broadcast::Sender<BlockImportEvent>,
     execution_forkchoice: Mutex<Option<ForkchoiceStateV1>>,
     force_data_availability_checks: bool,
-    /// Blocks with a reconstruction announced and not finished, so each is rebuilt once.
+    /// Blocks with a reconstruction announced and not finished, so each is announced once.
     reconstructions: parking_lot::Mutex<HashSet<B256>>,
 }
 
@@ -465,12 +465,28 @@ impl BeaconChain {
     }
 
     /// Announces a reconstruction once per block until `reconstruct_data_columns` finishes it.
+    /// An announcement nobody received is not reserved, so a later column announces it again.
     fn notify_reconstruction_ready(&self, block_root: B256) {
-        if self.reconstructions.lock().insert(block_root) {
-            let _ = self
+        if self.reconstructions.lock().insert(block_root)
+            && self
                 .block_import_sender
-                .send(BlockImportEvent::ReconstructionReady { block_root });
+                .send(BlockImportEvent::ReconstructionReady { block_root })
+                .is_err()
+        {
+            self.reconstructions.lock().remove(&block_root);
         }
+    }
+
+    /// Pending blocks with enough columns to rebuild the rest, for a subscriber that lagged and
+    /// may have missed their `ReconstructionReady`. Reservations of blocks that are no longer
+    /// pending are dropped, so lost announcements do not accumulate.
+    pub async fn reconstructable_pending_blocks(&self) -> Vec<B256> {
+        let store = self.store.lock().await;
+        let checker = &store.data_availability_checker;
+        self.reconstructions
+            .lock()
+            .retain(|block_root| checker.pending_block(block_root).is_some());
+        checker.reconstructable_block_roots()
     }
 
     /// Rebuilds the missing columns of a pending block from the half or more already stored, and
@@ -732,7 +748,65 @@ pub fn is_data_availability_check_required(
 
 #[cfg(test)]
 mod tests {
+    use ream_storage::db::ReamDB;
+
     use super::*;
+
+    /// Kept alongside the chain so the directory lives until the test ends.
+    fn test_chain() -> (tempfile::TempDir, BeaconChain) {
+        let data_dir = tempfile::tempdir().expect("tempdir should be created");
+        let beacon_db = ReamDB::new(data_dir.path().to_path_buf())
+            .expect("ReamDB should init")
+            .init_beacon_db()
+            .expect("beacon DB tables should init");
+        let chain = BeaconChain::new(
+            beacon_db,
+            Arc::new(OperationPool::default()),
+            Arc::new(SyncCommitteePool::default()),
+            None,
+            None,
+        );
+        (data_dir, chain)
+    }
+
+    #[tokio::test]
+    async fn an_announcement_nobody_received_is_announced_again() {
+        let (_data_dir, chain) = test_chain();
+        let block_root = B256::repeat_byte(1);
+
+        chain.notify_reconstruction_ready(block_root);
+        assert!(chain.reconstructions.lock().is_empty());
+
+        let mut events = chain.subscribe_block_imports();
+        chain.notify_reconstruction_ready(block_root);
+        assert_eq!(
+            events.try_recv().unwrap(),
+            BlockImportEvent::ReconstructionReady { block_root }
+        );
+        chain.notify_reconstruction_ready(block_root);
+        assert!(events.try_recv().is_err(), "announced once until it runs");
+    }
+
+    #[tokio::test]
+    async fn a_lagged_subscriber_drops_reservations_of_blocks_no_longer_pending() {
+        let (_data_dir, chain) = test_chain();
+        let block_root = B256::repeat_byte(1);
+        let mut events = chain.subscribe_block_imports();
+        chain.notify_reconstruction_ready(block_root);
+        for _ in 0..BLOCK_IMPORT_EVENT_CHANNEL_CAPACITY {
+            chain.notify_block_imported(B256::ZERO);
+        }
+        assert!(matches!(
+            events.recv().await,
+            Err(broadcast::error::RecvError::Lagged(_))
+        ));
+
+        // The block left the pending set while its announcement was skipped.
+        assert!(chain.reconstructable_pending_blocks().await.is_empty());
+        assert!(chain.reconstructions.lock().is_empty());
+        chain.notify_reconstruction_ready(block_root);
+        assert!(chain.reconstructions.lock().contains(&block_root));
+    }
 
     #[test]
     fn data_availability_boundary_tracks_fulu_and_retention_window() {

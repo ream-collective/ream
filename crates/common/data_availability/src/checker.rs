@@ -134,6 +134,15 @@ impl<State> DataAvailabilityChecker<State> {
         })
     }
 
+    /// The pending blocks that `can_reconstruct`.
+    pub fn reconstructable_block_roots(&self) -> Vec<B256> {
+        self.entries
+            .keys()
+            .filter(|block_root| self.can_reconstruct(block_root))
+            .copied()
+            .collect()
+    }
+
     pub fn pending_block_roots(&self) -> Vec<B256> {
         self.entries
             .iter()
@@ -238,6 +247,10 @@ mod tests {
 
         checker.add_column(root, NUMBER_OF_COLUMNS / 2 - 1, 1);
         assert!(checker.can_reconstruct(&root));
+        let short_root = B256::repeat_byte(8);
+        checker.insert_pending(short_root, block_with_blobs(1), ());
+        checker.add_column(short_root, 0, 1);
+        assert_eq!(checker.reconstructable_block_roots(), vec![root]);
         assert_eq!(
             checker.received_columns(&root).len() as u64,
             NUMBER_OF_COLUMNS / 2
@@ -250,6 +263,7 @@ mod tests {
             !checker.can_reconstruct(&root),
             "complete blocks need no reconstruction"
         );
+        assert!(checker.reconstructable_block_roots().is_empty());
     }
 
     #[test]
