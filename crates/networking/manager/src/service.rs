@@ -57,7 +57,10 @@ use crate::{
     },
     gossipsub::{
         handle::{handle_gossipsub_message, init_gossipsub_config_with_topics},
-        workers::{GossipWorkers, is_data_column, is_handled_concurrently},
+        workers::{
+            GossipWorkerBudget, GossipWorkers, PENDING_ITEM_QUEUE_CAPACITY, is_data_column,
+            is_handled_concurrently,
+        },
     },
     p2p_sender::P2PSender,
     req_resp::handle_req_resp_message,
@@ -407,18 +410,22 @@ impl NetworkManagerService {
         let mut column_fetch_tracker = ColumnFetchTracker::default();
         let (column_fetch_done_sender, mut column_fetch_done_receiver) =
             mpsc::unbounded_channel::<(B256, PeerId, ColumnFetchOutcome)>();
-        let (pending_item_sender, mut pending_item_receiver) = mpsc::unbounded_channel();
+        let (pending_item_sender, mut pending_item_receiver) =
+            mpsc::channel(PENDING_ITEM_QUEUE_CAPACITY);
+        let gossip_worker_budget = GossipWorkerBudget::for_current_runtime();
         let mut gossip_workers = GossipWorkers::start(
             beacon_chain.clone(),
             cached_db.clone(),
             p2p_sender.clone(),
             pending_item_sender.clone(),
+            &gossip_worker_budget,
         );
         let mut column_workers = GossipWorkers::start(
             beacon_chain.clone(),
             cached_db.clone(),
             p2p_sender.clone(),
             pending_item_sender,
+            &gossip_worker_budget,
         );
         let mut syncer_handle = block_range_syncer.start();
         // Avoid polling a completed JoinHandle after the syncer has caught up.

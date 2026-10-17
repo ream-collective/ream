@@ -87,6 +87,12 @@ lazy_static::lazy_static! {
         default_registry()
     ).expect("failed to create BEACON_DATA_COLUMN_SIDECAR_PROCESSING_SUCCESSES_TOTAL int counter");
 
+    pub static ref BEACON_GOSSIP_PENDING_ITEMS_DROPPED_TOTAL: IntCounter = register_int_counter_with_registry!(
+        "beacon_gossip_pending_items_dropped_total",
+        "Gossip columns waiting on their parent dropped because the manager loop's queue was full",
+        default_registry()
+    ).expect("failed to create BEACON_GOSSIP_PENDING_ITEMS_DROPPED_TOTAL int counter");
+
     pub static ref BEACON_DATA_COLUMN_SIDECAR_GOSSIP_VERIFICATION_SECONDS: Histogram = {
         // Gossip verification is expected to be fast (sub-100ms typical case).
         // Starting point only — re-tune against real hardware benchmarks.
