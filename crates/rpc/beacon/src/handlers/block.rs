@@ -35,10 +35,8 @@ use ream_consensus_beacon::{
 use ream_consensus_misc::constants::beacon::{
     GENESIS_SLOT, WHISTLEBLOWER_REWARD_QUOTIENT, genesis_validators_root,
 };
-use ream_fork_choice_beacon::store::Store;
 use ream_network_manager::p2p_sender::P2PSender;
 use ream_network_spec::networks::beacon_network_spec;
-use ream_operation_pool::OperationPool;
 use ream_p2p::{
     gossipsub::beacon::topics::{GossipTopic, GossipTopicKind},
     network::beacon::channel::GossipMessage,
@@ -84,7 +82,11 @@ pub struct ValidatorSyncCommitteeReward {
     pub reward: u64,
 }
 
-pub async fn get_block_root_from_id(block_id: ID, db: &BeaconDB) -> Result<B256, ApiError> {
+pub async fn get_block_root_from_id(
+    block_id: ID,
+    db: &BeaconDB,
+    beacon_chain: &BeaconChain,
+) -> Result<B256, ApiError> {
     let block_root = match block_id {
         ID::Finalized => {
             let finalized_checkpoint = db.finalized_checkpoint_provider().get().map_err(|err| {
@@ -104,15 +106,14 @@ pub async fn get_block_root_from_id(block_id: ID, db: &BeaconDB) -> Result<B256,
 
             Ok(Some(justified_checkpoint.root))
         }
-        ID::Head => {
-            // `get_head` reads the fork choice entirely out of the database, so the pools it
-            // is constructed with are never consulted here.
-            let store = Store::new(db.clone(), Arc::new(OperationPool::default()), None);
-
-            Ok(Some(store.get_head().map_err(|err| {
-                ApiError::InternalError(format!("Failed to get head, error: {err:?}"))
-            })?))
-        }
+        ID::Head => Ok(Some(
+            beacon_chain
+                .head()
+                .map_err(|err| {
+                    ApiError::InternalError(format!("Failed to get head, error: {err:?}"))
+                })?
+                .head_root,
+        )),
         ID::Genesis => db.slot_index_provider().get(GENESIS_SLOT),
         ID::Slot(slot) => db.slot_index_provider().get(slot),
         ID::Root(root) => Ok(Some(root)),
@@ -181,8 +182,9 @@ fn get_attester_slashing_rewards(
 pub async fn get_beacon_block_from_id(
     block_id: ID,
     db: &BeaconDB,
+    beacon_chain: &BeaconChain,
 ) -> Result<SignedBeaconBlock, ApiError> {
-    let block_root = get_block_root_from_id(block_id, db).await?;
+    let block_root = get_block_root_from_id(block_id, db, beacon_chain).await?;
 
     db.block_provider()
         .get(block_root)
@@ -208,9 +210,10 @@ pub async fn get_genesis() -> Result<impl Responder, ApiError> {
 #[get("/beacon/blocks/{block_id}/attestations")]
 pub async fn get_block_attestations(
     db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<BeaconChain>>,
     block_id: Path<ID>,
 ) -> Result<impl Responder, ApiError> {
-    let beacon_block = get_beacon_block_from_id(block_id.into_inner(), &db).await?;
+    let beacon_block = get_beacon_block_from_id(block_id.into_inner(), &db, &beacon_chain).await?;
 
     Ok(HttpResponse::Ok().json(BeaconVersionedResponse::new(
         beacon_block.message.body.attestations,
@@ -221,9 +224,10 @@ pub async fn get_block_attestations(
 #[get("/beacon/blocks/{block_id}/root")]
 pub async fn get_block_root(
     db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<BeaconChain>>,
     block_id: Path<ID>,
 ) -> Result<impl Responder, ApiError> {
-    let block_root = get_block_root_from_id(block_id.into_inner(), &db).await?;
+    let block_root = get_block_root_from_id(block_id.into_inner(), &db, &beacon_chain).await?;
 
     Ok(HttpResponse::Ok().json(BeaconResponse::new(RootResponse::new(block_root))))
 }
@@ -232,10 +236,11 @@ pub async fn get_block_root(
 #[get("/beacon/blocks/{block_id}/rewards")]
 pub async fn get_block_rewards(
     db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<BeaconChain>>,
     block_id: Path<ID>,
 ) -> Result<impl Responder, ApiError> {
     let block_id_value = block_id.into_inner();
-    let beacon_block = get_beacon_block_from_id(block_id_value.clone(), &db).await?;
+    let beacon_block = get_beacon_block_from_id(block_id_value.clone(), &db, &beacon_chain).await?;
     let beacon_state = get_state_from_id(block_id_value.clone(), &db).await?;
 
     let attestation_reward = get_attestations_rewards(&beacon_state, &beacon_block);
@@ -272,9 +277,10 @@ pub async fn get_block_rewards(
 #[get("/beacon/blocks/{block_id}")]
 pub async fn get_block_from_id(
     db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<BeaconChain>>,
     block_id: Path<ID>,
 ) -> Result<impl Responder, ApiError> {
-    let beacon_block = get_beacon_block_from_id(block_id.into_inner(), &db).await?;
+    let beacon_block = get_beacon_block_from_id(block_id.into_inner(), &db, &beacon_chain).await?;
 
     Ok(HttpResponse::Ok().json(BeaconVersionedResponse::new(beacon_block)))
 }
@@ -282,11 +288,12 @@ pub async fn get_block_from_id(
 #[post("/beacon/rewards/sync_committee/{block_id}")]
 pub async fn post_sync_committee_rewards(
     db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<BeaconChain>>,
     block_id: Path<ID>,
     validators: Json<Vec<ValidatorID>>,
 ) -> Result<impl Responder, ApiError> {
     let block_id_value = block_id.into_inner();
-    let beacon_block = get_beacon_block_from_id(block_id_value.clone(), &db).await?;
+    let beacon_block = get_beacon_block_from_id(block_id_value.clone(), &db, &beacon_chain).await?;
     let beacon_state = get_state_from_id(block_id_value.clone(), &db).await?;
 
     let sync_committee_rewards_map =
@@ -337,9 +344,10 @@ pub async fn post_sync_committee_rewards(
 pub async fn get_blind_block(
     http_request: HttpRequest,
     db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<BeaconChain>>,
     block_id: Path<ID>,
 ) -> Result<impl Responder, ApiError> {
-    let beacon_block = get_beacon_block_from_id(block_id.into_inner(), &db).await?;
+    let beacon_block = get_beacon_block_from_id(block_id.into_inner(), &db, &beacon_chain).await?;
     let blinded_beacon_block = beacon_block.as_signed_blinded_beacon_block();
     match http_request
         .headers()
