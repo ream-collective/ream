@@ -131,6 +131,8 @@ struct LookupEntry<BlockPayload, Peer> {
     payload: Option<StoredPayload<BlockPayload>>,
     peers: Vec<Peer>,
     next_peer: usize,
+    /// Peers already asked for this block, so a replacement can be one that was not.
+    asked_peers: Vec<Peer>,
     awaiting_parent: Option<B256>,
     state: LookupState,
     failed_downloads: u8,
@@ -234,6 +236,7 @@ where
                 payload: None,
                 peers: Vec::new(),
                 next_peer: 0,
+                asked_peers: Vec::new(),
                 awaiting_parent: None,
                 state: LookupState::AwaitingParent,
                 failed_downloads: 0,
@@ -353,6 +356,13 @@ where
                 entry.add_peer(replacement, max_peers);
             }
         }
+    }
+
+    /// The peers the lookup of `block_root` has asked for it so far.
+    pub fn asked_peers(&self, block_root: B256) -> &[Peer] {
+        self.entries
+            .get(&block_root)
+            .map_or(&[], |entry| entry.asked_peers.as_slice())
     }
 
     pub fn download_failed(&mut self, action_id: LookupActionId, block_root: B256) -> bool {
@@ -485,6 +495,9 @@ where
                     }
                     let peer = entry.peers[entry.next_peer % entry.peers.len()].clone();
                     entry.next_peer = entry.next_peer.wrapping_add(1);
+                    if !entry.asked_peers.contains(&peer) {
+                        entry.asked_peers.push(peer.clone());
+                    }
                     entry.state = LookupState::Downloading(action_id);
                     return Some(UnknownParentAction::RequestBlock {
                         action_id,
@@ -626,6 +639,7 @@ where
                         payload: None,
                         peers: vec![peer],
                         next_peer: 0,
+                        asked_peers: Vec::new(),
                         awaiting_parent: None,
                         state: LookupState::AwaitingDownload,
                         failed_downloads: 0,

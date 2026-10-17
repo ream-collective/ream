@@ -723,7 +723,7 @@ impl NetworkManagerService {
                                     fallback_lookup_peer(
                                         &network_state,
                                         &lookup_refusals,
-                                        &propagation_source,
+                                        &[propagation_source],
                                         meta.parent_root,
                                     )
                                     .unwrap_or(propagation_source)

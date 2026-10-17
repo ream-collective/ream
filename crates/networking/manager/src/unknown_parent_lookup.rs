@@ -196,12 +196,12 @@ impl BlocksByRootRefusals {
     }
 }
 
-/// A connected peer, other than `exclude`, that sent its status and has not refused blocks by root.
+/// A connected peer, not in `exclude`, that sent its status and has not refused blocks by root.
 /// The choice is spread over candidates by `block_root`, so concurrent lookups ask different peers.
 pub fn fallback_lookup_peer(
     network_state: &NetworkState,
     refusals: &BlocksByRootRefusals,
-    exclude: &PeerId,
+    exclude: &[PeerId],
     block_root: B256,
 ) -> Option<PeerId> {
     pick_fallback_peer(
@@ -219,11 +219,13 @@ pub fn fallback_lookup_peer(
 fn pick_fallback_peer(
     peers: impl Iterator<Item = (PeerId, bool)>,
     refusals: &BlocksByRootRefusals,
-    exclude: &PeerId,
+    exclude: &[PeerId],
     block_root: B256,
 ) -> Option<PeerId> {
     let mut candidates = peers
-        .filter(|(peer, sent_status)| *sent_status && peer != exclude && !refusals.contains(peer))
+        .filter(|(peer, sent_status)| {
+            *sent_status && !exclude.contains(peer) && !refusals.contains(peer)
+        })
         .map(|(peer, _)| peer)
         .collect::<Vec<_>>();
     if candidates.is_empty() {
@@ -289,7 +291,11 @@ pub async fn apply_unknown_parent_update(
             if matches!(error, ParentLookupRequestError::UnsupportedProtocol) {
                 refusals.insert(peer);
             }
-            let replacement = fallback_lookup_peer(network_state, refusals, &peer, requested_root);
+            // Prefer a peer this lookup has not asked yet. Without one, the lookup retries the
+            // peers it has rather than cycling between the last two that failed.
+            let mut asked = coordinator.asked_peers(requested_root).to_vec();
+            asked.push(peer);
+            let replacement = fallback_lookup_peer(network_state, refusals, &asked, requested_root);
             coordinator.replace_peer(requested_root, &peer, replacement);
             coordinator.download_failed(action_id, requested_root);
         }
@@ -429,6 +435,7 @@ mod tests {
 
     use anyhow::anyhow;
     use ream_p2p::network::beacon::channel::P2PCallbackError;
+    use ream_syncer::unknown_parent_lookups::UnknownParentLookupConfig;
     use tokio::sync::mpsc::{self, UnboundedReceiver, error::TryRecvError};
 
     use super::*;
@@ -606,13 +613,64 @@ mod tests {
             (usable, true),
         ];
         assert_eq!(
-            pick_fallback_peer(peers.into_iter(), &refusals, &excluded, B256::ZERO),
+            pick_fallback_peer(peers.into_iter(), &refusals, &[excluded], B256::ZERO),
             Some(usable)
         );
         assert_eq!(
-            pick_fallback_peer(peers.into_iter().take(3), &refusals, &excluded, B256::ZERO),
+            pick_fallback_peer(
+                peers.into_iter().take(3),
+                &refusals,
+                &[excluded],
+                B256::ZERO
+            ),
             None
         );
+    }
+
+    /// A lookup whose peers keep failing asks every connected peer once before retrying any.
+    #[test]
+    fn successive_fallbacks_ask_peers_not_yet_asked() {
+        let mut peers = [(); 3].map(|_| PeerId::random());
+        peers.sort();
+        let parent_root = B256::ZERO;
+        let mut coordinator =
+            UnknownParentLookupCoordinator::<(), PeerId>::new(UnknownParentLookupConfig::default());
+        coordinator.insert_gossip_block(
+            UnknownBlockMeta {
+                block_root: B256::repeat_byte(1),
+                parent_root,
+                slot: 1,
+            },
+            (),
+            peers[0],
+        );
+        let refusals = BlocksByRootRefusals::default();
+
+        let mut requested = Vec::new();
+        for _ in 0..peers.len() {
+            let Some(UnknownParentAction::RequestBlock {
+                action_id,
+                block_root,
+                peer,
+            }) = coordinator.next_action()
+            else {
+                panic!("expected a block request");
+            };
+            assert_eq!(block_root, parent_root);
+            requested.push(peer);
+
+            let mut asked = coordinator.asked_peers(parent_root).to_vec();
+            asked.push(peer);
+            let replacement = pick_fallback_peer(
+                peers.iter().map(|peer| (*peer, true)),
+                &refusals,
+                &asked,
+                parent_root,
+            );
+            coordinator.replace_peer(parent_root, &peer, replacement);
+            assert!(coordinator.download_failed(action_id, parent_root));
+        }
+        assert_eq!(requested, peers);
     }
 
     #[test]
