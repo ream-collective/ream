@@ -1,7 +1,7 @@
 use std::{
     path::PathBuf,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use alloy_primitives::B256;
@@ -42,7 +42,7 @@ use tokio::{
     sync::mpsc,
     time::{interval, sleep},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use tree_hash::TreeHash;
 
 use crate::{
@@ -57,7 +57,7 @@ use crate::{
     },
     gossipsub::{
         handle::{handle_gossipsub_message, init_gossipsub_config_with_topics},
-        workers::{GossipWorkers, is_handled_concurrently},
+        workers::{GossipWorkers, is_data_column, is_handled_concurrently},
     },
     p2p_sender::P2PSender,
     req_resp::handle_req_resp_message,
@@ -123,6 +123,114 @@ pub struct NetworkManagerService {
 struct ReconciledBlockLookupState {
     imported_roots: Vec<alloy_primitives::B256>,
     pending_availability_roots: Vec<alloy_primitives::B256>,
+}
+
+/// Time the manager loop spends handling blocks and sidecars itself, logged once a minute.
+/// Nothing else on the loop runs meanwhile, so a busy share near the window means queued events.
+#[derive(Default)]
+struct InlineGossipTimes {
+    since: Option<Instant>,
+    // Indexed by `inline_gossip_kind`: block, column, other.
+    count: [u64; 3],
+    busy: [Duration; 3],
+    max: Duration,
+}
+
+impl InlineGossipTimes {
+    fn record(&mut self, kind: usize, elapsed: Duration) {
+        let since = *self.since.get_or_insert_with(Instant::now);
+        self.count[kind] += 1;
+        self.busy[kind] += elapsed;
+        self.max = self.max.max(elapsed);
+        if since.elapsed() >= Duration::from_secs(60) {
+            info!(
+                window_ms = since.elapsed().as_millis() as u64,
+                blocks = self.count[0],
+                block_ms = self.busy[0].as_millis() as u64,
+                columns = self.count[1],
+                column_ms = self.busy[1].as_millis() as u64,
+                others = self.count[2],
+                other_ms = self.busy[2].as_millis() as u64,
+                max_ms = self.max.as_millis() as u64,
+                "timing: inline gossip"
+            );
+            *self = Self::default();
+        }
+    }
+}
+
+fn inline_gossip_kind(topic: &libp2p::gossipsub::TopicHash) -> usize {
+    match ream_p2p::gossipsub::beacon::topics::GossipTopic::from_topic_hash(topic).map(|t| t.kind) {
+        Ok(ream_p2p::gossipsub::beacon::topics::GossipTopicKind::BeaconBlock) => 0,
+        Ok(ream_p2p::gossipsub::beacon::topics::GossipTopicKind::DataColumnSidecar(_)) => 1,
+        _ => 2,
+    }
+}
+
+/// Hands a block or column waiting on its parent's availability to the pending lookups.
+async fn insert_pending_gossip_item<BlockPayload>(
+    beacon_chain: &BeaconChain,
+    block_lookup_coordinator: &mut BlockLookupCoordinator,
+    unknown_parent_lookups: &mut UnknownParentLookupCoordinator<BlockPayload, PeerId>,
+    item: PendingGossipItem,
+) {
+    let is_block = matches!(&item, PendingGossipItem::Block { .. });
+    let block_root = match &item {
+        PendingGossipItem::Block { block, .. } => block.block().message.tree_hash_root(),
+        PendingGossipItem::Column { column, .. } => column
+            .sidecar()
+            .signed_block_header
+            .message
+            .tree_hash_root(),
+    };
+    let current_slot = {
+        let store = beacon_chain.store.lock().await;
+        store.get_current_slot()
+    };
+    match current_slot {
+        Ok(current_slot) => {
+            let entry_existed = block_lookup_coordinator.contains_entry(&block_root);
+            let entries_before = block_lookup_coordinator.pending_entry_count();
+            let outcome = insert_pending_item(block_lookup_coordinator, item, current_slot);
+            let retained = matches!(
+                outcome,
+                ream_syncer::block_lookups::InsertOutcome::Inserted
+                    | ream_syncer::block_lookups::InsertOutcome::Duplicate
+            );
+            match outcome {
+                ream_syncer::block_lookups::InsertOutcome::Inserted if !entry_existed => {
+                    inc_int_counter_vec(
+                        &BEACON_BLOCK_LOOKUP_EVENTS_TOTAL,
+                        &[PENDING_AVAILABILITY_LOOKUP, "created"],
+                    );
+                    let evicted = entries_before
+                        .saturating_add(1)
+                        .saturating_sub(block_lookup_coordinator.pending_entry_count());
+                    if evicted > 0 {
+                        inc_int_counter_vec_by(
+                            &BEACON_BLOCK_LOOKUP_EVENTS_TOTAL,
+                            evicted as u64,
+                            &[PENDING_AVAILABILITY_LOOKUP, "pruned"],
+                        );
+                    }
+                }
+                ream_syncer::block_lookups::InsertOutcome::Rejected(_) => {
+                    inc_int_counter_vec(
+                        &BEACON_BLOCK_LOOKUP_EVENTS_TOTAL,
+                        &[PENDING_AVAILABILITY_LOOKUP, "rejected"],
+                    );
+                }
+                _ => {}
+            }
+            log_insert_outcome(block_root, outcome);
+            if is_block && retained {
+                unknown_parent_lookups.block_deferred_elsewhere(block_root);
+            }
+        }
+        Err(err) => {
+            error!("Failed to read current slot for pending gossip: {err}")
+        }
+    }
 }
 
 fn spawn_queued_column_fetches(
@@ -328,10 +436,22 @@ impl NetworkManagerService {
         let (unknown_parent_update_sender, mut unknown_parent_update_receiver) =
             mpsc::channel(MAX_LOOKUPS);
         let mut column_fetch_tracker = ColumnFetchTracker::default();
+        let mut inline_gossip_times = InlineGossipTimes::default();
         let (column_fetch_done_sender, mut column_fetch_done_receiver) =
             mpsc::unbounded_channel::<(B256, PeerId, ColumnFetchOutcome)>();
-        let gossip_workers =
-            GossipWorkers::start(beacon_chain.clone(), cached_db.clone(), p2p_sender.clone());
+        let (pending_item_sender, mut pending_item_receiver) = mpsc::unbounded_channel();
+        let gossip_workers = GossipWorkers::start(
+            beacon_chain.clone(),
+            cached_db.clone(),
+            p2p_sender.clone(),
+            pending_item_sender.clone(),
+        );
+        let column_workers = GossipWorkers::start(
+            beacon_chain.clone(),
+            cached_db.clone(),
+            p2p_sender.clone(),
+            pending_item_sender,
+        );
         let mut syncer_handle = block_range_syncer.start();
         // Avoid polling a completed JoinHandle after the syncer has caught up.
         let mut syncer_active = true;
@@ -465,7 +585,7 @@ impl NetworkManagerService {
                                     let beacon_chain = beacon_chain.clone();
                                     tokio::spawn(async move {
                                         if let Err(err) = beacon_chain.reconstruct_data_columns(block_root).await {
-                                            debug!(%block_root, "Column reconstruction did not import: {err:#}");
+                                            error!(%block_root, "Column reconstruction failed: {err:#}");
                                         }
                                     });
                                 }
@@ -685,9 +805,24 @@ impl NetworkManagerService {
                     }
                 }
                 // Handle inbound network events.
+                // Lookup work from columns that the column workers validated.
+                Some(item) = pending_item_receiver.recv() => {
+                    insert_pending_gossip_item(
+                        &beacon_chain,
+                        &mut block_lookup_coordinator,
+                        &mut unknown_parent_lookups,
+                        item,
+                    )
+                    .await;
+                }
                 Some(event) = manager_receiver.recv() => {
                     match event {
                         // Handles Gossipsub messages from other peers.
+                        ReamNetworkEvent::GossipsubMessage { propagation_source, message_id, message }
+                            if is_data_column(&message.topic) =>
+                        {
+                            column_workers.submit(message, message_id, propagation_source);
+                        }
                         ReamNetworkEvent::GossipsubMessage { propagation_source, message_id, message }
                             if is_handled_concurrently(&message.topic) =>
                         {
@@ -696,6 +831,8 @@ impl NetworkManagerService {
                         ReamNetworkEvent::GossipsubMessage { propagation_source, message_id, message } => {
                             let mut pending_item = None;
                             let mut unknown_parent_block = None;
+                            let kind = inline_gossip_kind(&message.topic);
+                            let started = Instant::now();
                             let acceptance = handle_gossipsub_message(
                                 message,
                                 &beacon_chain,
@@ -703,6 +840,7 @@ impl NetworkManagerService {
                                 &mut pending_item,
                                 &mut unknown_parent_block,
                             ).await;
+                            inline_gossip_times.record(kind, started.elapsed());
                             p2p_sender.report_gossip_validation(
                                 message_id,
                                 propagation_source,
@@ -756,75 +894,13 @@ impl NetworkManagerService {
                             }
 
                             if let Some(item) = pending_item {
-                                let is_block = matches!(&item, PendingGossipItem::Block { .. });
-                                let block_root = match &item {
-                                    PendingGossipItem::Block { block, .. } => {
-                                        block.block().message.tree_hash_root()
-                                    }
-                                    PendingGossipItem::Column { column, .. } => {
-                                        column.sidecar().signed_block_header.message.tree_hash_root()
-                                    }
-                                };
-                                let current_slot = {
-                                    let store = beacon_chain.store.lock().await;
-                                    store.get_current_slot()
-                                };
-                                match current_slot {
-                                    Ok(current_slot) => {
-                                        let entry_existed = block_lookup_coordinator
-                                            .contains_entry(&block_root);
-                                        let entries_before =
-                                            block_lookup_coordinator.pending_entry_count();
-                                        let outcome = insert_pending_item(
-                                            &mut block_lookup_coordinator,
-                                            item,
-                                            current_slot,
-                                        );
-                                        let retained = matches!(
-                                            outcome,
-                                            ream_syncer::block_lookups::InsertOutcome::Inserted
-                                                | ream_syncer::block_lookups::InsertOutcome::Duplicate
-                                        );
-                                        match outcome {
-                                            ream_syncer::block_lookups::InsertOutcome::Inserted
-                                                if !entry_existed =>
-                                            {
-                                                inc_int_counter_vec(
-                                                    &BEACON_BLOCK_LOOKUP_EVENTS_TOTAL,
-                                                    &[PENDING_AVAILABILITY_LOOKUP, "created"],
-                                                );
-                                                let evicted = entries_before
-                                                    .saturating_add(1)
-                                                    .saturating_sub(
-                                                        block_lookup_coordinator
-                                                            .pending_entry_count(),
-                                                    );
-                                                if evicted > 0 {
-                                                    inc_int_counter_vec_by(
-                                                        &BEACON_BLOCK_LOOKUP_EVENTS_TOTAL,
-                                                        evicted as u64,
-                                                        &[PENDING_AVAILABILITY_LOOKUP, "pruned"],
-                                                    );
-                                                }
-                                            }
-                                            ream_syncer::block_lookups::InsertOutcome::Rejected(_) => {
-                                                inc_int_counter_vec(
-                                                    &BEACON_BLOCK_LOOKUP_EVENTS_TOTAL,
-                                                    &[PENDING_AVAILABILITY_LOOKUP, "rejected"],
-                                                );
-                                            }
-                                            _ => {}
-                                        }
-                                        log_insert_outcome(block_root, outcome);
-                                        if is_block && retained {
-                                            unknown_parent_lookups
-                                                .block_deferred_elsewhere(block_root);
-                                        }
-                                    }
-                                    Err(err) => {
-                                        error!("Failed to read current slot for pending gossip: {err}")
-                                    }
-                                }
+                                insert_pending_gossip_item(
+                                    &beacon_chain,
+                                    &mut block_lookup_coordinator,
+                                    &mut unknown_parent_lookups,
+                                    item,
+                                )
+                                .await;
                             }
                         }
                         // Handles Req/Resp messages from other peers.

@@ -6464,6 +6464,7 @@ dependencies = [
  "ethereum_ssz_derive",
  "itertools 0.15.0",
  "rand 0.10.2",
+ "rayon",
  "ream-bls",
  "ream-consensus-misc",
  "ream-execution-engine",
