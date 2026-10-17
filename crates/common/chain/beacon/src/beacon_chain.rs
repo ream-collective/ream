@@ -724,7 +724,12 @@ pub fn is_data_availability_check_required(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf, time::SystemTime};
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+        time::SystemTime,
+    };
 
     use ream_consensus_beacon::data_column_sidecar::get_data_column_sidecars;
     use ream_fork_choice_beacon::data_availability::DataAvailabilityChecker;
@@ -733,12 +738,16 @@ mod tests {
     use super::*;
 
     fn test_chain() -> (PathBuf, BeaconChain) {
+        // The clock alone can repeat across parallel tests (macOS reports microseconds), and two
+        // tests sharing a directory fail with `DatabaseAlreadyOpen`.
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "ream-da64-chain-test-{}",
+            "ream-da64-chain-test-{}-{}",
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&path).unwrap();
         let db = ReamDB::new(path.clone()).unwrap().init_beacon_db().unwrap();
