@@ -330,7 +330,7 @@ impl NetworkManagerService {
         let mut column_fetch_tracker = ColumnFetchTracker::default();
         let (column_fetch_done_sender, mut column_fetch_done_receiver) =
             mpsc::unbounded_channel::<(B256, PeerId, ColumnFetchOutcome)>();
-        let gossip_workers =
+        let mut gossip_workers =
             GossipWorkers::start(beacon_chain.clone(), cached_db.clone(), p2p_sender.clone());
         let mut syncer_handle = block_range_syncer.start();
         // Avoid polling a completed JoinHandle after the syncer has caught up.
@@ -677,6 +677,15 @@ impl NetworkManagerService {
                     }
                 }
                 // Handle inbound network events.
+                Some(err) = gossip_workers.stopped() => {
+                    // A gossip worker only stops by panicking. Fail the service, as a panic on
+                    // this loop would, rather than keep running with fewer workers.
+                    if err.is_panic() {
+                        std::panic::resume_unwind(err.into_panic());
+                    }
+                    error!("A gossip worker stopped: {err}");
+                    return;
+                }
                 Some(event) = manager_receiver.recv() => {
                     match event {
                         // Handles Gossipsub messages from other peers.
