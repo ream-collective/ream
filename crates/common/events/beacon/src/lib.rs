@@ -232,7 +232,7 @@ impl TryFrom<Event> for BeaconEvent {
 pub trait BeaconEventSender {
     /// Send an event if the sender is available.
     ///
-    /// Returns silently if the sender is None or if sending fails (logs a warning).
+    /// Returns silently if the sender is None or nothing is subscribed.
     fn send_event(&self, event: BeaconEvent);
 }
 
@@ -243,8 +243,10 @@ impl BeaconEventSender for Option<tokio::sync::broadcast::Sender<BeaconEvent>> {
         };
 
         let event_name = event.event_name();
-        if let Err(err) = sender.send(event) {
-            tracing::warn!("Failed to send {} event: {}", event_name, err);
+        // A broadcast send fails only when nothing is subscribed, which is the normal state while
+        // no API client follows the event stream.
+        if sender.send(event).is_err() {
+            tracing::trace!("No subscribers for {event_name} event");
         }
     }
 }

@@ -4440,6 +4440,95 @@ mod tests {
     }
 
     #[test]
+    fn range_sync_reconstruction_leaves_nothing_to_cross_seed() {
+        use ream_chain_beacon::beacon_chain::BlockImportEvent;
+        use ream_consensus_beacon::data_column_sidecar::get_data_column_sidecars_from_block;
+        use ream_consensus_misc::misc::compute_start_slot_at_epoch;
+
+        initialize_test_network_spec();
+        let (_dir, chain) = test_beacon_chain();
+        let chain = Arc::new(chain);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let executor = ReamExecutor::new().unwrap();
+        let mut syncer = BlockRangeSyncer::new(
+            chain.clone(),
+            sender,
+            test_network_state(),
+            executor.clone(),
+        );
+
+        let blob = Blob::default();
+        let commitment = KZGCommitment(
+            das_context()
+                .blob_to_kzg_commitment(&blob.to_fixed_bytes())
+                .expect("test blob should produce a commitment"),
+        );
+        let fulu_slot = compute_start_slot_at_epoch(beacon_network_spec().fulu_fork_epoch);
+        let mut block = SignedBeaconBlock {
+            message: Default::default(),
+            signature: Default::default(),
+        };
+        block.message.slot = fulu_slot;
+        block
+            .message
+            .body
+            .blob_kzg_commitments
+            .push(commitment)
+            .expect("one commitment should fit");
+        let block_root = block.message.tree_hash_root();
+        let columns = get_data_column_sidecars_from_block(
+            &block,
+            vec![
+                compute_cells_and_kzg_proofs(&blob, das_context())
+                    .expect("test blob should produce cells and proofs"),
+            ],
+        )
+        .expect("test block should produce data columns");
+
+        // The range download returned half the columns; the block cache rebuilds the rest.
+        let mut cache = BlockCache::new(B256::ZERO, fulu_slot - 1);
+        cache
+            .add_blocks(vec![block.clone()], true, PeerId::random())
+            .expect("block should enter cache");
+        cache
+            .add_data_columns(
+                columns[..(NUMBER_OF_COLUMNS / 2) as usize].to_vec(),
+                &(0..NUMBER_OF_COLUMNS).collect(),
+            )
+            .expect("half the columns should reconstruct the rest");
+
+        let mut events = chain.subscribe_block_imports();
+        executor.runtime().block_on(async {
+            // Without a parent state `process_block` fails, after the columns are stored.
+            let _ = syncer.import_downloaded(cache).await;
+            assert!(
+                std::iter::from_fn(|| events.try_recv().ok())
+                    .any(|event| event == BlockImportEvent::ReconstructionReady { block_root }),
+                "importing the columns announces a reconstruction"
+            );
+
+            // Stored as a successful import would, so the reconstruction below reads the block.
+            chain
+                .db()
+                .block_provider()
+                .insert(block_root, block)
+                .expect("block should be stored");
+            // The network manager publishes exactly what this returns.
+            assert!(
+                chain
+                    .reconstruct_data_columns(block_root)
+                    .await
+                    .expect("reconstruction should succeed")
+                    .is_empty()
+            );
+        });
+        assert!(
+            receiver.try_recv().is_err(),
+            "range sync sends nothing to the network"
+        );
+    }
+
+    #[test]
     fn dropping_download_task_aborts_its_request() {
         let executor = ReamExecutor::new().unwrap();
         let handle = executor.spawn(std::future::pending::<StreamOutcome<SignedBeaconBlock>>());

@@ -25,8 +25,9 @@ use ream_fork_choice_beacon::{
     store::Store,
 };
 use ream_metrics::{
-    BEACON_BLOCK_PROCESSING_SECONDS, BEACON_EXECUTION_FORKCHOICE_UPDATE_SECONDS,
-    BEACON_STORE_LOCK_WAIT_SECONDS,
+    BEACON_BLOCK_PROCESSING_SECONDS, BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_RUN_TOTAL,
+    BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_SKIPPED_COMPLETE_TOTAL,
+    BEACON_EXECUTION_FORKCHOICE_UPDATE_SECONDS, BEACON_STORE_LOCK_WAIT_SECONDS,
 };
 use ream_network_spec::networks::beacon_network_spec;
 use ream_operation_pool::OperationPool;
@@ -195,6 +196,18 @@ impl BeaconChain {
         let mut store = self.store.lock().await;
         lock_wait_timer.observe_duration();
         let locked = started.elapsed();
+
+        // A block can reach this point after it was imported. Range sync stores a block's
+        // columns before processing the block, and those columns can complete the same block
+        // left pending by gossip. Two callers can also wait on the store lock with the same block.
+        // Importing it again would repeat the state transition and announce the block twice.
+        if store.db.block_provider().contains_key(block_root)?
+            && store.db.state_provider().contains_key(block_root)?
+        {
+            block_processing_timer.stop_and_discard();
+            debug!(%block_root, "Block is already imported");
+            return Ok(BlockProcessingOutcome::Imported { block_root });
+        }
 
         let network_spec = beacon_network_spec();
         let verify_data_availability = self.force_data_availability_checks
@@ -479,14 +492,23 @@ impl BeaconChain {
         }
     }
 
-    /// Rebuilds and stores columns for an available block in the background.
-    pub async fn reconstruct_data_columns(&self, block_root: B256) -> anyhow::Result<()> {
+    /// Rebuilds and stores columns for an available block in the background. Returns the columns
+    /// this call stored; columns already stored, including any that arrived while it ran, are
+    /// left out. das-core requires a node to send columns it obtained through reconstruction to
+    /// its subnet mesh, so a caller on the gossip path must publish the returned columns.
+    pub async fn reconstruct_data_columns(
+        &self,
+        block_root: B256,
+    ) -> anyhow::Result<Vec<DataColumnSidecar>> {
         let result = self.reconstruct_data_columns_inner(block_root).await;
         self.reconstructions.lock().remove(&block_root);
         result
     }
 
-    async fn reconstruct_data_columns_inner(&self, block_root: B256) -> anyhow::Result<()> {
+    async fn reconstruct_data_columns_inner(
+        &self,
+        block_root: B256,
+    ) -> anyhow::Result<Vec<DataColumnSidecar>> {
         // The 64th column announces reconstruction while its caller still holds the store lock
         // and has not stored the block yet. Taking the lock first waits for that import, so the
         // block read below finds the block.
@@ -498,7 +520,7 @@ impl BeaconChain {
             .required_columns()
             .clone();
         let Some(block) = self.db.block_provider().get(block_root)? else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         let header = block.signed_header();
         let provider = self.db.column_sidecars_provider();
@@ -518,11 +540,14 @@ impl BeaconChain {
                 .iter()
                 .map(|sidecar| sidecar.index)
                 .collect::<HashSet<_>>();
-            if available.len() < (NUMBER_OF_COLUMNS / 2) as usize
-                || required_columns.is_subset(&stored)
-            {
+            if required_columns.is_subset(&stored) {
+                BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_SKIPPED_COMPLETE_TOTAL.inc();
                 return Ok(Vec::new());
             }
+            if available.len() < (NUMBER_OF_COLUMNS / 2) as usize {
+                return Ok(Vec::new());
+            }
+            BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_RUN_TOTAL.inc();
             let available = available.iter().collect::<Vec<_>>();
             Ok(reconstruct_data_column_sidecars(&available)?
                 .into_iter()
@@ -533,9 +558,16 @@ impl BeaconChain {
 
         let recovered_count = recovered.len();
         let provider = self.db.column_sidecars_provider();
-        tokio::task::spawn_blocking(move || provider.insert_batch_if_missing(recovered)).await??;
-        debug!(%block_root, recovered = recovered_count, "Reconstructed data columns");
-        Ok(())
+        let stored =
+            tokio::task::spawn_blocking(move || provider.insert_batch_if_missing(recovered))
+                .await??;
+        debug!(
+            %block_root,
+            recovered = recovered_count,
+            stored = stored.len(),
+            "Reconstructed data columns"
+        );
+        Ok(stored)
     }
 
     fn process_block_attestations(&self, store: &mut Store, signed_block: &SignedBeaconBlock) {
@@ -724,7 +756,12 @@ pub fn is_data_availability_check_required(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf, time::SystemTime};
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+        time::SystemTime,
+    };
 
     use ream_consensus_beacon::data_column_sidecar::get_data_column_sidecars;
     use ream_fork_choice_beacon::data_availability::DataAvailabilityChecker;
@@ -733,12 +770,16 @@ mod tests {
     use super::*;
 
     fn test_chain() -> (PathBuf, BeaconChain) {
+        // The clock alone can repeat across parallel tests (macOS reports microseconds), and two
+        // tests sharing a directory fail with `DatabaseAlreadyOpen`.
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "ream-da64-chain-test-{}",
+            "ream-da64-chain-test-{}-{}",
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&path).unwrap();
         let db = ReamDB::new(path.clone()).unwrap().init_beacon_db().unwrap();
@@ -829,7 +870,14 @@ mod tests {
             Err(broadcast::error::TryRecvError::Empty)
         ));
 
-        chain.reconstruct_data_columns(root).await.unwrap();
+        let stored = chain.reconstruct_data_columns(root).await.unwrap();
+        assert_eq!(
+            stored
+                .iter()
+                .map(|sidecar| sidecar.index)
+                .collect::<Vec<_>>(),
+            (NUMBER_OF_COLUMNS / 2..NUMBER_OF_COLUMNS).collect::<Vec<_>>()
+        );
         for index in 0..NUMBER_OF_COLUMNS {
             assert!(
                 provider
@@ -838,6 +886,13 @@ mod tests {
                     .is_some()
             );
         }
+        assert!(
+            chain
+                .reconstruct_data_columns(root)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(matches!(
             events.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
@@ -889,6 +944,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconstruction_does_not_return_columns_that_were_already_stored() {
+        let (path, chain) = test_chain();
+        let block = empty_block();
+        let root = block.message.tree_hash_root();
+        chain
+            .db
+            .block_provider()
+            .insert(root, block.clone())
+            .unwrap();
+        let columns = empty_block_columns(&block);
+        let provider = chain.db.column_sidecars_provider();
+        let arrived = [NUMBER_OF_COLUMNS / 2, NUMBER_OF_COLUMNS - 1];
+        provider
+            .insert_batch(
+                columns
+                    .iter()
+                    .filter(|sidecar| {
+                        sidecar.index < NUMBER_OF_COLUMNS / 2 || arrived.contains(&sidecar.index)
+                    })
+                    .cloned()
+                    .collect(),
+            )
+            .unwrap();
+
+        let stored = chain.reconstruct_data_columns(root).await.unwrap();
+
+        assert_eq!(
+            stored
+                .iter()
+                .map(|sidecar| sidecar.index)
+                .collect::<Vec<_>>(),
+            (NUMBER_OF_COLUMNS / 2 + 1..NUMBER_OF_COLUMNS - 1).collect::<Vec<_>>()
+        );
+        drop(chain);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    fn fixture_state() -> BeaconState {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../../../testing/gossip-validation/tests/assets/sepolia/states/grandparent_state_9552074.ssz_snappy",
+        );
+        let bytes = snap::raw::Decoder::new()
+            .decompress_vec(&fs::read(path).unwrap())
+            .unwrap();
+        <BeaconState as ssz::Decode>::from_ssz_bytes(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn already_imported_block_is_not_imported_again() {
+        let (path, mut chain) = test_chain();
+        let (event_sender, mut beacon_events) = broadcast::channel(16);
+        chain.event_sender = Some(event_sender);
+        let block = empty_block();
+        let root = block.message.tree_hash_root();
+        chain
+            .db
+            .block_provider()
+            .insert(root, block.clone())
+            .unwrap();
+        chain
+            .db
+            .state_provider()
+            .insert(root, fixture_state())
+            .unwrap();
+        let mut import_events = chain.subscribe_block_imports();
+
+        // The parent state is not stored, so importing the block again would fail.
+        assert_eq!(
+            chain.process_block(block).await.unwrap(),
+            BlockProcessingOutcome::Imported { block_root: root }
+        );
+        assert!(matches!(
+            import_events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            beacon_events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        drop(chain);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn late_column_is_stored_after_block_import() {
         let (path, chain) = test_chain();
         let block = empty_block();
@@ -935,8 +1074,15 @@ mod tests {
             .insert_batch(columns[..(NUMBER_OF_COLUMNS / 2) as usize].to_vec())
             .unwrap();
 
-        chain.reconstruct_data_columns(root).await.unwrap();
+        let stored = chain.reconstruct_data_columns(root).await.unwrap();
 
+        assert_eq!(
+            stored
+                .iter()
+                .map(|sidecar| sidecar.index)
+                .collect::<Vec<_>>(),
+            vec![NUMBER_OF_COLUMNS / 2]
+        );
         assert!(
             provider
                 .get(ColumnIdentifier::new(root, NUMBER_OF_COLUMNS / 2))

@@ -148,6 +148,26 @@ lazy_static::lazy_static! {
         default_registry()
     ).expect("failed to create BEACON_DATA_AVAILABILITY_RECONSTRUCTED_COLUMNS_TOTAL int counter");
 
+    // Background reconstruction runs once per block after half its columns arrived. Range-sync
+    // imports announce it too and are counted as skipped, since range sync stored every column.
+    pub static ref BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_SKIPPED_COMPLETE_TOTAL: IntCounter = register_int_counter_with_registry!(
+        "beacon_data_availability_reconstructions_skipped_complete_total",
+        "Background reconstructions skipped because every required column was already stored",
+        default_registry()
+    ).expect("failed to create BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_SKIPPED_COMPLETE_TOTAL int counter");
+
+    pub static ref BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_RUN_TOTAL: IntCounter = register_int_counter_with_registry!(
+        "beacon_data_availability_reconstructions_run_total",
+        "Background reconstructions that rebuilt missing columns",
+        default_registry()
+    ).expect("failed to create BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_RUN_TOTAL int counter");
+
+    pub static ref BEACON_DATA_AVAILABILITY_CROSS_SEEDED_COLUMNS_TOTAL: IntCounter = register_int_counter_with_registry!(
+        "beacon_data_availability_cross_seeded_columns_total",
+        "Reconstructed columns published to their subnet meshes",
+        default_registry()
+    ).expect("failed to create BEACON_DATA_AVAILABILITY_CROSS_SEEDED_COLUMNS_TOTAL int counter");
+
     pub static ref BEACON_DATA_AVAILABILITY_RECONSTRUCTION_TIME_SECONDS: Histogram = {
         // Reconstruction can run into hundreds of ms to low seconds under load.
         let opts = HistogramOpts::new(

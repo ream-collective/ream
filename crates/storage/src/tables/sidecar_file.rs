@@ -166,9 +166,11 @@ impl PreparedSidecarFile {
     }
 
     /// Publish only files whose destination is still absent, atomically with respect to writers.
-    pub fn publish_batch_if_missing(files: Vec<Self>) -> Result<(), StoreError> {
+    /// Returns one flag per input file, in order: true when this call published it.
+    pub fn publish_batch_if_missing(files: Vec<Self>) -> Result<Vec<bool>, StoreError> {
         let _writer = WRITER.lock().unwrap_or_else(|err| err.into_inner());
         let mut missing = Vec::new();
+        let mut published = Vec::with_capacity(files.len());
         for file in files {
             let failed = PENDING
                 .lock()
@@ -176,17 +178,20 @@ impl PreparedSidecarFile {
                 .get(&file.destination)
                 .copied()
                 == Some(true);
-            if failed {
+            // A failed rollback leaves a file readers refuse, so it counts as absent.
+            let absent = failed
+                || match fs::metadata(&file.destination) {
+                    Ok(_) => false,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+                    Err(err) => return Err(err.into()),
+                };
+            published.push(absent);
+            if absent {
                 missing.push(file);
-                continue;
-            }
-            match fs::metadata(&file.destination) {
-                Ok(_) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => missing.push(file),
-                Err(err) => return Err(err.into()),
             }
         }
-        Self::publish_batch_locked(missing)
+        Self::publish_batch_locked(missing)?;
+        Ok(published)
     }
 
     fn publish_batch_locked(files: Vec<Self>) -> Result<(), StoreError> {
@@ -322,12 +327,16 @@ mod tests {
         let path = dir.path().join("existing");
         fs::write(&path, b"late column").unwrap();
 
-        PreparedSidecarFile::publish_batch_if_missing(vec![
+        let missing = dir.path().join("missing");
+        let published = PreparedSidecarFile::publish_batch_if_missing(vec![
             PreparedSidecarFile::new(path.clone(), b"reconstructed column").unwrap(),
+            PreparedSidecarFile::new(missing.clone(), b"reconstructed column").unwrap(),
         ])
         .unwrap();
 
+        assert_eq!(published, vec![false, true]);
         assert_eq!(fs::read(path).unwrap(), b"late column");
+        assert_eq!(fs::read(missing).unwrap(), b"reconstructed column");
     }
 
     #[test]

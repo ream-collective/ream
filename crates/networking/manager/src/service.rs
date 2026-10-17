@@ -56,6 +56,7 @@ use crate::{
         ColumnFetchOutcome, ColumnFetchTracker, fetch_missing_columns, pending_anchor_for_recovery,
     },
     gossipsub::{
+        cross_seed::reconstruct_and_cross_seed,
         handle::{handle_gossipsub_message, init_gossipsub_config_with_topics},
         workers::{GossipWorkers, is_data_column, is_handled_concurrently},
     },
@@ -583,8 +584,17 @@ impl NetworkManagerService {
                                 }
                                 ream_chain_beacon::beacon_chain::BlockImportEvent::ReconstructionReady { block_root } => {
                                     let beacon_chain = beacon_chain.clone();
+                                    let cached_db = cached_db.clone();
+                                    let p2p_sender = p2p_sender.clone();
                                     tokio::spawn(async move {
-                                        if let Err(err) = beacon_chain.reconstruct_data_columns(block_root).await {
+                                        if let Err(err) = reconstruct_and_cross_seed(
+                                            &beacon_chain,
+                                            &cached_db,
+                                            &p2p_sender,
+                                            block_root,
+                                        )
+                                        .await
+                                        {
                                             error!(%block_root, "Column reconstruction failed: {err:#}");
                                         }
                                     });

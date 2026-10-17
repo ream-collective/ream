@@ -21,6 +21,7 @@ discv5.workspace = true
 ethereum_ssz.workspace = true
 ethereum_ssz_derive.workspace = true
 libp2p.workspace = true
+rand.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tree_hash.workspace = true
@@ -52,6 +53,7 @@ ream-validator-beacon.workspace = true
 [dev-dependencies]
 ssz_types.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
