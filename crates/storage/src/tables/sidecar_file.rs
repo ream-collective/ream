@@ -113,17 +113,10 @@ fn remove_and_sync(path: &Path) -> std::io::Result<()> {
     File::open(path.parent().expect("sidecar parent"))?.sync_all()
 }
 
-/// Hands the file's data, or a directory's entries, to the drive. On macOS `sync_all` is
-/// `F_FULLFSYNC`, which also flushes the drive cache and costs tens of milliseconds on an
-/// external drive; at the chain head columns arrive one gossip message at a time, so a full
-/// flush per publication meant about 128 drive cache flushes per block, which also stalled the
-/// execution client's writes on the same drive. macOS therefore uses a plain `fsync`.
-///
-/// The drive cache is flushed by the next database commit: redb commits with
-/// `Durability::Immediate` use `F_FULLFSYNC`, and a block import commits after its columns are
-/// published, with the next block about a slot later. A power loss before that commit can lose
-/// sidecar files published since the last one, never part of a file, since each file is written
-/// under a temporary name and renamed into place; a lost file reads as a missing sidecar.
+/// Hands the file's data to the drive. Publication ends with a directory `sync_all`, which on
+/// macOS is `F_FULLFSYNC` and flushes the drive cache for every file written before it. A
+/// `F_FULLFSYNC` per file costs a drive cache flush each, tens of milliseconds on an external
+/// drive, for each of the 128 columns of a block, so macOS uses a plain `fsync` here.
 fn write_to_drive(file: &File) -> std::io::Result<()> {
     #[cfg(target_vendor = "apple")]
     {
@@ -258,7 +251,7 @@ impl PreparedSidecarFile {
             directories.insert(parent);
         }
         for directory in directories {
-            write_to_drive(&File::open(directory)?)?;
+            File::open(directory)?.sync_all()?;
         }
         publication.durable = true;
         Ok(())
