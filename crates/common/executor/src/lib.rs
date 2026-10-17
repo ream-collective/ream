@@ -1,10 +1,22 @@
-use std::{future::Future, sync::Arc, thread::sleep, time::Duration};
+use std::{fmt, future::Future, sync::Arc, thread::sleep, time::Duration};
 
-use anyhow::bail;
 #[cfg(feature = "shadow-integration")]
 use tokio::runtime;
 use tokio::{runtime::Runtime, sync::broadcast, task::JoinHandle};
 use tracing::warn;
+
+/// The error of a task spawned with `ReamExecutor::spawn` that `shutdown_signal` cancelled.
+/// Callers check for it with `anyhow::Error::is` to tell a requested shutdown from a failure.
+#[derive(Debug)]
+pub struct TaskCancelled;
+
+impl fmt::Display for TaskCancelled {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Task cancelled due to shutdown")
+    }
+}
+
+impl std::error::Error for TaskCancelled {}
 
 #[derive(Clone)]
 pub struct ReamExecutor {
@@ -44,9 +56,7 @@ impl ReamExecutor {
         self.runtime.spawn(async move {
             tokio::select! {
                 result = future => Ok(result),
-                _ = shutdown.recv() => {
-                    bail!("Task cancelled due to shutdown")
-                },
+                _ = shutdown.recv() => Err(TaskCancelled.into()),
             }
         })
     }
@@ -144,6 +154,17 @@ mod tests {
         });
 
         assert_eq!(executor.runtime.block_on(handle).unwrap().unwrap(), 42);
+    }
+
+    #[test]
+    fn test_shutdown_cancels_a_spawned_task() {
+        let executor = ReamExecutor::new().unwrap();
+
+        let handle = executor.spawn(std::future::pending::<()>());
+
+        executor.shutdown_signal();
+        let error = executor.runtime.block_on(handle).unwrap().unwrap_err();
+        assert!(error.is::<TaskCancelled>());
     }
 
     #[test]
