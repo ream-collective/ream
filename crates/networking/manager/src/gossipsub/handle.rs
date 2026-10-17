@@ -691,9 +691,6 @@ pub async fn handle_gossipsub_message(
                                 p2p_sender,
                                 light_client_optimistic_update.as_ssz_bytes(),
                             );
-
-                            *cached_db.forwarded_optimistic_update_slot.write().await =
-                                Some(light_client_optimistic_update.attested_header.beacon.slot);
                         }
                         ValidationResult::Ignore(reason) => {
                             info!("Light client optimistic update ignored: {reason}");

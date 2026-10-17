@@ -62,9 +62,17 @@ async fn validate_finality_update(
         .count() as u64;
 
     let has_supermajority = participation_count * 3 > SYNC_COMMITTEE_SIZE * 2;
-    if let Some((prev_slot, prev_slot_supermajority)) =
-        *cached_db.seen_forwarded_finality_update_slot.read().await
-    {
+
+    // [IGNORE] The finality_update is received after the block at signature_slot was given enough
+    // time to propagate through the network
+    if !sync_message_due_has_passed(genesis_time, update.signature_slot, now_ms) {
+        return Ok(ValidationResult::Ignore("Too early".to_string()));
+    };
+
+    // Updates are validated concurrently, so the forwarded slot is checked and recorded under one
+    // write lock. Otherwise two updates could both pass, and the older could be recorded last.
+    let mut forwarded_slot = cached_db.seen_forwarded_finality_update_slot.write().await;
+    if let Some((prev_slot, prev_slot_supermajority)) = *forwarded_slot {
         if new_slot < prev_slot {
             return Ok(ValidationResult::Ignore(
                 "Finality update slot is less than the last forwarded update slot".into(),
@@ -84,15 +92,8 @@ async fn validate_finality_update(
         }
     }
 
-    // [IGNORE] The finality_update is received after the block at signature_slot was given enough
-    // time to propagate through the network
-    if !sync_message_due_has_passed(genesis_time, update.signature_slot, now_ms) {
-        return Ok(ValidationResult::Ignore("Too early".to_string()));
-    };
-
-    *cached_db.seen_forwarded_finality_update_slot.write().await =
-        Some((new_slot, has_supermajority));
-
+    *forwarded_slot = Some((new_slot, has_supermajority));
+    // Still under the slot lock, so the stored update is the one the slot belongs to.
     *cached_db
         .forwarded_light_client_finality_update
         .write()
@@ -103,9 +104,75 @@ async fn validate_finality_update(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use ream_light_client::header::LightClientHeader;
     use ream_network_spec::networks::initialize_test_network_spec;
 
-    use super::sync_message_due_has_passed;
+    use super::*;
+
+    fn finality_update(finalized_slot: u64) -> LightClientFinalityUpdate {
+        let mut finalized_header = LightClientHeader::default();
+        finalized_header.beacon.slot = finalized_slot;
+        LightClientFinalityUpdate {
+            attested_header: LightClientHeader::default(),
+            finalized_header,
+            finality_branch: Default::default(),
+            sync_aggregate: Default::default(),
+            signature_slot: 0,
+        }
+    }
+
+    /// Validates `updates` at once and returns how many were accepted.
+    async fn accepted_concurrently(
+        cached_db: &Arc<BeaconCacheDB>,
+        updates: Vec<LightClientFinalityUpdate>,
+    ) -> usize {
+        let tasks = updates
+            .into_iter()
+            .map(|update| {
+                let cached_db = cached_db.clone();
+                tokio::spawn(async move {
+                    validate_finality_update(&update, 0, unix_time_ms(), &cached_db)
+                        .await
+                        .expect("validation runs")
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut accepted = 0;
+        for task in tasks {
+            if let ValidationResult::Accept = task.await.expect("validation task completes") {
+                accepted += 1;
+            }
+        }
+        accepted
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_copies_are_accepted_once() {
+        initialize_test_network_spec();
+        let cached_db = Arc::new(BeaconCacheDB::new());
+        let accepted = accepted_concurrently(&cached_db, vec![finality_update(64); 8]).await;
+        assert_eq!(accepted, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_older_update_is_never_recorded_over_a_newer_one() {
+        initialize_test_network_spec();
+        for _ in 0..32 {
+            let cached_db = Arc::new(BeaconCacheDB::new());
+            accepted_concurrently(&cached_db, (1..=8).map(finality_update).collect()).await;
+            let recorded_slot = *cached_db.seen_forwarded_finality_update_slot.read().await;
+            let stored_slot = cached_db
+                .forwarded_light_client_finality_update
+                .read()
+                .await
+                .as_ref()
+                .map(|update| update.finalized_header.beacon.slot);
+            assert_eq!(recorded_slot.map(|(slot, _)| slot), Some(8));
+            assert_eq!(stored_slot, Some(8));
+        }
+    }
 
     #[test]
     fn updates_wait_for_the_sync_message_due_time() {
