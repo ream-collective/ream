@@ -18,21 +18,17 @@ use crate::{
 /// block import write between them instead of waiting for the whole flush.
 const FLUSH_CHUNK_SIZE: usize = 16_384;
 
-/// Shortest time from the end of one background write to the start of the next: one mainnet
-/// epoch. A write costs about the same whether it carries one block's messages or an epoch's,
-/// because one block's messages already touch most of the table.
-const FLUSH_INTERVAL: Duration = Duration::from_secs(384);
-
 /// Latest messages of validators.
 ///
 /// A mainnet block carries votes from tens of thousands of validators at scattered indices, so
 /// writing them rewrites most of the table's pages. With a cache attached, new messages are kept
-/// in memory and written on another thread at most once per `FLUSH_INTERVAL`, in index order so
-/// each transaction touches only its own key range. Reads see the pending messages, so they
-/// always return the latest message. Shutdown writes everything still pending. A write starts
-/// only from an insert, so a crash loses the votes received since the last write: about one
-/// interval while blocks keep arriving, more if inserts stop. Fork choice relearns them from
-/// later blocks.
+/// in memory and written on another thread at most once per flush interval, one epoch, in index
+/// order so each transaction touches only its own key range; one block's messages already touch
+/// most of the table, so a write costs about the same whether it carries a block's or an epoch's.
+/// Reads see the pending messages, so they always return the latest message. An insert starts a
+/// write when one is due, and the storage's vote flush timer starts it when inserts stop, so a
+/// crash loses at most about one interval of votes. Fork choice relearns them from later blocks.
+/// Shutdown writes everything still pending.
 pub struct LatestMessagesTable {
     pub db: Arc<Database>,
     pub cache: Option<Arc<BeaconCacheDB>>,
@@ -103,30 +99,58 @@ impl LatestMessagesTable {
         let start_flush = {
             let mut pending = cache.pending_votes();
             pending.messages.extend(entries);
-            let due = pending
-                .last_flush
-                .is_none_or(|finished| finished.elapsed() >= FLUSH_INTERVAL);
-            let start = due && !pending.flushing;
-            if start {
-                pending.flushing = true;
-            }
-            start
+            claim_due_flush(&mut pending)
         };
         if start_flush {
-            let db = self.db.clone();
-            let worker_cache = cache.clone();
-            if let Err(err) = cache.spawn_storage_task(move || {
-                if let Err(err) = flush_pending_messages(&db, &worker_cache, false) {
-                    warn!("Failed to write latest messages: {err:?}");
-                }
-            }) {
-                cache.pending_votes().flushing = false;
-                // The update is already accepted into the overlay. Keep the success contract
-                // so fork choice applies it too; a later insert or shutdown retries the flush.
-                warn!("Failed to start latest messages writer: {err:?}");
-            }
+            self.spawn_flush(cache);
         }
         Ok(())
+    }
+
+    /// Starts a background write if the pending messages are due one, and returns how long until
+    /// they can next be due. Called by the vote flush timer, so votes are written when inserts
+    /// stop.
+    pub(crate) fn flush_if_due(&self) -> Duration {
+        let Some(cache) = &self.cache else {
+            return Duration::MAX;
+        };
+        let Ok(_accepting) = cache.storage_write_guard() else {
+            // Shutting down; shutdown writes what is pending.
+            return cache.pending_votes().flush_interval;
+        };
+        let (start_flush, wait) = {
+            let mut pending = cache.pending_votes();
+            let start = claim_due_flush(&mut pending);
+            let interval = pending.flush_interval;
+            let wait = match pending.last_flush {
+                // Not due yet: wake when it will be.
+                Some(finished) if !start && !pending.flushing && !pending.messages.is_empty() => {
+                    interval.saturating_sub(finished.elapsed())
+                }
+                // Nothing pending, or a write runs and sets `last_flush` when it finishes.
+                _ => interval,
+            };
+            (start, wait)
+        };
+        if start_flush {
+            self.spawn_flush(cache);
+        }
+        wait
+    }
+
+    fn spawn_flush(&self, cache: &Arc<BeaconCacheDB>) {
+        let db = self.db.clone();
+        let worker_cache = cache.clone();
+        if let Err(err) = cache.spawn_storage_task(move || {
+            if let Err(err) = flush_pending_messages(&db, &worker_cache, false) {
+                warn!("Failed to write latest messages: {err:?}");
+            }
+        }) {
+            cache.pending_votes().flushing = false;
+            // The update is already accepted into the overlay. Keep the success contract so fork
+            // choice applies it too; a later insert, the timer or shutdown retries the flush.
+            warn!("Failed to start latest messages writer: {err:?}");
+        }
     }
 
     /// Flush any retained votes after background workers and producers have stopped.
@@ -140,6 +164,20 @@ impl LatestMessagesTable {
     fn pending(&self) -> Option<std::sync::MutexGuard<'_, PendingLatestMessages>> {
         self.cache.as_ref().map(|cache| cache.pending_votes())
     }
+}
+
+/// Claims the next background write when one is due: messages are pending, no write runs, and
+/// the flush interval has passed since the last write finished.
+fn claim_due_flush(pending: &mut PendingLatestMessages) -> bool {
+    let due = !pending.messages.is_empty()
+        && !pending.flushing
+        && pending
+            .last_flush
+            .is_none_or(|finished| finished.elapsed() >= pending.flush_interval);
+    if due {
+        pending.flushing = true;
+    }
+    due
 }
 
 /// Writes the pending messages, then repeats while `drain` is set and messages are left. A
@@ -531,6 +569,42 @@ mod tests {
             reopened.latest_messages_provider().get(8).unwrap(),
             Some(message(2))
         );
+    }
+
+    #[test]
+    fn the_timer_writes_votes_left_pending_when_inserts_stop() {
+        let dir = TempDir::new("ream_vote_timer").unwrap();
+        let cache = Arc::new(BeaconCacheDB::default());
+        let db = ReamDB::new(dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap()
+            .with_cache(cache.clone());
+        let interval = Duration::from_millis(200);
+        db.start_vote_flush_timer(interval).unwrap();
+        assert_eq!(cache.pending_votes().flush_interval, interval);
+        let table = db.latest_messages_provider();
+        let stored = LatestMessagesTable {
+            db: db.votes_db.clone(),
+            cache: None,
+        };
+
+        // The first insert writes at once; the second falls within the interval and stays
+        // pending, and no insert follows it.
+        table.insert(7, message(1)).unwrap();
+        cache.join_storage_tasks().unwrap();
+        table.insert(8, message(2)).unwrap();
+        assert_eq!(stored.get(8).unwrap(), None);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !cache.pending_votes().messages.is_empty() || cache.pending_votes().flushing {
+            assert!(Instant::now() < deadline, "the timer never wrote the vote");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(stored.get(8).unwrap(), Some(message(2)));
+
+        db.shutdown_storage().unwrap();
+        assert!(cache.vote_flush_timer.lock().unwrap().is_none());
     }
 
     #[test]
