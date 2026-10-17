@@ -192,7 +192,9 @@ impl BeaconStateTable {
         prepared: PreparedStateImport,
     ) -> Result<(), StoreError> {
         self.clear_pending(block_root, state);
-        if prepared.wrote_state_file {
+        // A committed summary may already point at this root's file when the block is imported
+        // again; that file must stay.
+        if prepared.wrote_state_file && !self.is_stored_whole(block_root)? {
             remove_state_file(&self.data_dir, block_root)?;
         }
         Ok(())
@@ -633,6 +635,9 @@ fn write_state_file(
     file.as_file().sync_all()?;
     file.persist(state_file_path(data_dir, block_root))
         .map_err(|err| err.error)?;
+    // The rename is durable only once the directory is synced; the summary that names this file
+    // is committed after this returns.
+    fs::File::open(data_dir.join(STATE_FOLDER_NAME))?.sync_all()?;
     Ok(())
 }
 
