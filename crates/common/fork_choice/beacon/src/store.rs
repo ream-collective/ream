@@ -20,7 +20,7 @@ use ream_consensus_beacon::{
 };
 use ream_consensus_misc::{
     checkpoint::Checkpoint,
-    constants::beacon::{GENESIS_EPOCH, GENESIS_SLOT, INTERVALS_PER_SLOT, SLOTS_PER_EPOCH},
+    constants::beacon::{GENESIS_EPOCH, GENESIS_SLOT, SLOTS_PER_EPOCH},
     misc::{compute_epoch_at_slot, compute_start_slot_at_epoch, is_shuffling_stable},
 };
 use ream_data_availability::{DataAvailabilityChecker, PendingBlock};
@@ -52,6 +52,27 @@ use crate::{
 };
 
 const VALIDATOR_API_SYNC_TOLERANCE_EPOCHS: u64 = 2;
+const BASIS_POINTS: u64 = 10_000;
+const MILLISECONDS_PER_SECOND: u64 = 1_000;
+
+pub(crate) fn seconds_to_milliseconds(seconds: u64) -> u64 {
+    seconds.saturating_mul(MILLISECONDS_PER_SECOND)
+}
+
+pub(crate) fn get_slot_component_duration_ms(basis_points: u64) -> u64 {
+    basis_points.saturating_mul(beacon_network_spec().slot_duration_ms) / BASIS_POINTS
+}
+
+pub(crate) fn get_slots_since_genesis_at(time: u64, genesis_time: u64) -> u64 {
+    seconds_to_milliseconds(time.saturating_sub(genesis_time))
+        / beacon_network_spec().slot_duration_ms
+}
+
+pub(crate) fn get_time_at_slot(genesis_time: u64, slot: u64) -> u64 {
+    genesis_time.saturating_add(
+        beacon_network_spec().slot_duration_ms.saturating_mul(slot) / MILLISECONDS_PER_SECOND,
+    )
+}
 
 #[derive(Debug)]
 pub struct BlockWithEpochInfo {
@@ -229,12 +250,10 @@ impl Store {
     }
 
     pub fn get_slots_since_genesis(&self) -> anyhow::Result<u64> {
-        Ok(self
-            .db
-            .time_provider()
-            .get()?
-            .saturating_sub(self.db.genesis_time_provider().get()?)
-            / beacon_network_spec().seconds_per_slot())
+        Ok(get_slots_since_genesis_at(
+            self.db.time_provider().get()?,
+            self.db.genesis_time_provider().get()?,
+        ))
     }
 
     pub fn get_ancestor(&self, root: B256, slot: u64) -> anyhow::Result<B256> {
@@ -709,13 +728,16 @@ impl Store {
     }
 
     pub fn is_proposing_on_time(&self) -> anyhow::Result<bool> {
-        // Use half `SECONDS_PER_SLOT // INTERVALS_PER_SLOT` as the proposer reorg deadline
-        let time_into_slot = (self.db.time_provider().get()?
-            - self.db.genesis_time_provider().get()?)
-            % beacon_network_spec().seconds_per_slot();
-        let proposer_reorg_cutoff =
-            beacon_network_spec().seconds_per_slot() / INTERVALS_PER_SLOT / 2;
-        Ok(time_into_slot <= proposer_reorg_cutoff)
+        let seconds_since_genesis = self
+            .db
+            .time_provider()
+            .get()?
+            .saturating_sub(self.db.genesis_time_provider().get()?);
+        let time_into_slot_ms =
+            seconds_to_milliseconds(seconds_since_genesis) % beacon_network_spec().slot_duration_ms;
+        let proposer_reorg_cutoff_ms =
+            get_slot_component_duration_ms(beacon_network_spec().proposer_reorg_cutoff_bps);
+        Ok(time_into_slot_ms <= proposer_reorg_cutoff_ms)
     }
 
     pub fn is_finalization_ok(&self, slot: u64) -> anyhow::Result<bool> {
@@ -1178,9 +1200,10 @@ pub fn get_forkchoice_store(
         root: anchor_root,
     };
 
-    db.time_provider().insert(
-        anchor_state.genesis_time + beacon_network_spec().seconds_per_slot() * anchor_state.slot,
-    )?;
+    db.time_provider().insert(get_time_at_slot(
+        anchor_state.genesis_time,
+        anchor_state.slot,
+    ))?;
     db.genesis_time_provider()
         .insert(anchor_state.genesis_time)?;
     db.justified_checkpoint_provider()
@@ -1221,11 +1244,10 @@ pub fn get_forkchoice_store(
 }
 
 pub fn get_slots_since_genesis_from_db(db: &BeaconDB) -> anyhow::Result<u64> {
-    Ok(db
-        .time_provider()
-        .get()?
-        .saturating_sub(db.genesis_time_provider().get()?)
-        / beacon_network_spec().seconds_per_slot())
+    Ok(get_slots_since_genesis_at(
+        db.time_provider().get()?,
+        db.genesis_time_provider().get()?,
+    ))
 }
 
 pub fn get_current_slot_from_db(db: &BeaconDB) -> anyhow::Result<u64> {
