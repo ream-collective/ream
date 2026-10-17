@@ -368,9 +368,9 @@ impl BeaconCacheDB {
             .is_some_and(StateSnapshotWriter::is_finished)
         {
             let finished = writer.take().expect("finished writer exists");
-            finished
-                .join()
-                .map_err(|_| std::io::Error::other("state snapshot worker panicked"))?;
+            finished.join().map_err(|err| {
+                std::io::Error::other(format!("state snapshot worker panicked: {err:?}"))
+            })?;
         }
         if let Some(writer) = writer.as_ref() {
             return Ok(writer.queue.clone());
