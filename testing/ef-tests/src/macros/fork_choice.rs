@@ -17,7 +17,7 @@ macro_rules! test_fork_choice {
                 use ream_execution_rpc_types::get_blobs::{Blob, BlobAndProofV1};
                 use ream_fork_choice_beacon::{
                     handlers::{
-                        OnBlockOutcome, on_attestation, on_attester_slashing, on_block, on_tick,
+                        OnBlockOutcome, on_attestation, on_attester_slashing, on_block, on_block_attestations, on_tick,
                     },
                     store::{get_forkchoice_store, Store},
                 };
@@ -196,6 +196,13 @@ macro_rules! test_fork_choice {
                                         Ok(OnBlockOutcome::Imported)
                                     );
                                     assert_eq!(data_columns_valid && block_imported, blocks.valid.unwrap_or(true), "Unexpected result on on_block");
+                                    // The spec's test helper feeds an imported block's attestations to
+                                    // `on_attestation` with `is_from_block` and expects them all to apply.
+                                    if block_imported {
+                                        for result in on_block_attestations(&mut store, block.message.tree_hash_root(), &block.message.body.attestations) {
+                                            assert!(result.is_ok(), "Block attestation rejected by fork choice: {result:?}");
+                                        }
+                                    }
                                 }
                                 ForkChoiceStep::Attestation(attestations) => {
                                     let attestation_path =

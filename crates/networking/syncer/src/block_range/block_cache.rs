@@ -458,6 +458,9 @@ impl BlockCache {
         required_columns: &HashSet<u64>,
     ) -> anyhow::Result<()> {
         let mut validated = Vec::with_capacity(columns.len());
+        // A block's header hashes its whole body, payload transactions included, and every column
+        // of the block is checked against it, so each block's header is computed once.
+        let mut block_headers = HashMap::new();
         for column in columns {
             if !required_columns.contains(&column.index) {
                 continue;
@@ -477,8 +480,11 @@ impl BlockCache {
                 "Malformed data column sidecar {} for block {block_root}",
                 column.index
             );
+            let block_header = block_headers
+                .entry(block_root)
+                .or_insert_with(|| bundle.block.signed_header());
             ensure!(
-                column.signed_block_header == bundle.block.signed_header(),
+                column.signed_block_header == *block_header,
                 "Data column sidecar {} does not belong to block {block_root}",
                 column.index
             );

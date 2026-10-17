@@ -1,4 +1,7 @@
-use std::fs::{self, File};
+use std::{
+    fs::{self, File},
+    sync::Arc,
+};
 
 use alloy_primitives::B256;
 use anyhow::{bail, ensure};
@@ -12,8 +15,10 @@ use crate::{
     tables::{
         beacon::{
             backfill::{BOOTSTRAP, BackfillMeta, BackfillMode, GVR, IN_PROGRESS, MARKER, META},
+            beacon_state::STATE_FOLDER_NAME,
             blobs_and_proofs::BLOB_FOLDER_NAME,
             column_sidecars::COLUMN_FOLDER_NAME,
+            latest_messages::LatestMessagesTable,
         },
         table::REDBTable,
     },
@@ -320,7 +325,7 @@ impl BeaconDB {
                 "Conflicting bootstrap markers; refusing recovery"
             );
         }
-        for folder in [BLOB_FOLDER_NAME, COLUMN_FOLDER_NAME] {
+        for folder in [BLOB_FOLDER_NAME, COLUMN_FOLDER_NAME, STATE_FOLDER_NAME] {
             let dir = self.data_dir.join(folder);
             for entry in fs::read_dir(&dir)? {
                 let entry = entry?;
@@ -349,8 +354,14 @@ impl BeaconDB {
             write.delete_multimap_table(table)?;
         }
         write.commit()?;
+        // Fork choice votes live in a database of their own.
+        let write = self.votes_db.begin_write()?;
+        write.delete_table(LatestMessagesTable::TABLE_DEFINITION)?;
+        write.open_table(LatestMessagesTable::TABLE_DEFINITION)?;
+        write.commit()?;
         ReamDB {
             db: self.db.clone(),
+            votes_db: Arc::new(std::sync::Mutex::new(Some(self.votes_db.clone()))),
             data_dir: self.data_dir.clone(),
             bootstrap_cache: self.bootstrap_cache.clone(),
         }
@@ -365,6 +376,22 @@ impl BeaconDB {
                 .states
                 .lock()
                 .map_err(|err| anyhow::anyhow!("Poisoned state cache: {err}"))?
+                .clear();
+            cache
+                .pending_state_snapshots
+                .lock()
+                .map_err(|err| anyhow::anyhow!("Poisoned state snapshot cache: {err}"))?
+                .clear();
+            cache
+                .checkpoint_states
+                .lock()
+                .map_err(|err| anyhow::anyhow!("Poisoned checkpoint state cache: {err}"))?
+                .clear();
+            cache
+                .pending_latest_messages
+                .lock()
+                .map_err(|err| anyhow::anyhow!("Poisoned pending vote cache: {err}"))?
+                .messages
                 .clear();
         }
         Ok(true)
