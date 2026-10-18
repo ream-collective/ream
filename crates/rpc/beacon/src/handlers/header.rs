@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use actix_web::{
     HttpResponse, Responder, get,
     web::{Data, Path, Query},
@@ -8,6 +10,7 @@ use ream_api_types_beacon::{
     responses::BeaconResponse,
 };
 use ream_api_types_common::{error::ApiError, id::ID};
+use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_misc::beacon_block_header::SignedBeaconBlockHeader;
 use ream_storage::{db::beacon::BeaconDB, tables::table::REDBTable};
 use serde::{Deserialize, Serialize};
@@ -37,11 +40,12 @@ impl HeaderData {
 #[get("/beacon/headers")]
 pub async fn get_headers(
     db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<BeaconChain>>,
     slot: Query<SlotQuery>,
     parent_root: Query<ParentRootQuery>,
 ) -> Result<impl Responder, ApiError> {
     let (header, root) = match (slot.slot, parent_root.parent_root) {
-        (None, None) => get_header_from_slot(None, &db).await?,
+        (None, None) => get_header_from_slot(None, &db, &beacon_chain).await?,
         (None, Some(parent_root)) => {
             // get parent block to have access to `slot`
             let parent_block = db
@@ -54,7 +58,8 @@ pub async fn get_headers(
 
             // fetch block header at `slot+1`
             let (child_header, child_block_root) =
-                get_header_from_slot(Some(parent_block.message.slot + 1), &db).await?;
+                get_header_from_slot(Some(parent_block.message.slot + 1), &db, &beacon_chain)
+                    .await?;
 
             if child_header.message.parent_root != parent_root {
                 Err(ApiError::NotFound(format!(
@@ -64,9 +69,9 @@ pub async fn get_headers(
 
             (child_header, child_block_root)
         }
-        (Some(slot), None) => get_header_from_slot(Some(slot), &db).await?,
+        (Some(slot), None) => get_header_from_slot(Some(slot), &db, &beacon_chain).await?,
         (Some(slot), Some(parent_root)) => {
-            let (header, root) = get_header_from_slot(Some(slot), &db).await?;
+            let (header, root) = get_header_from_slot(Some(slot), &db, &beacon_chain).await?;
             if header.message.parent_root == parent_root {
                 (header, root)
             } else {
@@ -85,8 +90,9 @@ pub async fn get_headers(
 pub async fn get_headers_from_block(
     block_id: Path<ID>,
     db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<BeaconChain>>,
 ) -> Result<impl Responder, ApiError> {
-    let block = get_beacon_block_from_id(block_id.into_inner(), &db).await?;
+    let block = get_beacon_block_from_id(block_id.into_inner(), &db, &beacon_chain).await?;
     let header = block.signed_header();
 
     Ok(HttpResponse::Ok().json(BeaconResponse::new(HeaderData::new(
@@ -99,6 +105,7 @@ pub async fn get_headers_from_block(
 pub async fn get_header_from_slot(
     slot: Option<u64>,
     db: &BeaconDB,
+    beacon_chain: &BeaconChain,
 ) -> Result<(SignedBeaconBlockHeader, B256), ApiError> {
     let slot = match slot {
         Some(slot) => slot,
@@ -111,7 +118,7 @@ pub async fn get_header_from_slot(
             .ok_or_else(|| ApiError::NotFound(String::from("Unable to fetch latest slot")))?,
     };
 
-    let beacon_block = get_beacon_block_from_id(ID::Slot(slot), db).await?;
+    let beacon_block = get_beacon_block_from_id(ID::Slot(slot), db, beacon_chain).await?;
 
     let header = beacon_block.signed_header();
     let root = header.tree_hash_root();

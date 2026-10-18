@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use actix_web::{
     HttpResponse, Responder, get,
     web::{Data, Path},
@@ -5,6 +7,7 @@ use actix_web::{
 use actix_web_lab::extract::Query;
 use ream_api_types_beacon::{query::BlobSidecarQuery, responses::BeaconVersionedResponse};
 use ream_api_types_common::{error::ApiError, id::ID};
+use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::blob_sidecar::BlobIdentifier;
 use ream_storage::{db::beacon::BeaconDB, tables::table::CustomTable};
 use tree_hash::TreeHash;
@@ -14,10 +17,11 @@ use crate::handlers::block::get_beacon_block_from_id;
 #[get("/beacon/blob_sidecars/{block_id}")]
 pub async fn get_blob_sidecars(
     db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<BeaconChain>>,
     block_id: Path<ID>,
     query: Query<BlobSidecarQuery>,
 ) -> Result<impl Responder, ApiError> {
-    let beacon_block = get_beacon_block_from_id(block_id.into_inner(), &db).await?;
+    let beacon_block = get_beacon_block_from_id(block_id.into_inner(), &db, &beacon_chain).await?;
     let block_root = beacon_block.message.tree_hash_root();
 
     let indices = if let Some(indices) = &query.indices {

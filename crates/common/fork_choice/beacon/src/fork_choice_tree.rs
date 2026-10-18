@@ -108,6 +108,19 @@ impl ForkChoiceTree {
         self.nodes.contains_key(root)
     }
 
+    /// The spec's `get_ancestor(root, slot)`, following parent links in memory. Returns `None` if
+    /// `root`, or an ancestor still newer than `slot`, is not in the tree; the caller then reads
+    /// the blocks from the database.
+    pub fn ancestor(&self, mut root: B256, slot: u64) -> Option<B256> {
+        loop {
+            let node = self.nodes.get(&root)?;
+            if node.slot <= slot {
+                return Some(root);
+            }
+            root = node.parent?;
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
@@ -527,6 +540,23 @@ mod tests {
             }
         }
         assert_eq!(tree.pending_weight, expected);
+    }
+
+    #[test]
+    fn ancestor_follows_parents_and_stops_at_the_tree_root() {
+        let mut tree = ForkChoiceTree::new(block(1, 0, 10), genesis_context());
+        tree.insert(block(2, 1, 12)).unwrap();
+        tree.insert(block(3, 2, 15)).unwrap();
+
+        assert_eq!(tree.ancestor(root(3), 15), Some(root(3)));
+        assert_eq!(tree.ancestor(root(3), 20), Some(root(3)));
+        // Skipped slots resolve to the latest block at or before the slot.
+        assert_eq!(tree.ancestor(root(3), 14), Some(root(2)));
+        assert_eq!(tree.ancestor(root(3), 12), Some(root(2)));
+        assert_eq!(tree.ancestor(root(3), 10), Some(root(1)));
+        // Older than the finalized root, or an unknown root: the tree cannot answer.
+        assert_eq!(tree.ancestor(root(3), 9), None);
+        assert_eq!(tree.ancestor(root(9), 20), None);
     }
 
     fn tree_with_balances(validators: usize) -> ForkChoiceTree {

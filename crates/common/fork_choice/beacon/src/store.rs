@@ -20,7 +20,7 @@ use ream_consensus_beacon::{
 };
 use ream_consensus_misc::{
     checkpoint::Checkpoint,
-    constants::beacon::{GENESIS_EPOCH, GENESIS_SLOT, INTERVALS_PER_SLOT, SLOTS_PER_EPOCH},
+    constants::beacon::{GENESIS_EPOCH, GENESIS_SLOT, SLOTS_PER_EPOCH},
     misc::{compute_epoch_at_slot, compute_start_slot_at_epoch, is_shuffling_stable},
 };
 use ream_data_availability::{DataAvailabilityChecker, PendingBlock};
@@ -52,6 +52,40 @@ use crate::{
 };
 
 const VALIDATOR_API_SYNC_TOLERANCE_EPOCHS: u64 = 2;
+const BASIS_POINTS: u64 = 10_000;
+const MILLISECONDS_PER_SECOND: u64 = 1_000;
+
+pub(crate) fn seconds_to_milliseconds(seconds: u64) -> u64 {
+    seconds.saturating_mul(MILLISECONDS_PER_SECOND)
+}
+
+pub(crate) fn get_slot_component_duration_ms(basis_points: u64) -> u64 {
+    basis_points.saturating_mul(beacon_network_spec().slot_duration_ms) / BASIS_POINTS
+}
+
+pub(crate) fn get_slots_since_genesis_at(time: u64, genesis_time: u64) -> u64 {
+    slots_since_genesis(time, genesis_time, beacon_network_spec().slot_duration_ms)
+}
+
+pub(crate) fn get_time_at_slot(genesis_time: u64, slot: u64) -> u64 {
+    time_at_slot(genesis_time, slot, beacon_network_spec().slot_duration_ms)
+}
+
+fn slots_since_genesis(time: u64, genesis_time: u64, slot_duration_ms: u64) -> u64 {
+    seconds_to_milliseconds(time.saturating_sub(genesis_time)) / slot_duration_ms
+}
+
+/// The first whole second at or after the start of `slot`. Store time has whole-second
+/// resolution, and this is the earliest store time that `get_slots_since_genesis` maps to `slot`.
+/// Rounding down instead, as the spec's `on_tick` does, maps the time back to the previous slot
+/// when the slot duration is not a whole number of seconds, so `on_tick` would catch up forever.
+fn time_at_slot(genesis_time: u64, slot: u64, slot_duration_ms: u64) -> u64 {
+    genesis_time.saturating_add(
+        slot_duration_ms
+            .saturating_mul(slot)
+            .div_ceil(MILLISECONDS_PER_SECOND),
+    )
+}
 
 #[derive(Debug)]
 pub struct BlockWithEpochInfo {
@@ -229,15 +263,22 @@ impl Store {
     }
 
     pub fn get_slots_since_genesis(&self) -> anyhow::Result<u64> {
-        Ok(self
-            .db
-            .time_provider()
-            .get()?
-            .saturating_sub(self.db.genesis_time_provider().get()?)
-            / beacon_network_spec().seconds_per_slot())
+        Ok(get_slots_since_genesis_at(
+            self.db.time_provider().get()?,
+            self.db.genesis_time_provider().get()?,
+        ))
     }
 
     pub fn get_ancestor(&self, root: B256, slot: u64) -> anyhow::Result<B256> {
+        // Unfinalized blocks are in the fork choice tree, so their ancestry is resolved without
+        // reading and decoding each block from the database.
+        if let Some(ancestor) = self
+            .fork_choice
+            .as_ref()
+            .and_then(|tree| tree.ancestor(root, slot))
+        {
+            return Ok(ancestor);
+        }
         let block = self
             .db
             .block_provider()
@@ -709,13 +750,16 @@ impl Store {
     }
 
     pub fn is_proposing_on_time(&self) -> anyhow::Result<bool> {
-        // Use half `SECONDS_PER_SLOT // INTERVALS_PER_SLOT` as the proposer reorg deadline
-        let time_into_slot = (self.db.time_provider().get()?
-            - self.db.genesis_time_provider().get()?)
-            % beacon_network_spec().seconds_per_slot();
-        let proposer_reorg_cutoff =
-            beacon_network_spec().seconds_per_slot() / INTERVALS_PER_SLOT / 2;
-        Ok(time_into_slot <= proposer_reorg_cutoff)
+        let seconds_since_genesis = self
+            .db
+            .time_provider()
+            .get()?
+            .saturating_sub(self.db.genesis_time_provider().get()?);
+        let time_into_slot_ms =
+            seconds_to_milliseconds(seconds_since_genesis) % beacon_network_spec().slot_duration_ms;
+        let proposer_reorg_cutoff_ms =
+            get_slot_component_duration_ms(beacon_network_spec().proposer_reorg_cutoff_bps);
+        Ok(time_into_slot_ms <= proposer_reorg_cutoff_ms)
     }
 
     pub fn is_finalization_ok(&self, slot: u64) -> anyhow::Result<bool> {
@@ -1178,9 +1222,10 @@ pub fn get_forkchoice_store(
         root: anchor_root,
     };
 
-    db.time_provider().insert(
-        anchor_state.genesis_time + beacon_network_spec().seconds_per_slot() * anchor_state.slot,
-    )?;
+    db.time_provider().insert(get_time_at_slot(
+        anchor_state.genesis_time,
+        anchor_state.slot,
+    ))?;
     db.genesis_time_provider()
         .insert(anchor_state.genesis_time)?;
     db.justified_checkpoint_provider()
@@ -1221,11 +1266,10 @@ pub fn get_forkchoice_store(
 }
 
 pub fn get_slots_since_genesis_from_db(db: &BeaconDB) -> anyhow::Result<u64> {
-    Ok(db
-        .time_provider()
-        .get()?
-        .saturating_sub(db.genesis_time_provider().get()?)
-        / beacon_network_spec().seconds_per_slot())
+    Ok(get_slots_since_genesis_at(
+        db.time_provider().get()?,
+        db.genesis_time_provider().get()?,
+    ))
 }
 
 pub fn get_current_slot_from_db(db: &BeaconDB) -> anyhow::Result<u64> {
@@ -1323,6 +1367,52 @@ mod tests {
             .init_beacon_db()
             .unwrap();
         (db, temp_dir)
+    }
+
+    #[test]
+    fn slot_start_time_maps_back_to_its_slot() {
+        let genesis_time = 1_000;
+        for slot_duration_ms in [12_000, 12_500, 6_000, 4_000, 1_001, 2_750] {
+            for slot in 0..10_000 {
+                let time = time_at_slot(genesis_time, slot, slot_duration_ms);
+                assert_eq!(
+                    slots_since_genesis(time, genesis_time, slot_duration_ms),
+                    slot,
+                    "slot_duration_ms={slot_duration_ms} slot={slot}"
+                );
+                if slot > 0 {
+                    // The time is the earliest whole second in the slot.
+                    assert_eq!(
+                        slots_since_genesis(time - 1, genesis_time, slot_duration_ms),
+                        slot - 1,
+                        "slot_duration_ms={slot_duration_ms} slot={slot}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fractional_slot_tick_catch_up_advances_every_slot() {
+        // The loop in `on_tick`: with 12.5 s slots, flooring slot 1's start to genesis + 12 s
+        // left the store at slot 0 forever.
+        let genesis_time = 1_000;
+        let slot_duration_ms = 12_500;
+        let tick_time = genesis_time + 1_000;
+        let tick_slot = slots_since_genesis(tick_time, genesis_time, slot_duration_ms);
+        let mut store_time = genesis_time;
+        let mut iterations = 0;
+        while slots_since_genesis(store_time, genesis_time, slot_duration_ms) < tick_slot {
+            let current_slot = slots_since_genesis(store_time, genesis_time, slot_duration_ms);
+            store_time = time_at_slot(genesis_time, current_slot + 1, slot_duration_ms);
+            iterations += 1;
+            assert!(iterations <= tick_slot, "catch-up did not advance");
+        }
+        assert_eq!(iterations, tick_slot);
+        assert_eq!(
+            time_at_slot(genesis_time, 1, slot_duration_ms),
+            genesis_time + 13
+        );
     }
 
     #[test]

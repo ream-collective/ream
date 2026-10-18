@@ -35,7 +35,7 @@ use ream_p2p::{
     gossipsub::beacon::topics::{GossipTopic, GossipTopicKind},
     network::beacon::channel::GossipMessage,
 };
-use ream_storage::{cache::BeaconCacheDB, db::beacon::BeaconDB, tables::table::REDBTable};
+use ream_storage::{cache::BeaconCacheDB, db::beacon::BeaconDB};
 use ream_sync_committee_pool::SyncCommitteePool;
 use ream_validator_beacon::{
     attestation::{compute_subnet_for_attestation, single_attestation_to_attestation},
@@ -370,21 +370,11 @@ pub async fn get_attestations(
     Ok(HttpResponse::Ok().json(DataVersionedResponse::new(all_attestations)))
 }
 
-async fn get_head_state(beacon_chain: &BeaconChain) -> Result<BeaconState, ApiError> {
-    let store = beacon_chain.store.lock().await;
-
-    let head_root = store
-        .get_head()
+async fn get_head_state(beacon_chain: &BeaconChain) -> Result<Arc<BeaconState>, ApiError> {
+    let head = beacon_chain
+        .head()
         .map_err(|err| ApiError::InternalError(format!("Failed to get head root: {err:?}")))?;
-
-    store
-        .db
-        .state_provider()
-        .get(head_root)
-        .map_err(|err| ApiError::InternalError(format!("Failed to get head state: {err:?}")))?
-        .ok_or_else(|| {
-            ApiError::NotFound(format!("No beacon state found for head root: {head_root}"))
-        })
+    Ok(head.state)
 }
 
 /// POST /eth/v1/beacon/pool/sync_committees
