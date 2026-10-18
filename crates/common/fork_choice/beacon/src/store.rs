@@ -64,13 +64,26 @@ pub(crate) fn get_slot_component_duration_ms(basis_points: u64) -> u64 {
 }
 
 pub(crate) fn get_slots_since_genesis_at(time: u64, genesis_time: u64) -> u64 {
-    seconds_to_milliseconds(time.saturating_sub(genesis_time))
-        / beacon_network_spec().slot_duration_ms
+    slots_since_genesis(time, genesis_time, beacon_network_spec().slot_duration_ms)
 }
 
 pub(crate) fn get_time_at_slot(genesis_time: u64, slot: u64) -> u64 {
+    time_at_slot(genesis_time, slot, beacon_network_spec().slot_duration_ms)
+}
+
+fn slots_since_genesis(time: u64, genesis_time: u64, slot_duration_ms: u64) -> u64 {
+    seconds_to_milliseconds(time.saturating_sub(genesis_time)) / slot_duration_ms
+}
+
+/// The first whole second at or after the start of `slot`. Store time has whole-second
+/// resolution, and this is the earliest store time that `get_slots_since_genesis` maps to `slot`.
+/// Rounding down instead, as the spec's `on_tick` does, maps the time back to the previous slot
+/// when the slot duration is not a whole number of seconds, so `on_tick` would catch up forever.
+fn time_at_slot(genesis_time: u64, slot: u64, slot_duration_ms: u64) -> u64 {
     genesis_time.saturating_add(
-        beacon_network_spec().slot_duration_ms.saturating_mul(slot) / MILLISECONDS_PER_SECOND,
+        slot_duration_ms
+            .saturating_mul(slot)
+            .div_ceil(MILLISECONDS_PER_SECOND),
     )
 }
 
@@ -1354,6 +1367,52 @@ mod tests {
             .init_beacon_db()
             .unwrap();
         (db, temp_dir)
+    }
+
+    #[test]
+    fn slot_start_time_maps_back_to_its_slot() {
+        let genesis_time = 1_000;
+        for slot_duration_ms in [12_000, 12_500, 6_000, 4_000, 1_001, 2_750] {
+            for slot in 0..10_000 {
+                let time = time_at_slot(genesis_time, slot, slot_duration_ms);
+                assert_eq!(
+                    slots_since_genesis(time, genesis_time, slot_duration_ms),
+                    slot,
+                    "slot_duration_ms={slot_duration_ms} slot={slot}"
+                );
+                if slot > 0 {
+                    // The time is the earliest whole second in the slot.
+                    assert_eq!(
+                        slots_since_genesis(time - 1, genesis_time, slot_duration_ms),
+                        slot - 1,
+                        "slot_duration_ms={slot_duration_ms} slot={slot}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fractional_slot_tick_catch_up_advances_every_slot() {
+        // The loop in `on_tick`: with 12.5 s slots, flooring slot 1's start to genesis + 12 s
+        // left the store at slot 0 forever.
+        let genesis_time = 1_000;
+        let slot_duration_ms = 12_500;
+        let tick_time = genesis_time + 1_000;
+        let tick_slot = slots_since_genesis(tick_time, genesis_time, slot_duration_ms);
+        let mut store_time = genesis_time;
+        let mut iterations = 0;
+        while slots_since_genesis(store_time, genesis_time, slot_duration_ms) < tick_slot {
+            let current_slot = slots_since_genesis(store_time, genesis_time, slot_duration_ms);
+            store_time = time_at_slot(genesis_time, current_slot + 1, slot_duration_ms);
+            iterations += 1;
+            assert!(iterations <= tick_slot, "catch-up did not advance");
+        }
+        assert_eq!(iterations, tick_slot);
+        assert_eq!(
+            time_at_slot(genesis_time, 1, slot_duration_ms),
+            genesis_time + 13
+        );
     }
 
     #[test]
