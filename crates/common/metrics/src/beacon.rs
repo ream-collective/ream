@@ -93,6 +93,24 @@ lazy_static::lazy_static! {
         default_registry()
     ).expect("failed to create BEACON_GOSSIP_PENDING_ITEMS_DROPPED_TOTAL int counter");
 
+    pub static ref BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_SKIPPED_COMPLETE_TOTAL: IntCounter = register_int_counter_with_registry!(
+        "beacon_data_availability_reconstructions_skipped_complete_total",
+        "Reconstructions skipped because every required column was stored before they ran",
+        default_registry()
+    ).expect("failed to create BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_SKIPPED_COMPLETE_TOTAL int counter");
+
+    pub static ref BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_RUN_TOTAL: IntCounter = register_int_counter_with_registry!(
+        "beacon_data_availability_reconstructions_run_total",
+        "Reconstructions that rebuilt missing columns",
+        default_registry()
+    ).expect("failed to create BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_RUN_TOTAL int counter");
+
+    pub static ref BEACON_DATA_AVAILABILITY_CROSS_SEEDED_COLUMNS_TOTAL: IntCounter = register_int_counter_with_registry!(
+        "beacon_data_availability_cross_seeded_columns_total",
+        "Reconstructed columns published to their subnet meshes",
+        default_registry()
+    ).expect("failed to create BEACON_DATA_AVAILABILITY_CROSS_SEEDED_COLUMNS_TOTAL int counter");
+
     pub static ref BEACON_DATA_COLUMN_SIDECAR_GOSSIP_VERIFICATION_SECONDS: Histogram = {
         // Gossip verification is expected to be fast (sub-100ms typical case).
         // Starting point only — re-tune against real hardware benchmarks.
