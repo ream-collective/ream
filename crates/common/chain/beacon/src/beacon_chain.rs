@@ -23,9 +23,9 @@ use ream_execution_rpc_types::forkchoice_update::ForkchoiceStateV1;
 use ream_fork_choice_beacon::{
     data_availability::PendingBlock,
     handlers::{
-        OnBlockOutcome, is_on_chain_of, on_attestation, on_attester_slashing,
-        on_block_attestations, on_block_with_root, on_gossip_attestation_with_shuffling, on_tick,
-        process_available_block, shares_target_shuffling,
+        OnBlockOutcome, on_attestation, on_attester_slashing, on_block_attestations,
+        on_block_with_root, on_gossip_attestation_with_shuffling, on_tick, process_available_block,
+        shares_target_shuffling,
     },
     store::Store,
 };
@@ -213,8 +213,8 @@ impl BeaconChain {
         let mut store = self.store.lock().await;
         lock_wait_timer.observe_duration();
         let locked = started.elapsed();
-        // Fork choice reads committees of block attestations whose target is on another fork from
-        // that target's checkpoint state. Build any that are missing outside the lock.
+        // Fork choice reads committees of block attestations whose target has another shuffling
+        // from that target's checkpoint state. Build any that are missing outside the lock.
         let off_chain_targets = self.missing_off_chain_attestation_targets(&store, &signed_block);
         if !off_chain_targets.is_empty() {
             drop(store);
@@ -728,9 +728,9 @@ impl BeaconChain {
         Ok(())
     }
 
-    /// Targets of `signed_block`'s attestations that are not on the block's own chain and whose
-    /// checkpoint state is not in memory. Targets on the block's chain need no checkpoint state:
-    /// their committees are read from the block's post-state.
+    /// Targets of `signed_block`'s attestations whose shuffling differs from the block's and whose
+    /// checkpoint state is not in memory. Targets with the block's shuffling need no checkpoint
+    /// state: their committees are read from the block's post-state.
     fn missing_off_chain_attestation_targets(
         &self,
         store: &Store,
@@ -749,11 +749,14 @@ impl BeaconChain {
             .collect::<Vec<_>>();
         targets.sort();
         targets.dedup();
-        // The block is not stored yet; its parent's ancestry is its own below the block's slot.
+        // The block is not stored yet; its parent's ancestry is its own below the block's slot,
+        // which covers the shuffling decision slots of its attestations' targets.
         let parent_root = signed_block.message.parent_root;
+        let block_epoch = compute_epoch_at_slot(signed_block.message.slot);
         targets.retain(|target| {
             !checkpoint_states.is_in_memory(*target)
-                && !is_on_chain_of(store, parent_root, *target).unwrap_or(false)
+                && !shares_target_shuffling(store, block_epoch, parent_root, *target)
+                    .unwrap_or(false)
         });
         targets
     }
