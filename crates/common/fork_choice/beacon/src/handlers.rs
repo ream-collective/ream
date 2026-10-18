@@ -209,17 +209,8 @@ pub fn process_available_block(
         get_slot_component_duration_ms(beacon_network_spec().attestation_due_bps);
     let is_before_attesting_interval = time_into_slot_ms < attestation_threshold_ms;
     let is_timely = store.get_current_slot()? == block_slot && is_before_attesting_interval;
-    // The spec computes the head after the state transition and data-availability check, but
-    // before publishing this block to fork choice.
-    let head_root = store.get_head()?;
-    let proposer_boost_root = get_proposer_boost_root(
-        store,
-        head_root,
-        block_root,
-        block_slot,
-        parent_root,
-        is_timely,
-    )?;
+    let proposer_boost_root =
+        get_proposer_boost_root(store, block_root, block_slot, parent_root, is_timely)?;
     let pulled_up = state.compute_justification_and_finalization()?;
     let current_epoch = store.get_current_store_epoch()?;
 
@@ -318,20 +309,43 @@ fn get_candidate_dependent_root(
     }
 }
 
+/// The spec's `update_proposer_boost_root` for a block that is not committed yet.
+///
+/// Only the first timely block of a slot can be boosted, so every other block returns before the
+/// head and ancestor lookups, as in Lighthouse. The spec computes the head on every import but
+/// uses it only here. Without the fork choice tree that head is a full fork choice run over the
+/// database.
 fn get_proposer_boost_root(
     store: &Store,
-    head_root: B256,
     block_root: B256,
     block_slot: u64,
     parent_root: B256,
     is_timely: bool,
 ) -> anyhow::Result<Option<B256>> {
     let is_first_block = store.db.proposer_boost_root_provider().get()? == B256::ZERO;
-    let is_same_dependent_root =
-        get_candidate_dependent_root(store, block_root, block_slot, parent_root)?
-            == get_dependent_root(store, head_root)?;
+    if !is_timely || !is_first_block {
+        return Ok(None);
+    }
 
-    Ok((is_timely && is_first_block && is_same_dependent_root).then_some(block_root))
+    // The spec computes the head after the state transition and data-availability check, but
+    // before publishing this block to fork choice.
+    let head_root = store.get_head()?;
+    let is_same_dependent_root =
+        is_same_dependent_root(store, head_root, block_root, block_slot, parent_root)?;
+    Ok(is_same_dependent_root.then_some(block_root))
+}
+
+fn is_same_dependent_root(
+    store: &Store,
+    head_root: B256,
+    block_root: B256,
+    block_slot: u64,
+    parent_root: B256,
+) -> anyhow::Result<bool> {
+    Ok(
+        get_candidate_dependent_root(store, block_root, block_slot, parent_root)?
+            == get_dependent_root(store, head_root)?,
+    )
 }
 
 /// Runs ``on_attestation`` with ``is_from_block`` for the attestations of a block whose
@@ -543,7 +557,10 @@ mod tests {
     };
     use tempdir::TempDir;
 
-    use super::{Store, ensure_only_attester, get_proposer_boost_root, get_time_at_slot};
+    use super::{
+        Store, ensure_only_attester, get_proposer_boost_root, get_time_at_slot,
+        is_same_dependent_root,
+    };
 
     #[test]
     fn a_gossip_vote_counts_only_for_the_verified_attester() {
@@ -602,29 +619,63 @@ mod tests {
         }
 
         let store = Store::new(db, Arc::new(OperationPool::default()), None);
-        assert_eq!(
-            get_proposer_boost_root(
+        assert!(
+            !is_same_dependent_root(
                 &store,
                 head_root,
                 candidate_root,
                 current_slot,
                 candidate_parent_root,
-                true,
             )
-            .unwrap(),
+            .unwrap()
+        );
+        assert!(
+            is_same_dependent_root(&store, head_root, candidate_root, current_slot, head_root)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn proposer_boost_skips_head_lookup_unless_first_timely_block() {
+        initialize_test_network_spec();
+        let temp_dir = TempDir::new("ream_proposer_boost_gate").unwrap();
+        let db = ReamDB::new(temp_dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap();
+        let genesis_time = 1_000;
+        let current_slot = 2 * ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH;
+        db.genesis_time_provider().insert(genesis_time).unwrap();
+        db.time_provider()
+            .insert(get_time_at_slot(genesis_time, current_slot))
+            .unwrap();
+        db.proposer_boost_root_provider()
+            .insert(B256::ZERO)
+            .unwrap();
+        // No checkpoints or blocks are stored, so a head or ancestor lookup would fail.
+        let store = Store::new(db, Arc::new(OperationPool::default()), None);
+        let candidate_root = B256::repeat_byte(0x23);
+        let parent_root = B256::repeat_byte(0x22);
+
+        assert_eq!(
+            get_proposer_boost_root(&store, candidate_root, current_slot, parent_root, false)
+                .unwrap(),
             None
         );
+        assert!(
+            get_proposer_boost_root(&store, candidate_root, current_slot, parent_root, true)
+                .is_err()
+        );
+
+        store
+            .db
+            .proposer_boost_root_provider()
+            .insert(B256::repeat_byte(0x99))
+            .unwrap();
         assert_eq!(
-            get_proposer_boost_root(
-                &store,
-                head_root,
-                candidate_root,
-                current_slot,
-                head_root,
-                true,
-            )
-            .unwrap(),
-            Some(candidate_root)
+            get_proposer_boost_root(&store, candidate_root, current_slot, parent_root, true)
+                .unwrap(),
+            None
         );
     }
 }
