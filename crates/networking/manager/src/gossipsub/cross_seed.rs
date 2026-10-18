@@ -68,11 +68,14 @@ mod tests {
         electra::beacon_block::SignedBeaconBlock,
     };
     use ream_network_spec::networks::initialize_test_network_spec;
-    use ream_p2p::network::beacon::channel::P2PMessage;
+    use ream_p2p::{
+        gossipsub::beacon::message::GossipsubMessage, network::beacon::channel::P2PMessage,
+    };
     use ssz::Decode;
     use tokio::sync::mpsc;
 
     use super::*;
+    use crate::gossipsub::handle::init_gossipsub_config_with_topics;
 
     fn columns_at_slot(slot: u64) -> Vec<DataColumnSidecar> {
         let mut block = SignedBeaconBlock {
@@ -174,6 +177,38 @@ mod tests {
                 .await
                 .contains(&seen_tuple(&columns[0]))
         );
+    }
+
+    #[tokio::test]
+    async fn published_columns_use_a_topic_the_node_subscribes_to() {
+        initialize_test_network_spec();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let columns = columns_at_slot(1);
+
+        publish_reconstructed_columns(
+            columns[..1].to_vec(),
+            0,
+            &BeaconCacheDB::default(),
+            &P2PSender(sender),
+        )
+        .await;
+
+        let Ok(P2PMessage::Gossip(message)) = receiver.try_recv() else {
+            panic!("the column should be published");
+        };
+        // Peers on this node's fork digest dedupe by topic and data, so a copy published on any
+        // other topic would get a different message id and reach a different mesh.
+        assert!(
+            init_gossipsub_config_with_topics(None)
+                .topics
+                .contains(&message.topic)
+        );
+        let decoded = GossipsubMessage::decode(&message.topic.into(), &message.data)
+            .expect("the published column should decode on its topic");
+        assert!(matches!(
+            decoded,
+            GossipsubMessage::DataColumnSidecar(sidecar) if *sidecar == columns[0]
+        ));
     }
 
     #[tokio::test]

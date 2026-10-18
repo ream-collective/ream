@@ -1027,6 +1027,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconstruction_returns_only_the_columns_it_rebuilt() {
+        let mut state = test_beacon_state();
+        let (_data_dir, chain, parent_root) = test_chain_with_anchor(state.clone());
+        state.slot += 1;
+        let (block, columns) =
+            block_with_blob_columns(state.slot, parent_root, state.tree_hash_root());
+        let root = block.message.tree_hash_root();
+        chain
+            .store
+            .lock()
+            .await
+            .data_availability_checker
+            .insert_pending(root, block, state);
+        // One column more than half, so a received column is in the rebuilt matrix too.
+        let received = (NUMBER_OF_COLUMNS / 2 + 1) as usize;
+        chain
+            .import_data_column_sidecars_if(columns[..received].to_vec(), |_| Ok(()))
+            .await
+            .unwrap();
+
+        let rebuilt = chain.reconstruct_data_columns(root).await.unwrap();
+
+        // The caller cross-seeds what is returned, so received columns must not be in it.
+        assert_eq!(rebuilt, columns[received..].to_vec());
+        assert!(chain.db.block_provider().get(root).unwrap().is_some());
+        assert!(
+            chain
+                .reconstruct_data_columns(root)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an imported block has nothing left to rebuild"
+        );
+    }
+
+    #[tokio::test]
     async fn columns_stored_before_their_block_announce_no_reconstruction() {
         let (_data_dir, chain) = test_chain();
         let block = empty_block();
