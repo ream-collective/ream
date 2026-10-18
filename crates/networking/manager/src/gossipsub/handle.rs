@@ -115,11 +115,13 @@ pub fn init_gossipsub_config_with_topics(history_length: Option<usize>) -> Gossi
         });
     }
 
-    for subnet_id in 0..beacon_network_spec().blob_sidecar_subnet_count_electra {
-        topics.push(GossipTopic {
-            fork: fork_digest,
-            kind: GossipTopicKind::BlobSidecar(subnet_id),
-        });
+    if subscribes_to_blob_sidecars(beacon_network_spec().current_epoch()) {
+        for subnet_id in 0..beacon_network_spec().blob_sidecar_subnet_count_electra {
+            topics.push(GossipTopic {
+                fork: fork_digest,
+                kind: GossipTopicKind::BlobSidecar(subnet_id),
+            });
+        }
     }
 
     for subnet_id in 0..DATA_COLUMN_SIDECAR_SUBNET_COUNT {
@@ -132,6 +134,12 @@ pub fn init_gossipsub_config_with_topics(history_length: Option<usize>) -> Gossi
     gossipsub_config.set_topics(topics);
 
     gossipsub_config
+}
+
+/// Fulu deprecates the `blob_sidecar_{subnet_id}` topics: blob data travels as data columns from
+/// FULU_FORK_EPOCH on (consensus-specs v1.7.0-alpha.11, fulu/p2p-interface.md).
+fn subscribes_to_blob_sidecars(epoch: u64) -> bool {
+    epoch < beacon_network_spec().fulu_fork_epoch
 }
 
 async fn import_gossip_attestation(
@@ -808,6 +816,15 @@ mod tests {
             matches!(acceptance, MessageAcceptance::Reject),
             "expected Reject, got {acceptance:?}"
         );
+    }
+
+    #[test]
+    fn blob_sidecar_topics_end_at_fulu() {
+        initialize_test_network_spec();
+        let fulu_fork_epoch = beacon_network_spec().fulu_fork_epoch;
+        assert!(subscribes_to_blob_sidecars(fulu_fork_epoch - 1));
+        assert!(!subscribes_to_blob_sidecars(fulu_fork_epoch));
+        assert!(!subscribes_to_blob_sidecars(fulu_fork_epoch + 1));
     }
 
     #[test]
