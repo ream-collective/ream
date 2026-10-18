@@ -152,6 +152,17 @@ impl CheckpointStatesTable {
         Ok(())
     }
 
+    /// Whether `checkpoint`'s state is held in memory, so `get_shared` returns it without building
+    /// it. Always false without a cache, since nothing is kept then.
+    pub fn is_in_memory(&self, checkpoint: Checkpoint) -> bool {
+        self.in_memory(checkpoint).is_some()
+    }
+
+    /// Whether built checkpoint states are kept for later lookups.
+    pub fn keeps_states(&self) -> bool {
+        self.cache.is_some()
+    }
+
     fn in_memory(&self, checkpoint: Checkpoint) -> Option<Arc<BeaconState>> {
         self.cache
             .as_ref()?
