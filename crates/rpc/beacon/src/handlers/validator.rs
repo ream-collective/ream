@@ -549,7 +549,7 @@ pub async fn get_attestation_data(
     }
 
     let head_root = head.head_root;
-    let state = head.state.as_ref().clone();
+    let state = &head.state;
 
     let beacon_block_root = if slot >= state.slot {
         head_root

@@ -370,11 +370,11 @@ pub async fn get_attestations(
     Ok(HttpResponse::Ok().json(DataVersionedResponse::new(all_attestations)))
 }
 
-async fn get_head_state(beacon_chain: &BeaconChain) -> Result<BeaconState, ApiError> {
+async fn get_head_state(beacon_chain: &BeaconChain) -> Result<Arc<BeaconState>, ApiError> {
     let head = beacon_chain
         .head()
         .map_err(|err| ApiError::InternalError(format!("Failed to get head root: {err:?}")))?;
-    Ok(head.state.as_ref().clone())
+    Ok(head.state)
 }
 
 /// POST /eth/v1/beacon/pool/sync_committees
