@@ -1,4 +1,7 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use alloy_primitives::B256;
 use anyhow::anyhow;
@@ -20,9 +23,9 @@ use ream_execution_rpc_types::forkchoice_update::ForkchoiceStateV1;
 use ream_fork_choice_beacon::{
     data_availability::PendingBlock,
     handlers::{
-        OnBlockOutcome, determines_target_committees, on_attestation, on_attester_slashing,
-        on_block_attestations, on_block_with_root, on_gossip_attestation_with_committees, on_tick,
-        process_available_block,
+        OnBlockOutcome, on_attestation, on_attester_slashing, on_block_attestations,
+        on_block_with_root, on_gossip_attestation_with_shuffling, on_tick, process_available_block,
+        shares_target_shuffling,
     },
     store::Store,
 };
@@ -42,7 +45,7 @@ use ream_storage::{
     },
 };
 use ream_sync_committee_pool::SyncCommitteePool;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, Semaphore, broadcast};
 use tracing::{debug, warn};
 use tree_hash::TreeHash;
 
@@ -95,6 +98,9 @@ impl CachedHead {
 }
 
 /// BeaconChain is the main struct which manages the nodes local beacon chain.
+/// Checkpoint state builds that may run at once, as Prysm's `attPreStateRegenSem`.
+const CHECKPOINT_STATE_REGEN_PERMITS: usize = 1;
+
 pub struct BeaconChain {
     pub store: Mutex<Store>,
     cached_head: RwLock<Option<CachedHead>>,
@@ -107,10 +113,13 @@ pub struct BeaconChain {
     force_data_availability_checks: bool,
     /// Blocks with a reconstruction announced and not finished, so each is announced once.
     reconstructions: parking_lot::Mutex<HashSet<B256>>,
-    /// Held while a missing attestation target checkpoint state is built outside the store lock,
-    /// so attestations that need the same checkpoint wait for one build instead of each making a
-    /// copy of the state.
-    checkpoint_state_build: Mutex<()>,
+    /// One lock per checkpoint whose state is being built outside the store lock, so attestations
+    /// that need the same checkpoint wait for one build instead of each copying the state
+    /// (Prysm's per-checkpoint `Multilock`).
+    checkpoint_state_locks: parking_lot::Mutex<HashMap<Checkpoint, Arc<Mutex<()>>>>,
+    /// Checkpoint state builds that may run at once. Each copies a state and may run epoch
+    /// processing; Prysm also allows one (`attPreStateRegenSem`).
+    checkpoint_state_regen: Semaphore,
 }
 
 impl BeaconChain {
@@ -151,7 +160,8 @@ impl BeaconChain {
             block_import_sender,
             execution_forkchoice: Mutex::new(None),
             reconstructions: parking_lot::Mutex::new(HashSet::new()),
-            checkpoint_state_build: Mutex::new(()),
+            checkpoint_state_locks: parking_lot::Mutex::new(HashMap::new()),
+            checkpoint_state_regen: Semaphore::new(CHECKPOINT_STATE_REGEN_PERMITS),
             force_data_availability_checks: false,
         }
     }
@@ -679,10 +689,11 @@ impl BeaconChain {
         let mut store = self.store.lock().await;
         // When the target checkpoint state is not in memory, read the committee from the head
         // state if it has the same shuffling, as Prysm does; otherwise build the checkpoint state
-        // outside the lock.
-        let committee_state = head.filter(|head| {
+        // outside the lock. Without a cached head (no anchor block stored yet) there is no
+        // shortcut, and the checkpoint state is used as before.
+        let shuffling_head = head.filter(|head| {
             !self.db.checkpoint_states_provider().is_in_memory(target)
-                && determines_target_committees(
+                && shares_target_shuffling(
                     &store,
                     head.state.get_current_epoch(),
                     head.head_root,
@@ -690,16 +701,16 @@ impl BeaconChain {
                 )
                 .unwrap_or(false)
         });
-        if committee_state.is_none() && !self.db.checkpoint_states_provider().is_in_memory(target) {
+        if shuffling_head.is_none() && !self.db.checkpoint_states_provider().is_in_memory(target) {
             drop(store);
             self.prepare_checkpoint_state(target).await;
             store = self.store.lock().await;
         }
-        on_gossip_attestation_with_committees(
+        on_gossip_attestation_with_shuffling(
             &mut store,
             attestation,
             attester_index,
-            committee_state.as_ref().map(|head| head.state.as_ref()),
+            shuffling_head.as_ref().map(|head| head.state.as_ref()),
         )?;
         self.publish_cached_head(&store);
         drop(store);
@@ -720,7 +731,26 @@ impl BeaconChain {
         if !checkpoint_states.keeps_states() || checkpoint_states.is_in_memory(target) {
             return;
         }
-        let _build = self.checkpoint_state_build.lock().await;
+        let checkpoint_lock = self
+            .checkpoint_state_locks
+            .lock()
+            .entry(target)
+            .or_default()
+            .clone();
+        let _checkpoint = checkpoint_lock.lock().await;
+        // An attestation that waited here finds the state the first one built.
+        if !checkpoint_states.is_in_memory(target) {
+            self.build_checkpoint_state(target).await;
+        }
+        // Waiters keep their own handle; later attestations find the state in memory.
+        self.checkpoint_state_locks.lock().remove(&target);
+    }
+
+    /// Builds `target`'s checkpoint state on a blocking thread and keeps it in memory.
+    async fn build_checkpoint_state(&self, target: Checkpoint) {
+        let Ok(_regen) = self.checkpoint_state_regen.acquire().await else {
+            return;
+        };
         let db = self.db.clone();
         let started = std::time::Instant::now();
         match tokio::task::spawn_blocking(move || {

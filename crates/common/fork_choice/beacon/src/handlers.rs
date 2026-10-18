@@ -521,22 +521,22 @@ pub fn on_gossip_attestation(
     attestation: Attestation,
     verified_attester: u64,
 ) -> anyhow::Result<()> {
-    on_gossip_attestation_with_committees(store, attestation, verified_attester, None)
+    on_gossip_attestation_with_shuffling(store, attestation, verified_attester, None)
 }
 
-/// ``on_gossip_attestation`` that reads the target committee from `committee_state` when one is
+/// ``on_gossip_attestation`` that reads the target committee from `shuffling_state` when one is
 /// given, instead of the target checkpoint state. Pass a state only when
-/// ``determines_target_committees`` holds for it.
-pub fn on_gossip_attestation_with_committees(
+/// ``shares_target_shuffling`` holds for it.
+pub fn on_gossip_attestation_with_shuffling(
     store: &mut Store,
     attestation: Attestation,
     verified_attester: u64,
-    committee_state: Option<&BeaconState>,
+    shuffling_state: Option<&BeaconState>,
 ) -> anyhow::Result<()> {
     store.validate_on_attestation(&attestation, false)?;
 
     let target_state;
-    let committee_state = match committee_state {
+    let shuffling_state = match shuffling_state {
         Some(state) => state,
         None => {
             target_state = store
@@ -547,16 +547,16 @@ pub fn on_gossip_attestation_with_committees(
             &target_state
         }
     };
-    let indexed_attestation = committee_state.get_indexed_attestation(&attestation)?;
+    let indexed_attestation = shuffling_state.get_indexed_attestation(&attestation)?;
     ensure_only_attester(&indexed_attestation.attesting_indices, verified_attester)?;
     store.update_latest_messages(vec![verified_attester], attestation)?;
 
     Ok(())
 }
 
-/// Whether the post-state of block `state_block_root`, at `state_epoch`, computes the same
-/// committees for `target.epoch` as the target checkpoint state, so they can be read from it
-/// without building that checkpoint state.
+/// Whether the post-state of block `state_block_root`, at `state_epoch`, has the same shuffling
+/// for `target.epoch` as the target checkpoint state, so committees can be read from it without
+/// building that checkpoint state.
 ///
 /// Committees of epoch E depend on the RANDAO mix of epoch E - 2 and on the validators active in
 /// E, and activations and exits are scheduled at least five epochs ahead. Two chains that share
@@ -564,7 +564,7 @@ pub fn on_gossip_attestation_with_committees(
 /// shuffling decision root and Prysm's `getRecentPreState` check. The state must also hold that
 /// data, which it does for its previous, current and next epoch
 /// (`BeaconState::determines_committees_of`).
-pub fn determines_target_committees(
+pub fn shares_target_shuffling(
     store: &Store,
     state_epoch: u64,
     state_block_root: B256,
@@ -603,8 +603,8 @@ mod tests {
     use tempdir::TempDir;
 
     use super::{
-        Store, determines_target_committees, ensure_only_attester, get_proposer_boost_root,
-        get_time_at_slot, is_same_dependent_root,
+        Store, ensure_only_attester, get_proposer_boost_root, get_time_at_slot,
+        is_same_dependent_root, shares_target_shuffling,
     };
 
     #[test]
@@ -681,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn head_state_serves_committees_only_for_targets_sharing_its_shuffling() {
+    fn head_state_is_used_only_for_targets_sharing_its_shuffling() {
         initialize_test_network_spec();
         let temp_dir = TempDir::new("ream_target_committees").unwrap();
         let db = ReamDB::new(temp_dir.path().to_path_buf())
@@ -708,23 +708,19 @@ mod tests {
         let target = |epoch, root| Checkpoint { epoch, root };
 
         assert!(
-            determines_target_committees(&store, head_epoch, head_root, target(2, head_root))
-                .unwrap()
+            shares_target_shuffling(&store, head_epoch, head_root, target(2, head_root)).unwrap()
         );
         // A target on a fork with another block at the decision slot has other committees.
         assert!(
-            !determines_target_committees(&store, head_epoch, head_root, target(2, fork_root))
-                .unwrap()
+            !shares_target_shuffling(&store, head_epoch, head_root, target(2, fork_root)).unwrap()
         );
         // The head state does not hold the data for epochs beyond its next one, and committees
         // of the first epochs are not looked up this way.
         assert!(
-            !determines_target_committees(&store, head_epoch, head_root, target(4, head_root))
-                .unwrap()
+            !shares_target_shuffling(&store, head_epoch, head_root, target(4, head_root)).unwrap()
         );
         assert!(
-            !determines_target_committees(&store, head_epoch, head_root, target(1, head_root))
-                .unwrap()
+            !shares_target_shuffling(&store, head_epoch, head_root, target(1, head_root)).unwrap()
         );
     }
 
