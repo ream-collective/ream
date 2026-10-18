@@ -6,7 +6,7 @@ use parking_lot::RwLock;
 use ream_consensus_beacon::{
     attestation::Attestation,
     attester_slashing::AttesterSlashing,
-    data_column_sidecar::{ColumnIdentifier, DataColumnSidecar},
+    data_column_sidecar::{ColumnIdentifier, DataColumnSidecar, NUMBER_OF_COLUMNS},
     electra::{beacon_block::SignedBeaconBlock, beacon_state::BeaconState},
     matrix_entry::reconstruct_data_column_sidecars,
 };
@@ -60,8 +60,8 @@ pub enum BlockImportEvent {
     PendingAvailability {
         block_root: B256,
     },
-    /// A pending block has at least half of its columns: the subscriber should run
-    /// `reconstruct_data_columns`, which is too slow to run where the last column arrived.
+    /// A pending block has enough columns to rebuild its missing required ones. The subscriber
+    /// should run `reconstruct_data_columns`, which is too slow to run where the column arrived.
     ReconstructionReady {
         block_root: B256,
     },
@@ -204,7 +204,6 @@ impl BeaconChain {
                 network_spec.fulu_fork_epoch,
                 network_spec.min_epochs_for_data_column_sidecars_requests,
             );
-
         let outcome = on_block_with_root(
             &mut store,
             &signed_block,
@@ -217,7 +216,6 @@ impl BeaconChain {
 
         if outcome == OnBlockOutcome::PendingAvailability {
             debug!("Block is pending data availability: root={}", block_root);
-            // Columns that arrived before the block may already be enough to rebuild the rest.
             let reconstructable = store.data_availability_checker.can_reconstruct(&block_root);
             drop(store);
             self.notify_block_pending_availability(block_root);
@@ -264,12 +262,12 @@ impl BeaconChain {
         slot: u64,
     ) -> anyhow::Result<()> {
         let mut store = self.store.lock().await;
-        let imported_block =
+        let imported =
             self.process_data_column_sidecar_locked(&mut store, block_root, column_index, slot)?;
         let reconstructable = store.data_availability_checker.can_reconstruct(&block_root);
         drop(store);
 
-        if let Some((imported_block_root, block_event)) = imported_block {
+        if let Some((imported_block_root, block_event)) = imported {
             self.notify_block_imported(imported_block_root);
             self.publish_block_event(block_event);
             self.update_execution_forkchoice(true).await;
@@ -339,13 +337,13 @@ impl BeaconChain {
             .filter(|root| store.data_availability_checker.can_reconstruct(root))
             .collect::<Vec<_>>();
         drop(store);
-        for (root, event) in imported {
-            self.notify_block_imported(root);
-            self.publish_block_event(event);
+        for (block_root, block_event) in imported {
+            self.notify_block_imported(block_root);
+            self.publish_block_event(block_event);
             self.update_execution_forkchoice(true).await;
         }
-        for root in reconstructable {
-            self.notify_reconstruction_ready(root);
+        for block_root in reconstructable {
+            self.notify_reconstruction_ready(block_root);
         }
         Ok(())
     }
@@ -366,11 +364,10 @@ impl BeaconChain {
         store
             .data_availability_checker
             .add_column(block_root, column_index, slot);
-        if let Some(pending) = store.data_availability_checker.take_if_complete(block_root) {
-            Ok(Some(self.import_available_block(store, pending)?))
-        } else {
-            Ok(None)
-        }
+        let Some(pending) = store.data_availability_checker.take_if_complete(block_root) else {
+            return Ok(None);
+        };
+        Ok(Some(self.import_available_block(store, pending)?))
     }
 
     fn import_available_block(
@@ -489,12 +486,7 @@ impl BeaconChain {
         checker.reconstructable_block_roots()
     }
 
-    /// Rebuilds the missing columns of a pending block from the half or more already stored, and
-    /// imports them, which makes the block available. A supernode otherwise waits until every
-    /// one of the 128 columns has arrived by gossip or by request.
-    ///
-    /// The store lock is held only to read what is pending and, by the import, to add the
-    /// columns; reading 64 column files and recovering the rest run without it.
+    /// Rebuilds the missing columns of a pending block and imports them before the block.
     pub async fn reconstruct_data_columns(&self, block_root: B256) -> anyhow::Result<()> {
         let result = self.reconstruct_data_columns_inner(block_root).await;
         self.reconstructions.lock().remove(&block_root);
@@ -502,7 +494,7 @@ impl BeaconChain {
     }
 
     async fn reconstruct_data_columns_inner(&self, block_root: B256) -> anyhow::Result<()> {
-        let (header, received, missing) = {
+        let (header, required_columns) = {
             let store = self.store.lock().await;
             let checker = &store.data_availability_checker;
             if !checker.can_reconstruct(&block_root) {
@@ -513,27 +505,37 @@ impl BeaconChain {
             };
             (
                 pending.signed_block.signed_header(),
-                checker.received_columns(&block_root),
-                checker.missing_columns(&block_root),
+                checker.required_columns().clone(),
             )
         };
-
         let provider = self.db.column_sidecars_provider();
         let expected_header = header.clone();
         let recovered = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let mut available = Vec::with_capacity(received.len());
-            for index in received {
+            let mut available = Vec::with_capacity(NUMBER_OF_COLUMNS as usize);
+            for index in 0..NUMBER_OF_COLUMNS {
                 if let Some(sidecar) = provider.get(ColumnIdentifier::new(block_root, index))?
                     && sidecar.signed_block_header == expected_header
                 {
                     available.push(sidecar);
                 }
             }
+            // Gossip often delivers every column before this runs; then there is nothing to
+            // rebuild.
+            let stored = available
+                .iter()
+                .map(|sidecar| sidecar.index)
+                .collect::<HashSet<_>>();
+            if available.len() < (NUMBER_OF_COLUMNS / 2) as usize
+                || required_columns.is_subset(&stored)
+            {
+                return Ok(Vec::new());
+            }
             let available = available.iter().collect::<Vec<_>>();
-            let reconstructed = reconstruct_data_column_sidecars(&available)?;
-            Ok(reconstructed
+            Ok(reconstruct_data_column_sidecars(&available)?
                 .into_iter()
-                .filter(|sidecar| missing.contains(&sidecar.index))
+                .filter(|sidecar| {
+                    required_columns.contains(&sidecar.index) && !stored.contains(&sidecar.index)
+                })
                 .collect::<Vec<_>>())
         })
         .await??;
@@ -748,9 +750,86 @@ pub fn is_data_availability_check_required(
 
 #[cfg(test)]
 mod tests {
-    use ream_storage::db::ReamDB;
+    use std::path::PathBuf;
+
+    use ream_consensus_beacon::{
+        data_column_sidecar::{get_data_column_sidecars, get_data_column_sidecars_from_block},
+        electra::beacon_block::BeaconBlock,
+        matrix_entry::{compute_cells_and_kzg_proofs, das_context},
+    };
+    use ream_consensus_misc::polynomial_commitments::kzg_commitment::KZGCommitment;
+    use ream_execution_rpc_types::get_blobs::Blob;
+    use ream_fork_choice_beacon::{
+        data_availability::{AvailabilityEntryStatus, DataAvailabilityChecker},
+        store::get_forkchoice_store,
+    };
+    use ream_network_spec::networks::beacon::initialize_test_network_spec;
+    use ream_storage::{db::ReamDB, tables::table::REDBTable};
+    use ssz::Decode;
 
     use super::*;
+
+    fn empty_block_columns(block: &SignedBeaconBlock) -> Vec<DataColumnSidecar> {
+        get_data_column_sidecars(
+            block.signed_header(),
+            block.message.body.blob_kzg_commitments.clone(),
+            Default::default(),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    fn empty_block() -> SignedBeaconBlock {
+        SignedBeaconBlock {
+            message: Default::default(),
+            signature: Default::default(),
+        }
+    }
+
+    fn block_with_blob_columns(
+        slot: u64,
+        parent_root: B256,
+        state_root: B256,
+    ) -> (SignedBeaconBlock, Vec<DataColumnSidecar>) {
+        let blob = Blob::default();
+        let commitment = KZGCommitment(
+            das_context()
+                .blob_to_kzg_commitment(&blob.to_fixed_bytes())
+                .expect("test blob should produce a commitment"),
+        );
+        let mut block = SignedBeaconBlock {
+            message: BeaconBlock {
+                slot,
+                parent_root,
+                state_root,
+                ..Default::default()
+            },
+            signature: Default::default(),
+        };
+        block
+            .message
+            .body
+            .blob_kzg_commitments
+            .push(commitment)
+            .expect("one commitment should fit");
+        let cells_and_proofs = compute_cells_and_kzg_proofs(&blob, das_context())
+            .expect("test blob should produce cells and proofs");
+        let columns = get_data_column_sidecars_from_block(&block, vec![cells_and_proofs])
+            .expect("test block should produce data columns");
+        (block, columns)
+    }
+
+    fn test_beacon_state() -> BeaconState {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../../../testing/gossip-validation/tests/assets/sepolia/states/\
+             grandparent_state_9552074.ssz_snappy",
+        );
+        let compressed = std::fs::read(path).expect("test beacon state should be readable");
+        let bytes = snap::raw::Decoder::new()
+            .decompress_vec(&compressed)
+            .expect("test beacon state should decompress");
+        BeaconState::from_ssz_bytes(&bytes).expect("test beacon state should decode")
+    }
 
     /// Kept alongside the chain so the directory lives until the test ends.
     fn test_chain() -> (tempfile::TempDir, BeaconChain) {
@@ -767,6 +846,34 @@ mod tests {
             None,
         );
         (data_dir, chain)
+    }
+
+    fn test_chain_with_anchor(anchor_state: BeaconState) -> (tempfile::TempDir, BeaconChain, B256) {
+        initialize_test_network_spec();
+        let data_dir = tempfile::tempdir().expect("tempdir should be created");
+        let beacon_db = ReamDB::new(data_dir.path().to_path_buf())
+            .expect("ReamDB should init")
+            .init_beacon_db()
+            .expect("beacon DB tables should init");
+        let anchor_block = SignedBeaconBlock {
+            message: BeaconBlock {
+                slot: anchor_state.slot,
+                state_root: anchor_state.tree_hash_root(),
+                ..Default::default()
+            },
+            signature: Default::default(),
+        };
+        let anchor_root = anchor_block.message.tree_hash_root();
+        get_forkchoice_store(anchor_state, anchor_block, beacon_db.clone())
+            .expect("anchor should initialize fork choice storage");
+        let chain = BeaconChain::new(
+            beacon_db,
+            Arc::new(OperationPool::default()),
+            Arc::new(SyncCommitteePool::default()),
+            None,
+            None,
+        );
+        (data_dir, chain, anchor_root)
     }
 
     #[tokio::test]
@@ -838,5 +945,158 @@ mod tests {
             fulu_epoch,
             retention_epochs,
         ));
+    }
+
+    #[tokio::test]
+    async fn reconstruction_completes_before_importing_the_block() {
+        let mut state = test_beacon_state();
+        let (_data_dir, chain, parent_root) = test_chain_with_anchor(state.clone());
+        state.slot += 1;
+        let (block, columns) =
+            block_with_blob_columns(state.slot, parent_root, state.tree_hash_root());
+        let root = block.message.tree_hash_root();
+        let provider = chain.db.column_sidecars_provider();
+        chain
+            .store
+            .lock()
+            .await
+            .data_availability_checker
+            .insert_pending(root, block.clone(), state);
+
+        let mut events = chain.subscribe_block_imports();
+        chain
+            .import_data_column_sidecars_if(
+                columns[..(NUMBER_OF_COLUMNS / 2) as usize].to_vec(),
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            events.recv().await.unwrap(),
+            BlockImportEvent::ReconstructionReady { block_root: root }
+        );
+        assert!(chain.db.block_provider().get(root).unwrap().is_none());
+        assert_eq!(
+            chain
+                .store
+                .lock()
+                .await
+                .data_availability_checker
+                .status(&root),
+            AvailabilityEntryStatus::PendingBlock
+        );
+
+        chain.reconstruct_data_columns(root).await.unwrap();
+        assert!(chain.db.block_provider().get(root).unwrap().is_some());
+        for index in 0..NUMBER_OF_COLUMNS {
+            assert!(
+                provider
+                    .get(ColumnIdentifier::new(root, index))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert_eq!(
+            events.recv().await.unwrap(),
+            BlockImportEvent::Imported { block_root: root }
+        );
+    }
+
+    #[tokio::test]
+    async fn columns_stored_before_their_block_announce_no_reconstruction() {
+        let (_data_dir, chain) = test_chain();
+        let block = empty_block();
+        let root = block.message.tree_hash_root();
+        let mut events = chain.subscribe_block_imports();
+
+        // Range sync stores every column of a block before processing the block. The checker
+        // passes half of them partway through the batch, while the block is still unknown.
+        chain
+            .import_data_column_sidecars_if(empty_block_columns(&block), |_| Ok(()))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(chain.reconstructions.lock().is_empty());
+        assert_eq!(
+            chain
+                .store
+                .lock()
+                .await
+                .data_availability_checker
+                .status(&root),
+            AvailabilityEntryStatus::ColumnsOnly
+        );
+    }
+
+    #[tokio::test]
+    async fn late_column_is_stored_after_block_import() {
+        let (_data_dir, chain) = test_chain();
+        let block = empty_block();
+        let root = block.message.tree_hash_root();
+        chain
+            .db
+            .block_provider()
+            .insert(root, block.clone())
+            .unwrap();
+        let sidecar = empty_block_columns(&block).remove(0);
+
+        chain
+            .import_data_column_sidecar_if(sidecar.clone(), |_| Ok(()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            chain
+                .db
+                .column_sidecars_provider()
+                .get(ColumnIdentifier::new(root, sidecar.index))
+                .unwrap(),
+            Some(sidecar)
+        );
+    }
+
+    #[tokio::test]
+    async fn reconstruction_stores_only_required_custody_columns() {
+        let mut state = test_beacon_state();
+        let (_data_dir, chain, parent_root) = test_chain_with_anchor(state.clone());
+        chain.store.lock().await.data_availability_checker =
+            DataAvailabilityChecker::new((0..NUMBER_OF_COLUMNS / 2 + 1).collect());
+        state.slot += 1;
+        let (block, columns) =
+            block_with_blob_columns(state.slot, parent_root, state.tree_hash_root());
+        let root = block.message.tree_hash_root();
+        chain
+            .store
+            .lock()
+            .await
+            .data_availability_checker
+            .insert_pending(root, block, state);
+        let provider = chain.db.column_sidecars_provider();
+        chain
+            .import_data_column_sidecars_if(
+                columns[..(NUMBER_OF_COLUMNS / 2) as usize].to_vec(),
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+
+        chain.reconstruct_data_columns(root).await.unwrap();
+
+        assert!(
+            provider
+                .get(ColumnIdentifier::new(root, NUMBER_OF_COLUMNS / 2))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            provider
+                .get(ColumnIdentifier::new(root, NUMBER_OF_COLUMNS / 2 + 1))
+                .unwrap()
+                .is_none()
+        );
     }
 }

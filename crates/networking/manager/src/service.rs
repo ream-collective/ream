@@ -42,7 +42,7 @@ use tokio::{
     sync::mpsc,
     time::{interval, sleep},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use tree_hash::TreeHash;
 
 use crate::{
@@ -57,7 +57,10 @@ use crate::{
     },
     gossipsub::{
         handle::{handle_gossipsub_message, init_gossipsub_config_with_topics},
-        workers::{GossipWorkers, is_handled_concurrently},
+        workers::{
+            GossipWorkerBudget, GossipWorkers, PENDING_ITEM_QUEUE_CAPACITY, is_data_column,
+            is_handled_concurrently,
+        },
     },
     p2p_sender::P2PSender,
     req_resp::handle_req_resp_message,
@@ -125,6 +128,88 @@ struct ReconciledBlockLookupState {
     pending_availability_roots: Vec<alloy_primitives::B256>,
 }
 
+/// Hands a block or column waiting on its parent's availability to the pending lookups.
+async fn insert_pending_gossip_item<BlockPayload>(
+    beacon_chain: &BeaconChain,
+    block_lookup_coordinator: &mut BlockLookupCoordinator,
+    unknown_parent_lookups: &mut UnknownParentLookupCoordinator<BlockPayload, PeerId>,
+    item: PendingGossipItem,
+) {
+    let is_block = matches!(&item, PendingGossipItem::Block { .. });
+    let block_root = match &item {
+        PendingGossipItem::Block { block, .. } => block.block().message.tree_hash_root(),
+        PendingGossipItem::Column { column, .. } => column
+            .sidecar()
+            .signed_block_header
+            .message
+            .tree_hash_root(),
+    };
+    let current_slot = {
+        let store = beacon_chain.store.lock().await;
+        store.get_current_slot()
+    };
+    match current_slot {
+        Ok(current_slot) => {
+            let entry_existed = block_lookup_coordinator.contains_entry(&block_root);
+            let entries_before = block_lookup_coordinator.pending_entry_count();
+            let outcome = insert_pending_item(block_lookup_coordinator, item, current_slot);
+            let retained = matches!(
+                outcome,
+                ream_syncer::block_lookups::InsertOutcome::Inserted
+                    | ream_syncer::block_lookups::InsertOutcome::Duplicate
+            );
+            match outcome {
+                ream_syncer::block_lookups::InsertOutcome::Inserted if !entry_existed => {
+                    inc_int_counter_vec(
+                        &BEACON_BLOCK_LOOKUP_EVENTS_TOTAL,
+                        &[PENDING_AVAILABILITY_LOOKUP, "created"],
+                    );
+                    let evicted = entries_before
+                        .saturating_add(1)
+                        .saturating_sub(block_lookup_coordinator.pending_entry_count());
+                    if evicted > 0 {
+                        inc_int_counter_vec_by(
+                            &BEACON_BLOCK_LOOKUP_EVENTS_TOTAL,
+                            evicted as u64,
+                            &[PENDING_AVAILABILITY_LOOKUP, "pruned"],
+                        );
+                    }
+                }
+                ream_syncer::block_lookups::InsertOutcome::Rejected(_) => {
+                    inc_int_counter_vec(
+                        &BEACON_BLOCK_LOOKUP_EVENTS_TOTAL,
+                        &[PENDING_AVAILABILITY_LOOKUP, "rejected"],
+                    );
+                }
+                _ => {}
+            }
+            log_insert_outcome(block_root, outcome);
+            if is_block && retained {
+                unknown_parent_lookups.block_deferred_elsewhere(block_root);
+            }
+            if !is_block && retained {
+                // The block event may have been handled while this column was still validating.
+                // Reconcile after insertion so an earlier event cannot leave it waiting forever.
+                let reconciliation =
+                    reconcile_block_lookup_state(beacon_chain, vec![block_root]).await;
+                if reconciliation.imported_roots.contains(&block_root) {
+                    block_lookup_coordinator.parent_imported(block_root);
+                    unknown_parent_lookups.block_imported(block_root);
+                } else if reconciliation
+                    .pending_availability_roots
+                    .contains(&block_root)
+                {
+                    block_lookup_coordinator.mark_block_pending_availability(block_root);
+                    unknown_parent_lookups.block_pending_availability(block_root);
+                }
+            }
+        }
+        Err(err) => {
+            error!("Failed to read current slot for pending gossip: {err}")
+        }
+    }
+}
+
 fn spawn_queued_column_fetches(
     tracker: &mut ColumnFetchTracker,
     beacon_chain: &Arc<BeaconChain>,
@@ -155,13 +240,27 @@ fn spawn_queued_column_fetches(
     }
 }
 
-/// Rebuilds a pending block's missing columns on its own task: reading the stored columns and
-/// recovering the rest takes too long for the event loop.
+/// Rebuilds a block's missing columns on its own task: reading the stored columns and recovering
+/// the rest takes too long for the event loop.
+/// Attempts per announced reconstruction. The block stays pending until its columns are rebuilt,
+/// and no further column may arrive to announce it again, so a transient failure is retried.
+const COLUMN_RECONSTRUCTION_ATTEMPTS: u32 = 3;
+const COLUMN_RECONSTRUCTION_RETRY_DELAY: Duration = Duration::from_secs(1);
+
 fn spawn_column_reconstruction(beacon_chain: &Arc<BeaconChain>, block_root: B256) {
     let beacon_chain = beacon_chain.clone();
     tokio::spawn(async move {
-        if let Err(err) = beacon_chain.reconstruct_data_columns(block_root).await {
-            debug!(%block_root, "Column reconstruction did not import: {err:#}");
+        for attempt in 1..=COLUMN_RECONSTRUCTION_ATTEMPTS {
+            // A block that left the pending set, or no longer needs columns, returns Ok.
+            let Err(err) = beacon_chain.reconstruct_data_columns(block_root).await else {
+                return;
+            };
+            if attempt == COLUMN_RECONSTRUCTION_ATTEMPTS {
+                error!(%block_root, attempt, "Column reconstruction failed: {err:#}");
+                return;
+            }
+            warn!(%block_root, attempt, "Column reconstruction failed, retrying: {err:#}");
+            sleep(COLUMN_RECONSTRUCTION_RETRY_DELAY).await;
         }
     });
 }
@@ -341,8 +440,23 @@ impl NetworkManagerService {
         let mut column_fetch_tracker = ColumnFetchTracker::default();
         let (column_fetch_done_sender, mut column_fetch_done_receiver) =
             mpsc::unbounded_channel::<(B256, PeerId, ColumnFetchOutcome)>();
-        let mut gossip_workers =
-            GossipWorkers::start(beacon_chain.clone(), cached_db.clone(), p2p_sender.clone());
+        let (pending_item_sender, mut pending_item_receiver) =
+            mpsc::channel(PENDING_ITEM_QUEUE_CAPACITY);
+        let gossip_worker_budget = GossipWorkerBudget::for_current_runtime();
+        let mut gossip_workers = GossipWorkers::start(
+            beacon_chain.clone(),
+            cached_db.clone(),
+            p2p_sender.clone(),
+            pending_item_sender.clone(),
+            &gossip_worker_budget,
+        );
+        let mut column_workers = GossipWorkers::start(
+            beacon_chain.clone(),
+            cached_db.clone(),
+            p2p_sender.clone(),
+            pending_item_sender,
+            &gossip_worker_budget,
+        );
         let mut syncer_handle = block_range_syncer.start();
         // Avoid polling a completed JoinHandle after the syncer has caught up.
         let mut syncer_active = true;
@@ -705,9 +819,32 @@ impl NetworkManagerService {
                     error!("A gossip worker stopped: {err}");
                     return;
                 }
+                Some(err) = column_workers.stopped() => {
+                    // A column worker also stops only by panicking.
+                    if err.is_panic() {
+                        std::panic::resume_unwind(err.into_panic());
+                    }
+                    error!("A gossip column worker stopped: {err}");
+                    return;
+                }
+                // Lookup work from columns that the column workers validated.
+                Some(item) = pending_item_receiver.recv() => {
+                    insert_pending_gossip_item(
+                        &beacon_chain,
+                        &mut block_lookup_coordinator,
+                        &mut unknown_parent_lookups,
+                        item,
+                    )
+                    .await;
+                }
                 Some(event) = manager_receiver.recv() => {
                     match event {
                         // Handles Gossipsub messages from other peers.
+                        ReamNetworkEvent::GossipsubMessage { propagation_source, message_id, message }
+                            if is_data_column(&message.topic) =>
+                        {
+                            column_workers.submit(message, message_id, propagation_source);
+                        }
                         ReamNetworkEvent::GossipsubMessage { propagation_source, message_id, message }
                             if is_handled_concurrently(&message.topic) =>
                         {
@@ -776,75 +913,13 @@ impl NetworkManagerService {
                             }
 
                             if let Some(item) = pending_item {
-                                let is_block = matches!(&item, PendingGossipItem::Block { .. });
-                                let block_root = match &item {
-                                    PendingGossipItem::Block { block, .. } => {
-                                        block.block().message.tree_hash_root()
-                                    }
-                                    PendingGossipItem::Column { column, .. } => {
-                                        column.sidecar().signed_block_header.message.tree_hash_root()
-                                    }
-                                };
-                                let current_slot = {
-                                    let store = beacon_chain.store.lock().await;
-                                    store.get_current_slot()
-                                };
-                                match current_slot {
-                                    Ok(current_slot) => {
-                                        let entry_existed = block_lookup_coordinator
-                                            .contains_entry(&block_root);
-                                        let entries_before =
-                                            block_lookup_coordinator.pending_entry_count();
-                                        let outcome = insert_pending_item(
-                                            &mut block_lookup_coordinator,
-                                            item,
-                                            current_slot,
-                                        );
-                                        let retained = matches!(
-                                            outcome,
-                                            ream_syncer::block_lookups::InsertOutcome::Inserted
-                                                | ream_syncer::block_lookups::InsertOutcome::Duplicate
-                                        );
-                                        match outcome {
-                                            ream_syncer::block_lookups::InsertOutcome::Inserted
-                                                if !entry_existed =>
-                                            {
-                                                inc_int_counter_vec(
-                                                    &BEACON_BLOCK_LOOKUP_EVENTS_TOTAL,
-                                                    &[PENDING_AVAILABILITY_LOOKUP, "created"],
-                                                );
-                                                let evicted = entries_before
-                                                    .saturating_add(1)
-                                                    .saturating_sub(
-                                                        block_lookup_coordinator
-                                                            .pending_entry_count(),
-                                                    );
-                                                if evicted > 0 {
-                                                    inc_int_counter_vec_by(
-                                                        &BEACON_BLOCK_LOOKUP_EVENTS_TOTAL,
-                                                        evicted as u64,
-                                                        &[PENDING_AVAILABILITY_LOOKUP, "pruned"],
-                                                    );
-                                                }
-                                            }
-                                            ream_syncer::block_lookups::InsertOutcome::Rejected(_) => {
-                                                inc_int_counter_vec(
-                                                    &BEACON_BLOCK_LOOKUP_EVENTS_TOTAL,
-                                                    &[PENDING_AVAILABILITY_LOOKUP, "rejected"],
-                                                );
-                                            }
-                                            _ => {}
-                                        }
-                                        log_insert_outcome(block_root, outcome);
-                                        if is_block && retained {
-                                            unknown_parent_lookups
-                                                .block_deferred_elsewhere(block_root);
-                                        }
-                                    }
-                                    Err(err) => {
-                                        error!("Failed to read current slot for pending gossip: {err}")
-                                    }
-                                }
+                                insert_pending_gossip_item(
+                                    &beacon_chain,
+                                    &mut block_lookup_coordinator,
+                                    &mut unknown_parent_lookups,
+                                    item,
+                                )
+                                .await;
                             }
                         }
                         // Handles Req/Resp messages from other peers.
