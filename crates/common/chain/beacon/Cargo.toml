@@ -33,5 +33,9 @@ ream-req-resp.workspace = true
 ream-storage.workspace = true
 ream-sync-committee-pool.workspace = true
 
+[dev-dependencies]
+snap.workspace = true
+tempfile.workspace = true
+
 [lints]
 workspace = true

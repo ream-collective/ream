@@ -162,6 +162,9 @@ pub fn apply_block_import_event<BlockPayload, ColumnPayload>(
         BlockImportEvent::PendingAvailability { block_root } => {
             coordinator.mark_block_pending_availability(block_root);
         }
+        // The network manager service runs the reconstruction; the block stays pending until
+        // its rebuilt columns are imported.
+        BlockImportEvent::ReconstructionReady { .. } => {}
     }
 }
 
@@ -287,14 +290,17 @@ pub(crate) fn ensure_pending_item_is_importable_with_store(
         bail!("finalized checkpoint is no longer an ancestor");
     }
 
-    // Make sure data column only's imported when it's actually in DA checker module
+    // A delayed worker result remains useful after the block imports: storing the verified
+    // column fills custody and avoids an RPC refetch.
     if let Some(block_root) = data_column_block_root
         && !matches!(
             store.data_availability_checker.status(&block_root),
             AvailabilityEntryStatus::PendingBlock | AvailabilityEntryStatus::Complete
         )
+        && !(store.db.block_provider().get(block_root)?.is_some()
+            && store.db.state_provider().get(block_root)?.is_some())
     {
-        bail!("column's block is no longer pending data availability");
+        bail!("column's block is neither pending data availability nor imported");
     }
 
     Ok(())
@@ -390,6 +396,35 @@ mod tests {
         );
 
         assert_eq!(coordinator.pending_block_count(), 0);
+        assert!(matches!(
+            coordinator.next_action(),
+            Some(CoordinatorAction::ImportColumn { meta, payload: 2, .. })
+                if meta.identifier == identifier
+        ));
+    }
+
+    #[test]
+    fn external_import_event_releases_its_pending_columns() {
+        ream_network_spec::networks::beacon::initialize_test_network_spec();
+        let mut coordinator = ream_syncer::block_lookups::BlockLookupCoordinator::<u8, u8>::new(
+            BlockLookupConfig::for_data_column_retention(1),
+        );
+        let block_root = B256::repeat_byte(1);
+        let identifier = ColumnIdentifier::new(block_root, 0);
+        assert!(matches!(
+            coordinator.insert_pending_column(
+                PendingColumnMeta {
+                    identifier,
+                    slot: 1,
+                },
+                2,
+                1,
+            ),
+            InsertOutcome::Inserted
+        ));
+
+        apply_block_import_event(&mut coordinator, BlockImportEvent::Imported { block_root });
+
         assert!(matches!(
             coordinator.next_action(),
             Some(CoordinatorAction::ImportColumn { meta, payload: 2, .. })

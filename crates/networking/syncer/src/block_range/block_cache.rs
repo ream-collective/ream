@@ -9,12 +9,9 @@ use libp2p::PeerId;
 use ream_chain_beacon::beacon_chain::is_data_availability_check_required;
 use ream_consensus_beacon::{
     blob_sidecar::{BlobIdentifier, BlobSidecar},
-    data_column_sidecar::{
-        ColumnIdentifier, DataColumnSidecar, NUMBER_OF_COLUMNS,
-        get_data_column_sidecars_from_column_sidecar,
-    },
+    data_column_sidecar::{ColumnIdentifier, DataColumnSidecar, NUMBER_OF_COLUMNS},
     electra::beacon_block::SignedBeaconBlock,
-    matrix_entry::{das_context, recover_cells_and_kzg_proofs},
+    matrix_entry::reconstruct_data_column_sidecars,
 };
 use ream_consensus_misc::misc::compute_epoch_at_slot;
 use ream_network_spec::networks::beacon_network_spec;
@@ -458,6 +455,9 @@ impl BlockCache {
         required_columns: &HashSet<u64>,
     ) -> anyhow::Result<()> {
         let mut validated = Vec::with_capacity(columns.len());
+        // A block's header hashes its whole body, payload transactions included, and every column
+        // of the block is checked against it, so each block's header is computed once.
+        let mut block_headers = HashMap::new();
         for column in columns {
             if !required_columns.contains(&column.index) {
                 continue;
@@ -477,8 +477,11 @@ impl BlockCache {
                 "Malformed data column sidecar {} for block {block_root}",
                 column.index
             );
+            let block_header = block_headers
+                .entry(block_root)
+                .or_insert_with(|| bundle.block.signed_header());
             ensure!(
-                column.signed_block_header == bundle.block.signed_header(),
+                column.signed_block_header == *block_header,
                 "Data column sidecar {} does not belong to block {block_root}",
                 column.index
             );
@@ -891,32 +894,7 @@ fn reconstruct_required_columns(
     }
 
     let available: Vec<&DataColumnSidecar> = bundle.columns.values().collect();
-    let base = *available
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("no data column is available for reconstruction"))?;
-    let blob_count = base.column.len();
-    let mut cells_and_kzg_proofs = Vec::with_capacity(blob_count);
-
-    for blob_index in 0..blob_count {
-        let mut column_indices = Vec::with_capacity(available.len());
-        let mut cells = Vec::with_capacity(available.len());
-        for sidecar in &available {
-            let cell = sidecar.column.get(blob_index).ok_or_else(|| {
-                anyhow::anyhow!("column {} is missing blob row {blob_index}", sidecar.index)
-            })?;
-            column_indices.push(sidecar.index);
-            cells.push(cell.clone());
-        }
-        cells_and_kzg_proofs.push(recover_cells_and_kzg_proofs(
-            column_indices,
-            cells,
-            das_context(),
-        )?);
-    }
-
-    let reconstructed =
-        get_data_column_sidecars_from_column_sidecar(base.clone(), cells_and_kzg_proofs)
-            .map_err(|err| anyhow::anyhow!("failed to assemble reconstructed columns: {err}"))?;
+    let reconstructed = reconstruct_data_column_sidecars(&available)?;
     let block_root = bundle.block.message.tree_hash_root();
     for column in reconstructed {
         if required_columns.contains(&column.index) {

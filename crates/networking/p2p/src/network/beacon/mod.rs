@@ -27,6 +27,7 @@ use libp2p::{
     futures::StreamExt,
     gossipsub::{
         Event as GossipsubEvent, IdentTopic as Topic, Message, MessageAuthenticity, MessageId,
+        PublishError,
     },
     identify,
     multiaddr::Protocol,
@@ -79,7 +80,7 @@ use tokio::{
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     time::{interval, sleep},
 };
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use utils::read_meta_data_from_disk;
 
 use crate::{
@@ -535,8 +536,14 @@ impl Network {
                             self.swarm.behaviour_mut().req_resp.send_response(peer_id, connection_id, stream_id, *message)
                         },
                         P2PMessage::Gossip(message) => {
-                            if let Err(err) = self.swarm.behaviour_mut().gossipsub.publish(message.topic, message.data) {
-                                warn!("Failed to publish gossip message: {err}");
+                            match self.swarm.behaviour_mut().gossipsub.publish(message.topic, message.data) {
+                                Ok(_) => {}
+                                // Gossipsub already holds this message, received from a peer.
+                                // Cross-seeding a reconstructed column expects this.
+                                Err(PublishError::Duplicate) => {
+                                    debug!("Not publishing a gossip message gossipsub already has");
+                                }
+                                Err(err) => warn!("Failed to publish gossip message: {err}"),
                             }
                         }
                         P2PMessage::ReportGossipValidation { message_id, propagation_source, acceptance } => {

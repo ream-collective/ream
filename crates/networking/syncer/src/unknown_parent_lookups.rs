@@ -131,6 +131,8 @@ struct LookupEntry<BlockPayload, Peer> {
     payload: Option<StoredPayload<BlockPayload>>,
     peers: Vec<Peer>,
     next_peer: usize,
+    /// Peers already asked for this block, so a replacement can be one that was not.
+    asked_peers: Vec<Peer>,
     awaiting_parent: Option<B256>,
     state: LookupState,
     failed_downloads: u8,
@@ -234,6 +236,7 @@ where
                 payload: None,
                 peers: Vec::new(),
                 next_peer: 0,
+                asked_peers: Vec::new(),
                 awaiting_parent: None,
                 state: LookupState::AwaitingParent,
                 failed_downloads: 0,
@@ -271,7 +274,9 @@ where
         if parent_status == ParentStatus::Unknown
             && self.failed_roots.contains_key(&meta.parent_root)
         {
-            self.drop_subtree(root);
+            // Only the ancestor failed. Marking this chain too would refresh the mark with every
+            // new gossip block, so lookups would stay blocked after the ancestor's mark expires.
+            self.discard_subtree(root);
             return Err(InsertError::RecentlyFailed);
         }
 
@@ -324,6 +329,40 @@ where
             }
         }
         Ok(true)
+    }
+
+    /// Stops asking `peer` for `block_root` and asks `replacement` instead. A block's gossip
+    /// sources may be nodes that relay gossip but do not serve blocks by root; without other peers
+    /// its lookup would fail on every attempt.
+    pub fn replace_peer(&mut self, block_root: B256, peer: &Peer, replacement: Option<Peer>) {
+        let max_peers = usize::from(self.config.max_attempts);
+        if let Some(entry) = self.entries.get_mut(&block_root) {
+            // Keep the only peer rather than leave the lookup with nobody to ask.
+            if replacement.is_none() && entry.peers.len() <= 1 {
+                return;
+            }
+            if let Some(position) = entry.peers.iter().position(|known| known == peer) {
+                // `next_peer` indexes the peer asked next. Removing a peer before it shifts that
+                // peer down one place, so the cursor moves with it and no peer is skipped.
+                let cursor = entry.next_peer % entry.peers.len();
+                entry.peers.remove(position);
+                entry.next_peer = if position < cursor {
+                    cursor - 1
+                } else {
+                    cursor
+                };
+            }
+            if let Some(replacement) = replacement {
+                entry.add_peer(replacement, max_peers);
+            }
+        }
+    }
+
+    /// The peers the lookup of `block_root` has asked for it so far.
+    pub fn asked_peers(&self, block_root: B256) -> &[Peer] {
+        self.entries
+            .get(&block_root)
+            .map_or(&[], |entry| entry.asked_peers.as_slice())
     }
 
     pub fn download_failed(&mut self, action_id: LookupActionId, block_root: B256) -> bool {
@@ -456,6 +495,9 @@ where
                     }
                     let peer = entry.peers[entry.next_peer % entry.peers.len()].clone();
                     entry.next_peer = entry.next_peer.wrapping_add(1);
+                    if !entry.asked_peers.contains(&peer) {
+                        entry.asked_peers.push(peer.clone());
+                    }
                     entry.state = LookupState::Downloading(action_id);
                     return Some(UnknownParentAction::RequestBlock {
                         action_id,
@@ -597,6 +639,7 @@ where
                         payload: None,
                         peers: vec![peer],
                         next_peer: 0,
+                        asked_peers: Vec::new(),
                         awaiting_parent: None,
                         state: LookupState::AwaitingDownload,
                         failed_downloads: 0,
@@ -736,6 +779,23 @@ where
     }
 
     fn drop_subtree(&mut self, root: B256) {
+        let now = Instant::now();
+        for root in self.subtree(root) {
+            self.mark_failed_root(root, now);
+        }
+        self.discard_subtree(root);
+    }
+
+    /// Removes `root` and its descendants without recording them as failed.
+    fn discard_subtree(&mut self, root: B256) {
+        for root in self.subtree(root) {
+            self.remove_entry(root);
+            self.children_by_parent.remove(&root);
+        }
+        self.remove_orphan_placeholders();
+    }
+
+    fn subtree(&self, root: B256) -> HashSet<B256> {
         let mut stack = vec![root];
         let mut roots = HashSet::new();
         while let Some(next) = stack.pop() {
@@ -746,13 +806,7 @@ where
                 stack.extend(children.iter().copied());
             }
         }
-        let now = Instant::now();
-        for root in roots {
-            self.mark_failed_root(root, now);
-            self.remove_entry(root);
-            self.children_by_parent.remove(&root);
-        }
-        self.remove_orphan_placeholders();
+        roots
     }
 
     fn remove_orphan_placeholders(&mut self) {
@@ -873,6 +927,66 @@ mod tests {
             } => (action_id, meta, origin, payload),
             UnknownParentAction::RequestBlock { .. } => panic!("expected process action"),
         }
+    }
+
+    /// A chain dropped because an ancestor recently failed is not itself recorded as failed;
+    /// otherwise every new gossip block refreshes the mark and lookups never resume.
+    #[test]
+    fn a_failed_ancestor_does_not_mark_its_descendants_as_failed() {
+        let mut coordinator = UnknownParentLookupCoordinator::new(config());
+        coordinator.mark_failed_root(root(1), Instant::now());
+        assert_eq!(
+            coordinator.insert_gossip_block(meta(3, 2, 3), 30, 7),
+            InsertOutcome::Inserted
+        );
+        let (action_id, requested, _) = request_action(&mut coordinator);
+        assert_eq!(requested, root(2));
+
+        assert_eq!(
+            coordinator.download_succeeded(action_id, meta(2, 1, 2), 20, ParentStatus::Unknown),
+            Err(InsertError::RecentlyFailed)
+        );
+        assert!(coordinator.is_empty());
+        assert!(!coordinator.failed_roots.contains_key(&root(2)));
+        assert!(!coordinator.failed_roots.contains_key(&root(3)));
+        assert_eq!(
+            coordinator.insert_gossip_block(meta(4, 3, 4), 40, 8),
+            InsertOutcome::Inserted
+        );
+    }
+
+    #[test]
+    fn a_replaced_peer_is_not_asked_again() {
+        let mut coordinator = UnknownParentLookupCoordinator::new(config());
+        coordinator.insert_gossip_block(meta(2, 1, 2), 20, 7);
+        let (action_id, requested, peer) = request_action(&mut coordinator);
+        assert_eq!((requested, peer), (root(1), 7));
+
+        coordinator.replace_peer(root(1), &7, Some(9));
+        assert!(coordinator.download_failed(action_id, root(1)));
+        let (_, requested, peer) = request_action(&mut coordinator);
+        assert_eq!((requested, peer), (root(1), 9));
+    }
+
+    #[test]
+    fn replacing_a_peer_does_not_skip_the_next_one() {
+        let mut coordinator = UnknownParentLookupCoordinator::new(config());
+        for peer in [7, 8, 9, 10] {
+            coordinator.insert_gossip_block(meta(2, 1, 2), 20, peer);
+        }
+        let (action_id, requested, peer) = request_action(&mut coordinator);
+        assert_eq!((requested, peer), (root(1), 7));
+
+        coordinator.replace_peer(root(1), &7, None);
+        assert!(coordinator.download_failed(action_id, root(1)));
+        let (action_id, _, peer) = request_action(&mut coordinator);
+        assert_eq!(peer, 8);
+
+        // Removing a peer after the cursor leaves it in place.
+        coordinator.replace_peer(root(1), &10, None);
+        assert!(coordinator.download_failed(action_id, root(1)));
+        let (_, _, peer) = request_action(&mut coordinator);
+        assert_eq!(peer, 9);
     }
 
     #[test]

@@ -25,6 +25,10 @@ use ream_executor::ReamExecutor;
 use ream_fork_choice_beacon::data_availability::{
     AvailabilityEntryStatus, DataAvailabilityChecker,
 };
+use ream_light_client::{
+    finality_update::LightClientFinalityUpdate, header::LightClientHeader,
+    optimistic_update::LightClientOptimisticUpdate,
+};
 use ream_mock_execution_engine::block_generator::{
     genesis_execution_payload, sample_blob_and_commitment,
 };
@@ -43,13 +47,18 @@ use ream_network_manager::{
     },
     p2p_sender::P2PSender,
     service::NetworkManagerService,
-    unknown_parent_lookup::{apply_unknown_parent_update, spawn_unknown_parent_action},
+    unknown_parent_lookup::{
+        BlocksByRootRefusals, apply_unknown_parent_update, spawn_unknown_parent_action,
+    },
 };
 use ream_operation_pool::OperationPool;
 use ream_p2p::{
     gossipsub::beacon::topics::{GossipTopic, GossipTopicKind},
     network::{
-        beacon::channel::{GossipMessage, P2PCallbackResponse, P2PMessage, P2PRequest},
+        beacon::{
+            channel::{GossipMessage, P2PCallbackResponse, P2PMessage, P2PRequest},
+            network_state::NetworkState,
+        },
         misc::peer_id_from_enr,
     },
 };
@@ -88,6 +97,20 @@ struct BlobBlockFixture {
     signed_block: SignedBeaconBlock,
     post_state: Option<BeaconState>,
     column: DataColumnSidecar,
+}
+
+/// A network state without peers: these lookups never fall back to other peers.
+fn empty_network_state() -> NetworkState {
+    NetworkState {
+        local_enr: discv5::Enr::builder()
+            .build(&discv5::enr::CombinedKey::generate_secp256k1())
+            .expect("valid enr")
+            .into(),
+        peer_table: Default::default(),
+        meta_data: Default::default(),
+        status: Default::default(),
+        data_dir: std::path::PathBuf::new(),
+    }
 }
 
 struct GossipLookupHarness {
@@ -274,7 +297,6 @@ impl GossipLookupHarness {
             },
             &self.beacon_chain,
             &self.cached_db,
-            &self.p2p_sender,
             &mut pending_item,
             &mut unknown_parent_block,
         )
@@ -1212,7 +1234,6 @@ async fn test_unknown_parent_block_imports_after_parent_arrives() {
         },
         &harness.beacon_chain,
         &harness.cached_db,
-        &harness.p2p_sender,
         &mut pending_item,
         &mut unknown_parent_block,
     )
@@ -1298,7 +1319,14 @@ async fn test_unknown_parent_block_imports_after_parent_arrives() {
         .await
         .expect("parent download should finish")
         .expect("lookup update channel should remain open");
-    apply_unknown_parent_update(&mut coordinator, &harness.beacon_chain, update).await;
+    apply_unknown_parent_update(
+        &mut coordinator,
+        &harness.beacon_chain,
+        &empty_network_state(),
+        &mut BlocksByRootRefusals::default(),
+        update,
+    )
+    .await;
 
     for (expected_root, expected_column) in [
         (parent_root, parent.column.clone()),
@@ -1322,7 +1350,14 @@ async fn test_unknown_parent_block_imports_after_parent_arrives() {
             .await
             .expect("block processing should finish")
             .expect("lookup update channel should remain open");
-        apply_unknown_parent_update(&mut coordinator, &harness.beacon_chain, update).await;
+        apply_unknown_parent_update(
+            &mut coordinator,
+            &harness.beacon_chain,
+            &empty_network_state(),
+            &mut BlocksByRootRefusals::default(),
+            update,
+        )
+        .await;
 
         assert_eq!(
             harness
@@ -1636,10 +1671,8 @@ async fn test_rpc_column_fetch_rechecks_finality_before_import() {
         harness.deliver_block(&pending.signed_block).await.0,
         MessageAcceptance::Accept
     ));
-    assert!(matches!(
-        harness.p2p_receiver.try_recv(),
-        Ok(P2PMessage::Gossip(_))
-    ));
+    // Gossipsub forwards an accepted message itself, so the handler sends nothing.
+    assert!(harness.p2p_receiver.try_recv().is_err());
     assert_eq!(
         harness
             .beacon_chain
@@ -1709,5 +1742,55 @@ async fn test_rpc_column_fetch_rechecks_finality_before_import() {
             .expect("column lookup should succeed")
             .is_none(),
         "a column rejected at release must not enter served storage"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_a_valid_light_client_update_is_accepted_for_forwarding() {
+    let (mut harness, _genesis_state, _genesis_block) =
+        GossipLookupHarness::new("light_client_update_acceptance").await;
+    let mut attested_header = LightClientHeader::default();
+    attested_header.beacon.slot = 1;
+    *harness
+        .cached_db
+        .forwarded_light_client_finality_update
+        .write()
+        .await = Some(LightClientFinalityUpdate {
+        attested_header: attested_header.clone(),
+        finalized_header: LightClientHeader::default(),
+        finality_branch: Default::default(),
+        sync_aggregate: Default::default(),
+        signature_slot: 0,
+    });
+    let update = LightClientOptimisticUpdate {
+        attested_header,
+        sync_aggregate: Default::default(),
+        signature_slot: 0,
+    };
+
+    // Gossipsub forwards only what the handler reports as ACCEPT; the handler publishes nothing.
+    let (acceptance, _) = harness
+        .deliver(
+            GossipTopicKind::LightClientOptimisticUpdate,
+            update.as_ssz_bytes(),
+        )
+        .await;
+    assert!(
+        matches!(acceptance, MessageAcceptance::Accept),
+        "expected Accept, got {acceptance:?}"
+    );
+    assert!(harness.p2p_receiver.try_recv().is_err());
+
+    // A copy for an already forwarded slot is not forwarded again.
+    let (acceptance, _) = harness
+        .deliver(
+            GossipTopicKind::LightClientOptimisticUpdate,
+            update.as_ssz_bytes(),
+        )
+        .await;
+    assert!(
+        matches!(acceptance, MessageAcceptance::Ignore),
+        "expected Ignore, got {acceptance:?}"
     );
 }

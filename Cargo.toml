@@ -109,6 +109,7 @@ lazy_static = "1.5.0"
 lean-multisig = { git = "https://github.com/leanEthereum/leanVM.git", rev = "2498896ca4d32a545a98a1b1cf1ca78f7f13f553" }
 lean-multisig-type2 = { package = "lean-multisig", git = "https://github.com/leanEthereum/leanMultisig.git", rev = "e2592df4e30fdddbbf8ae26a333116c68cec7026" }
 leansig = { git = "https://github.com/leanEthereum//leanSig.git", branch = "devnet4" }
+libc = "0.2.184"
 libp2p = { version = "0.56", default-features = false, features = [
     "identify",
     "yamux",
@@ -135,6 +136,7 @@ parking_lot = "0.12.5"
 prometheus_exporter = { git = "https://github.com/AlexanderThaller/prometheus_exporter", rev = "c49efe614486f998b20eb410ae0caf3e904cf540" }
 rand = "0.10.2"
 rand_chacha = "0.10.0"
+rayon = "1.11.0"
 redb = "4.1.0"
 reqwest = { version = "0.13.4", default-features = false, features = [
     "rustls",

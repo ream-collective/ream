@@ -267,9 +267,9 @@ impl<BlockPayload, ColumnPayload> BlockLookupCoordinator<BlockPayload, ColumnPay
         InsertOutcome::Inserted
     }
 
-    /// Queues only the immediate pending children of an imported parent.
+    /// Queues late columns for an imported block and its immediate pending children.
     pub fn parent_imported(&mut self, parent_root: B256) {
-        self.remove_entry(parent_root);
+        self.remove_block_only(parent_root);
         if let Some(children) = self.children_by_parent.remove(&parent_root) {
             for child_root in children {
                 let block = self
@@ -289,11 +289,17 @@ impl<BlockPayload, ColumnPayload> BlockLookupCoordinator<BlockPayload, ColumnPay
                 }
             }
         }
+        // Preserve block progress ahead of late custody writes on the sequential worker.
+        self.queue_columns(parent_root);
     }
 
     /// Queues a block's own columns only after that block enters the DA checker.
     pub fn mark_block_pending_availability(&mut self, block_root: B256) {
         self.remove_block_only(block_root);
+        self.queue_columns(block_root);
+    }
+
+    fn queue_columns(&mut self, block_root: B256) {
         if let Some(entry) = self.entries.get_mut(&block_root) {
             let mut queued = false;
             for column in &mut entry.columns {
@@ -790,7 +796,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_releases_columns_but_imported_drops_them() {
+    fn pending_and_imported_blocks_release_their_columns() {
         let mut pending = BlockLookupCoordinator::<u8, u8>::new(config());
         let block = block_meta(1, 9, 1);
         let column = column_meta(1, 0, 1);
@@ -830,7 +836,10 @@ mod tests {
             .expect("block should dispatch")
             .action_id();
         imported.block_imported(action_id, block.block_root);
-        assert!(!imported.contains_column(&column.identifier));
+        assert!(matches!(
+            imported.next_action(),
+            Some(CoordinatorAction::ImportColumn { payload: 2, .. })
+        ));
     }
 
     #[test]

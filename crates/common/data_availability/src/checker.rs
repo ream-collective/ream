@@ -114,6 +114,34 @@ impl<State> DataAvailabilityChecker<State> {
         missing
     }
 
+    /// The received columns of `block_root`, sorted.
+    pub fn received_columns(&self, block_root: &B256) -> Vec<u64> {
+        let Some(entry) = self.entries.get(block_root) else {
+            return Vec::new();
+        };
+        let mut received = entry.received_columns.iter().copied().collect::<Vec<_>>();
+        received.sort_unstable();
+        received
+    }
+
+    /// Whether `block_root` is pending and has enough columns to reconstruct every required one.
+    pub fn can_reconstruct(&self, block_root: &B256) -> bool {
+        self.entries.get(block_root).is_some_and(|entry| {
+            entry.pending_block.is_some()
+                && !self.is_complete(entry)
+                && entry.received_columns.len() as u64 >= NUMBER_OF_COLUMNS / 2
+        })
+    }
+
+    /// The pending blocks that `can_reconstruct`.
+    pub fn reconstructable_block_roots(&self) -> Vec<B256> {
+        self.entries
+            .keys()
+            .filter(|block_root| self.can_reconstruct(block_root))
+            .copied()
+            .collect()
+    }
+
     pub fn pending_block_roots(&self) -> Vec<B256> {
         self.entries
             .iter()
@@ -205,6 +233,39 @@ mod tests {
     }
 
     #[test]
+    fn a_pending_block_with_half_the_columns_can_be_reconstructed() {
+        let mut checker = DataAvailabilityChecker::<()>::supernode();
+        let root = B256::repeat_byte(9);
+        for index in 0..NUMBER_OF_COLUMNS / 2 - 1 {
+            checker.add_column(root, index, 1);
+        }
+        assert!(!checker.can_reconstruct(&root), "columns without a block");
+
+        checker.insert_pending(root, block_with_blobs(1), ());
+        assert!(!checker.can_reconstruct(&root), "one column short of half");
+
+        checker.add_column(root, NUMBER_OF_COLUMNS / 2 - 1, 1);
+        assert!(checker.can_reconstruct(&root));
+        let short_root = B256::repeat_byte(8);
+        checker.insert_pending(short_root, block_with_blobs(1), ());
+        checker.add_column(short_root, 0, 1);
+        assert_eq!(checker.reconstructable_block_roots(), vec![root]);
+        assert_eq!(
+            checker.received_columns(&root).len() as u64,
+            NUMBER_OF_COLUMNS / 2
+        );
+
+        for index in NUMBER_OF_COLUMNS / 2..NUMBER_OF_COLUMNS {
+            checker.add_column(root, index, 1);
+        }
+        assert!(
+            !checker.can_reconstruct(&root),
+            "complete blocks need no reconstruction"
+        );
+        assert!(checker.reconstructable_block_roots().is_empty());
+    }
+
+    #[test]
     fn block_waits_for_all_required_columns() {
         let mut checker = checker(&[0, 1, 2]);
         let root = B256::repeat_byte(2);
@@ -283,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn supernode_requires_all_128_columns() {
+    fn supernode_requires_all_columns() {
         let mut checker: DataAvailabilityChecker<()> = DataAvailabilityChecker::supernode();
         let root = B256::repeat_byte(8);
 
@@ -291,7 +352,40 @@ mod tests {
         for index in 0..NUMBER_OF_COLUMNS - 1 {
             checker.add_column(root, index, 10);
         }
+        assert_eq!(checker.status(&root), AvailabilityEntryStatus::PendingBlock);
+        assert!(checker.can_reconstruct(&root));
         checker.add_column(root, NUMBER_OF_COLUMNS - 1, 10);
+        assert_eq!(checker.status(&root), AvailabilityEntryStatus::Complete);
+        assert!(checker.take_if_complete(root).is_some());
+    }
+
+    #[test]
+    fn smaller_custody_set_still_requires_every_required_column() {
+        let mut checker = checker(&[0, 1, 2]);
+        let root = B256::repeat_byte(16);
+        checker.insert_pending(root, block_with_blobs(1), ());
+        checker.add_column(root, 0, 10);
+        checker.add_column(root, 1, 10);
+        assert_eq!(checker.status(&root), AvailabilityEntryStatus::PendingBlock);
+        checker.add_column(root, 2, 10);
+        assert_eq!(checker.status(&root), AvailabilityEntryStatus::Complete);
+    }
+
+    #[test]
+    fn custody_set_larger_than_half_reconstructs_before_completion() {
+        let mut checker =
+            DataAvailabilityChecker::<()>::new((0..NUMBER_OF_COLUMNS / 2 + 1).collect());
+        let root = B256::repeat_byte(17);
+        checker.insert_pending(root, block_with_blobs(1), ());
+        for index in 0..NUMBER_OF_COLUMNS / 2 {
+            checker.add_column(root, index, 10);
+        }
+
+        assert_eq!(checker.status(&root), AvailabilityEntryStatus::PendingBlock);
+        assert!(checker.can_reconstruct(&root));
+        assert!(checker.take_if_complete(root).is_none());
+
+        checker.add_column(root, NUMBER_OF_COLUMNS / 2, 10);
         assert_eq!(checker.status(&root), AvailabilityEntryStatus::Complete);
         assert!(checker.take_if_complete(root).is_some());
     }

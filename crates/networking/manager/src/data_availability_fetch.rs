@@ -325,6 +325,13 @@ pub async fn fetch_missing_columns(
     let slot = expected_header.message.slot;
     if let Err(err) = beacon_chain
         .import_data_column_sidecars_if(columns, move |store| {
+            if let Some(imported_block) = store.db.block_provider().get(block_root)? {
+                ensure!(
+                    imported_block.signed_header() == expected_header,
+                    "data column signed header does not match the imported block"
+                );
+                return Ok(());
+            }
             ensure_pending_item_is_importable_with_store(
                 store,
                 slot,

@@ -3,7 +3,7 @@ use ream_consensus_beacon::{
     bls_to_execution_change::SignedBLSToExecutionChange, electra::beacon_state::BeaconState,
 };
 use ream_network_spec::networks::beacon_network_spec;
-use ream_storage::cache::{AddressValidaterIndexIdentifier, BeaconCacheDB};
+use ream_storage::cache::{AddressValidaterIndexIdentifier, BeaconCacheDB, insert_if_unseen};
 
 use super::result::ValidationResult;
 
@@ -49,11 +49,11 @@ pub async fn validate_bls_to_execution_change(
         )));
     }
 
-    cached_db
-        .seen_bls_to_execution_change
-        .write()
-        .await
-        .put(key, ());
+    if !insert_if_unseen(&cached_db.seen_bls_to_execution_change, key).await {
+        return Ok(ValidationResult::Ignore(
+            "A BLS to execution change for this validator has already been seen".to_string(),
+        ));
+    }
 
     Ok(ValidationResult::Accept)
 }

@@ -10,7 +10,7 @@ use ream_consensus_misc::{
 use ream_fork_choice_beacon::store::get_checkpoint_block_from_db;
 use ream_network_spec::networks::beacon_network_spec;
 use ream_storage::{
-    cache::{AggregateAndProofKey, BeaconCacheDB},
+    cache::{AggregateAndProofKey, BeaconCacheDB, insert_if_unseen},
     tables::table::REDBTable,
 };
 use ream_validator_beacon::{
@@ -72,6 +72,14 @@ pub async fn validate_aggregate_and_proof(
     } else {
         attestation.data.index
     };
+
+    // The head state fixes committees up to one epoch past its own. Further out it has no cached
+    // shuffling and would shuffle the whole registry for every aggregate while the node syncs.
+    if !state.determines_committees_of(attestation.data.target.epoch) {
+        return Ok(ValidationResult::Ignore(
+            "Head state is too far behind to compute the aggregate's committee".to_string(),
+        ));
+    }
 
     // [REJECT] The committee index is within the expected range
     let committee_count = state.get_committee_count_per_slot(attestation.data.target.epoch);
@@ -304,12 +312,12 @@ pub async fn validate_aggregate_and_proof(
         ));
     }
 
-    // Mark this aggregate_and_proof as seen
-    cached_db
-        .seen_aggregate_and_proof
-        .write()
-        .await
-        .put(aggregate_key, ());
+    // Mark this aggregate_and_proof as seen, unless a concurrent copy got there first.
+    if !insert_if_unseen(&cached_db.seen_aggregate_and_proof, aggregate_key).await {
+        return Ok(ValidationResult::Ignore(
+            "An aggregate from this aggregator for this epoch has already been seen".to_string(),
+        ));
+    }
 
     Ok(ValidationResult::Accept)
 }

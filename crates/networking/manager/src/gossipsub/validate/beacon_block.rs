@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::anyhow;
 use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::electra::{beacon_block::SignedBeaconBlock, beacon_state::BeaconState};
@@ -42,7 +44,7 @@ impl GossipValidatedBlock {
 
 struct ParentContext {
     block: SignedBeaconBlock,
-    state: BeaconState,
+    state: Arc<BeaconState>,
     pending_availability: bool,
 }
 
@@ -50,6 +52,27 @@ pub async fn validate_gossip_beacon_block(
     beacon_chain: &BeaconChain,
     cached_db: &BeaconCacheDB,
     block: &SignedBeaconBlock,
+) -> anyhow::Result<DependencyValidationResult<GossipValidatedBlock>> {
+    validate_block_with_parent(beacon_chain, cached_db, block, true).await
+}
+
+/// ``validate_gossip_beacon_block`` for a block an unknown-parent lookup releases once its parent
+/// is known. The "first block with a valid signature for the proposer and slot" rule only decides
+/// what gossip propagates: this block may have recorded its own signature when it first arrived,
+/// and importing it now is not a second propagation.
+pub async fn validate_lookup_beacon_block(
+    beacon_chain: &BeaconChain,
+    cached_db: &BeaconCacheDB,
+    block: &SignedBeaconBlock,
+) -> anyhow::Result<DependencyValidationResult<GossipValidatedBlock>> {
+    validate_block_with_parent(beacon_chain, cached_db, block, false).await
+}
+
+async fn validate_block_with_parent(
+    beacon_chain: &BeaconChain,
+    cached_db: &BeaconCacheDB,
+    block: &SignedBeaconBlock,
+    enforce_first_seen: bool,
 ) -> anyhow::Result<DependencyValidationResult<GossipValidatedBlock>> {
     let db = beacon_chain.db();
 
@@ -97,7 +120,16 @@ pub async fn validate_gossip_beacon_block(
         });
     };
 
-    match validate_beacon_block(beacon_chain, cached_db, block, &parent.state, &parent).await? {
+    match validate_beacon_block(
+        beacon_chain,
+        cached_db,
+        block,
+        &parent.state,
+        &parent,
+        enforce_first_seen,
+    )
+    .await?
+    {
         ValidationResult::Accept => {}
         ValidationResult::Ignore(reason) => {
             return Ok(DependencyValidationResult::Ignore(reason));
@@ -123,6 +155,7 @@ async fn validate_beacon_block(
     block: &SignedBeaconBlock,
     state: &BeaconState,
     parent: &ParentContext,
+    enforce_first_seen: bool,
 ) -> anyhow::Result<ValidationResult> {
     let db = beacon_chain.db();
 
@@ -147,14 +180,15 @@ async fn validate_beacon_block(
 
     // [IGNORE] The block is the first block with valid signature received for the proposer for the
     // slot.
-    if cached_db
-        .seen_proposer_signature
-        .read()
-        .await
-        .contains(&AddressSlotIdentifier {
-            address: validator.public_key.clone(),
-            slot: block.message.slot,
-        })
+    if enforce_first_seen
+        && cached_db
+            .seen_proposer_signature
+            .read()
+            .await
+            .contains(&AddressSlotIdentifier {
+                address: validator.public_key.clone(),
+                slot: block.message.slot,
+            })
     {
         return Ok(ValidationResult::Ignore(
             "Signature already received".to_string(),
@@ -269,7 +303,7 @@ async fn validate_beacon_block(
         slot: block.message.slot,
     };
     let mut seen_proposer_signatures = cached_db.seen_proposer_signature.write().await;
-    if seen_proposer_signatures.contains(&proposer_slot) {
+    if enforce_first_seen && seen_proposer_signatures.contains(&proposer_slot) {
         return Ok(ValidationResult::Ignore(
             "Signature already received".to_string(),
         ));

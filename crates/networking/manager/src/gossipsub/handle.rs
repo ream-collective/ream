@@ -1,31 +1,29 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use anyhow::ensure;
 pub use libp2p::gossipsub::{Message, MessageAcceptance};
 use ream_chain_beacon::beacon_chain::{BeaconChain, BlockProcessingOutcome};
 use ream_consensus_beacon::{
     blob_sidecar::BlobIdentifier, data_column_sidecar::DATA_COLUMN_SIDECAR_SUBNET_COUNT,
-    electra::beacon_state::BeaconState, single_attestation::SingleAttestation,
+    single_attestation::SingleAttestation,
 };
-use ream_consensus_misc::constants::beacon::{
-    MIN_ATTESTATION_INCLUSION_DELAY, genesis_validators_root,
+use ream_consensus_misc::{
+    constants::beacon::{MIN_ATTESTATION_INCLUSION_DELAY, genesis_validators_root},
+    misc::compute_epoch_at_slot,
 };
 use ream_execution_rpc_types::get_blobs::BlobAndProofV1;
 use ream_network_spec::networks::beacon_network_spec;
-use ream_p2p::{
-    gossipsub::beacon::{
-        configurations::GossipsubConfig,
-        message::GossipsubMessage,
-        topics::{GossipTopic, GossipTopicKind},
-    },
-    network::beacon::channel::GossipMessage,
+use ream_p2p::gossipsub::beacon::{
+    configurations::GossipsubConfig,
+    message::GossipsubMessage,
+    topics::{GossipTopic, GossipTopicKind},
 };
 use ream_storage::{cache::BeaconCacheDB, tables::table::CustomTable};
 use ream_validator_beacon::{
     attestation::single_attestation_to_attestation, blob_sidecars::compute_subnet_for_blob_sidecar,
     constants::SYNC_COMMITTEE_SUBNET_COUNT,
 };
-use ssz::Encode;
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use tree_hash::TreeHash;
 
 use crate::{
@@ -46,7 +44,6 @@ use crate::{
         sync_committee_contribution_and_proof::validate_sync_committee_contribution_and_proof,
         voluntary_exit::validate_voluntary_exit,
     },
-    p2p_sender::P2PSender,
 };
 
 pub struct UnknownParentGossipBlock {
@@ -118,11 +115,13 @@ pub fn init_gossipsub_config_with_topics(history_length: Option<usize>) -> Gossi
         });
     }
 
-    for subnet_id in 0..beacon_network_spec().blob_sidecar_subnet_count_electra {
-        topics.push(GossipTopic {
-            fork: fork_digest,
-            kind: GossipTopicKind::BlobSidecar(subnet_id),
-        });
+    if subscribes_to_blob_sidecars(beacon_network_spec().current_epoch()) {
+        for subnet_id in 0..beacon_network_spec().blob_sidecar_subnet_count_electra {
+            topics.push(GossipTopic {
+                fork: fork_digest,
+                kind: GossipTopicKind::BlobSidecar(subnet_id),
+            });
+        }
     }
 
     for subnet_id in 0..DATA_COLUMN_SIDECAR_SUBNET_COUNT {
@@ -137,6 +136,12 @@ pub fn init_gossipsub_config_with_topics(history_length: Option<usize>) -> Gossi
     gossipsub_config
 }
 
+/// Fulu deprecates the `blob_sidecar_{subnet_id}` topics: blob data travels as data columns from
+/// FULU_FORK_EPOCH on (consensus-specs v1.7.0-alpha.11, fulu/p2p-interface.md).
+fn subscribes_to_blob_sidecars(epoch: u64) -> bool {
+    epoch < beacon_network_spec().fulu_fork_epoch
+}
+
 async fn import_gossip_attestation(
     beacon_chain: &BeaconChain,
     single_attestation: &SingleAttestation,
@@ -144,13 +149,14 @@ async fn import_gossip_attestation(
     // Nothing here needs the store lock: the head snapshot is published by the writers and the
     // operation pool is independently synchronized.
     let head = beacon_chain.head()?;
-    let attestation = if head.state.slot < single_attestation.data.slot {
-        let mut state = BeaconState::clone(&head.state);
-        state.process_slots(single_attestation.data.slot)?;
-        single_attestation_to_attestation(single_attestation, &state)?
-    } else {
-        single_attestation_to_attestation(single_attestation, &head.state)?
-    };
+    // Validation accepted the attestation against a head at most this old, so the head state
+    // fixes its committee without being advanced.
+    ensure!(
+        head.state
+            .determines_committees_of(compute_epoch_at_slot(single_attestation.data.slot)),
+        "Head state is too far behind to compute the attestation's committee"
+    );
+    let attestation = single_attestation_to_attestation(single_attestation, &head.state)?;
 
     beacon_chain
         .operation_pool()
@@ -160,17 +166,12 @@ async fn import_gossip_attestation(
         head.current_slot >= single_attestation.data.slot + MIN_ATTESTATION_INCLUSION_DELAY;
 
     if should_process_attestation {
-        beacon_chain.process_attestation(attestation, false).await?;
+        beacon_chain
+            .process_gossip_attestation(attestation, single_attestation.attester_index)
+            .await?;
     }
 
     Ok(())
-}
-
-fn forward_gossip_message(message: &Message, p2p_sender: &P2PSender, data: Vec<u8>) {
-    p2p_sender.send_gossip(GossipMessage {
-        topic: GossipTopic::from_topic_hash(&message.topic).expect("invalid topic hash"),
-        data,
-    });
 }
 
 fn message_acceptance(validation_result: &ValidationResult) -> MessageAcceptance {
@@ -178,6 +179,17 @@ fn message_acceptance(validation_result: &ValidationResult) -> MessageAcceptance
         ValidationResult::Accept => MessageAcceptance::Accept,
         ValidationResult::Reject(_) => MessageAcceptance::Reject,
         ValidationResult::Ignore(_) => MessageAcceptance::Ignore,
+    }
+}
+
+/// Acceptance for the topics whose handler only reports a validation result. Gossipsub forwards a
+/// message only when it is reported as ACCEPT, so a valid message must be reported as ACCEPT.
+/// Rejections are still reported as IGNORE on these topics, so a validation bug here cannot get
+/// honest peers penalized.
+fn accepted_message_acceptance(validation_result: &ValidationResult) -> MessageAcceptance {
+    match validation_result {
+        ValidationResult::Accept => MessageAcceptance::Accept,
+        ValidationResult::Reject(_) | ValidationResult::Ignore(_) => MessageAcceptance::Ignore,
     }
 }
 
@@ -199,14 +211,13 @@ pub async fn handle_gossipsub_message(
     message: Message,
     beacon_chain: &BeaconChain,
     cached_db: &BeaconCacheDB,
-    p2p_sender: &P2PSender,
     pending_item: &mut Option<PendingGossipItem>,
     unknown_parent_block: &mut Option<UnknownParentGossipBlock>,
 ) -> MessageAcceptance {
     match GossipsubMessage::decode(&message.topic, &message.data) {
         Ok(gossip_message) => match gossip_message {
             GossipsubMessage::BeaconBlock(signed_block) => {
-                info!(
+                debug!(
                     "Beacon block received over gossipsub: slot: {}, root: {}",
                     signed_block.message.slot,
                     signed_block.message.block_root()
@@ -240,7 +251,6 @@ pub async fn handle_gossipsub_message(
                 let acceptance = dependency_message_acceptance(&validation_result);
                 match validation_result {
                     DependencyValidationResult::Accept => {
-                        let signed_block_bytes = signed_block.as_ssz_bytes();
                         match beacon_chain.process_block(*signed_block).await {
                             Ok(BlockProcessingOutcome::Imported { .. }) => {}
                             Ok(BlockProcessingOutcome::PendingAvailability { .. }) => {}
@@ -248,7 +258,6 @@ pub async fn handle_gossipsub_message(
                                 error!("Failed to process gossipsub beacon block: {err}");
                             }
                         }
-                        forward_gossip_message(&message, p2p_sender, signed_block_bytes);
                     }
                     DependencyValidationResult::Ignore(reason) => {
                         warn!("Ignoring gossipsub beacon block: {reason}");
@@ -300,23 +309,18 @@ pub async fn handle_gossipsub_message(
                         {
                             warn!("Failed to import gossipsub beacon attestation: {err}");
                         }
-                        forward_gossip_message(
-                            &message,
-                            p2p_sender,
-                            single_attestation.as_ssz_bytes(),
-                        );
                     }
                     ValidationResult::Reject(reason) => {
                         info!("Attestation rejected: {reason}");
                     }
                     ValidationResult::Ignore(reason) => {
-                        info!("Attestation ignored: {reason}");
+                        debug!("Attestation ignored: {reason}");
                     }
                 }
                 acceptance
             }
             GossipsubMessage::BlsToExecutionChange(signed_bls_to_execution_change) => {
-                info!(
+                debug!(
                     "BLS to Execution Change received over gossipsub: root: {}",
                     signed_bls_to_execution_change.tree_hash_root()
                 );
@@ -328,29 +332,27 @@ pub async fn handle_gossipsub_message(
                 )
                 .await
                 {
-                    Ok(validation_result) => match validation_result {
-                        ValidationResult::Accept => {
-                            forward_gossip_message(
-                                &message,
-                                p2p_sender,
-                                signed_bls_to_execution_change.as_ssz_bytes(),
-                            );
+                    Ok(validation_result) => {
+                        let acceptance = accepted_message_acceptance(&validation_result);
+                        match validation_result {
+                            ValidationResult::Accept => {}
+                            ValidationResult::Reject(reason) => {
+                                info!("BLS to Execution Change rejected: {reason}");
+                            }
+                            ValidationResult::Ignore(reason) => {
+                                debug!("BLS to Execution Change ignored: {reason}");
+                            }
                         }
-                        ValidationResult::Reject(reason) => {
-                            info!("BLS to Execution Change rejected: {reason}");
-                        }
-                        ValidationResult::Ignore(reason) => {
-                            info!("BLS to Execution Change ignored: {reason}");
-                        }
-                    },
+                        acceptance
+                    }
                     Err(err) => {
                         error!("Could not validate BLS to Execution Change: {err}");
+                        MessageAcceptance::Ignore
                     }
                 }
-                MessageAcceptance::Ignore
             }
             GossipsubMessage::AggregateAndProof(aggregate_and_proof) => {
-                info!(
+                debug!(
                     "Aggregate And Proof received over gossipsub: root: {}",
                     aggregate_and_proof.tree_hash_root()
                 );
@@ -358,26 +360,24 @@ pub async fn handle_gossipsub_message(
                 match validate_aggregate_and_proof(&aggregate_and_proof, beacon_chain, cached_db)
                     .await
                 {
-                    Ok(validation_result) => match validation_result {
-                        ValidationResult::Accept => {
-                            forward_gossip_message(
-                                &message,
-                                p2p_sender,
-                                aggregate_and_proof.as_ssz_bytes(),
-                            );
+                    Ok(validation_result) => {
+                        let acceptance = accepted_message_acceptance(&validation_result);
+                        match validation_result {
+                            ValidationResult::Accept => {}
+                            ValidationResult::Reject(reason) => {
+                                info!("Aggregate and proof rejected: {reason}");
+                            }
+                            ValidationResult::Ignore(reason) => {
+                                debug!("Aggregate and proof ignored: {reason}");
+                            }
                         }
-                        ValidationResult::Reject(reason) => {
-                            info!("Aggregate and proof rejected: {reason}");
-                        }
-                        ValidationResult::Ignore(reason) => {
-                            info!("Aggregate and proof ignored: {reason}");
-                        }
-                    },
+                        acceptance
+                    }
                     Err(err) => {
                         error!("Could not validate aggregate and proof: {err}");
+                        MessageAcceptance::Ignore
                     }
                 }
-                MessageAcceptance::Ignore
             }
             GossipsubMessage::SyncCommittee((sync_committee, subnet_id)) => {
                 trace!(
@@ -388,29 +388,27 @@ pub async fn handle_gossipsub_message(
                 match validate_sync_committee(&sync_committee, beacon_chain, subnet_id, cached_db)
                     .await
                 {
-                    Ok(validation_result) => match validation_result {
-                        ValidationResult::Accept => {
-                            forward_gossip_message(
-                                &message,
-                                p2p_sender,
-                                sync_committee.as_ssz_bytes(),
-                            );
+                    Ok(validation_result) => {
+                        let acceptance = accepted_message_acceptance(&validation_result);
+                        match validation_result {
+                            ValidationResult::Accept => {}
+                            ValidationResult::Reject(reason) => {
+                                info!("Sync committee message rejected: {reason}");
+                            }
+                            ValidationResult::Ignore(reason) => {
+                                trace!("Sync committee message ignored: {reason}");
+                            }
                         }
-                        ValidationResult::Reject(reason) => {
-                            info!("Sync committee message rejected: {reason}");
-                        }
-                        ValidationResult::Ignore(reason) => {
-                            trace!("Sync committee message ignored: {reason}");
-                        }
-                    },
+                        acceptance
+                    }
                     Err(err) => {
                         error!("Could not validate sync committee message: {err}");
+                        MessageAcceptance::Ignore
                     }
                 }
-                MessageAcceptance::Ignore
             }
             GossipsubMessage::SyncCommitteeContributionAndProof(signed_contribution_and_proof) => {
-                info!(
+                debug!(
                     "Sync Committee Contribution And Proof received over gossipsub: root: {}",
                     signed_contribution_and_proof.tree_hash_root()
                 );
@@ -422,91 +420,89 @@ pub async fn handle_gossipsub_message(
                 )
                 .await
                 {
-                    Ok(validation_result) => match validation_result {
-                        ValidationResult::Accept => {
-                            forward_gossip_message(
-                                &message,
-                                p2p_sender,
-                                signed_contribution_and_proof.as_ssz_bytes(),
-                            );
-                        }
+                    Ok(validation_result) => {
+                        let acceptance = accepted_message_acceptance(&validation_result);
+                        match validation_result {
+                            ValidationResult::Accept => {}
 
-                        ValidationResult::Reject(reason) => {
-                            info!("Sync committee contribution and proof rejected: {reason}");
+                            ValidationResult::Reject(reason) => {
+                                info!("Sync committee contribution and proof rejected: {reason}");
+                            }
+                            ValidationResult::Ignore(reason) => {
+                                debug!("Sync committee contribution and proof ignored: {reason}");
+                            }
                         }
-                        ValidationResult::Ignore(reason) => {
-                            info!("Sync committee contribution and proof ignored: {reason}");
-                        }
-                    },
+                        acceptance
+                    }
                     Err(err) => {
                         error!("Could not validate sync committee contribution and proof: {err}");
+                        MessageAcceptance::Ignore
                     }
                 }
-                MessageAcceptance::Ignore
             }
             GossipsubMessage::AttesterSlashing(attester_slashing) => {
-                info!(
+                debug!(
                     "Attester Slashing received over gossipsub: root: {}",
                     attester_slashing.tree_hash_root()
                 );
 
                 match validate_attester_slashing(&attester_slashing, beacon_chain, cached_db).await
                 {
-                    Ok(validation_result) => match validation_result {
-                        ValidationResult::Accept => {
-                            let attester_slashing_bytes = attester_slashing.as_ssz_bytes();
-                            forward_gossip_message(&message, p2p_sender, attester_slashing_bytes);
-                            if let Err(err) = beacon_chain
-                                .process_attester_slashing(*attester_slashing)
-                                .await
-                            {
-                                error!("Failed to process gossipsub attester slashing: {err}");
+                    Ok(validation_result) => {
+                        let acceptance = accepted_message_acceptance(&validation_result);
+                        match validation_result {
+                            ValidationResult::Accept => {
+                                if let Err(err) = beacon_chain
+                                    .process_attester_slashing(*attester_slashing)
+                                    .await
+                                {
+                                    error!("Failed to process gossipsub attester slashing: {err}");
+                                }
+                            }
+                            ValidationResult::Reject(reason) => {
+                                info!("Attester slashing rejected: {reason}");
+                            }
+                            ValidationResult::Ignore(reason) => {
+                                debug!("Attester slashing ignored: {reason}");
                             }
                         }
-                        ValidationResult::Reject(reason) => {
-                            info!("Attester slashing rejected: {reason}");
-                        }
-                        ValidationResult::Ignore(reason) => {
-                            info!("Attester slashing ignored: {reason}");
-                        }
-                    },
+                        acceptance
+                    }
                     Err(err) => {
                         error!("Could not validate attester slashing: {err}");
+                        MessageAcceptance::Ignore
                     }
                 }
-                MessageAcceptance::Ignore
             }
             GossipsubMessage::ProposerSlashing(proposer_slashing) => {
-                info!(
+                debug!(
                     "Proposer Slashing received over gossipsub: root: {}",
                     proposer_slashing.tree_hash_root()
                 );
 
                 match validate_proposer_slashing(&proposer_slashing, beacon_chain, cached_db).await
                 {
-                    Ok(validation_result) => match validation_result {
-                        ValidationResult::Accept => {
-                            forward_gossip_message(
-                                &message,
-                                p2p_sender,
-                                proposer_slashing.as_ssz_bytes(),
-                            );
+                    Ok(validation_result) => {
+                        let acceptance = accepted_message_acceptance(&validation_result);
+                        match validation_result {
+                            ValidationResult::Accept => {}
+                            ValidationResult::Reject(reason) => {
+                                info!("Proposer slashing rejected: {reason}");
+                            }
+                            ValidationResult::Ignore(reason) => {
+                                debug!("Proposer slashing ignored: {reason}");
+                            }
                         }
-                        ValidationResult::Reject(reason) => {
-                            info!("Proposer slashing rejected: {reason}");
-                        }
-                        ValidationResult::Ignore(reason) => {
-                            info!("Proposer slashing ignored: {reason}");
-                        }
-                    },
+                        acceptance
+                    }
                     Err(err) => {
                         error!("Could not validate proposer slashing: {err}");
+                        MessageAcceptance::Ignore
                     }
                 }
-                MessageAcceptance::Ignore
             }
             GossipsubMessage::BlobSidecar(blob_sidecar) => {
-                info!(
+                debug!(
                     "Blob Sidecar received over gossipsub: root: {}",
                     blob_sidecar.tree_hash_root()
                 );
@@ -518,46 +514,50 @@ pub async fn handle_gossipsub_message(
                 )
                 .await
                 {
-                    Ok(validation_result) => match validation_result {
-                        ValidationResult::Accept => {
-                            let blob_sidecar_bytes = blob_sidecar.as_ssz_bytes();
-                            let provider = beacon_chain.db().blobs_and_proofs_provider();
-                            let insert_result = tokio::task::spawn_blocking(move || {
-                                provider.insert(
-                                    BlobIdentifier::new(
-                                        blob_sidecar.signed_block_header.message.tree_hash_root(),
-                                        blob_sidecar.index,
-                                    ),
-                                    BlobAndProofV1 {
-                                        blob: blob_sidecar.blob,
-                                        proof: blob_sidecar.kzg_proof,
-                                    },
-                                )
-                            })
-                            .await;
-                            match insert_result {
-                                Ok(Ok(())) => {}
-                                Ok(Err(err)) => error!("Failed to insert blob_sidecar: {err}"),
-                                Err(err) => error!("Blob persistence task failed: {err}"),
+                    Ok(validation_result) => {
+                        let acceptance = accepted_message_acceptance(&validation_result);
+                        match validation_result {
+                            ValidationResult::Accept => {
+                                let provider = beacon_chain.db().blobs_and_proofs_provider();
+                                let insert_result = tokio::task::spawn_blocking(move || {
+                                    provider.insert(
+                                        BlobIdentifier::new(
+                                            blob_sidecar
+                                                .signed_block_header
+                                                .message
+                                                .tree_hash_root(),
+                                            blob_sidecar.index,
+                                        ),
+                                        BlobAndProofV1 {
+                                            blob: blob_sidecar.blob,
+                                            proof: blob_sidecar.kzg_proof,
+                                        },
+                                    )
+                                })
+                                .await;
+                                match insert_result {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(err)) => error!("Failed to insert blob_sidecar: {err}"),
+                                    Err(err) => error!("Blob persistence task failed: {err}"),
+                                }
                             }
-
-                            forward_gossip_message(&message, p2p_sender, blob_sidecar_bytes);
+                            ValidationResult::Reject(reason) => {
+                                info!("Blob_sidecar rejected: {reason}");
+                            }
+                            ValidationResult::Ignore(reason) => {
+                                debug!("Blob_sidecar ignored: {reason}");
+                            }
                         }
-                        ValidationResult::Reject(reason) => {
-                            info!("Blob_sidecar rejected: {reason}");
-                        }
-                        ValidationResult::Ignore(reason) => {
-                            info!("Blob_sidecar ignored: {reason}");
-                        }
-                    },
+                        acceptance
+                    }
                     Err(err) => {
                         error!("Could not validate blob_sidecar: {err}");
+                        MessageAcceptance::Ignore
                     }
                 }
-                MessageAcceptance::Ignore
             }
             GossipsubMessage::DataColumnSidecar(data_column_sidecar) => {
-                info!(
+                debug!(
                     "Data Column Sidecar received over gossipsub: index: {}, root: {}",
                     data_column_sidecar.index,
                     data_column_sidecar
@@ -618,7 +618,7 @@ pub async fn handle_gossipsub_message(
                         info!("Data column sidecar rejected: {reason}");
                     }
                     DependencyValidationResult::Ignore(reason) => {
-                        info!("Data column sidecar ignored: {reason}");
+                        debug!("Data column sidecar ignored: {reason}");
                     }
                     DependencyValidationResult::UnknownParent { .. } => {
                         unreachable!("data column validation cannot return unknown-parent")
@@ -633,40 +633,39 @@ pub async fn handle_gossipsub_message(
                 acceptance
             }
             GossipsubMessage::LightClientFinalityUpdate(light_client_finality_update) => {
-                info!(
+                debug!(
                     "Light Client Finality Update received over gossipsub: root: {}",
                     light_client_finality_update.tree_hash_root()
                 );
 
                 match validate_light_client_finality_update(
                     &light_client_finality_update,
+                    beacon_chain,
                     cached_db,
                 )
                 .await
                 {
-                    Ok(validation_result) => match validation_result {
-                        ValidationResult::Accept => {
-                            forward_gossip_message(
-                                &message,
-                                p2p_sender,
-                                light_client_finality_update.as_ssz_bytes(),
-                            );
+                    Ok(validation_result) => {
+                        let acceptance = accepted_message_acceptance(&validation_result);
+                        match validation_result {
+                            ValidationResult::Accept => {}
+                            ValidationResult::Reject(reason) => {
+                                info!("Light client finality update rejected: {reason}");
+                            }
+                            ValidationResult::Ignore(reason) => {
+                                debug!("Light client finality update ignored: {reason}");
+                            }
                         }
-                        ValidationResult::Reject(reason) => {
-                            info!("Light client finality update rejected: {reason}");
-                        }
-                        ValidationResult::Ignore(reason) => {
-                            info!("Light client finality update ignored: {reason}");
-                        }
-                    },
+                        acceptance
+                    }
                     Err(err) => {
                         error!("Could not validate light client finality update: {err}");
+                        MessageAcceptance::Ignore
                     }
                 }
-                MessageAcceptance::Ignore
             }
             GossipsubMessage::LightClientOptimisticUpdate(light_client_optimistic_update) => {
-                info!(
+                debug!(
                     "Light Client Optimistic Update received over gossipsub: root: {}",
                     light_client_optimistic_update.tree_hash_root()
                 );
@@ -678,57 +677,50 @@ pub async fn handle_gossipsub_message(
                 )
                 .await
                 {
-                    Ok(validation_result) => match validation_result {
-                        ValidationResult::Accept => {
-                            forward_gossip_message(
-                                &message,
-                                p2p_sender,
-                                light_client_optimistic_update.as_ssz_bytes(),
-                            );
-
-                            *cached_db.forwarded_optimistic_update_slot.write().await =
-                                Some(light_client_optimistic_update.attested_header.beacon.slot);
+                    Ok(validation_result) => {
+                        let acceptance = accepted_message_acceptance(&validation_result);
+                        match validation_result {
+                            ValidationResult::Accept => {}
+                            ValidationResult::Ignore(reason) => {
+                                debug!("Light client optimistic update ignored: {reason}");
+                            }
+                            ValidationResult::Reject(reason) => {
+                                info!("Light client optimistic update rejected: {reason}");
+                            }
                         }
-                        ValidationResult::Ignore(reason) => {
-                            info!("Light client optimistic update ignored: {reason}");
-                        }
-                        ValidationResult::Reject(reason) => {
-                            info!("Light client optimistic update rejected: {reason}");
-                        }
-                    },
+                        acceptance
+                    }
                     Err(err) => {
                         error!("Could not validate light client optimistic update: {err}");
+                        MessageAcceptance::Ignore
                     }
                 }
-                MessageAcceptance::Ignore
             }
             GossipsubMessage::VoluntaryExit(voluntary_exit) => {
-                info!(
+                debug!(
                     "Voluntary Exit received over gossipsub: root: {}",
                     voluntary_exit.tree_hash_root()
                 );
 
                 match validate_voluntary_exit(&voluntary_exit, beacon_chain, cached_db).await {
-                    Ok(validation_result) => match validation_result {
-                        ValidationResult::Accept => {
-                            forward_gossip_message(
-                                &message,
-                                p2p_sender,
-                                voluntary_exit.as_ssz_bytes(),
-                            );
+                    Ok(validation_result) => {
+                        let acceptance = accepted_message_acceptance(&validation_result);
+                        match validation_result {
+                            ValidationResult::Accept => {}
+                            ValidationResult::Reject(reason) => {
+                                info!("voluntary_exit rejected: {reason}");
+                            }
+                            ValidationResult::Ignore(reason) => {
+                                debug!("voluntary_exit ignored: {reason}");
+                            }
                         }
-                        ValidationResult::Reject(reason) => {
-                            info!("voluntary_exit rejected: {reason}");
-                        }
-                        ValidationResult::Ignore(reason) => {
-                            info!("voluntary_exit ignored: {reason}");
-                        }
-                    },
+                        acceptance
+                    }
                     Err(err) => {
                         error!("Could not validate voluntary_exit: {err}");
+                        MessageAcceptance::Ignore
                     }
                 }
-                MessageAcceptance::Ignore
             }
         },
         Err(err) => {
@@ -751,12 +743,11 @@ mod tests {
     };
     use ream_network_spec::networks::initialize_test_network_spec;
     use ream_operation_pool::OperationPool;
-    use ream_p2p::network::beacon::channel::P2PMessage;
     use ream_storage::db::ReamDB;
     use ream_sync_committee_pool::SyncCommitteePool;
+    use ssz::Encode;
     use ssz_types::{FixedVector, VariableList};
     use tempfile::TempDir;
-    use tokio::sync::mpsc;
 
     use super::*;
 
@@ -795,8 +786,6 @@ mod tests {
         initialize_test_network_spec();
         let (_data_dir, beacon_chain) = test_beacon_chain();
         let cached_db = BeaconCacheDB::default();
-        let (gossip_tx, _gossip_rx) = mpsc::unbounded_channel::<P2PMessage>();
-        let p2p_sender = P2PSender(gossip_tx);
 
         // Subnet 5 (index % 128) delivered on topic subnet 6 - a mismatch rejected early.
         let sidecar = sidecar_with_index(5);
@@ -818,7 +807,6 @@ mod tests {
             message,
             &beacon_chain,
             &cached_db,
-            &p2p_sender,
             &mut pending_item,
             &mut unknown_parent_block,
         )
@@ -828,5 +816,30 @@ mod tests {
             matches!(acceptance, MessageAcceptance::Reject),
             "expected Reject, got {acceptance:?}"
         );
+    }
+
+    #[test]
+    fn blob_sidecar_topics_end_at_fulu() {
+        initialize_test_network_spec();
+        let fulu_fork_epoch = beacon_network_spec().fulu_fork_epoch;
+        assert!(subscribes_to_blob_sidecars(fulu_fork_epoch - 1));
+        assert!(!subscribes_to_blob_sidecars(fulu_fork_epoch));
+        assert!(!subscribes_to_blob_sidecars(fulu_fork_epoch + 1));
+    }
+
+    #[test]
+    fn only_a_passed_validation_is_forwarded_on_report_only_topics() {
+        assert!(matches!(
+            accepted_message_acceptance(&ValidationResult::Accept),
+            MessageAcceptance::Accept
+        ));
+        assert!(matches!(
+            accepted_message_acceptance(&ValidationResult::Ignore("seen".to_string())),
+            MessageAcceptance::Ignore
+        ));
+        assert!(matches!(
+            accepted_message_acceptance(&ValidationResult::Reject("invalid".to_string())),
+            MessageAcceptance::Ignore
+        ));
     }
 }

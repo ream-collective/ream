@@ -20,7 +20,7 @@ use ream_consensus_beacon::{
 };
 use ream_consensus_misc::{
     checkpoint::Checkpoint,
-    constants::beacon::{GENESIS_EPOCH, GENESIS_SLOT, INTERVALS_PER_SLOT, SLOTS_PER_EPOCH},
+    constants::beacon::{GENESIS_EPOCH, GENESIS_SLOT, SLOTS_PER_EPOCH},
     misc::{compute_epoch_at_slot, compute_start_slot_at_epoch, is_shuffling_stable},
 };
 use ream_data_availability::{DataAvailabilityChecker, PendingBlock};
@@ -31,7 +31,7 @@ use ream_metrics::{
 use ream_network_spec::networks::beacon_network_spec;
 use ream_operation_pool::OperationPool;
 use ream_storage::{
-    db::beacon::BeaconDB,
+    db::beacon::{BeaconDB, CheckpointWrites},
     errors::StoreError,
     tables::{
         field::{CustomField, REDBField},
@@ -52,6 +52,40 @@ use crate::{
 };
 
 const VALIDATOR_API_SYNC_TOLERANCE_EPOCHS: u64 = 2;
+const BASIS_POINTS: u64 = 10_000;
+const MILLISECONDS_PER_SECOND: u64 = 1_000;
+
+pub(crate) fn seconds_to_milliseconds(seconds: u64) -> u64 {
+    seconds.saturating_mul(MILLISECONDS_PER_SECOND)
+}
+
+pub(crate) fn get_slot_component_duration_ms(basis_points: u64) -> u64 {
+    basis_points.saturating_mul(beacon_network_spec().slot_duration_ms) / BASIS_POINTS
+}
+
+pub(crate) fn get_slots_since_genesis_at(time: u64, genesis_time: u64) -> u64 {
+    slots_since_genesis(time, genesis_time, beacon_network_spec().slot_duration_ms)
+}
+
+pub(crate) fn get_time_at_slot(genesis_time: u64, slot: u64) -> u64 {
+    time_at_slot(genesis_time, slot, beacon_network_spec().slot_duration_ms)
+}
+
+fn slots_since_genesis(time: u64, genesis_time: u64, slot_duration_ms: u64) -> u64 {
+    seconds_to_milliseconds(time.saturating_sub(genesis_time)) / slot_duration_ms
+}
+
+/// The first whole second at or after the start of `slot`. Store time has whole-second
+/// resolution, and this is the earliest store time that `get_slots_since_genesis` maps to `slot`.
+/// Rounding down instead, as the spec's `on_tick` does, maps the time back to the previous slot
+/// when the slot duration is not a whole number of seconds, so `on_tick` would catch up forever.
+fn time_at_slot(genesis_time: u64, slot: u64, slot_duration_ms: u64) -> u64 {
+    genesis_time.saturating_add(
+        slot_duration_ms
+            .saturating_mul(slot)
+            .div_ceil(MILLISECONDS_PER_SECOND),
+    )
+}
 
 #[derive(Debug)]
 pub struct BlockWithEpochInfo {
@@ -91,6 +125,88 @@ impl RetryBackoff {
 
     fn reset(&mut self) {
         *self = Self::new();
+    }
+}
+
+/// The store's checkpoints, read once, updated in memory and written as one `CheckpointWrites`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StoreCheckpoints {
+    pub justified: Checkpoint,
+    pub previous_justified: Option<Checkpoint>,
+    pub finalized: Checkpoint,
+    pub unrealized_justified: Checkpoint,
+    pub unrealized_finalized: Checkpoint,
+    stored: StoredCheckpoints,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StoredCheckpoints {
+    justified: Checkpoint,
+    previous_justified: Option<Checkpoint>,
+    finalized: Checkpoint,
+    unrealized_justified: Checkpoint,
+    unrealized_finalized: Checkpoint,
+}
+
+impl StoreCheckpoints {
+    pub(crate) fn read(db: &BeaconDB) -> anyhow::Result<Self> {
+        let stored = StoredCheckpoints {
+            justified: db.justified_checkpoint_provider().get()?,
+            previous_justified: db.previous_justified_checkpoint_provider().get().ok(),
+            finalized: db.finalized_checkpoint_provider().get()?,
+            unrealized_justified: db.unrealized_justified_checkpoint_provider().get()?,
+            unrealized_finalized: db.unrealized_finalized_checkpoint_provider().get()?,
+        };
+        Ok(Self {
+            justified: stored.justified,
+            previous_justified: stored.previous_justified,
+            finalized: stored.finalized,
+            unrealized_justified: stored.unrealized_justified,
+            unrealized_finalized: stored.unrealized_finalized,
+            stored,
+        })
+    }
+
+    /// Spec ``update_checkpoints``: keep the newer justified and finalized checkpoints.
+    pub(crate) fn realize(
+        &mut self,
+        justified: Checkpoint,
+        finalized: Checkpoint,
+        previous_justified: Checkpoint,
+    ) {
+        if justified.epoch > self.justified.epoch {
+            self.justified = justified;
+        }
+        self.previous_justified = Some(previous_justified);
+        if finalized.epoch > self.finalized.epoch {
+            self.finalized = finalized;
+        }
+    }
+
+    /// Spec ``update_unrealized_checkpoints``: keep the newer unrealized checkpoints.
+    pub(crate) fn pull_up(&mut self, justified: Checkpoint, finalized: Checkpoint) {
+        if justified.epoch > self.unrealized_justified.epoch {
+            self.unrealized_justified = justified;
+        }
+        if finalized.epoch > self.unrealized_finalized.epoch {
+            self.unrealized_finalized = finalized;
+        }
+    }
+
+    /// The checkpoints that differ from the stored ones.
+    pub(crate) fn writes(&self) -> CheckpointWrites {
+        let stored = &self.stored;
+        CheckpointWrites {
+            justified: (self.justified != stored.justified).then_some(self.justified),
+            previous_justified: self
+                .previous_justified
+                .filter(|_| self.previous_justified != stored.previous_justified),
+            finalized: (self.finalized != stored.finalized).then_some(self.finalized),
+            unrealized_justified: (self.unrealized_justified != stored.unrealized_justified)
+                .then_some(self.unrealized_justified),
+            unrealized_finalized: (self.unrealized_finalized != stored.unrealized_finalized)
+                .then_some(self.unrealized_finalized),
+        }
     }
 }
 
@@ -147,15 +263,22 @@ impl Store {
     }
 
     pub fn get_slots_since_genesis(&self) -> anyhow::Result<u64> {
-        Ok(self
-            .db
-            .time_provider()
-            .get()?
-            .saturating_sub(self.db.genesis_time_provider().get()?)
-            / beacon_network_spec().seconds_per_slot())
+        Ok(get_slots_since_genesis_at(
+            self.db.time_provider().get()?,
+            self.db.genesis_time_provider().get()?,
+        ))
     }
 
     pub fn get_ancestor(&self, root: B256, slot: u64) -> anyhow::Result<B256> {
+        // Unfinalized blocks are in the fork choice tree, so their ancestry is resolved without
+        // reading and decoding each block from the database.
+        if let Some(ancestor) = self
+            .fork_choice
+            .as_ref()
+            .and_then(|tree| tree.ancestor(root, slot))
+        {
+            return Ok(ancestor);
+        }
         let block = self
             .db
             .block_provider()
@@ -482,19 +605,11 @@ impl Store {
         tree: &mut ForkChoiceTree,
         justified_checkpoint: Checkpoint,
     ) -> anyhow::Result<()> {
-        let mut justified_state = self
+        // The checkpoint states table computes a missing state from its block's state.
+        let justified_state = self
             .db
             .checkpoint_states_provider()
-            .get(justified_checkpoint)?;
-        if justified_state.is_none() {
-            // A newly justified checkpoint's state is normally stored when an attestation targeting
-            // it is processed, which can come after the block that justified it.
-            self.store_target_checkpoint_state(justified_checkpoint)?;
-            justified_state = self
-                .db
-                .checkpoint_states_provider()
-                .get(justified_checkpoint)?;
-        }
+            .get_shared(justified_checkpoint)?;
         let Some(state) = justified_state else {
             // Keep the previous balances; `balances_checkpoint` stays behind so the next refresh
             // retries.
@@ -532,7 +647,7 @@ impl Store {
         let realized = if compute_epoch_at_slot(block.slot) >= current_epoch {
             self.db
                 .state_provider()
-                .get(root)?
+                .get_shared(root)?
                 .map(|state| state.current_justified_checkpoint)
         } else {
             None
@@ -549,102 +664,68 @@ impl Store {
         })
     }
 
-    /// Update checkpoints in store if necessary
-    pub fn update_checkpoints(
+    /// Updates metrics and caches for checkpoints that were just committed. Cleanup failures
+    /// are logged: the checkpoints are already stored, and the next finalization retries it.
+    pub(crate) fn publish_checkpoint_writes(
         &mut self,
-        justified_checkpoint: Checkpoint,
+        writes: &CheckpointWrites,
+        previous_justified: Checkpoint,
+    ) {
+        if let Some(checkpoint) = writes.justified {
+            BEACON_CURRENT_JUSTIFIED_EPOCH.set(checkpoint.epoch as i64);
+        }
+        BEACON_PREVIOUS_JUSTIFIED_EPOCH.set(previous_justified.epoch as i64);
+        if let Some(checkpoint) = writes.finalized {
+            BEACON_FINALIZED_EPOCH.set(checkpoint.epoch as i64);
+            if let Err(err) = self.apply_finalization_side_effects(checkpoint) {
+                warn!("Failed to apply finalized checkpoint cleanup: {err:?}");
+            }
+        }
+    }
+
+    /// Apply cleanup derived from an already committed finalized checkpoint.
+    pub(crate) fn apply_finalization_side_effects(
+        &mut self,
         finalized_checkpoint: Checkpoint,
-        previous_justified_checkpoint: Checkpoint,
     ) -> anyhow::Result<()> {
-        // Update justified checkpoint
-        if justified_checkpoint.epoch > self.db.justified_checkpoint_provider().get()?.epoch {
-            self.db
-                .justified_checkpoint_provider()
-                .insert(justified_checkpoint)?;
-            BEACON_CURRENT_JUSTIFIED_EPOCH.set(justified_checkpoint.epoch as i64);
+        if let Some(state) = self
+            .db
+            .state_provider()
+            .get_shared(finalized_checkpoint.root)?
+        {
+            self.operation_pool.clean_signed_voluntary_exits(&state);
+            self.operation_pool
+                .clean_proposer_preparations(self.get_current_store_epoch()?);
+
+            if let Some(block) = self.db.block_provider().get(finalized_checkpoint.root)? {
+                for signed_bls_to_execution_change in block.message.body.bls_to_execution_changes {
+                    self.operation_pool.remove_signed_bls_to_execution_change(
+                        signed_bls_to_execution_change.tree_hash_root(),
+                    );
+                }
+            }
+        }
+
+        let current_slot = self.get_current_slot()?;
+        let min_retention_epochs = beacon_network_spec().min_epochs_for_blob_sidecars_requests;
+        match self.db.prune_old_blobs(current_slot, min_retention_epochs) {
+            Ok(pruned_count) if pruned_count > 0 => {
+                tracing::info!("Pruned {pruned_count} old blobs");
+            }
+            Ok(_) => {}
+            Err(err) => tracing::error!("Failed to prune old blobs: {err}"),
         }
 
         self.db
-            .previous_justified_checkpoint_provider()
-            .insert(previous_justified_checkpoint)?;
-        BEACON_PREVIOUS_JUSTIFIED_EPOCH.set(previous_justified_checkpoint.epoch as i64);
-
-        // Update finalized checkpoint
-        if finalized_checkpoint.epoch > self.db.finalized_checkpoint_provider().get()?.epoch {
-            self.db
-                .finalized_checkpoint_provider()
-                .insert(finalized_checkpoint)?;
-            BEACON_FINALIZED_EPOCH.set(finalized_checkpoint.epoch as i64);
-            // Clean operation pool
-            if let Some(state) = self.db.state_provider().get(finalized_checkpoint.root)? {
-                self.operation_pool.clean_signed_voluntary_exits(&state);
-
-                // Clean expired proposer preparations
-                let current_epoch = self.get_current_store_epoch()?;
-                self.operation_pool
-                    .clean_proposer_preparations(current_epoch);
-
-                if let Some(block) = self.db.block_provider().get(finalized_checkpoint.root)? {
-                    for signed_bls_to_execution_change in
-                        block.message.body.bls_to_execution_changes
-                    {
-                        self.operation_pool.remove_signed_bls_to_execution_change(
-                            signed_bls_to_execution_change.tree_hash_root(),
-                        );
-                    }
-                }
-            }
-
-            // Prune old blobs based on the retention period
-            let current_slot = self.get_current_slot()?;
-            let min_retention_epochs = beacon_network_spec().min_epochs_for_blob_sidecars_requests;
-            match self.db.prune_old_blobs(current_slot, min_retention_epochs) {
-                Ok(pruned_count) => {
-                    if pruned_count > 0 {
-                        tracing::info!("Pruned {} old blobs", pruned_count);
-                    }
-                }
-                Err(err) => {
-                    tracing::error!("Failed to prune old blobs: {}", err);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Update unrealized checkpoints in store if necessary
-    pub fn update_unrealized_checkpoints(
-        &mut self,
-        unrealized_justified_checkpoint: Checkpoint,
-        unrealized_finalized_checkpoint: Checkpoint,
-    ) -> anyhow::Result<()> {
-        // Update unrealized justified checkpoint
-        if unrealized_justified_checkpoint.epoch
-            > self
-                .db
-                .unrealized_justified_checkpoint_provider()
-                .get()?
-                .epoch
+            .state_provider()
+            .prune_finalized_in_background(finalized_checkpoint.root);
+        if let Err(err) = self
+            .db
+            .checkpoint_states_provider()
+            .prune_before(finalized_checkpoint.epoch)
         {
-            self.db
-                .unrealized_justified_checkpoint_provider()
-                .insert(unrealized_justified_checkpoint)?;
+            warn!("Failed to prune finalized checkpoint states: {err:?}");
         }
-
-        // Update unrealized finalized checkpoint
-        if unrealized_finalized_checkpoint.epoch
-            > self
-                .db
-                .unrealized_finalized_checkpoint_provider()
-                .get()?
-                .epoch
-        {
-            self.db
-                .unrealized_finalized_checkpoint_provider()
-                .insert(unrealized_finalized_checkpoint)?;
-        }
-
         Ok(())
     }
 
@@ -669,13 +750,16 @@ impl Store {
     }
 
     pub fn is_proposing_on_time(&self) -> anyhow::Result<bool> {
-        // Use half `SECONDS_PER_SLOT // INTERVALS_PER_SLOT` as the proposer reorg deadline
-        let time_into_slot = (self.db.time_provider().get()?
-            - self.db.genesis_time_provider().get()?)
-            % beacon_network_spec().seconds_per_slot();
-        let proposer_reorg_cutoff =
-            beacon_network_spec().seconds_per_slot() / INTERVALS_PER_SLOT / 2;
-        Ok(time_into_slot <= proposer_reorg_cutoff)
+        let seconds_since_genesis = self
+            .db
+            .time_provider()
+            .get()?
+            .saturating_sub(self.db.genesis_time_provider().get()?);
+        let time_into_slot_ms =
+            seconds_to_milliseconds(seconds_since_genesis) % beacon_network_spec().slot_duration_ms;
+        let proposer_reorg_cutoff_ms =
+            get_slot_component_duration_ms(beacon_network_spec().proposer_reorg_cutoff_bps);
+        Ok(time_into_slot_ms <= proposer_reorg_cutoff_ms)
     }
 
     pub fn is_finalization_ok(&self, slot: u64) -> anyhow::Result<bool> {
@@ -688,7 +772,7 @@ impl Store {
         let justified_checkpoint_state = self
             .db
             .checkpoint_states_provider()
-            .get(self.db.justified_checkpoint_provider().get()?)?
+            .get_shared(self.db.justified_checkpoint_provider().get()?)?
             .ok_or(anyhow!("Failed to find checkpoint in checkpoint states"))?;
         let committee_weight =
             get_total_active_balance(&justified_checkpoint_state) / SLOTS_PER_EPOCH;
@@ -700,7 +784,7 @@ impl Store {
         let state = &self
             .db
             .checkpoint_states_provider()
-            .get(self.db.justified_checkpoint_provider().get()?)?
+            .get_shared(self.db.justified_checkpoint_provider().get()?)?
             .ok_or_else(|| anyhow!("checkpoint_states not found"))?;
 
         let unslashed_and_active_indices: Vec<u64> = state
@@ -784,7 +868,7 @@ impl Store {
             let head_state = self
                 .db
                 .state_provider()
-                .get(block_root)?
+                .get_shared(block_root)?
                 .ok_or_else(|| anyhow!("state not found"))?;
             Ok(head_state.current_justified_checkpoint)
         }
@@ -805,7 +889,7 @@ impl Store {
         let justified_state = self
             .db
             .checkpoint_states_provider()
-            .get(self.db.justified_checkpoint_provider().get()?)?
+            .get_shared(self.db.justified_checkpoint_provider().get()?)?
             .ok_or(anyhow!("Justified checkpoint must exist in the store"))?;
 
         let reorg_threshold =
@@ -819,7 +903,7 @@ impl Store {
         let justified_state = self
             .db
             .checkpoint_states_provider()
-            .get(self.db.justified_checkpoint_provider().get()?)?
+            .get_shared(self.db.justified_checkpoint_provider().get()?)?
             .ok_or(anyhow!("Justified checkpoint must exist in the store"))?;
 
         let parent_threshold =
@@ -891,36 +975,49 @@ impl Store {
         attesting_indices: Vec<u64>,
         attestation: Attestation,
     ) -> anyhow::Result<()> {
-        let target = attestation.data.target;
-        let beacon_block_root = attestation.data.beacon_block_root;
-        let mut non_equivocating_attesting_indices = vec![];
+        self.update_latest_messages_batch(vec![(attesting_indices, attestation)])
+    }
 
+    /// ``update_latest_messages`` for several attestations, in order, with one database read and
+    /// one write. A block carries attestations from tens of thousands of validators, and reading
+    /// and committing each attestation's messages separately cost more than the block's state
+    /// transition.
+    pub fn update_latest_messages_batch(
+        &mut self,
+        attestations: Vec<(Vec<u64>, Attestation)>,
+    ) -> anyhow::Result<()> {
         let equivocating = self
             .db
             .equivocating_indices_provider()
             .get()
             .unwrap_or_default();
-
-        for &index in &attesting_indices {
-            if !equivocating.contains(&index) {
-                non_equivocating_attesting_indices.push(index);
-            }
-        }
-
         let latest_messages = self.db.latest_messages_provider();
-        let mut updates = Vec::new();
-        for index in non_equivocating_attesting_indices {
-            if latest_messages
-                .get(index)?
-                .is_none_or(|message| target.epoch > message.epoch)
-            {
-                updates.push((
-                    index,
-                    LatestMessage {
-                        epoch: target.epoch,
-                        root: beacon_block_root,
-                    },
-                ));
+        let mut stored = latest_messages.get_many(
+            attestations
+                .iter()
+                .flat_map(|(indices, _)| indices.iter().copied())
+                .filter(|index| !equivocating.contains(index))
+                .collect::<HashSet<u64>>(),
+        )?;
+
+        let mut updates = HashMap::new();
+        for (attesting_indices, attestation) in attestations {
+            let target = attestation.data.target;
+            let message = LatestMessage {
+                epoch: target.epoch,
+                root: attestation.data.beacon_block_root,
+            };
+            for index in attesting_indices {
+                if equivocating.contains(&index) {
+                    continue;
+                }
+                if stored
+                    .get(&index)
+                    .is_none_or(|latest| target.epoch > latest.epoch)
+                {
+                    stored.insert(index, message.clone());
+                    updates.insert(index, message.clone());
+                }
             }
         }
         if !updates.is_empty() {
@@ -978,7 +1075,7 @@ impl Store {
         if current_slot > previous_slot && compute_slots_since_epoch_start(current_slot) == 0 {
             match self.get_head() {
                 Ok(head) => {
-                    if let Some(state) = self.db.state_provider().get(head)? {
+                    if let Some(state) = self.db.state_provider().get_shared(head)? {
                         let active_count = state
                             .get_active_validator_indices(state.get_current_epoch())
                             .len();
@@ -992,16 +1089,17 @@ impl Store {
                 }
             };
 
-            let unrealized_justified = self.db.unrealized_justified_checkpoint_provider().get()?;
-            let unrealized_finalized = self.db.unrealized_finalized_checkpoint_provider().get()?;
-
+            let mut checkpoints = StoreCheckpoints::read(&self.db)?;
             // On epoch boundary, previous_justified becomes what was previously current justified
-            let previous_justified = self.db.justified_checkpoint_provider().get()?;
-            self.update_checkpoints(
-                unrealized_justified,
-                unrealized_finalized,
+            let previous_justified = checkpoints.justified;
+            checkpoints.realize(
+                checkpoints.unrealized_justified,
+                checkpoints.unrealized_finalized,
                 previous_justified,
-            )?;
+            );
+            let writes = checkpoints.writes();
+            self.db.commit_checkpoints(&writes)?;
+            self.publish_checkpoint_writes(&writes, previous_justified);
         }
 
         self.refresh_fork_choice();
@@ -1084,65 +1182,6 @@ impl Store {
         Ok(())
     }
 
-    pub fn store_target_checkpoint_state(&mut self, target: Checkpoint) -> anyhow::Result<()> {
-        if self.db.checkpoint_states_provider().get(target)?.is_some() {
-            return Ok(());
-        }
-
-        let Some(mut base_state) = self.db.state_provider().get(target.root)? else {
-            return Ok(());
-        };
-
-        let target_slot = compute_start_slot_at_epoch(target.epoch);
-        if base_state.slot < target_slot {
-            base_state.process_slots(target_slot)?;
-        }
-        self.db
-            .checkpoint_states_provider()
-            .insert(target, base_state)?;
-
-        Ok(())
-    }
-
-    /// Pulls up the checkpoints of ``state``, the post-state of the block at ``block_root``.
-    pub fn compute_pulled_up_tip(
-        &mut self,
-        block_root: B256,
-        state: &BeaconState,
-    ) -> anyhow::Result<()> {
-        // Pull up the post-state of the block to the next epoch boundary
-        let pulled_up = state.compute_justification_and_finalization()?;
-
-        // Reading the count from the shuffling also computes it for the epoch's first block, which
-        // its attestations need next.
-        BEACON_CURRENT_ACTIVE_VALIDATORS.set(
-            state
-                .get_shuffled_active_validator_indices(state.get_current_epoch())
-                .len() as i64,
-        );
-
-        self.db
-            .unrealized_justifications_provider()
-            .insert(block_root, pulled_up.current_justified_checkpoint)?;
-        self.update_unrealized_checkpoints(
-            pulled_up.current_justified_checkpoint,
-            pulled_up.finalized_checkpoint,
-        )?;
-
-        // If the block is from a prior epoch, apply the realized values
-        let block_epoch = compute_epoch_at_slot(state.slot);
-        let current_epoch = self.get_current_store_epoch()?;
-        if block_epoch < current_epoch {
-            self.update_checkpoints(
-                pulled_up.current_justified_checkpoint,
-                pulled_up.finalized_checkpoint,
-                pulled_up.previous_justified_checkpoint,
-            )?;
-        }
-
-        Ok(())
-    }
-
     pub fn is_syncing_for_validator_api(&self) -> anyhow::Result<bool> {
         let head = self.get_head()?;
 
@@ -1183,9 +1222,10 @@ pub fn get_forkchoice_store(
         root: anchor_root,
     };
 
-    db.time_provider().insert(
-        anchor_state.genesis_time + beacon_network_spec().seconds_per_slot() * anchor_state.slot,
-    )?;
+    db.time_provider().insert(get_time_at_slot(
+        anchor_state.genesis_time,
+        anchor_state.slot,
+    ))?;
     db.genesis_time_provider()
         .insert(anchor_state.genesis_time)?;
     db.justified_checkpoint_provider()
@@ -1226,11 +1266,10 @@ pub fn get_forkchoice_store(
 }
 
 pub fn get_slots_since_genesis_from_db(db: &BeaconDB) -> anyhow::Result<u64> {
-    Ok(db
-        .time_provider()
-        .get()?
-        .saturating_sub(db.genesis_time_provider().get()?)
-        / beacon_network_spec().seconds_per_slot())
+    Ok(get_slots_since_genesis_at(
+        db.time_provider().get()?,
+        db.genesis_time_provider().get()?,
+    ))
 }
 
 pub fn get_current_slot_from_db(db: &BeaconDB) -> anyhow::Result<u64> {
@@ -1328,6 +1367,52 @@ mod tests {
             .init_beacon_db()
             .unwrap();
         (db, temp_dir)
+    }
+
+    #[test]
+    fn slot_start_time_maps_back_to_its_slot() {
+        let genesis_time = 1_000;
+        for slot_duration_ms in [12_000, 12_500, 6_000, 4_000, 1_001, 2_750] {
+            for slot in 0..10_000 {
+                let time = time_at_slot(genesis_time, slot, slot_duration_ms);
+                assert_eq!(
+                    slots_since_genesis(time, genesis_time, slot_duration_ms),
+                    slot,
+                    "slot_duration_ms={slot_duration_ms} slot={slot}"
+                );
+                if slot > 0 {
+                    // The time is the earliest whole second in the slot.
+                    assert_eq!(
+                        slots_since_genesis(time - 1, genesis_time, slot_duration_ms),
+                        slot - 1,
+                        "slot_duration_ms={slot_duration_ms} slot={slot}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fractional_slot_tick_catch_up_advances_every_slot() {
+        // The loop in `on_tick`: with 12.5 s slots, flooring slot 1's start to genesis + 12 s
+        // left the store at slot 0 forever.
+        let genesis_time = 1_000;
+        let slot_duration_ms = 12_500;
+        let tick_time = genesis_time + 1_000;
+        let tick_slot = slots_since_genesis(tick_time, genesis_time, slot_duration_ms);
+        let mut store_time = genesis_time;
+        let mut iterations = 0;
+        while slots_since_genesis(store_time, genesis_time, slot_duration_ms) < tick_slot {
+            let current_slot = slots_since_genesis(store_time, genesis_time, slot_duration_ms);
+            store_time = time_at_slot(genesis_time, current_slot + 1, slot_duration_ms);
+            iterations += 1;
+            assert!(iterations <= tick_slot, "catch-up did not advance");
+        }
+        assert_eq!(iterations, tick_slot);
+        assert_eq!(
+            time_at_slot(genesis_time, 1, slot_duration_ms),
+            genesis_time + 13
+        );
     }
 
     #[test]

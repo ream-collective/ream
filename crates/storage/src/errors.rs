@@ -14,6 +14,12 @@ pub enum StoreError {
     #[error("DecodeError not found {0}")]
     DecodeError(String),
 
+    #[error("Failed to rebuild beacon state: {0}")]
+    StateRebuild(String),
+
+    #[error("Corrupt beacon state: {0}")]
+    StateCorruption(String),
+
     #[error("SnappyError not found {0}")]
     SnappyError(#[from] snap::Error),
 }

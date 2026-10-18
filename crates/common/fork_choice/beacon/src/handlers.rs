@@ -1,3 +1,8 @@
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    sync::Arc,
+};
+
 use alloy_primitives::{B256, map::HashSet};
 use anyhow::{anyhow, ensure};
 use ream_consensus_beacon::{
@@ -7,13 +12,19 @@ use ream_consensus_beacon::{
     predicates::is_slashable_attestation_data,
 };
 use ream_consensus_misc::{
-    constants::beacon::INTERVALS_PER_SLOT, misc::compute_start_slot_at_epoch,
+    checkpoint::Checkpoint,
+    constants::beacon::MIN_SEED_LOOKAHEAD,
+    misc::{compute_epoch_at_slot, compute_start_slot_at_epoch},
 };
 use ream_data_availability::PendingBlock;
 use ream_execution_engine::engine_trait::ExecutionApi;
-use ream_metrics::{BEACON_BLOCK_STATE_TRANSITION_SECONDS, BEACON_PROCESSED_DEPOSITS_TOTAL};
+use ream_metrics::{
+    BEACON_BLOCK_STATE_TRANSITION_SECONDS, BEACON_CURRENT_ACTIVE_VALIDATORS,
+    BEACON_PROCESSED_DEPOSITS_TOTAL,
+};
 use ream_network_spec::networks::beacon_network_spec;
 use ream_storage::{
+    db::beacon::{BlockImportData, ForkChoiceRecord},
     errors::StoreError,
     tables::{
         field::{CustomField, REDBField},
@@ -22,7 +33,10 @@ use ream_storage::{
 };
 use tree_hash::TreeHash;
 
-use crate::store::Store;
+use crate::store::{
+    Store, StoreCheckpoints, get_slot_component_duration_ms, get_slots_since_genesis_at,
+    get_time_at_slot, seconds_to_milliseconds,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnBlockOutcome {
@@ -37,14 +51,34 @@ pub async fn on_block(
     execution_engine: &Option<impl ExecutionApi>,
     verify_data_availability: bool,
 ) -> anyhow::Result<OnBlockOutcome> {
+    let block_root = signed_block.message.tree_hash_root();
+    on_block_with_root(
+        store,
+        signed_block,
+        block_root,
+        execution_engine,
+        verify_data_availability,
+    )
+    .await
+}
+
+/// ``on_block`` for a block whose root the caller already computed. Hashing a mainnet block
+/// hashes its whole execution payload, a few milliseconds each time.
+pub async fn on_block_with_root(
+    store: &mut Store,
+    signed_block: &SignedBeaconBlock,
+    block_root: B256,
+    execution_engine: &Option<impl ExecutionApi>,
+    verify_data_availability: bool,
+) -> anyhow::Result<OnBlockOutcome> {
     let block = &signed_block.message;
     let parent_root = block.parent_root;
     let block_slot = block.slot;
-    let block_root = block.tree_hash_root();
+    let started = std::time::Instant::now();
 
     // Parent block must be known
     ensure!(
-        store.db.state_provider().get(parent_root)?.is_some(),
+        store.db.state_provider().contains_key(parent_root)?,
         "Missing parent block state for parent_root: {parent_root:x}",
     );
 
@@ -73,12 +107,13 @@ pub async fn on_block(
     ensure!(store.db.finalized_checkpoint_provider().get()?.root == finalized_checkpoint_block);
     // Check the block is valid and compute the post-state
     // Make a copy of the state to avoid mutability issues
-    let mut state = store
-        .db
-        .state_provider()
-        .get(parent_root)?
-        .ok_or_else(|| anyhow!("beacon state not found"))?
-        .clone();
+    let mut state = Arc::unwrap_or_clone(
+        store
+            .db
+            .state_provider()
+            .get_shared(parent_root)?
+            .ok_or_else(|| anyhow!("beacon state not found"))?,
+    );
     // The parent state is the parent block's post-state, and the parent block commits to its root,
     // which was checked when the parent was imported.
     let parent_state_root = store
@@ -88,9 +123,10 @@ pub async fn on_block(
         .ok_or_else(|| anyhow!("parent block not found"))?
         .message
         .state_root;
+    let state_loaded = started.elapsed();
     let state_transition_timer = BEACON_BLOCK_STATE_TRANSITION_SECONDS.start_timer();
-    state
-        .state_transition_from_root(
+    let epoch_start_state = state
+        .state_transition_keeping_epoch_start(
             signed_block,
             true,
             execution_engine,
@@ -98,6 +134,23 @@ pub async fn on_block(
         )
         .await?;
     state_transition_timer.observe_duration();
+    let transitioned = started.elapsed();
+    tracing::debug!(
+        target: "ream::timing",
+        slot = block_slot,
+        checks_and_state_load_ms = state_loaded.as_millis() as u64,
+        state_transition_ms = (transitioned - state_loaded).as_millis() as u64,
+        "timing: on_block"
+    );
+    if let Some(epoch_start_state) = epoch_start_state {
+        store.db.checkpoint_states_provider().insert_shared(
+            Checkpoint {
+                epoch: compute_epoch_at_slot(block_slot),
+                root: parent_root,
+            },
+            Arc::new(epoch_start_state),
+        );
+    }
 
     let pending = PendingBlock {
         signed_block: signed_block.clone(),
@@ -106,7 +159,7 @@ pub async fn on_block(
 
     // If no data availability check is required, process the block immediately.
     if !verify_data_availability {
-        process_available_block(store, pending)?;
+        process_available_block(store, pending, block_root)?;
         return Ok(OnBlockOutcome::Imported);
     }
 
@@ -126,62 +179,91 @@ pub async fn on_block(
 
     match available {
         Some(available) => {
-            process_available_block(store, available)?;
+            process_available_block(store, available, block_root)?;
             Ok(OnBlockOutcome::Imported)
         }
         None => Ok(OnBlockOutcome::PendingAvailability),
     }
 }
 
-pub fn process_available_block(store: &mut Store, pending: PendingBlock) -> anyhow::Result<()> {
+/// Imports `pending`, the block at `block_root`, once its data is available.
+pub fn process_available_block(
+    store: &mut Store,
+    pending: PendingBlock,
+    block_root: B256,
+) -> anyhow::Result<()> {
     let signed_block = pending.signed_block;
-    let block_root = signed_block.message.tree_hash_root();
     let block_slot = signed_block.message.slot;
     let parent_root = signed_block.message.parent_root;
-    let state: BeaconState = pending.post_state;
+    let state = Arc::new(pending.post_state);
 
-    BEACON_PROCESSED_DEPOSITS_TOTAL.set(state.eth1_deposit_index as i64);
-
-    // Add new block to the store
-    store.db.block_provider().insert(block_root, signed_block)?;
-
-    // Add new state for this block to the store
-    store
+    // Complete every fallible read and consensus calculation before publishing the import.
+    let seconds_since_genesis = store
         .db
-        .state_provider()
-        .insert(block_root, state.clone())?;
-    // The state cache keeps a clone that shares this state's caches, so its children reuse the
-    // shuffling computed here.
-    state.prepare_next_epoch_shuffling();
-
-    // Add block timeliness to the store
-    let time_into_slot = (store.db.time_provider().get()?
-        - store.db.genesis_time_provider().get()?)
-        % beacon_network_spec().seconds_per_slot();
-    let is_before_attesting_interval =
-        time_into_slot < beacon_network_spec().seconds_per_slot() / INTERVALS_PER_SLOT;
+        .time_provider()
+        .get()?
+        .saturating_sub(store.db.genesis_time_provider().get()?);
+    let time_into_slot_ms =
+        seconds_to_milliseconds(seconds_since_genesis) % beacon_network_spec().slot_duration_ms;
+    let attestation_threshold_ms =
+        get_slot_component_duration_ms(beacon_network_spec().attestation_due_bps);
+    let is_before_attesting_interval = time_into_slot_ms < attestation_threshold_ms;
     let is_timely = store.get_current_slot()? == block_slot && is_before_attesting_interval;
-    store
-        .db
-        .block_timeliness_provider()
-        .insert(block_root, is_timely)?;
+    let proposer_boost_root =
+        get_proposer_boost_root(store, block_root, block_slot, parent_root, is_timely)?;
+    let pulled_up = state.compute_justification_and_finalization()?;
+    let current_epoch = store.get_current_store_epoch()?;
 
-    // Add proposer score boost if the block is timely and not conflicting with an existing block
-    let is_first_block = store.db.proposer_boost_root_provider().get()? == B256::ZERO;
-
-    if is_timely && is_first_block {
-        store.db.proposer_boost_root_provider().insert(block_root)?;
-    }
-
-    // Update checkpoints in store if necessary
-    store.update_checkpoints(
+    let mut checkpoints = StoreCheckpoints::read(&store.db)?;
+    checkpoints.realize(
         state.current_justified_checkpoint,
         state.finalized_checkpoint,
         state.previous_justified_checkpoint,
-    )?;
+    );
+    checkpoints.pull_up(
+        pulled_up.current_justified_checkpoint,
+        pulled_up.finalized_checkpoint,
+    );
+    // A block from a prior epoch has its pulled-up checkpoints realized immediately.
+    if compute_epoch_at_slot(state.slot) < current_epoch {
+        checkpoints.realize(
+            pulled_up.current_justified_checkpoint,
+            pulled_up.finalized_checkpoint,
+            pulled_up.previous_justified_checkpoint,
+        );
+    }
+    let writes = checkpoints.writes();
 
-    // Eagerly compute unrealized justification and finality.
-    store.compute_pulled_up_tip(block_root, &state)?;
+    let commit_started = std::time::Instant::now();
+    store.db.commit_block_import(BlockImportData {
+        block_root,
+        block: signed_block,
+        state: state.clone(),
+        record: ForkChoiceRecord {
+            is_timely,
+            proposer_boost_root,
+            unrealized_justification: pulled_up.current_justified_checkpoint,
+            checkpoints: writes,
+        },
+    })?;
+    tracing::debug!(
+        target: "ream::timing",
+        slot = block_slot,
+        commit_ms = commit_started.elapsed().as_millis() as u64,
+        "timing: block commit"
+    );
+
+    BEACON_PROCESSED_DEPOSITS_TOTAL.set(state.eth1_deposit_index as i64);
+    BEACON_CURRENT_ACTIVE_VALIDATORS.set(
+        state
+            .get_shuffled_active_validator_indices(state.get_current_epoch())
+            .len() as i64,
+    );
+    // `realize` always sets the previous justified checkpoint.
+    if let Some(previous_justified) = checkpoints.previous_justified {
+        store.publish_checkpoint_writes(&writes, previous_justified);
+    }
+    state.prepare_next_epoch_shuffling();
 
     // Fork choice tree maintenance is the last step, once the store mutation is committed.
     store.fork_choice_insert_block(
@@ -193,6 +275,136 @@ pub fn process_available_block(store: &mut Store, pending: PendingBlock) -> anyh
     store.refresh_fork_choice();
 
     Ok(())
+}
+
+fn get_dependent_root(store: &Store, root: B256) -> anyhow::Result<B256> {
+    let epoch = store.get_current_store_epoch()?;
+    if epoch <= MIN_SEED_LOOKAHEAD {
+        return Ok(B256::ZERO);
+    }
+
+    let dependent_slot = compute_start_slot_at_epoch(epoch - MIN_SEED_LOOKAHEAD) - 1;
+    store.get_ancestor(root, dependent_slot)
+}
+
+/// Computes the candidate block's dependent root before the block is committed. This is
+/// equivalent to inserting the block and calling `get_dependent_root`: if the block is newer than
+/// the dependent slot, the lookup immediately continues from its already-stored parent.
+fn get_candidate_dependent_root(
+    store: &Store,
+    block_root: B256,
+    block_slot: u64,
+    parent_root: B256,
+) -> anyhow::Result<B256> {
+    let epoch = store.get_current_store_epoch()?;
+    if epoch <= MIN_SEED_LOOKAHEAD {
+        return Ok(B256::ZERO);
+    }
+
+    let dependent_slot = compute_start_slot_at_epoch(epoch - MIN_SEED_LOOKAHEAD) - 1;
+    if block_slot > dependent_slot {
+        store.get_ancestor(parent_root, dependent_slot)
+    } else {
+        Ok(block_root)
+    }
+}
+
+/// The spec's `update_proposer_boost_root` for a block that is not committed yet.
+///
+/// Only the first timely block of a slot can be boosted, so every other block returns before the
+/// head and ancestor lookups, as in Lighthouse. The spec computes the head on every import but
+/// uses it only here. Without the fork choice tree that head is a full fork choice run over the
+/// database.
+fn get_proposer_boost_root(
+    store: &Store,
+    block_root: B256,
+    block_slot: u64,
+    parent_root: B256,
+    is_timely: bool,
+) -> anyhow::Result<Option<B256>> {
+    let is_first_block = store.db.proposer_boost_root_provider().get()? == B256::ZERO;
+    if !is_timely || !is_first_block {
+        return Ok(None);
+    }
+
+    // The spec computes the head after the state transition and data-availability check, but
+    // before publishing this block to fork choice.
+    let head_root = store.get_head()?;
+    let is_same_dependent_root =
+        is_same_dependent_root(store, head_root, block_root, block_slot, parent_root)?;
+    Ok(is_same_dependent_root.then_some(block_root))
+}
+
+fn is_same_dependent_root(
+    store: &Store,
+    head_root: B256,
+    block_root: B256,
+    block_slot: u64,
+    parent_root: B256,
+) -> anyhow::Result<bool> {
+    Ok(
+        get_candidate_dependent_root(store, block_root, block_slot, parent_root)?
+            == get_dependent_root(store, head_root)?,
+    )
+}
+
+/// Runs ``on_attestation`` with ``is_from_block`` for the attestations of a block whose
+/// ``state_transition`` succeeded, returning one result per attestation.
+///
+/// ``state_transition`` already verified each attestation's signature against the same committees
+/// the target state yields, so the signature is not verified again here. Each target checkpoint
+/// state is read once per block: decoding it costs as much as the rest of the work for one
+/// attestation.
+pub fn on_block_attestations(
+    store: &mut Store,
+    block_root: B256,
+    attestations: &[Attestation],
+) -> Vec<anyhow::Result<()>> {
+    let mut target_states: HashMap<Checkpoint, Arc<BeaconState>> = HashMap::new();
+    let mut votes = Vec::new();
+    let mut results = Vec::with_capacity(attestations.len());
+    for attestation in attestations {
+        let attesting_indices = (|| {
+            store.validate_on_attestation(attestation, true)?;
+            let target = attestation.data.target;
+            let target_state = match target_states.entry(target) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => entry.insert(
+                    store
+                        .db
+                        .checkpoint_states_provider()
+                        .get_shared(target)?
+                        .ok_or_else(|| anyhow!("checkpoint_states not found"))?,
+                ),
+            };
+            let indexed_attestation = target_state.get_indexed_attestation(attestation)?;
+            // The spec verifies the signature against the target state. state_transition already
+            // verified it with the committees of the block's own chain, which are the target
+            // state's committees when the target is that chain's checkpoint. A target on another
+            // fork can have a different shuffling, so the same bits name other validators.
+            let target_on_block_chain = store
+                .get_ancestor(block_root, compute_start_slot_at_epoch(target.epoch))?
+                == target.root;
+            if !target_on_block_chain {
+                ensure!(
+                    target_state.is_valid_indexed_attestation(&indexed_attestation)?,
+                    "Attestation signature must be valid for the target state"
+                );
+            }
+            anyhow::Ok(indexed_attestation.attesting_indices)
+        })();
+        results.push(attesting_indices.map(|indices| {
+            votes.push((indices.to_vec(), attestation.clone()));
+        }));
+    }
+
+    // One write covers every valid attestation, so its failure fails each of them.
+    if let Err(err) = store.update_latest_messages_batch(votes) {
+        for result in results.iter_mut().filter(|result| result.is_ok()) {
+            *result = Err(anyhow!("failed to update latest messages: {err:#}"));
+        }
+    }
+    results
 }
 
 /// Run ``on_attester_slashing`` immediately upon receiving a new ``AttesterSlashing``
@@ -209,10 +421,10 @@ pub fn on_attester_slashing(
         &attestation_2.data
     ));
 
-    let state = &store
+    let state = store
         .db
         .state_provider()
-        .get(store.db.justified_checkpoint_provider().get()?.root)?
+        .get_shared(store.db.justified_checkpoint_provider().get()?.root)?
         .ok_or_else(|| anyhow!("beacon state not found"))?;
 
     ensure!(state.is_valid_indexed_attestation(&attestation_1)?);
@@ -263,10 +475,9 @@ pub fn on_tick(store: &mut Store, time: u64) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let tick_slot = (time - genesis_time) / beacon_network_spec().seconds_per_slot();
+    let tick_slot = get_slots_since_genesis_at(time, genesis_time);
     while store.get_current_slot()? < tick_slot {
-        let previous_time = store.db.genesis_time_provider().get()?
-            + (store.get_current_slot()? + 1) * beacon_network_spec().seconds_per_slot();
+        let previous_time = get_time_at_slot(genesis_time, store.get_current_slot()? + 1);
         store.on_tick_per_slot(previous_time)?;
     }
     store.on_tick_per_slot(time)?;
@@ -286,13 +497,12 @@ pub fn on_attestation(
 ) -> anyhow::Result<()> {
     store.validate_on_attestation(&attestation, is_from_block)?;
 
-    store.store_target_checkpoint_state(attestation.data.target)?;
-
-    // Get state at the `target` to fully validate attestation
-    let target_state = &store
+    // Get state at the `target` to fully validate attestation. The checkpoint states table
+    // computes it when missing; sharing it avoids copying a state per attestation.
+    let target_state = store
         .db
         .checkpoint_states_provider()
-        .get(attestation.data.target)?
+        .get_shared(attestation.data.target)?
         .ok_or_else(|| anyhow!("checkpoint_states not found"))?;
     let indexed_attestation = target_state.get_indexed_attestation(&attestation)?;
     ensure!(target_state.is_valid_indexed_attestation(&indexed_attestation)?);
@@ -300,4 +510,172 @@ pub fn on_attestation(
     store.update_latest_messages(indexed_attestation.attesting_indices.to_vec(), attestation)?;
 
     Ok(())
+}
+
+/// ``on_attestation`` for a gossip attestation whose single attester's signature gossip validation
+/// already verified, so it is not verified again here. That check only covers
+/// ``verified_attester``, so the target state's committee must name exactly that validator: under
+/// a different shuffling the attestation's bit would belong to someone else.
+pub fn on_gossip_attestation(
+    store: &mut Store,
+    attestation: Attestation,
+    verified_attester: u64,
+) -> anyhow::Result<()> {
+    store.validate_on_attestation(&attestation, false)?;
+
+    let target_state = store
+        .db
+        .checkpoint_states_provider()
+        .get_shared(attestation.data.target)?
+        .ok_or_else(|| anyhow!("checkpoint_states not found"))?;
+    let indexed_attestation = target_state.get_indexed_attestation(&attestation)?;
+    ensure_only_attester(&indexed_attestation.attesting_indices, verified_attester)?;
+    store.update_latest_messages(vec![verified_attester], attestation)?;
+
+    Ok(())
+}
+
+fn ensure_only_attester(attesting_indices: &[u64], verified_attester: u64) -> anyhow::Result<()> {
+    ensure!(
+        attesting_indices == [verified_attester],
+        "target committee names {attesting_indices:?}, not the verified attester {verified_attester}"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use alloy_primitives::B256;
+    use ream_consensus_beacon::electra::beacon_block::{BeaconBlock, SignedBeaconBlock};
+    use ream_network_spec::networks::initialize_test_network_spec;
+    use ream_operation_pool::OperationPool;
+    use ream_storage::{
+        db::ReamDB,
+        tables::{field::REDBField, table::REDBTable},
+    };
+    use tempdir::TempDir;
+
+    use super::{
+        Store, ensure_only_attester, get_proposer_boost_root, get_time_at_slot,
+        is_same_dependent_root,
+    };
+
+    #[test]
+    fn a_gossip_vote_counts_only_for_the_verified_attester() {
+        assert!(ensure_only_attester(&[7], 7).is_ok());
+        assert!(ensure_only_attester(&[8], 7).is_err());
+        assert!(ensure_only_attester(&[7, 8], 7).is_err());
+        assert!(ensure_only_attester(&[], 7).is_err());
+    }
+
+    fn block(slot: u64, parent_root: B256) -> SignedBeaconBlock {
+        SignedBeaconBlock {
+            message: BeaconBlock {
+                slot,
+                parent_root,
+                ..Default::default()
+            },
+            signature: Default::default(),
+        }
+    }
+
+    #[test]
+    fn proposer_boost_is_withheld_for_a_different_dependent_root() {
+        initialize_test_network_spec();
+        let temp_dir = TempDir::new("ream_proposer_boost_dependent_root").unwrap();
+        let db = ReamDB::new(temp_dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap();
+        let genesis_time = 1_000;
+        let current_slot = 2 * ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH;
+        db.genesis_time_provider().insert(genesis_time).unwrap();
+        db.time_provider()
+            .insert(get_time_at_slot(genesis_time, current_slot))
+            .unwrap();
+        db.proposer_boost_root_provider()
+            .insert(B256::ZERO)
+            .unwrap();
+
+        let head_dependent_root = B256::repeat_byte(0x11);
+        let head_root = B256::repeat_byte(0x12);
+        let candidate_dependent_root = B256::repeat_byte(0x21);
+        let candidate_parent_root = B256::repeat_byte(0x22);
+        let candidate_root = B256::repeat_byte(0x23);
+        let dependent_slot = ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH - 1;
+
+        for (root, signed_block) in [
+            (head_dependent_root, block(dependent_slot, B256::ZERO)),
+            (head_root, block(current_slot - 1, head_dependent_root)),
+            (candidate_dependent_root, block(dependent_slot, B256::ZERO)),
+            (
+                candidate_parent_root,
+                block(current_slot - 1, candidate_dependent_root),
+            ),
+        ] {
+            db.block_provider().insert(root, signed_block).unwrap();
+        }
+
+        let store = Store::new(db, Arc::new(OperationPool::default()), None);
+        assert!(
+            !is_same_dependent_root(
+                &store,
+                head_root,
+                candidate_root,
+                current_slot,
+                candidate_parent_root,
+            )
+            .unwrap()
+        );
+        assert!(
+            is_same_dependent_root(&store, head_root, candidate_root, current_slot, head_root)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn proposer_boost_skips_head_lookup_unless_first_timely_block() {
+        initialize_test_network_spec();
+        let temp_dir = TempDir::new("ream_proposer_boost_gate").unwrap();
+        let db = ReamDB::new(temp_dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap();
+        let genesis_time = 1_000;
+        let current_slot = 2 * ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH;
+        db.genesis_time_provider().insert(genesis_time).unwrap();
+        db.time_provider()
+            .insert(get_time_at_slot(genesis_time, current_slot))
+            .unwrap();
+        db.proposer_boost_root_provider()
+            .insert(B256::ZERO)
+            .unwrap();
+        // No checkpoints or blocks are stored, so a head or ancestor lookup would fail.
+        let store = Store::new(db, Arc::new(OperationPool::default()), None);
+        let candidate_root = B256::repeat_byte(0x23);
+        let parent_root = B256::repeat_byte(0x22);
+
+        assert_eq!(
+            get_proposer_boost_root(&store, candidate_root, current_slot, parent_root, false)
+                .unwrap(),
+            None
+        );
+        assert!(
+            get_proposer_boost_root(&store, candidate_root, current_slot, parent_root, true)
+                .is_err()
+        );
+
+        store
+            .db
+            .proposer_boost_root_provider()
+            .insert(B256::repeat_byte(0x99))
+            .unwrap();
+        assert_eq!(
+            get_proposer_boost_root(&store, candidate_root, current_slot, parent_root, true)
+                .unwrap(),
+            None
+        );
+    }
 }
