@@ -23,9 +23,9 @@ use ream_execution_rpc_types::forkchoice_update::ForkchoiceStateV1;
 use ream_fork_choice_beacon::{
     data_availability::PendingBlock,
     handlers::{
-        OnBlockOutcome, on_attestation, on_attester_slashing, on_block_attestations,
-        on_block_with_root, on_gossip_attestation_with_shuffling, on_tick, process_available_block,
-        shares_target_shuffling,
+        OnBlockOutcome, is_on_chain_of, on_attestation, on_attester_slashing,
+        on_block_attestations, on_block_with_root, on_gossip_attestation_with_shuffling, on_tick,
+        process_available_block, shares_target_shuffling,
     },
     store::Store,
 };
@@ -213,6 +213,16 @@ impl BeaconChain {
         let mut store = self.store.lock().await;
         lock_wait_timer.observe_duration();
         let locked = started.elapsed();
+        // Fork choice reads committees of block attestations whose target is on another fork from
+        // that target's checkpoint state. Build any that are missing outside the lock.
+        let off_chain_targets = self.missing_off_chain_attestation_targets(&store, &signed_block);
+        if !off_chain_targets.is_empty() {
+            drop(store);
+            for target in off_chain_targets {
+                self.prepare_checkpoint_state(target).await;
+            }
+            store = self.store.lock().await;
+        }
 
         // A block can reach this point after it was imported. Range sync stores a block's
         // columns before processing the block, and those columns can complete the same block
@@ -716,6 +726,36 @@ impl BeaconChain {
         drop(store);
         self.update_execution_forkchoice(false).await;
         Ok(())
+    }
+
+    /// Targets of `signed_block`'s attestations that are not on the block's own chain and whose
+    /// checkpoint state is not in memory. Targets on the block's chain need no checkpoint state:
+    /// their committees are read from the block's post-state.
+    fn missing_off_chain_attestation_targets(
+        &self,
+        store: &Store,
+        signed_block: &SignedBeaconBlock,
+    ) -> Vec<Checkpoint> {
+        let checkpoint_states = self.db.checkpoint_states_provider();
+        if !checkpoint_states.keeps_states() {
+            return Vec::new();
+        }
+        let mut targets = signed_block
+            .message
+            .body
+            .attestations
+            .iter()
+            .map(|attestation| attestation.data.target)
+            .collect::<Vec<_>>();
+        targets.sort();
+        targets.dedup();
+        // The block is not stored yet; its parent's ancestry is its own below the block's slot.
+        let parent_root = signed_block.message.parent_root;
+        targets.retain(|target| {
+            !checkpoint_states.is_in_memory(*target)
+                && !is_on_chain_of(store, parent_root, *target).unwrap_or(false)
+        });
+        targets
     }
 
     /// Builds an attestation's target checkpoint state before the store lock is taken.
