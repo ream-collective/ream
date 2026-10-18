@@ -11,7 +11,8 @@ use ream_consensus_beacon::{
     matrix_entry::reconstruct_data_column_sidecars,
 };
 use ream_consensus_misc::{
-    checkpoint::Checkpoint, constants::beacon::genesis_validators_root, misc::compute_epoch_at_slot,
+    beacon_block_header::SignedBeaconBlockHeader, checkpoint::Checkpoint,
+    constants::beacon::genesis_validators_root, misc::compute_epoch_at_slot,
 };
 use ream_events_beacon::{BeaconEvent, BeaconEventSender, event::chain::BlockEvent};
 use ream_execution_engine::ExecutionEngine;
@@ -499,6 +500,21 @@ impl BeaconChain {
         checker.reconstructable_block_roots()
     }
 
+    /// Pending blocks that can be reconstructed while no reconstruction is announced or running
+    /// for them, reserved for the caller to reconstruct. A reconstruction that gave up after its
+    /// retries has released its reservation, so it is picked up here again.
+    pub async fn reserve_unannounced_reconstructions(&self) -> Vec<B256> {
+        let store = self.store.lock().await;
+        let roots = store
+            .data_availability_checker
+            .reconstructable_block_roots();
+        let mut reservations = self.reconstructions.lock();
+        roots
+            .into_iter()
+            .filter(|block_root| reservations.insert(*block_root))
+            .collect()
+    }
+
     /// Rebuilds the missing columns of a pending block and imports them before the block.
     /// Returns the rebuilt columns it stored, which the caller must cross-seed (das-core
     /// "Reconstruction and cross-seeding").
@@ -566,15 +582,7 @@ impl BeaconChain {
 
         let recovered_count = recovered.len();
         self.import_data_column_sidecars_if(recovered.clone(), move |store| {
-            let pending = store
-                .data_availability_checker
-                .pending_block(&block_root)
-                .ok_or_else(|| anyhow!("block {block_root} is no longer pending"))?;
-            anyhow::ensure!(
-                pending.signed_block.signed_header() == header,
-                "block {block_root} changed while its columns were rebuilt"
-            );
-            Ok(())
+            rebuilt_columns_releasable(store, block_root, &header)
         })
         .await?;
         debug!(%block_root, recovered = recovered_count, "Reconstructed data columns");
@@ -772,6 +780,31 @@ pub fn is_data_availability_check_required(
     block_epoch >= boundary_epoch
 }
 
+/// Whether columns rebuilt for `block_root` from blocks with `header` may still be stored. The
+/// block is normally still pending. Gossip or range sync can also deliver its remaining columns
+/// during the rebuild and import it; its rebuilt columns are then stored and cross-seeded all the
+/// same, since das-core requires exposing every reconstructed column.
+fn rebuilt_columns_releasable(
+    store: &Store,
+    block_root: B256,
+    header: &SignedBeaconBlockHeader,
+) -> anyhow::Result<()> {
+    let stored_header = match store.data_availability_checker.pending_block(&block_root) {
+        Some(pending) => pending.signed_block.signed_header(),
+        None => store
+            .db
+            .block_provider()
+            .get(block_root)?
+            .ok_or_else(|| anyhow!("block {block_root} is neither pending nor imported"))?
+            .signed_header(),
+    };
+    anyhow::ensure!(
+        &stored_header == header,
+        "block {block_root} changed while its columns were rebuilt"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -916,6 +949,43 @@ mod tests {
         );
         chain.notify_reconstruction_ready(block_root);
         assert!(events.try_recv().is_err(), "announced once until it runs");
+    }
+
+    #[tokio::test]
+    async fn a_reconstruction_that_gave_up_is_reserved_again() {
+        let mut state = test_beacon_state();
+        let (_data_dir, chain, parent_root) = test_chain_with_anchor(state.clone());
+        state.slot += 1;
+        let (block, columns) =
+            block_with_blob_columns(state.slot, parent_root, state.tree_hash_root());
+        let root = block.message.tree_hash_root();
+        chain
+            .store
+            .lock()
+            .await
+            .data_availability_checker
+            .insert_pending(root, block, state);
+        // An announcement nobody receives is not reserved.
+        let _events = chain.subscribe_block_imports();
+        chain
+            .import_data_column_sidecars_if(
+                columns[..(NUMBER_OF_COLUMNS / 2) as usize].to_vec(),
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+
+        // The announcement holds the reservation, so nothing new is reserved.
+        assert!(chain.reconstructions.lock().contains(&root));
+        assert!(chain.reserve_unannounced_reconstructions().await.is_empty());
+
+        // A reconstruction that gave up releases it; the block is reserved once again.
+        chain.reconstructions.lock().remove(&root);
+        assert_eq!(
+            chain.reserve_unannounced_reconstructions().await,
+            vec![root]
+        );
+        assert!(chain.reserve_unannounced_reconstructions().await.is_empty());
     }
 
     #[tokio::test]
@@ -1100,6 +1170,27 @@ mod tests {
             .decompress_vec(&std::fs::read(path).unwrap())
             .unwrap();
         <BeaconState as ssz::Decode>::from_ssz_bytes(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn rebuilt_columns_of_a_block_imported_during_the_rebuild_are_kept() {
+        let (_data_dir, chain) = test_chain();
+        let block = empty_block();
+        let root = block.message.tree_hash_root();
+        let header = block.signed_header();
+        let mut other_block = empty_block();
+        other_block.message.slot = 1;
+
+        let store = chain.store.lock().await;
+        assert!(rebuilt_columns_releasable(&store, root, &header).is_err());
+
+        store
+            .db
+            .block_provider()
+            .insert(root, block.clone())
+            .unwrap();
+        assert!(rebuilt_columns_releasable(&store, root, &header).is_ok());
+        assert!(rebuilt_columns_releasable(&store, root, &other_block.signed_header()).is_err());
     }
 
     #[tokio::test]

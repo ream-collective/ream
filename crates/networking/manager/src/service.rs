@@ -841,6 +841,11 @@ impl NetworkManagerService {
                                 &network_state,
                                 &column_fetch_done_sender,
                             );
+                            // A reconstruction that gave up after its retries is announced again
+                            // only when another column arrives, which may never happen.
+                            for block_root in beacon_chain.reserve_unannounced_reconstructions().await {
+                                spawn_column_reconstruction(&beacon_chain, &cached_db, &p2p_sender, block_root);
+                            }
                         }
                         (Err(err), _, _) => error!("Failed to read current slot: {err}"),
                         (_, Err(err), _) => error!("Failed to read finalized checkpoint: {err}"),
