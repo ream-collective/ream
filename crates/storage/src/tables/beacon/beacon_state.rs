@@ -873,6 +873,7 @@ mod tests {
             .with_cache(cache.clone());
         let state = sepolia_state();
         let root = B256::repeat_byte(1);
+        insert_block_for_state(&db, root, &state);
         db.state_provider()
             .insert_shared(root, state.clone())
             .unwrap();
