@@ -242,11 +242,25 @@ fn spawn_queued_column_fetches(
 
 /// Rebuilds a block's missing columns on its own task: reading the stored columns and recovering
 /// the rest takes too long for the event loop.
+/// Attempts per announced reconstruction. The block stays pending until its columns are rebuilt,
+/// and no further column may arrive to announce it again, so a transient failure is retried.
+const COLUMN_RECONSTRUCTION_ATTEMPTS: u32 = 3;
+const COLUMN_RECONSTRUCTION_RETRY_DELAY: Duration = Duration::from_secs(1);
+
 fn spawn_column_reconstruction(beacon_chain: &Arc<BeaconChain>, block_root: B256) {
     let beacon_chain = beacon_chain.clone();
     tokio::spawn(async move {
-        if let Err(err) = beacon_chain.reconstruct_data_columns(block_root).await {
-            error!(%block_root, "Column reconstruction failed: {err:#}");
+        for attempt in 1..=COLUMN_RECONSTRUCTION_ATTEMPTS {
+            // A block that left the pending set, or no longer needs columns, returns Ok.
+            let Err(err) = beacon_chain.reconstruct_data_columns(block_root).await else {
+                return;
+            };
+            if attempt == COLUMN_RECONSTRUCTION_ATTEMPTS {
+                error!(%block_root, attempt, "Column reconstruction failed: {err:#}");
+                return;
+            }
+            warn!(%block_root, attempt, "Column reconstruction failed, retrying: {err:#}");
+            sleep(COLUMN_RECONSTRUCTION_RETRY_DELAY).await;
         }
     });
 }
