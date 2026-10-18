@@ -6,9 +6,6 @@ use std::{
 };
 
 use libp2p::PeerId;
-use ream_consensus_beacon::custody_group::{
-    compute_columns_for_custody_group, get_custody_group_indices,
-};
 use ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH;
 use ream_p2p::network::beacon::{network_state::NetworkState, peer::CachedPeer};
 use ream_req_resp::beacon::messages::status::Status;
@@ -65,7 +62,6 @@ pub struct PeerInfo {
     pub peer_status: PeerStatus,
     pub processed_blocks: u64,
     pub sync_requests_started: u64,
-    custody_columns: Option<HashSet<u64>>,
 }
 
 pub struct PeerManager {
@@ -76,17 +72,6 @@ pub struct PeerManager {
 }
 
 impl PeerManager {
-    fn custody_columns(peer: &CachedPeer) -> Option<HashSet<u64>> {
-        let enr = peer.enr.as_ref()?;
-        let metadata = peer.meta_data.as_ref()?;
-        let groups = get_custody_group_indices(enr.node_id(), metadata.custody_group_count).ok()?;
-        let mut columns = HashSet::new();
-        for group in groups {
-            columns.extend(compute_columns_for_custody_group(group).ok()?);
-        }
-        Some(columns)
-    }
-
     fn peer_preference(peer_a: (&PeerId, &PeerInfo), peer_b: (&PeerId, &PeerInfo)) -> Ordering {
         let (id_a, info_a) = peer_a;
         let (id_b, info_b) = peer_b;
@@ -123,11 +108,9 @@ impl PeerManager {
                 continue;
             }
 
-            let custody_columns = Self::custody_columns(peer);
             match self.peers.entry(peer.peer_id) {
                 Entry::Occupied(mut entry) => {
                     entry.get_mut().peer = peer.clone();
-                    entry.get_mut().custody_columns = custody_columns;
                 }
                 Entry::Vacant(entry) => {
                     entry.insert(PeerInfo {
@@ -135,7 +118,6 @@ impl PeerManager {
                         peer_status: PeerStatus::Idle,
                         processed_blocks: 0,
                         sync_requests_started: 0,
-                        custody_columns,
                     });
                 }
             }
@@ -198,6 +180,9 @@ impl PeerManager {
         self.reserve(&peer_id)
     }
 
+    /// Picks the idle peer expected to serve the most `(column, slot)` pairs. A peer is expected
+    /// to serve a column only if its advertised custody covers it, so peers whose custody is
+    /// unknown or invalid are never selected.
     pub fn fetch_idle_peer_for_columns_from_excluding(
         &mut self,
         eligible: &[PeerId],
@@ -220,12 +205,8 @@ impl PeerManager {
             .filter(|(_, info)| matches!(info.peer_status, PeerStatus::Idle))
             .filter(|(_, info)| coverage(info) > 0)
             .max_by(|peer_a, peer_b| {
-                peer_a
-                    .1
-                    .custody_columns
-                    .is_some()
-                    .cmp(&peer_b.1.custody_columns.is_some())
-                    .then_with(|| coverage(peer_a.1).cmp(&coverage(peer_b.1)))
+                coverage(peer_a.1)
+                    .cmp(&coverage(peer_b.1))
                     .then_with(|| Self::peer_preference(*peer_a, *peer_b))
             })
             .map(|(peer_id, _)| *peer_id)?;
@@ -233,9 +214,7 @@ impl PeerManager {
     }
 
     fn info_custodies_column(info: &PeerInfo, column: u64) -> bool {
-        info.custody_columns
-            .as_ref()
-            .is_none_or(|columns| columns.contains(&column))
+        info.peer.custody().custodies_column(column)
     }
 
     fn info_can_serve_slot(info: &PeerInfo, slot: u64) -> bool {
@@ -248,7 +227,7 @@ impl PeerManager {
     pub fn peer_custodies_column(&self, peer_id: &PeerId, column: u64) -> bool {
         self.peers
             .get(peer_id)
-            .is_none_or(|info| Self::info_custodies_column(info, column))
+            .is_some_and(|info| Self::info_custodies_column(info, column))
     }
 
     pub fn peer_can_serve_slot(&self, peer_id: &PeerId, slot: u64) -> bool {
@@ -435,6 +414,7 @@ mod tests {
     use std::path::PathBuf;
 
     use discv5::{Enr, enr::CombinedKey};
+    use libp2p_identity::Keypair;
     use parking_lot::RwLock;
     use ream_peer::{ConnectionState, Direction};
     use ream_req_resp::beacon::messages::{meta_data::GetMetaDataV3, status::Status};
@@ -464,6 +444,26 @@ mod tests {
         peer
     }
 
+    /// A connected peer with a secp256k1 identity that advertised `custody_group_count` in its
+    /// MetaData.
+    fn custody_peer(status: Status, custody_group_count: u64) -> CachedPeer {
+        let peer_id = Keypair::generate_secp256k1().public().to_peer_id();
+        let mut peer = CachedPeer::new(
+            peer_id,
+            None,
+            ConnectionState::Connected,
+            Direction::Inbound,
+            None,
+        );
+        peer.status = Some(status);
+        peer.update_meta_data(GetMetaDataV3 {
+            seq_number: 1,
+            custody_group_count,
+            ..Default::default()
+        });
+        peer
+    }
+
     fn insert_idle(peer_manager: &mut PeerManager, peer: CachedPeer) {
         peer_manager.peers.insert(
             peer.peer_id,
@@ -472,7 +472,6 @@ mod tests {
                 peer_status: PeerStatus::Idle,
                 processed_blocks: 0,
                 sync_requests_started: 0,
-                custody_columns: None,
             },
         );
     }
@@ -660,71 +659,156 @@ mod tests {
     #[test]
     fn data_column_selection_uses_the_peers_advertised_custody() {
         let mut peer_manager = PeerManager::new(test_network_state());
-        let wrong_peer = test_peer(Status::default());
-        let right_peer = test_peer(Status::default());
+        let wrong_peer = custody_peer(Status::default(), 4);
+        let right_peer = custody_peer(Status::default(), 4);
         let wrong_id = wrong_peer.peer_id;
         let right_id = right_peer.peer_id;
+        let column = (0..128)
+            .find(|column| {
+                right_peer.custody().custodies_column(*column)
+                    && !wrong_peer.custody().custodies_column(*column)
+            })
+            .expect("two random 4-group custodies differ");
         insert_idle(&mut peer_manager, wrong_peer);
         insert_idle(&mut peer_manager, right_peer);
-        peer_manager
-            .peers
-            .get_mut(&wrong_id)
-            .unwrap()
-            .custody_columns = Some(HashSet::from([1, 2]));
-        peer_manager
-            .peers
-            .get_mut(&right_id)
-            .unwrap()
-            .custody_columns = Some(HashSet::from([7, 8]));
 
         let selected = peer_manager
             .fetch_idle_peer_for_columns_from_excluding(
                 &[wrong_id, right_id],
-                &[(7, 0)],
+                &[(column, 0)],
                 &HashSet::new(),
             )
-            .expect("the peer responsible for column 7 should be selected");
+            .expect("the peer responsible for the column should be selected");
 
         assert_eq!(selected.peer_id, right_id);
+        assert!(peer_manager.peer_custodies_column(&right_id, column));
+        assert!(!peer_manager.peer_custodies_column(&wrong_id, column));
     }
 
     #[test]
-    fn data_column_selection_prefers_known_custody_over_unknown_metadata() {
+    fn data_column_selection_never_assumes_custody_without_a_valid_advertisement() {
         let mut peer_manager = PeerManager::new(test_network_state());
-        let unknown_peer = test_peer(Status::default());
-        let known_peer = test_peer(Status::default());
-        let unknown_id = unknown_peer.peer_id;
-        let known_id = known_peer.peer_id;
-        insert_idle(&mut peer_manager, unknown_peer);
-        insert_idle(&mut peer_manager, known_peer);
-        peer_manager
-            .peers
-            .get_mut(&known_id)
-            .unwrap()
-            .custody_columns = Some(HashSet::from([7]));
+        let unadvertised = test_peer(Status::default());
+        let invalid = custody_peer(Status::default(), 129);
+        let unadvertised_id = unadvertised.peer_id;
+        let invalid_id = invalid.peer_id;
+        insert_idle(&mut peer_manager, unadvertised);
+        insert_idle(&mut peer_manager, invalid);
 
+        let every_column = (0..128).map(|column| (column, 0)).collect::<Vec<_>>();
+        assert!(
+            peer_manager
+                .fetch_idle_peer_for_columns_from_excluding(
+                    &[unadvertised_id, invalid_id],
+                    &every_column,
+                    &HashSet::new(),
+                )
+                .is_none()
+        );
+        for peer_id in [unadvertised_id, invalid_id, PeerId::random()] {
+            assert!((0..128).all(|column| !peer_manager.peer_custodies_column(&peer_id, column)));
+        }
+    }
+
+    #[test]
+    fn data_column_selection_prefers_the_peer_covering_more_requested_columns() {
+        let mut peer_manager = PeerManager::new(test_network_state());
+        let partial = custody_peer(Status::default(), 4);
+        let full = custody_peer(Status::default(), 128);
+        let partial_id = partial.peer_id;
+        let full_id = full.peer_id;
+        let partial_columns = partial
+            .custody()
+            .groups()
+            .expect("advertised")
+            .custody_columns
+            .clone();
+        let extra_column = (0..128)
+            .find(|column| !partial_columns.contains(column))
+            .expect("partial custody leaves columns out");
+        insert_idle(&mut peer_manager, partial);
+        insert_idle(&mut peer_manager, full);
+
+        let mut requested = partial_columns
+            .iter()
+            .map(|column| (*column, 0))
+            .collect::<Vec<_>>();
+        requested.push((extra_column, 0));
         let selected = peer_manager
             .fetch_idle_peer_for_columns_from_excluding(
-                &[unknown_id, known_id],
-                &[(7, 100), (8, 100)],
+                &[partial_id, full_id],
+                &requested,
                 &HashSet::new(),
             )
-            .expect("the peer with known coverage should win over unknown metadata");
+            .expect("an eligible peer exists");
+        assert_eq!(selected.peer_id, full_id);
 
-        assert_eq!(selected.peer_id, known_id);
+        // With the full-custody peer busy, the overlapping partial peer still serves its share.
+        let selected = peer_manager
+            .fetch_idle_peer_for_columns_from_excluding(
+                &[partial_id, full_id],
+                &requested,
+                &HashSet::new(),
+            )
+            .expect("the partial peer covers some requested columns");
+        assert_eq!(selected.peer_id, partial_id);
+    }
+
+    #[test]
+    fn data_column_selection_tracks_meta_data_updates_and_disconnects() {
+        let network_state = test_network_state();
+        let peer = custody_peer(Status::default(), 4);
+        let peer_id = peer.peer_id;
+        let column = (0..128)
+            .find(|column| !peer.custody().custodies_column(*column))
+            .expect("4 groups leave columns out");
+        network_state.peer_table.write().insert(peer_id, peer);
+        let mut peer_manager = PeerManager::new(network_state.clone());
+        peer_manager.update_peer_set();
+        assert!(!peer_manager.peer_custodies_column(&peer_id, column));
+
+        assert!(network_state.update_peer_meta_data(
+            peer_id,
+            GetMetaDataV3 {
+                seq_number: 2,
+                custody_group_count: 128,
+                ..Default::default()
+            },
+        ));
+        peer_manager.update_peer_set();
+        assert!(peer_manager.peer_custodies_column(&peer_id, column));
+
+        network_state.peer_disconnected(peer_id);
+        peer_manager.update_peer_set();
+        assert!(!peer_manager.peer_custodies_column(&peer_id, column));
+        assert!(
+            peer_manager
+                .fetch_idle_peer_for_columns_from_excluding(
+                    &[peer_id],
+                    &[(column, 0)],
+                    &HashSet::new(),
+                )
+                .is_none()
+        );
     }
 
     #[test]
     fn data_column_selection_respects_earliest_available_slot() {
         let mut peer_manager = PeerManager::new(test_network_state());
-        let unavailable = test_peer(Status {
-            earliest_available_slot: 101,
-            ..Default::default()
-        });
-        let available = test_peer(Status {
-            earliest_available_slot: 90,
-            ..Default::default()
-        });
+        let unavailable = custody_peer(
+            Status {
+                earliest_available_slot: 101,
+                ..Default::default()
+            },
+            128,
+        );
+        let available = custody_peer(
+            Status {
+                earliest_available_slot: 90,
+                ..Default::default()
+            },
+            128,
+        );
         let unavailable_id = unavailable.peer_id;
         let available_id = available.peer_id;
         insert_idle(&mut peer_manager, unavailable);
@@ -740,7 +824,6 @@ mod tests {
 
         assert_eq!(selected.peer_id, available_id);
     }
-
     #[test]
     fn peers_satisfying_distinguishes_finalized_and_head_qualification() {
         let mut peer_manager = PeerManager::new(test_network_state());
@@ -795,7 +878,6 @@ mod tests {
                 peer_status: PeerStatus::Downloading,
                 processed_blocks: 0,
                 sync_requests_started: 0,
-                custody_columns: None,
             },
         );
 
