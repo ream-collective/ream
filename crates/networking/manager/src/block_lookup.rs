@@ -162,7 +162,8 @@ pub fn apply_block_import_event<BlockPayload, ColumnPayload>(
         BlockImportEvent::PendingAvailability { block_root } => {
             coordinator.mark_block_pending_availability(block_root);
         }
-        // The block is already imported; its rebuilt columns are only stored.
+        // The network manager service runs the reconstruction; the block stays pending until
+        // its rebuilt columns are imported.
         BlockImportEvent::ReconstructionReady { .. } => {}
     }
 }

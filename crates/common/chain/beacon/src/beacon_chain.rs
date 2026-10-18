@@ -25,8 +25,9 @@ use ream_fork_choice_beacon::{
     store::Store,
 };
 use ream_metrics::{
-    BEACON_BLOCK_PROCESSING_SECONDS, BEACON_EXECUTION_FORKCHOICE_UPDATE_SECONDS,
-    BEACON_STORE_LOCK_WAIT_SECONDS,
+    BEACON_BLOCK_PROCESSING_SECONDS, BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_RUN_TOTAL,
+    BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_SKIPPED_COMPLETE_TOTAL,
+    BEACON_EXECUTION_FORKCHOICE_UPDATE_SECONDS, BEACON_STORE_LOCK_WAIT_SECONDS,
 };
 use ream_network_spec::networks::beacon_network_spec;
 use ream_operation_pool::OperationPool;
@@ -499,21 +500,29 @@ impl BeaconChain {
     }
 
     /// Rebuilds the missing columns of a pending block and imports them before the block.
-    pub async fn reconstruct_data_columns(&self, block_root: B256) -> anyhow::Result<()> {
+    /// Returns the rebuilt columns it stored, which the caller must cross-seed (das-core
+    /// "Reconstruction and cross-seeding").
+    pub async fn reconstruct_data_columns(
+        &self,
+        block_root: B256,
+    ) -> anyhow::Result<Vec<DataColumnSidecar>> {
         let result = self.reconstruct_data_columns_inner(block_root).await;
         self.reconstructions.lock().remove(&block_root);
         result
     }
 
-    async fn reconstruct_data_columns_inner(&self, block_root: B256) -> anyhow::Result<()> {
+    async fn reconstruct_data_columns_inner(
+        &self,
+        block_root: B256,
+    ) -> anyhow::Result<Vec<DataColumnSidecar>> {
         let (header, required_columns) = {
             let store = self.store.lock().await;
             let checker = &store.data_availability_checker;
             if !checker.can_reconstruct(&block_root) {
-                return Ok(());
+                return Ok(Vec::new());
             }
             let Some(pending) = checker.pending_block(&block_root) else {
-                return Ok(());
+                return Ok(Vec::new());
             };
             (
                 pending.signed_block.signed_header(),
@@ -537,11 +546,14 @@ impl BeaconChain {
                 .iter()
                 .map(|sidecar| sidecar.index)
                 .collect::<HashSet<_>>();
-            if available.len() < (NUMBER_OF_COLUMNS / 2) as usize
-                || required_columns.is_subset(&stored)
-            {
+            if available.len() < (NUMBER_OF_COLUMNS / 2) as usize {
                 return Ok(Vec::new());
             }
+            if required_columns.is_subset(&stored) {
+                BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_SKIPPED_COMPLETE_TOTAL.inc();
+                return Ok(Vec::new());
+            }
+            BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_RUN_TOTAL.inc();
             let available = available.iter().collect::<Vec<_>>();
             Ok(reconstruct_data_column_sidecars(&available)?
                 .into_iter()
@@ -553,7 +565,7 @@ impl BeaconChain {
         .await??;
 
         let recovered_count = recovered.len();
-        self.import_data_column_sidecars_if(recovered, move |store| {
+        self.import_data_column_sidecars_if(recovered.clone(), move |store| {
             let pending = store
                 .data_availability_checker
                 .pending_block(&block_root)
@@ -566,7 +578,7 @@ impl BeaconChain {
         })
         .await?;
         debug!(%block_root, recovered = recovered_count, "Reconstructed data columns");
-        Ok(())
+        Ok(recovered)
     }
 
     fn process_block_attestations(

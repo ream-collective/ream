@@ -42,7 +42,7 @@ use tokio::{
     sync::mpsc,
     time::{interval, sleep},
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tree_hash::TreeHash;
 
 use crate::{
@@ -56,6 +56,7 @@ use crate::{
         ColumnFetchOutcome, ColumnFetchTracker, fetch_missing_columns, pending_anchor_for_recovery,
     },
     gossipsub::{
+        cross_seed::publish_reconstructed_columns,
         handle::{handle_gossipsub_message, init_gossipsub_config_with_topics},
         workers::{
             GossipWorkerBudget, GossipWorkers, PENDING_ITEM_QUEUE_CAPACITY, is_data_column,
@@ -240,27 +241,63 @@ fn spawn_queued_column_fetches(
     }
 }
 
-/// Rebuilds a block's missing columns on its own task: reading the stored columns and recovering
-/// the rest takes too long for the event loop.
 /// Attempts per announced reconstruction. The block stays pending until its columns are rebuilt,
 /// and no further column may arrive to announce it again, so a transient failure is retried.
 const COLUMN_RECONSTRUCTION_ATTEMPTS: u32 = 3;
 const COLUMN_RECONSTRUCTION_RETRY_DELAY: Duration = Duration::from_secs(1);
 
-fn spawn_column_reconstruction(beacon_chain: &Arc<BeaconChain>, block_root: B256) {
+/// Wait before rebuilding, so columns a few milliseconds away arrive by gossip instead (das-core
+/// allows a delay). The block's import waits for the rebuild, so the delay is kept as short as
+/// Lighthouse v8.2.0's `QUEUED_RECONSTRUCTION_DELAY`.
+const COLUMN_RECONSTRUCTION_DELAY: Duration = Duration::from_millis(150);
+
+/// Rebuilds a block's missing columns on its own task, since reading the stored columns and
+/// recovering the rest takes too long for the event loop, then cross-seeds the rebuilt ones.
+fn spawn_column_reconstruction(
+    beacon_chain: &Arc<BeaconChain>,
+    cached_db: &Arc<BeaconCacheDB>,
+    p2p_sender: &P2PSender,
+    block_root: B256,
+) {
     let beacon_chain = beacon_chain.clone();
+    let cached_db = cached_db.clone();
+    let p2p_sender = p2p_sender.clone();
     tokio::spawn(async move {
+        sleep(COLUMN_RECONSTRUCTION_DELAY).await;
         for attempt in 1..=COLUMN_RECONSTRUCTION_ATTEMPTS {
-            // A block that left the pending set, or no longer needs columns, returns Ok.
-            let Err(err) = beacon_chain.reconstruct_data_columns(block_root).await else {
-                return;
-            };
-            if attempt == COLUMN_RECONSTRUCTION_ATTEMPTS {
-                error!(%block_root, attempt, "Column reconstruction failed: {err:#}");
-                return;
+            // A block that left the pending set, or no longer needs columns, returns no columns.
+            match beacon_chain.reconstruct_data_columns(block_root).await {
+                Ok(rebuilt) => {
+                    if rebuilt.is_empty() {
+                        return;
+                    }
+                    let finalized_slot =
+                        match beacon_chain.db().finalized_checkpoint_provider().get() {
+                            Ok(checkpoint) => compute_start_slot_at_epoch(checkpoint.epoch),
+                            Err(err) => {
+                                error!(%block_root, "Cannot cross-seed rebuilt columns: {err}");
+                                return;
+                            }
+                        };
+                    let published = publish_reconstructed_columns(
+                        rebuilt,
+                        finalized_slot,
+                        &cached_db,
+                        &p2p_sender,
+                    )
+                    .await;
+                    debug!(%block_root, published, "Cross-seeded reconstructed data columns");
+                    return;
+                }
+                Err(err) if attempt == COLUMN_RECONSTRUCTION_ATTEMPTS => {
+                    error!(%block_root, attempt, "Column reconstruction failed: {err:#}");
+                    return;
+                }
+                Err(err) => {
+                    warn!(%block_root, attempt, "Column reconstruction failed, retrying: {err:#}");
+                    sleep(COLUMN_RECONSTRUCTION_RETRY_DELAY).await;
+                }
             }
-            warn!(%block_root, attempt, "Column reconstruction failed, retrying: {err:#}");
-            sleep(COLUMN_RECONSTRUCTION_RETRY_DELAY).await;
         }
     });
 }
@@ -587,7 +624,7 @@ impl NetworkManagerService {
                                     );
                                 }
                                 ream_chain_beacon::beacon_chain::BlockImportEvent::ReconstructionReady { block_root } => {
-                                    spawn_column_reconstruction(&beacon_chain, block_root);
+                                    spawn_column_reconstruction(&beacon_chain, &cached_db, &p2p_sender, block_root);
                                 }
                             }
                             record_removed_lookup_entries(
@@ -636,7 +673,7 @@ impl NetworkManagerService {
                             // Skipped events may include a ReconstructionReady, which is sent
                             // once per block.
                             for block_root in beacon_chain.reconstructable_pending_blocks().await {
-                                spawn_column_reconstruction(&beacon_chain, block_root);
+                                spawn_column_reconstruction(&beacon_chain, &cached_db, &p2p_sender, block_root);
                             }
                             record_removed_lookup_entries(
                                 PENDING_AVAILABILITY_LOOKUP,
