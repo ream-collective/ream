@@ -20,8 +20,9 @@ use ream_execution_rpc_types::forkchoice_update::ForkchoiceStateV1;
 use ream_fork_choice_beacon::{
     data_availability::PendingBlock,
     handlers::{
-        OnBlockOutcome, on_attestation, on_attester_slashing, on_block_attestations,
-        on_block_with_root, on_gossip_attestation, on_tick, process_available_block,
+        OnBlockOutcome, determines_target_committees, on_attestation, on_attester_slashing,
+        on_block_attestations, on_block_with_root, on_gossip_attestation_with_committees, on_tick,
+        process_available_block,
     },
     store::Store,
 };
@@ -673,9 +674,33 @@ impl BeaconChain {
         attestation: Attestation,
         attester_index: u64,
     ) -> anyhow::Result<()> {
-        self.prepare_checkpoint_state(attestation.data.target).await;
+        let target = attestation.data.target;
+        let head = self.head().ok();
         let mut store = self.store.lock().await;
-        on_gossip_attestation(&mut store, attestation, attester_index)?;
+        // When the target checkpoint state is not in memory, read the committee from the head
+        // state if it has the same shuffling, as Prysm does; otherwise build the checkpoint state
+        // outside the lock.
+        let committee_state = head.filter(|head| {
+            !self.db.checkpoint_states_provider().is_in_memory(target)
+                && determines_target_committees(
+                    &store,
+                    head.state.get_current_epoch(),
+                    head.head_root,
+                    target,
+                )
+                .unwrap_or(false)
+        });
+        if committee_state.is_none() && !self.db.checkpoint_states_provider().is_in_memory(target) {
+            drop(store);
+            self.prepare_checkpoint_state(target).await;
+            store = self.store.lock().await;
+        }
+        on_gossip_attestation_with_committees(
+            &mut store,
+            attestation,
+            attester_index,
+            committee_state.as_ref().map(|head| head.state.as_ref()),
+        )?;
         self.publish_cached_head(&store);
         drop(store);
         self.update_execution_forkchoice(false).await;

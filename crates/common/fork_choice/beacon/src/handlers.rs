@@ -521,18 +521,62 @@ pub fn on_gossip_attestation(
     attestation: Attestation,
     verified_attester: u64,
 ) -> anyhow::Result<()> {
+    on_gossip_attestation_with_committees(store, attestation, verified_attester, None)
+}
+
+/// ``on_gossip_attestation`` that reads the target committee from `committee_state` when one is
+/// given, instead of the target checkpoint state. Pass a state only when
+/// ``determines_target_committees`` holds for it.
+pub fn on_gossip_attestation_with_committees(
+    store: &mut Store,
+    attestation: Attestation,
+    verified_attester: u64,
+    committee_state: Option<&BeaconState>,
+) -> anyhow::Result<()> {
     store.validate_on_attestation(&attestation, false)?;
 
-    let target_state = store
-        .db
-        .checkpoint_states_provider()
-        .get_shared(attestation.data.target)?
-        .ok_or_else(|| anyhow!("checkpoint_states not found"))?;
-    let indexed_attestation = target_state.get_indexed_attestation(&attestation)?;
+    let target_state;
+    let committee_state = match committee_state {
+        Some(state) => state,
+        None => {
+            target_state = store
+                .db
+                .checkpoint_states_provider()
+                .get_shared(attestation.data.target)?
+                .ok_or_else(|| anyhow!("checkpoint_states not found"))?;
+            &target_state
+        }
+    };
+    let indexed_attestation = committee_state.get_indexed_attestation(&attestation)?;
     ensure_only_attester(&indexed_attestation.attesting_indices, verified_attester)?;
     store.update_latest_messages(vec![verified_attester], attestation)?;
 
     Ok(())
+}
+
+/// Whether the post-state of block `state_block_root`, at `state_epoch`, computes the same
+/// committees for `target.epoch` as the target checkpoint state, so they can be read from it
+/// without building that checkpoint state.
+///
+/// Committees of epoch E depend on the RANDAO mix of epoch E - 2 and on the validators active in
+/// E, and activations and exits are scheduled at least five epochs ahead. Two chains that share
+/// the block at the last slot of epoch E - 2 therefore share E's committees. This is Lighthouse's
+/// shuffling decision root and Prysm's `getRecentPreState` check. The state must also hold that
+/// data, which it does for its previous, current and next epoch
+/// (`BeaconState::determines_committees_of`).
+pub fn determines_target_committees(
+    store: &Store,
+    state_epoch: u64,
+    state_block_root: B256,
+    target: Checkpoint,
+) -> anyhow::Result<bool> {
+    let held_by_state = target.epoch + 1 >= state_epoch && target.epoch <= state_epoch + 1;
+    if target.epoch <= MIN_SEED_LOOKAHEAD || !held_by_state {
+        return Ok(false);
+    }
+    let decision_slot = compute_start_slot_at_epoch(target.epoch - MIN_SEED_LOOKAHEAD) - 1;
+    Ok(store.get_ancestor(state_block_root, decision_slot)?
+        == store.get_ancestor(target.root, decision_slot)?)
 }
 
 fn ensure_only_attester(attesting_indices: &[u64], verified_attester: u64) -> anyhow::Result<()> {
@@ -549,6 +593,7 @@ mod tests {
 
     use alloy_primitives::B256;
     use ream_consensus_beacon::electra::beacon_block::{BeaconBlock, SignedBeaconBlock};
+    use ream_consensus_misc::checkpoint::Checkpoint;
     use ream_network_spec::networks::initialize_test_network_spec;
     use ream_operation_pool::OperationPool;
     use ream_storage::{
@@ -558,8 +603,8 @@ mod tests {
     use tempdir::TempDir;
 
     use super::{
-        Store, ensure_only_attester, get_proposer_boost_root, get_time_at_slot,
-        is_same_dependent_root,
+        Store, determines_target_committees, ensure_only_attester, get_proposer_boost_root,
+        get_time_at_slot, is_same_dependent_root,
     };
 
     #[test]
@@ -631,6 +676,54 @@ mod tests {
         );
         assert!(
             is_same_dependent_root(&store, head_root, candidate_root, current_slot, head_root)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn head_state_serves_committees_only_for_targets_sharing_its_shuffling() {
+        initialize_test_network_spec();
+        let temp_dir = TempDir::new("ream_target_committees").unwrap();
+        let db = ReamDB::new(temp_dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap();
+        let slots_per_epoch = ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH;
+        // Committees of epoch 2 are decided by the block at slot 31, the last slot of epoch 0.
+        let decision_slot = slots_per_epoch - 1;
+        let decision_root = B256::repeat_byte(0x11);
+        let head_root = B256::repeat_byte(0x12);
+        let fork_decision_root = B256::repeat_byte(0x21);
+        let fork_root = B256::repeat_byte(0x22);
+        for (root, signed_block) in [
+            (decision_root, block(decision_slot, B256::ZERO)),
+            (head_root, block(2 * slots_per_epoch, decision_root)),
+            (fork_decision_root, block(decision_slot, B256::ZERO)),
+            (fork_root, block(2 * slots_per_epoch, fork_decision_root)),
+        ] {
+            db.block_provider().insert(root, signed_block).unwrap();
+        }
+        let store = Store::new(db, Arc::new(OperationPool::default()), None);
+        let head_epoch = 2;
+        let target = |epoch, root| Checkpoint { epoch, root };
+
+        assert!(
+            determines_target_committees(&store, head_epoch, head_root, target(2, head_root))
+                .unwrap()
+        );
+        // A target on a fork with another block at the decision slot has other committees.
+        assert!(
+            !determines_target_committees(&store, head_epoch, head_root, target(2, fork_root))
+                .unwrap()
+        );
+        // The head state does not hold the data for epochs beyond its next one, and committees
+        // of the first epochs are not looked up this way.
+        assert!(
+            !determines_target_committees(&store, head_epoch, head_root, target(4, head_root))
+                .unwrap()
+        );
+        assert!(
+            !determines_target_committees(&store, head_epoch, head_root, target(1, head_root))
                 .unwrap()
         );
     }
