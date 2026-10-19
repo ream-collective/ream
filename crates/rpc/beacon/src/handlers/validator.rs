@@ -70,7 +70,6 @@ use ream_execution_rpc_types::{
     get_blobs::{Blob, BlobAndProofV1},
     get_payload::{BlobsBundle, Payload},
 };
-use ream_fork_choice_beacon::store::Store;
 use ream_network_manager::{
     gossipsub::validate::{
         aggregate_and_proof::validate_aggregate_and_proof, result::ValidationResult,
@@ -632,15 +631,14 @@ pub async fn post_beacon_committee_selections(
 #[get("/validator/sync_committee_contribution")]
 pub async fn get_sync_committee_contribution(
     db: Data<BeaconDB>,
-    operation_pool: Data<Arc<OperationPool>>,
+    beacon_chain: Data<Arc<BeaconChain>>,
     sync_committee_pool: Data<Arc<SyncCommitteePool>>,
     query: Query<SyncCommitteeContributionQuery>,
 ) -> Result<impl Responder, ApiError> {
-    let store = Store::new(db.get_ref().clone(), operation_pool.get_ref().clone(), None);
-
-    if store.is_syncing_for_validator_api().map_err(|err| {
-        ApiError::InternalError(format!("Failed to check syncing status, err: {err:?}"))
-    })? {
+    let head = beacon_chain
+        .head()
+        .map_err(|err| ApiError::InternalError(format!("Failed to get head: {err:?}")))?;
+    if validator_api_is_syncing(head.current_slot, head.head_slot) {
         return Err(ApiError::UnderSyncing);
     }
 
@@ -655,9 +653,7 @@ pub async fn get_sync_committee_contribution(
         )));
     }
 
-    let current_slot = store.get_current_slot().map_err(|err| {
-        ApiError::InternalError(format!("Failed to get current slot, err: {err:?}"))
-    })?;
+    let current_slot = head.current_slot;
 
     // Validate slot is not too far in the future
     if slot > current_slot + 1 {
