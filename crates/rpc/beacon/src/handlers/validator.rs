@@ -1,10 +1,13 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use actix_web::{
     HttpResponse, Responder, get, post,
     web::{Data, Json, Path, Query},
 };
-use alloy_primitives::{Address, B256, U256, aliases::B32};
+use alloy_primitives::{Address, B256, U256};
 use ream_api_types_beacon::{
     block::{FullBlockData, ProduceBlockData, ProduceBlockResponse},
     committee::{BeaconCommitteeSubscription, SyncCommitteeSubscription},
@@ -40,8 +43,9 @@ use ream_consensus_misc::{
     checkpoint::Checkpoint,
     constants::beacon::{
         DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
-        FULU_FORK_EPOCH, MAX_COMMITTEES_PER_SLOT, PROPOSER_REWARD_QUOTIENT, SLOTS_PER_EPOCH,
-        SYNC_COMMITTEE_PROPOSER_REWARD_QUOTIENT, WHISTLEBLOWER_REWARD_QUOTIENT,
+        MAX_COMMITTEES_PER_SLOT, PROPOSER_REWARD_QUOTIENT, SLOTS_PER_EPOCH,
+        SYNC_COMMITTEE_PROPOSER_REWARD_QUOTIENT, SYNC_COMMITTEE_SIZE,
+        WHISTLEBLOWER_REWARD_QUOTIENT, genesis_validators_root,
     },
     deposit::Deposit,
     fork_name::ForkName,
@@ -82,10 +86,7 @@ use ream_validator_beacon::{
         DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, SYNC_COMMITTEE_SUBNET_COUNT,
     },
     execution_requests::get_execution_requests,
-    sync_committee::{
-        SyncAggregatorSelectionData, compute_subnets_for_sync_committee,
-        is_sync_committee_aggregator,
-    },
+    sync_committee::{SyncAggregatorSelectionData, is_sync_committee_aggregator},
 };
 use serde::Serialize;
 use ssz_types::{
@@ -100,10 +101,6 @@ use super::{duties::head_chain_block_root, state::get_state_from_id};
 ///  For slots in Electra and later, this AttestationData must have a committee_index of 0.
 const ELECTRA_COMMITTEE_INDEX: u64 = 0;
 const MAX_VALIDATOR_COUNT: usize = 100;
-
-fn gossip_fork_digest(state: &BeaconState) -> B32 {
-    beacon_network_spec().fork_digest(FULU_FORK_EPOCH, state.genesis_validators_root)
-}
 
 fn build_validator_balances(
     validators: &[(Validator, u64)],
@@ -795,36 +792,20 @@ pub async fn post_aggregate_and_proofs_v2(
     })))
 }
 
-#[derive(Debug, Clone)]
-pub enum SubscriptionAction {
-    Subscribe { subnet_id: u64, fork: B32 },
-}
-
-impl SubscriptionAction {
-    fn subnet_id(&self) -> u64 {
-        match self {
-            SubscriptionAction::Subscribe { subnet_id, .. } => *subnet_id,
-        }
-    }
-
-    fn fork(&self) -> B32 {
-        match self {
-            SubscriptionAction::Subscribe { fork, .. } => *fork,
-        }
-    }
-}
-
 #[post("/validator/beacon_committee_subscriptions")]
 pub async fn post_beacon_committee_subscriptions(
-    db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<BeaconChain>>,
     subscriptions: Json<Vec<BeaconCommitteeSubscription>>,
     network: Data<Mutex<Network>>,
 ) -> Result<impl Responder, ApiError> {
-    let mut subnets: HashSet<(u64, B32)> = HashSet::new();
+    let head = beacon_chain
+        .head()
+        .map_err(|err| ApiError::InternalError(format!("Failed to get head: {err:?}")))?;
+    // Subnet to the last slot it is needed for. Only aggregators join a subnet: everyone else
+    // publishes to it without subscribing.
+    let mut subnets: HashMap<u64, u64> = HashMap::new();
 
     for sub in subscriptions.into_inner() {
-        let state = get_state_from_id(ID::Slot(sub.slot), &db).await?;
-
         if sub.committees_at_slot > MAX_COMMITTEES_PER_SLOT {
             return Err(ApiError::BadRequest(
                 "Committees at a slot should be less than the maximum committees per slot".into(),
@@ -837,144 +818,126 @@ pub async fn post_beacon_committee_subscriptions(
             ));
         }
 
-        let committee_members = state
-            .get_beacon_committee(sub.slot, sub.committee_index)
-            .map_err(|err| ApiError::InternalError(format!("Failed to get committee: {err}")))?;
-
-        if !committee_members.contains(&sub.validator_index) {
-            return Err(ApiError::BadRequest(
-                "Validator not part of the committee".into(),
-            ));
+        // The head state fixes committees up to the next epoch; later duties are not checked.
+        if head
+            .state
+            .determines_committees_of(compute_epoch_at_slot(sub.slot))
+        {
+            let committee_members = head
+                .state
+                .get_beacon_committee(sub.slot, sub.committee_index)
+                .map_err(|err| {
+                    ApiError::InternalError(format!("Failed to get committee: {err}"))
+                })?;
+            if !committee_members.contains(&sub.validator_index) {
+                return Err(ApiError::BadRequest(
+                    "Validator not part of the committee".into(),
+                ));
+            }
         }
 
+        if !sub.is_aggregator {
+            continue;
+        }
         let subnet_id =
             compute_subnet_for_attestation(sub.committees_at_slot, sub.slot, sub.committee_index);
-
-        let fork = gossip_fork_digest(&state);
-
-        subnets.insert((subnet_id, fork));
+        let until_slot = subnets.entry(subnet_id).or_insert(sub.slot);
+        *until_slot = (*until_slot).max(sub.slot);
     }
 
-    let actions: Vec<SubscriptionAction> = subnets
-        .into_iter()
-        .map(|(subnet_id, fork)| SubscriptionAction::Subscribe { subnet_id, fork })
-        .collect();
-
+    let fork = beacon_network_spec().fork_digest(
+        beacon_network_spec().current_epoch(),
+        genesis_validators_root(),
+    );
     let mut network = network.lock().await;
-
-    for action in actions {
+    for (subnet_id, until_slot) in subnets {
         let topic = GossipTopic {
-            fork: action.fork(),
-            kind: GossipTopicKind::BeaconAttestation(action.subnet_id()),
+            fork,
+            kind: GossipTopicKind::BeaconAttestation(subnet_id),
         };
-
-        if !network.subscribe_to_topic(topic) {
+        if !network.subscribe_for_duty(topic, until_slot) {
             return Err(ApiError::InternalError(
                 "Failed to subscribe to attestation subnet".to_string(),
             ));
         }
     }
 
-    Ok(HttpResponse::Ok().json(serde_json::json!({
-        "data": "success"
-    })))
+    Ok(HttpResponse::Ok().finish())
 }
 
 #[post("/validator/sync_committee_subscriptions")]
 pub async fn post_sync_committee_subscriptions(
-    db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<BeaconChain>>,
     subscriptions: Json<Vec<SyncCommitteeSubscription>>,
     network: Data<Mutex<Network>>,
 ) -> Result<impl Responder, ApiError> {
     let subscriptions = subscriptions.into_inner();
-
     if subscriptions.is_empty() {
         return Err(ApiError::BadRequest("Empty request body".to_string()));
     }
 
-    let highest_slot = db
-        .slot_index_provider()
-        .get_highest_slot()
-        .map_err(|err| {
-            ApiError::InternalError(format!("Failed to get_highest_slot, error: {err:?}"))
-        })?
-        .ok_or(ApiError::NotFound(
-            "Failed to find highest slot".to_string(),
-        ))?;
-    let state = get_state_from_id(ID::Slot(highest_slot), &db).await?;
-    let current_epoch = state.get_current_epoch();
+    let head = beacon_chain
+        .head()
+        .map_err(|err| ApiError::InternalError(format!("Failed to get head: {err:?}")))?;
+    let current_epoch = compute_epoch_at_slot(head.current_slot);
+    let subcommittee_size = SYNC_COMMITTEE_SIZE / SYNC_COMMITTEE_SUBNET_COUNT;
 
-    let mut subnets_to_subscribe: HashSet<(u64, B32)> = HashSet::new();
-
+    // Subnet to the last slot it is needed for.
+    let mut subnets: HashMap<u64, u64> = HashMap::new();
     for subscription in subscriptions {
-        let validator = state
+        if head
+            .state
             .validators
             .get(subscription.validator_index as usize)
-            .ok_or_else(|| {
-                ApiError::BadRequest(format!(
-                    "Validator index {} not found",
-                    subscription.validator_index
-                ))
-            })?;
-
-        if !validator.is_active_validator(current_epoch) {
+            .is_none()
+        {
             return Err(ApiError::BadRequest(format!(
-                "Validator {} is not active",
+                "Validator index {} not found",
                 subscription.validator_index
             )));
         }
 
-        // Validate until_epoch is in the future
+        // `until_epoch` is exclusive.
         if subscription.until_epoch <= current_epoch {
             return Err(ApiError::BadRequest(format!(
                 "until_epoch {} must be greater than current epoch {current_epoch}",
                 subscription.until_epoch
             )));
         }
+        let until_slot = compute_start_slot_at_epoch(subscription.until_epoch) - 1;
 
-        // Compute which subnets this validator needs to subscribe to
-        let validator_subnets = compute_subnets_for_sync_committee(
-            &state,
-            subscription.validator_index,
-        )
-        .map_err(|err| {
-            ApiError::InternalError(format!("Failed to compute sync committee subnets: {err}"))
-        })?;
-
-        // Validate that the provided sync_committee_indices match the computed subnets
-        let provided_indices: HashSet<u64> = subscription
-            .sync_committee_indices
-            .iter()
-            .copied()
-            .collect();
-        if provided_indices != validator_subnets {
-            return Err(ApiError::BadRequest(format!(
-                "Provided sync_committee_indices {provided_indices:?} do not match computed subnets {validator_subnets:?}",
-            )));
-        }
-
-        let fork = gossip_fork_digest(&state);
-        for subnet_id in validator_subnets {
-            subnets_to_subscribe.insert((subnet_id, fork));
+        // `sync_committee_indices` are positions in the sync committee, 128 per subnet.
+        for index in subscription.sync_committee_indices {
+            if index >= SYNC_COMMITTEE_SIZE {
+                return Err(ApiError::BadRequest(format!(
+                    "Sync committee index {index} is out of range"
+                )));
+            }
+            let entry = subnets
+                .entry(index / subcommittee_size)
+                .or_insert(until_slot);
+            *entry = (*entry).max(until_slot);
         }
     }
 
-    // Subscribe to all required subnets
+    let fork = beacon_network_spec().fork_digest(
+        beacon_network_spec().current_epoch(),
+        genesis_validators_root(),
+    );
     let mut network = network.lock().await;
-    for (subnet_id, fork) in subnets_to_subscribe {
+    for (subnet_id, until_slot) in subnets {
         let topic = GossipTopic {
             fork,
             kind: GossipTopicKind::SyncCommittee(subnet_id),
         };
-
-        if !network.subscribe_to_topic(topic) {
+        if !network.subscribe_for_duty(topic, until_slot) {
             return Err(ApiError::InternalError(format!(
                 "Failed to subscribe to sync committee subnet {subnet_id}",
             )));
         }
     }
 
-    Ok(HttpResponse::Ok().body(""))
+    Ok(HttpResponse::Ok().finish())
 }
 
 /// Verify validator registration signature

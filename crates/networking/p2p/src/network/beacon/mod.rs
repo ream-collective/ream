@@ -142,14 +142,14 @@ fn enr_subnet_bitfields(enr: &Enr) -> anyhow::Result<(BitVector<U64>, BitVector<
 
 /// Epoch at `now` for a chain that started at `genesis_time`, counted like the fork choice store.
 /// Before genesis this is epoch 0, so the mesh for the first backbone subnets forms early.
+fn epoch_at(genesis_time: u64, now: SystemTime) -> u64 {
+    compute_epoch_at_slot(slot_at(genesis_time, now))
+}
+
 /// The slot at `now` for a chain that started at `genesis_time`, 0 before genesis.
 fn slot_at(genesis_time: u64, now: SystemTime) -> u64 {
     let now = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     now.saturating_sub(genesis_time) / beacon_network_spec().seconds_per_slot()
-}
-
-fn epoch_at(genesis_time: u64, now: SystemTime) -> u64 {
-    compute_epoch_at_slot(slot_at(genesis_time, now))
 }
 
 /// Time from `now` until `epoch` starts on the clock of [`epoch_at`], so once it has elapsed
@@ -256,6 +256,8 @@ pub struct Network {
     target_peers: usize,
     /// Gossipsub peer scoring settings, `None` when scoring is off.
     peer_score_settings: Option<PeerScoreSettings>,
+    /// Subnet topics joined for validator duties, with the last slot each is needed for.
+    duty_topics: HashMap<GossipTopic, u64>,
 }
 
 impl Network {
@@ -398,6 +400,7 @@ impl Network {
             genesis_time: config.genesis_time,
             backbone_topics: HashMap::new(),
             target_peers: config.target_peers,
+            duty_topics: HashMap::new(),
             sampling_columns,
             meta_data_requests: HashMap::new(),
             peer_score_settings,
@@ -646,6 +649,7 @@ impl Network {
                     if let Err(err) = self.sync_attestation_subnets(SystemTime::now()) {
                         warn!("Failed to sync attestation subnets: {err:?}");
                     }
+                    self.expire_duty_topics(SystemTime::now());
                     // Retries a failed fork update and catches a boundary the timer slept past.
                     next_fork_update.set(self.update_fork_enr(SystemTime::now()).map(sleep).into());
 
@@ -1353,6 +1357,37 @@ impl Network {
         }
     }
 
+    /// Joins `topic` for a validator duty and stays subscribed until `until_slot` has passed.
+    pub fn subscribe_for_duty(&mut self, topic: GossipTopic, until_slot: u64) -> bool {
+        if !self.subscribe_to_topic(topic) {
+            return false;
+        }
+        let until = self.duty_topics.entry(topic).or_insert(until_slot);
+        *until = (*until).max(until_slot);
+        true
+    }
+
+    /// Leaves duty topics whose last slot has passed, unless they are backbone subnets.
+    fn expire_duty_topics(&mut self, now: SystemTime) {
+        let current_slot = slot_at(self.genesis_time, now);
+        let expired: Vec<GossipTopic> = self
+            .duty_topics
+            .iter()
+            .filter(|(_, until_slot)| **until_slot < current_slot)
+            .map(|(topic, _)| *topic)
+            .collect();
+        for topic in expired {
+            self.duty_topics.remove(&topic);
+            if !self
+                .backbone_topics
+                .values()
+                .any(|backbone| *backbone == topic)
+            {
+                self.unsubscribe_from_topic(topic);
+            }
+        }
+    }
+
     pub fn unsubscribe_from_topic(&mut self, topic: GossipTopic) -> bool {
         self.subscribed_topics.lock().remove(&topic);
 
@@ -1421,7 +1456,9 @@ impl Network {
             .filter(|subnet_id| !desired.0.get(*subnet_id as usize).unwrap_or(false))
             .collect();
         for subnet_id in dropped {
-            if let Some(topic) = self.backbone_topics.remove(&subnet_id) {
+            if let Some(topic) = self.backbone_topics.remove(&subnet_id)
+                && !self.duty_topics.contains_key(&topic)
+            {
                 self.unsubscribe_from_topic(topic);
             }
         }
@@ -2340,7 +2377,7 @@ mod tests {
         ))
     }
 
-    /// All subnet topics, as the manager configures them.
+    /// All subnet topics, as a node joined to every subnet has them.
     fn all_subnet_topics() -> Vec<GossipTopic> {
         let fork = beacon_network_spec().fork_digest(
             beacon_network_spec().current_epoch(),
@@ -2454,6 +2491,48 @@ mod tests {
         assert_eq!(network.enr(), enr);
         assert_eq!(meta_data_seq(&network), seq);
         assert_subnets_consistent(&network, data_dir.path());
+    }
+
+    #[test]
+    fn duty_subnets_are_left_after_their_last_slot() {
+        initialize_test_network_spec();
+
+        let runtime = Runtime::new().unwrap();
+        let data_dir = TestDataDir::new();
+        let mut network = create_local_network(&runtime, data_dir.path()).unwrap();
+        let backbone = advertised(&network);
+        let duty_subnet = (0..ATTESTATION_SUBNET_COUNT as u64)
+            .find(|subnet_id| !backbone.is_attestation_subnet_enabled(*subnet_id).unwrap())
+            .unwrap();
+        let backbone_subnet = (0..ATTESTATION_SUBNET_COUNT as u64)
+            .find(|subnet_id| backbone.is_attestation_subnet_enabled(*subnet_id).unwrap())
+            .unwrap();
+        let fork = beacon_network_spec().fork_digest(0, genesis_validators_root());
+        let topic = |subnet_id| GossipTopic {
+            fork,
+            kind: GossipTopicKind::BeaconAttestation(subnet_id),
+        };
+        let slot_start = |slot: u64| {
+            epoch_start(0) + Duration::from_secs(slot * beacon_network_spec().seconds_per_slot())
+        };
+        let joined = |network: &Network, subnet_id: u64| {
+            subscribed_subnets(network)
+                .0
+                .get(subnet_id as usize)
+                .unwrap()
+        };
+
+        assert!(!joined(&network, duty_subnet));
+        assert!(network.subscribe_for_duty(topic(duty_subnet), 10));
+        assert!(network.subscribe_for_duty(topic(duty_subnet), 8));
+        assert!(network.subscribe_for_duty(topic(backbone_subnet), 10));
+
+        network.expire_duty_topics(slot_start(10));
+        assert!(joined(&network, duty_subnet));
+        network.expire_duty_topics(slot_start(11));
+        assert!(!joined(&network, duty_subnet));
+        assert!(joined(&network, backbone_subnet));
+        assert!(network.duty_topics.is_empty());
     }
 
     #[test]

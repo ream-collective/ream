@@ -26,7 +26,6 @@ use ream_storage::{
 };
 use ream_validator_beacon::{
     attestation::single_attestation_to_attestation, blob_sidecars::compute_subnet_for_blob_sidecar,
-    constants::SYNC_COMMITTEE_SUBNET_COUNT,
 };
 use tracing::{debug, error, info, trace, warn};
 use tree_hash::TreeHash;
@@ -111,20 +110,9 @@ pub fn init_gossipsub_config_with_topics(
         },
     ];
 
-    // Subnets
-    for subnet_id in 0..beacon_network_spec().attestation_subnet_count {
-        topics.push(GossipTopic {
-            fork: fork_digest,
-            kind: GossipTopicKind::BeaconAttestation(subnet_id),
-        });
-    }
-
-    for subnet_id in 0..SYNC_COMMITTEE_SUBNET_COUNT {
-        topics.push(GossipTopic {
-            fork: fork_digest,
-            kind: GossipTopicKind::SyncCommittee(subnet_id),
-        });
-    }
+    // Attestation and sync committee subnets are joined per node (backbone) and per validator
+    // duty, not all at once: every attestation subnet together carries one attestation per
+    // active validator per epoch.
 
     if subscribes_to_blob_sidecars(beacon_network_spec().current_epoch()) {
         for subnet_id in 0..beacon_network_spec().blob_sidecar_subnet_count_electra {
