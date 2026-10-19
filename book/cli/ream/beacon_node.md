@@ -43,6 +43,8 @@ Options:
           The URL of a service compatible with the MEV-boost API
       --blob-retention-epochs <BLOB_RETENTION_EPOCHS>
           Number of epochs to retain blob sidecars. Defaults to network spec value (4096 epochs for mainnet, ~18 days)
+      --disable-get-blobs
+          Do not fetch the blobs of gossip blocks from the execution client with engine_getBlobsV2
       --metrics
           Enable metrics
       --metrics-address <METRICS_ADDRESS>

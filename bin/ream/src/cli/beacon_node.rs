@@ -100,6 +100,12 @@ pub struct BeaconNodeConfig {
     )]
     pub blob_retention_epochs: Option<u64>,
 
+    #[arg(
+        long,
+        help = "Do not fetch the blobs of gossip blocks from the execution client with engine_getBlobsV2"
+    )]
+    pub disable_get_blobs: bool,
+
     #[arg(long = "metrics", help = "Enable metrics", default_value_t = DEFAULT_METRICS_ENABLED)]
     pub enable_metrics: bool,
 
@@ -128,6 +134,7 @@ impl From<BeaconNodeConfig> for ManagerConfig {
             mev_relay_url: config.mev_relay_url,
             blob_retention_epochs: config.blob_retention_epochs,
             gossipsub_history_length: None,
+            disable_get_blobs: config.disable_get_blobs,
         }
     }
 }

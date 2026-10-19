@@ -131,6 +131,7 @@ impl GossipWorkers {
                     &cached_db,
                     &mut pending_item,
                     &mut unknown_parent_block,
+                    |_| {},
                 )
                 .await;
                 // Only blocks produce unknown-parent work, and they never come here.

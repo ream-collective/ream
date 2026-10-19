@@ -251,6 +251,23 @@ lazy_static::lazy_static! {
         ).expect("failed to create BEACON_ENGINE_GET_BLOBS_V2_REQUEST_DURATION_SECONDS")
     };
 
+    // Columns built from blobs held by the execution client (Lighthouse's `beacon_blobs_from_el_*`)
+    pub static ref BEACON_BLOBS_FROM_EL_HIT_TOTAL: IntCounter = register_int_counter_with_registry!(
+        "beacon_blobs_from_el_hit_total", "Blocks whose blobs were all returned by the execution client", default_registry()
+    ).expect("failed to create BEACON_BLOBS_FROM_EL_HIT_TOTAL int counter");
+
+    pub static ref BEACON_BLOBS_FROM_EL_MISS_TOTAL: IntCounter = register_int_counter_with_registry!(
+        "beacon_blobs_from_el_miss_total", "Blocks with a blob the execution client did not have", default_registry()
+    ).expect("failed to create BEACON_BLOBS_FROM_EL_MISS_TOTAL int counter");
+
+    pub static ref BEACON_BLOBS_FROM_EL_ERROR_TOTAL: IntCounter = register_int_counter_with_registry!(
+        "beacon_blobs_from_el_error_total", "Failed requests for blobs from the execution client", default_registry()
+    ).expect("failed to create BEACON_BLOBS_FROM_EL_ERROR_TOTAL int counter");
+
+    pub static ref BEACON_DATA_COLUMNS_FROM_EL_IMPORTED_TOTAL: IntCounter = register_int_counter_with_registry!(
+        "beacon_data_columns_from_el_imported_total", "Data columns built from execution client blobs and imported", default_registry()
+    ).expect("failed to create BEACON_DATA_COLUMNS_FROM_EL_IMPORTED_TOTAL int counter");
+
     // PeerDAS: Engine API — engine_get_blobs_v3 Metrics
     pub static ref BEACON_ENGINE_GET_BLOBS_V3_REQUESTS_TOTAL: IntCounter = register_int_counter_with_registry!(
         "beacon_engine_getBlobsV3_requests_total", "Total engine_getBlobsV3 requests sent", default_registry()

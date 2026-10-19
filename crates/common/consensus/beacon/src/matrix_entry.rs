@@ -8,7 +8,7 @@ use rayon::{
 use ream_consensus_misc::{
     constants::beacon::CELLS_PER_EXT_BLOB, polynomial_commitments::kzg_proof::KZGProof,
 };
-use ream_execution_rpc_types::get_blobs::Blob;
+use ream_execution_rpc_types::get_blobs::{Blob, BlobAndProofV2};
 use ream_metrics::{
     BEACON_DATA_AVAILABILITY_RECONSTRUCTED_COLUMNS_TOTAL,
     BEACON_DATA_AVAILABILITY_RECONSTRUCTION_TIME_SECONDS,
@@ -16,8 +16,12 @@ use ream_metrics::{
 use rust_eth_kzg::{Cell as KZGCell, DASContext, KZGProof as Proof, TrustedSetup, UsePrecomp};
 use ssz_types::FixedVector;
 
-use crate::data_column_sidecar::{
-    Cell, DataColumnSidecar, NUMBER_OF_COLUMNS, get_data_column_sidecars_from_column_sidecar,
+use crate::{
+    data_column_sidecar::{
+        Cell, DataColumnSidecar, NUMBER_OF_COLUMNS, get_data_column_sidecars_from_block,
+        get_data_column_sidecars_from_column_sidecar,
+    },
+    electra::beacon_block::SignedBeaconBlock,
 };
 
 // Gossip and range-sync callers share this pool. Using at most half of the available CPUs and no
@@ -245,6 +249,38 @@ pub fn reconstruct_data_column_sidecars(
     Ok(reconstructed)
 }
 
+/// Builds all `NUMBER_OF_COLUMNS` sidecars of `signed_block` from its blobs and their cell proofs,
+/// as `engine_getBlobsV2` returns them, one per commitment and in commitment order.
+///
+/// Only the cells are computed. The proofs are taken as given: the execution client verified them
+/// when the blob transactions entered its pool, and Lighthouse trusts them the same way.
+pub fn data_column_sidecars_from_execution_blobs(
+    signed_block: &SignedBeaconBlock,
+    blobs_and_proofs: Vec<BlobAndProofV2>,
+) -> Result<Vec<DataColumnSidecar>> {
+    let commitment_count = signed_block.message.body.blob_kzg_commitments.len();
+    ensure!(
+        blobs_and_proofs.len() == commitment_count,
+        "execution client returned {} blobs for {commitment_count} commitments",
+        blobs_and_proofs.len()
+    );
+    let context = das_context();
+    let cells_and_kzg_proofs = reconstruction_pool()
+        .install(|| {
+            blobs_and_proofs
+                .into_par_iter()
+                .map(|BlobAndProofV2 { blob, proofs }| {
+                    let cells = compute_cells(blob, context)?;
+                    Ok((cells.into_iter().collect(), proofs.to_vec()))
+                })
+                .collect::<Vec<_>>()
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    get_data_column_sidecars_from_block(signed_block, cells_and_kzg_proofs)
+        .map_err(|err| anyhow!("failed to assemble columns from execution blobs: {err}"))
+}
+
 fn convert_cell(kzg_cell: KZGCell) -> Cell {
     FixedVector::try_from(kzg_cell.to_vec()).expect("Cell conversion failed")
 }
@@ -285,10 +321,12 @@ mod tests {
     };
 
     use rand::{RngExt, SeedableRng, rngs::StdRng, seq::SliceRandom};
+    use ream_consensus_misc::polynomial_commitments::kzg_commitment::KZGCommitment;
     use rust_eth_kzg::{DASContext, TrustedSetup, UsePrecomp};
     use ssz::Decode;
 
     use super::*;
+    use crate::electra::beacon_block::BeaconBlock;
 
     const BYTES_PER_BLOB: usize = 131072;
 
@@ -402,6 +440,54 @@ mod tests {
 
         let rebuilt = reconstruct_data_column_sidecars(&half)?;
         assert_eq!(rebuilt, sidecars);
+        Ok(())
+    }
+
+    #[test]
+    fn execution_blobs_build_the_columns_of_the_block() -> Result<()> {
+        let mut rng = StdRng::seed_from_u64(4242);
+        let blobs = (0..2)
+            .map(|_| get_sample_blob(&mut rng))
+            .collect::<Vec<_>>();
+        let mut block = SignedBeaconBlock {
+            message: BeaconBlock::default(),
+            signature: Default::default(),
+        };
+        let mut cells_and_kzg_proofs = Vec::new();
+        let mut blobs_and_proofs = Vec::new();
+        for blob in blobs {
+            let commitment = das_context()
+                .blob_to_kzg_commitment(&blob.to_fixed_bytes())
+                .map_err(|err| anyhow!("{err:?}"))?;
+            block
+                .message
+                .body
+                .blob_kzg_commitments
+                .push(KZGCommitment(commitment))
+                .map_err(|err| anyhow!("{err:?}"))?;
+            let (cells, proofs) = compute_cells_and_kzg_proofs(&blob, das_context())?;
+            blobs_and_proofs.push(BlobAndProofV2 {
+                blob,
+                proofs: FixedVector::new(proofs.clone()).map_err(|err| anyhow!("{err:?}"))?,
+            });
+            cells_and_kzg_proofs.push((cells, proofs));
+        }
+
+        let expected = get_data_column_sidecars_from_block(&block, cells_and_kzg_proofs)
+            .map_err(|err| anyhow!("{err}"))?;
+        assert_eq!(
+            data_column_sidecars_from_execution_blobs(&block, blobs_and_proofs.clone())?,
+            expected
+        );
+        assert!(
+            expected
+                .iter()
+                .all(DataColumnSidecar::verify_inclusion_proof)
+        );
+
+        // A response for other blocks' blobs cannot be matched to the commitments.
+        blobs_and_proofs.pop();
+        assert!(data_column_sidecars_from_execution_blobs(&block, blobs_and_proofs).is_err());
         Ok(())
     }
 
