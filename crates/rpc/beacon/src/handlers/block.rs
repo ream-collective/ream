@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -33,7 +34,9 @@ use ream_consensus_beacon::{
     matrix_entry::{compute_cells_and_kzg_proofs, das_context},
 };
 use ream_consensus_misc::{
-    constants::beacon::{GENESIS_SLOT, WHISTLEBLOWER_REWARD_QUOTIENT, genesis_validators_root},
+    constants::beacon::{
+        GENESIS_SLOT, WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA, genesis_validators_root,
+    },
     polynomial_commitments::kzg_commitment::KZGCommitment,
 };
 use ream_execution_rpc_types::get_blobs::Blob;
@@ -124,57 +127,78 @@ pub async fn get_block_root_from_id(
     Ok(block_root)
 }
 
-fn get_attestations_rewards(beacon_state: &BeaconState, beacon_block: &SignedBeaconBlock) -> u64 {
-    let mut attester_reward = 0;
-    let attestations = &beacon_block.message.body.attestations;
-    for attestation in attestations {
-        if let Ok(attesting_indices) = beacon_state.get_attesting_indices(attestation) {
-            for index in attesting_indices {
-                attester_reward += beacon_state.get_proposer_reward(index);
-            }
-        }
+/// What a slashing pays the proposer, who is also the whistleblower: the whole whistleblower
+/// reward. A validator already slashed earlier in the block pays nothing.
+fn slashing_reward(beacon_state: &BeaconState, index: u64, slashed: &mut HashSet<u64>) -> u64 {
+    let Some(validator) = beacon_state.validators.get(index as usize) else {
+        return 0;
+    };
+    if !validator.is_slashable_validator(beacon_state.get_current_epoch()) || !slashed.insert(index)
+    {
+        return 0;
     }
-    attester_reward
+    validator.effective_balance / WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA
 }
 
 fn get_proposer_slashing_rewards(
     beacon_state: &BeaconState,
     beacon_block: &SignedBeaconBlock,
+    slashed: &mut HashSet<u64>,
 ) -> u64 {
-    let mut proposer_slashing_reward = 0;
-    let proposer_slashings = &beacon_block.message.body.proposer_slashings;
-    for proposer_slashing in proposer_slashings {
-        let index = proposer_slashing.signed_header_1.message.proposer_index;
-        let reward = beacon_state.validators[index as usize].effective_balance;
-        proposer_slashing_reward += reward;
-    }
-    proposer_slashing_reward
+    beacon_block
+        .message
+        .body
+        .proposer_slashings
+        .iter()
+        .map(|slashing| {
+            slashing_reward(
+                beacon_state,
+                slashing.signed_header_1.message.proposer_index,
+                slashed,
+            )
+        })
+        .sum()
 }
 
 fn get_attester_slashing_rewards(
     beacon_state: &BeaconState,
     beacon_block: &SignedBeaconBlock,
+    slashed: &mut HashSet<u64>,
 ) -> u64 {
-    let mut attester_slashing_reward = 0;
-    let attester_shashings = &beacon_block.message.body.attester_slashings;
-    let current_epoch = beacon_state.get_current_epoch();
-
-    for attester_shashing in attester_shashings {
-        if let Ok((attestation_indices_1, attestation_indices_2)) =
-            beacon_state.get_slashable_attester_indices(attester_shashing)
+    let mut reward = 0;
+    for attester_slashing in &beacon_block.message.body.attester_slashings {
+        if let Ok((indices_1, indices_2)) =
+            beacon_state.get_slashable_attester_indices(attester_slashing)
         {
-            for index in &attestation_indices_1 & &attestation_indices_2 {
-                let validator = &beacon_state.validators[index as usize];
-                if validator.is_slashable_validator(current_epoch) {
-                    let reward = beacon_state.validators[index as usize].effective_balance
-                        / WHISTLEBLOWER_REWARD_QUOTIENT;
-                    attester_slashing_reward += reward;
-                }
+            let mut indices: Vec<u64> = (&indices_1 & &indices_2).into_iter().collect();
+            indices.sort_unstable();
+            for index in indices {
+                reward += slashing_reward(beacon_state, index, slashed);
             }
         }
     }
+    reward
+}
 
-    attester_slashing_reward
+/// The block's pre-state: the parent's post-state advanced to the block's slot.
+fn get_block_pre_state(
+    db: &BeaconDB,
+    beacon_block: &SignedBeaconBlock,
+) -> Result<BeaconState, ApiError> {
+    let parent_root = beacon_block.message.parent_root;
+    let mut beacon_state = db
+        .state_provider()
+        .get(parent_root)
+        .map_err(|err| ApiError::InternalError(format!("Failed to get parent state: {err:?}")))?
+        .ok_or_else(|| ApiError::NotFound(format!("No state for parent block {parent_root}")))?;
+    if beacon_state.slot < beacon_block.message.slot {
+        beacon_state
+            .process_slots(beacon_block.message.slot)
+            .map_err(|err| {
+                ApiError::InternalError(format!("Failed to advance the parent state: {err}"))
+            })?;
+    }
+    Ok(beacon_state)
 }
 
 pub async fn get_beacon_block_from_id(
@@ -276,12 +300,20 @@ async fn block_rewards(
     db: &BeaconDB,
     beacon_chain: &BeaconChain,
 ) -> Result<HttpResponse, ApiError> {
-    let (beacon_block, beacon_state) =
-        get_block_and_state_from_id(block_id, db, beacon_chain).await?;
+    let beacon_block = get_beacon_block_from_id(block_id, db, beacon_chain).await?;
+    let beacon_state = get_block_pre_state(db, &beacon_block)?;
 
-    let attestation_reward = get_attestations_rewards(&beacon_state, &beacon_block);
-    let attester_slashing_reward = get_attester_slashing_rewards(&beacon_state, &beacon_block);
-    let proposer_slashing_reward = get_proposer_slashing_rewards(&beacon_state, &beacon_block);
+    // Same order as `process_operations`.
+    let mut slashed = HashSet::new();
+    let proposer_slashing_reward =
+        get_proposer_slashing_rewards(&beacon_state, &beacon_block, &mut slashed);
+    let attester_slashing_reward =
+        get_attester_slashing_rewards(&beacon_state, &beacon_block, &mut slashed);
+    let attestation_reward = beacon_state
+        .attestations_proposer_reward(&beacon_block.message.body.attestations)
+        .map_err(|err| {
+            ApiError::InternalError(format!("Failed to compute attestation rewards: {err}"))
+        })?;
     let (_, proposer_reward) = beacon_state.get_proposer_and_participant_rewards();
 
     let sync_aggregate_reward = beacon_block

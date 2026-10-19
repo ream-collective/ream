@@ -2545,37 +2545,81 @@ impl BeaconState {
             "Attestation signature must be valid"
         );
 
+        let is_current = data.target.epoch == self.get_current_epoch();
+        let mut participation = if is_current {
+            std::mem::take(&mut self.current_epoch_participation)
+        } else {
+            std::mem::take(&mut self.previous_epoch_participation)
+        };
+        let proposer_reward = self.mark_participation(
+            &mut participation,
+            indexed_attestation.attesting_indices.iter().copied(),
+            &participation_flag_indices,
+        );
+        if is_current {
+            self.current_epoch_participation = participation;
+        } else {
+            self.previous_epoch_participation = participation;
+        }
+        self.increase_balance(self.get_beacon_proposer_index(None)?, proposer_reward?)?;
+        Ok(())
+    }
+
+    /// Sets `flag_indices` for `attesting_indices` and returns the proposer reward for the flags
+    /// that were not set yet.
+    fn mark_participation(
+        &self,
+        participation: &mut VariableList<u8, ValidatorRegistryLimit>,
+        attesting_indices: impl Iterator<Item = u64>,
+        flag_indices: &[u8],
+    ) -> anyhow::Result<u64> {
         let base_reward_per_increment = self.get_base_reward_per_increment();
         let mut proposer_reward_numerator = 0;
-        for &index in indexed_attestation.attesting_indices.iter() {
-            let index = index as usize;
+        for index in attesting_indices {
+            let epoch_part = participation.get_mut(index as usize).ok_or_else(|| {
+                anyhow!("Validator index {index} out of bounds in epoch_participation")
+            })?;
             for (flag_index, &weight) in PARTICIPATION_FLAG_WEIGHTS.iter().enumerate() {
                 let flag_index = flag_index as u8;
-                let epoch_participation = if data.target.epoch == self.get_current_epoch() {
-                    &mut self.current_epoch_participation
-                } else {
-                    &mut self.previous_epoch_participation
-                };
-
-                let epoch_part = epoch_participation.get_mut(index).ok_or_else(|| {
-                    anyhow!("Validator index {index} out of bounds in epoch_participation",)
-                })?;
-
-                if participation_flag_indices.contains(&flag_index)
-                    && !Self::has_flag(*epoch_part, flag_index)
-                {
+                if flag_indices.contains(&flag_index) && !Self::has_flag(*epoch_part, flag_index) {
                     *epoch_part = Self::add_flag(*epoch_part, flag_index);
                     proposer_reward_numerator +=
-                        self.get_base_reward(index as u64, base_reward_per_increment) * weight;
+                        self.get_base_reward(index, base_reward_per_increment) * weight;
                 }
             }
         }
-        // Reward proposer
         let proposer_reward_denominator =
             (WEIGHT_DENOMINATOR - PROPOSER_WEIGHT) * WEIGHT_DENOMINATOR / PROPOSER_WEIGHT;
-        let proposer_reward = proposer_reward_numerator / proposer_reward_denominator;
-        self.increase_balance(self.get_beacon_proposer_index(None)?, proposer_reward)?;
-        Ok(())
+        Ok(proposer_reward_numerator / proposer_reward_denominator)
+    }
+
+    /// What including `attestations` pays the proposer, on the block's pre-state.
+    pub fn attestations_proposer_reward(
+        &self,
+        attestations: &[Attestation],
+    ) -> anyhow::Result<u64> {
+        let mut current = self.current_epoch_participation.clone();
+        let mut previous = self.previous_epoch_participation.clone();
+        let mut reward = 0;
+        for attestation in attestations {
+            let data = &attestation.data;
+            let flag_indices = self.get_attestation_participation_flag_indices(
+                data,
+                self.slot.saturating_sub(data.slot),
+            )?;
+            let participation = if data.target.epoch == self.get_current_epoch() {
+                &mut current
+            } else {
+                &mut previous
+            };
+            let attesting_indices = self.get_attesting_indices(attestation)?;
+            reward += self.mark_participation(
+                participation,
+                attesting_indices.into_iter(),
+                &flag_indices,
+            )?;
+        }
+        Ok(reward)
     }
 
     pub fn process_randao_mixes_reset(&mut self) -> anyhow::Result<()> {
@@ -3842,6 +3886,74 @@ mod tests {
             hash(body.randao_reveal.to_slice()).as_slice(),
         );
         assert_eq!(skipped.get_randao_mix(epoch), expected);
+    }
+
+    fn sepolia_asset<T: Decode>(path: &str) -> T {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../testing/gossip-validation/tests/assets/sepolia")
+            .join(path);
+        let bytes = Decoder::new()
+            .decompress_vec(&std::fs::read(path).unwrap())
+            .unwrap();
+        T::from_ssz_bytes(&bytes).unwrap()
+    }
+
+    /// The proposer is paid only for flags a block sets for the first time, as the post-state
+    /// shows. Sums of per-attestation rewards round down once per attestation.
+    #[test]
+    fn attestations_proposer_reward_pays_only_new_participation_flags() {
+        let mut pre_state = sepolia_state();
+        let block: crate::electra::beacon_block::SignedBeaconBlock =
+            sepolia_asset("blocks/parent_9552075.ssz_snappy");
+        let post_state: BeaconState = sepolia_asset("states/parent_state_9552075.ssz_snappy");
+        pre_state.process_slots(block.message.slot).unwrap();
+
+        let attestations = &block.message.body.attestations;
+        let reward = pre_state
+            .attestations_proposer_reward(attestations)
+            .unwrap();
+
+        let base_reward_per_increment = pre_state.get_base_reward_per_increment();
+        let mut numerator = 0;
+        for (before, after) in [
+            (
+                &pre_state.previous_epoch_participation,
+                &post_state.previous_epoch_participation,
+            ),
+            (
+                &pre_state.current_epoch_participation,
+                &post_state.current_epoch_participation,
+            ),
+        ] {
+            for (index, (before, after)) in before.iter().zip(after.iter()).enumerate() {
+                for (flag_index, weight) in PARTICIPATION_FLAG_WEIGHTS.iter().enumerate() {
+                    let flag_index = flag_index as u8;
+                    if !BeaconState::has_flag(*before, flag_index)
+                        && BeaconState::has_flag(*after, flag_index)
+                    {
+                        numerator += pre_state
+                            .get_base_reward(index as u64, base_reward_per_increment)
+                            * weight;
+                    }
+                }
+            }
+        }
+        let denominator =
+            (WEIGHT_DENOMINATOR - PROPOSER_WEIGHT) * WEIGHT_DENOMINATOR / PROPOSER_WEIGHT;
+        let expected = numerator / denominator;
+        assert!(reward > 0);
+        assert!(reward <= expected && expected - reward < attestations.len() as u64);
+
+        // Including the same votes twice pays nothing more.
+        let doubled: Vec<_> = attestations
+            .iter()
+            .chain(attestations.iter())
+            .cloned()
+            .collect();
+        assert_eq!(
+            pre_state.attestations_proposer_reward(&doubled).unwrap(),
+            reward
+        );
     }
 
     /// Two sibling blocks from the same proposer carry the same RANDAO reveal. If one of them
