@@ -17,11 +17,14 @@ use ream_consensus_beacon::{
 use ream_consensus_misc::{
     beacon_block_header::SignedBeaconBlockHeader,
     checkpoint::Checkpoint,
-    constants::beacon::genesis_validators_root,
+    constants::beacon::{SLOTS_PER_HISTORICAL_ROOT, genesis_validators_root},
     indexed_attestation::IndexedAttestation,
-    misc::{compute_epoch_at_slot, get_committee_indices},
+    misc::{compute_epoch_at_slot, compute_start_slot_at_epoch, get_committee_indices},
 };
-use ream_events_beacon::{BeaconEvent, BeaconEventSender, event::chain::BlockEvent};
+use ream_events_beacon::{
+    BeaconEvent, BeaconEventSender,
+    event::chain::{BlockEvent, ChainReorgEvent, FinalizedCheckpointEvent, HeadEvent},
+};
 use ream_execution_engine::{ExecutionEngine, engine_trait::ExecutionApi};
 use ream_execution_rpc_types::{
     execution_payload::WithdrawalV1,
@@ -1372,11 +1375,76 @@ impl BeaconChain {
                     .as_ref()
                     .is_none_or(|previous| !previous.is_equivalent(&head))
                 {
+                    let events = previous
+                        .as_ref()
+                        .map(|previous| self.head_change_events(previous, &head))
+                        .unwrap_or_default();
                     *self.cached_head.write() = Some(head);
+                    for event in events {
+                        self.event_sender.send_event(event);
+                    }
                 }
             }
             Err(err) => warn!("Failed to refresh the cached head: {err:#}"),
         }
+    }
+
+    /// The `head`, `chain_reorg` and `finalized_checkpoint` events for a head change.
+    fn head_change_events(&self, previous: &CachedHead, head: &CachedHead) -> Vec<BeaconEvent> {
+        let mut events = Vec::new();
+        if previous.head_root != head.head_root {
+            let epoch = compute_epoch_at_slot(head.head_slot);
+            let state_root = self.block_state_root(head.head_root);
+            if let Some(depth) = reorg_depth(
+                &previous.state,
+                previous.head_root,
+                &head.state,
+                head.head_root,
+            ) {
+                events.push(BeaconEvent::ChainReorg(ChainReorgEvent {
+                    slot: head.head_slot,
+                    depth,
+                    old_head_block: previous.head_root,
+                    new_head_block: head.head_root,
+                    old_head_state: self.block_state_root(previous.head_root),
+                    new_head_state: state_root,
+                    epoch,
+                    execution_optimistic: false,
+                }));
+            }
+            events.push(BeaconEvent::Head(HeadEvent {
+                slot: head.head_slot,
+                block: head.head_root,
+                state: state_root,
+                epoch_transition: epoch != compute_epoch_at_slot(previous.head_slot),
+                previous_duty_dependent_root: dependent_root(
+                    &head.state,
+                    head.head_root,
+                    epoch.saturating_sub(1),
+                ),
+                current_duty_dependent_root: dependent_root(&head.state, head.head_root, epoch),
+                execution_optimistic: false,
+            }));
+        }
+        if head.finalized_checkpoint.epoch > previous.finalized_checkpoint.epoch {
+            events.push(BeaconEvent::FinalizedCheckpoint(FinalizedCheckpointEvent {
+                block: head.finalized_checkpoint.root,
+                state: self.block_state_root(head.finalized_checkpoint.root),
+                epoch: head.finalized_checkpoint.epoch,
+                execution_optimistic: false,
+            }));
+        }
+        events
+    }
+
+    fn block_state_root(&self, block_root: B256) -> B256 {
+        self.db
+            .block_provider()
+            .get(block_root)
+            .ok()
+            .flatten()
+            .map(|block| block.message.state_root)
+            .unwrap_or_default()
     }
 
     /// Reads the head from the store. The state is only reloaded when the head block changed.
@@ -1500,6 +1568,51 @@ fn rebuilt_columns_releasable(
         "block {block_root} changed while its columns were rebuilt"
     );
     Ok(())
+}
+
+/// Root of the block at or before `slot` in the chain of `head_root`, whose post-state is
+/// `state`.
+fn block_root_at(state: &BeaconState, head_root: B256, slot: u64) -> Option<B256> {
+    if slot >= state.slot {
+        return Some(head_root);
+    }
+    state.get_block_root_at_slot(slot).ok()
+}
+
+/// Block root at the last slot before `epoch`, or the genesis block root for epoch 0, as the
+/// duties of `epoch` depend on it.
+fn dependent_root(state: &BeaconState, head_root: B256, epoch: u64) -> B256 {
+    block_root_at(
+        state,
+        head_root,
+        compute_start_slot_at_epoch(epoch).saturating_sub(1),
+    )
+    .unwrap_or_default()
+}
+
+/// Slots from the old head back to the latest slot both chains share, or `None` if the new head
+/// descends from the old one.
+fn reorg_depth(
+    old_state: &BeaconState,
+    old_root: B256,
+    new_state: &BeaconState,
+    new_root: B256,
+) -> Option<u64> {
+    let old_slot = old_state.slot;
+    if old_slot < new_state.slot && block_root_at(new_state, new_root, old_slot) == Some(old_root) {
+        return None;
+    }
+    let lowest = old_slot
+        .min(new_state.slot)
+        .saturating_sub(SLOTS_PER_HISTORICAL_ROOT - 1);
+    let mut slot = old_slot.min(new_state.slot);
+    while slot > lowest {
+        if block_root_at(old_state, old_root, slot) == block_root_at(new_state, new_root, slot) {
+            break;
+        }
+        slot -= 1;
+    }
+    Some(old_slot - slot)
 }
 
 #[cfg(test)]
@@ -2341,6 +2454,57 @@ mod tests {
         assert_eq!(
             prepared.id_for(10, B256::repeat_byte(1), Address::ZERO),
             None
+        );
+    }
+
+    #[test]
+    fn duty_dependent_roots_are_the_last_block_before_each_epoch() {
+        let state = fixture_state();
+        let head_root = B256::repeat_byte(7);
+        let epoch = state.get_current_epoch();
+        let start = compute_start_slot_at_epoch(epoch);
+
+        assert_eq!(
+            dependent_root(&state, head_root, epoch),
+            state.get_block_root_at_slot(start - 1).unwrap()
+        );
+        assert_eq!(
+            dependent_root(&state, head_root, epoch - 1),
+            state
+                .get_block_root_at_slot(compute_start_slot_at_epoch(epoch - 1) - 1)
+                .unwrap()
+        );
+        assert_eq!(dependent_root(&state, head_root, epoch + 1), head_root);
+    }
+
+    #[test]
+    fn reorg_depth_counts_slots_back_to_the_shared_chain() {
+        let parent = fixture_state();
+        let parent_root = B256::repeat_byte(1);
+
+        // A child of the old head is not a reorg.
+        let mut child = parent.clone();
+        child.slot += 1;
+        let index = (parent.slot % SLOTS_PER_HISTORICAL_ROOT) as usize;
+        child.block_roots[index] = parent_root;
+        assert_eq!(
+            reorg_depth(&parent, parent_root, &child, B256::repeat_byte(2)),
+            None
+        );
+
+        // A sibling one slot later that skips the old head drops one slot.
+        let mut sibling = child.clone();
+        sibling.block_roots[index] =
+            parent.block_roots[((parent.slot - 1) % SLOTS_PER_HISTORICAL_ROOT) as usize];
+        assert_eq!(
+            reorg_depth(&parent, parent_root, &sibling, B256::repeat_byte(3)),
+            Some(1)
+        );
+
+        // A competing block at the same slot drops one slot too.
+        assert_eq!(
+            reorg_depth(&parent, parent_root, &parent, B256::repeat_byte(4)),
+            Some(1)
         );
     }
 }
