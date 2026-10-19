@@ -54,7 +54,7 @@ use ssz::{Decode, Encode};
 use tracing::{error, info, warn};
 use tree_hash::TreeHash;
 
-use crate::handlers::{representation::checkpoint_response, state::get_state_from_id};
+use crate::handlers::{representation::checkpoint_response, state::get_state_by_block_root};
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct BlockRewards {
@@ -239,6 +239,28 @@ pub async fn get_block_root(
     Ok(HttpResponse::Ok().json(BeaconResponse::new(RootResponse::new(block_root))))
 }
 
+/// Block, and its post-state, for a block id. A root here is a block root, not a state root.
+async fn get_block_and_state_from_id(
+    block_id: ID,
+    db: &BeaconDB,
+    beacon_chain: &BeaconChain,
+) -> Result<(SignedBeaconBlock, BeaconState), ApiError> {
+    let block_root = get_block_root_from_id(block_id.clone(), db, beacon_chain).await?;
+    let beacon_block = get_beacon_block_from_id(ID::Root(block_root), db, beacon_chain).await?;
+    let beacon_state = get_state_by_block_root(db, block_root)?;
+    Ok((beacon_block, beacon_state))
+}
+
+/// Standard path of the block rewards endpoint.
+#[get("/beacon/rewards/blocks/{block_id}")]
+pub async fn get_rewards_blocks(
+    db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<BeaconChain>>,
+    block_id: Path<ID>,
+) -> Result<impl Responder, ApiError> {
+    block_rewards(block_id.into_inner(), &db, &beacon_chain).await
+}
+
 /// Called by `/beacon/blocks/{block_id}/rewards` to get the block rewards response
 #[get("/beacon/blocks/{block_id}/rewards")]
 pub async fn get_block_rewards(
@@ -246,9 +268,16 @@ pub async fn get_block_rewards(
     beacon_chain: Data<Arc<BeaconChain>>,
     block_id: Path<ID>,
 ) -> Result<impl Responder, ApiError> {
-    let block_id_value = block_id.into_inner();
-    let beacon_block = get_beacon_block_from_id(block_id_value.clone(), &db, &beacon_chain).await?;
-    let beacon_state = get_state_from_id(block_id_value.clone(), &db).await?;
+    block_rewards(block_id.into_inner(), &db, &beacon_chain).await
+}
+
+async fn block_rewards(
+    block_id: ID,
+    db: &BeaconDB,
+    beacon_chain: &BeaconChain,
+) -> Result<HttpResponse, ApiError> {
+    let (beacon_block, beacon_state) =
+        get_block_and_state_from_id(block_id, db, beacon_chain).await?;
 
     let attestation_reward = get_attestations_rewards(&beacon_state, &beacon_block);
     let attester_slashing_reward = get_attester_slashing_rewards(&beacon_state, &beacon_block);
@@ -304,9 +333,8 @@ pub async fn post_sync_committee_rewards(
     block_id: Path<ID>,
     validators: Json<Vec<ValidatorID>>,
 ) -> Result<impl Responder, ApiError> {
-    let block_id_value = block_id.into_inner();
-    let beacon_block = get_beacon_block_from_id(block_id_value.clone(), &db, &beacon_chain).await?;
-    let beacon_state = get_state_from_id(block_id_value.clone(), &db).await?;
+    let (beacon_block, beacon_state) =
+        get_block_and_state_from_id(block_id.into_inner(), &db, &beacon_chain).await?;
 
     let sync_committee_rewards_map =
         match beacon_state.compute_sync_committee_rewards(&beacon_block) {
@@ -941,7 +969,11 @@ mod tests {
     use std::path::PathBuf;
 
     use ream_network_spec::networks::initialize_test_network_spec;
+    use ream_operation_pool::OperationPool;
+    use ream_storage::{db::ReamDB, tables::table::REDBTable};
+    use ream_sync_committee_pool::SyncCommitteePool;
     use ssz::Decode;
+    use tempdir::TempDir;
 
     use super::*;
 
@@ -1031,5 +1063,49 @@ mod tests {
             genesis.genesis_validators_root,
             state.genesis_validators_root
         );
+    }
+
+    fn fixture_state() -> BeaconState {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../../testing/gossip-validation/tests/assets/sepolia/states/\
+             grandparent_state_9552074.ssz_snappy",
+        );
+        let compressed = std::fs::read(path).expect("reads fixture state");
+        let bytes = snap::raw::Decoder::new()
+            .decompress_vec(&compressed)
+            .expect("decompresses fixture state");
+        BeaconState::from_ssz_bytes(&bytes).expect("decodes fixture state")
+    }
+
+    #[tokio::test]
+    async fn rewards_resolve_a_block_root_as_a_block_id() {
+        let temp_dir = TempDir::new("ream_rpc_beacon_block").expect("creates temp directory");
+        let db = ReamDB::new(temp_dir.path().to_path_buf())
+            .expect("creates database")
+            .init_beacon_db()
+            .expect("initializes beacon database");
+        let state = fixture_state();
+        let mut block = SignedBeaconBlock {
+            message: Default::default(),
+            signature: Default::default(),
+        };
+        block.message.slot = state.slot;
+        block.message.state_root = state.tree_hash_root();
+        let block_root = block.message.tree_hash_root();
+        db.block_provider().insert(block_root, block).unwrap();
+        db.state_provider().insert(block_root, state).unwrap();
+        let beacon_chain = BeaconChain::new(
+            db.clone(),
+            Arc::new(OperationPool::default()),
+            Arc::new(SyncCommitteePool::default()),
+            None,
+            None,
+        );
+
+        let (_, state) = get_block_and_state_from_id(ID::Root(block_root), &db, &beacon_chain)
+            .await
+            .expect("block root resolves to the block's post-state");
+
+        assert_eq!(state.slot, fixture_state().slot);
     }
 }
