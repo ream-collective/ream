@@ -6,7 +6,7 @@ use ream_api_types_common::id::ID;
 use ream_bls::{PrivateKey, traits::Signable};
 use ream_consensus_beacon::voluntary_exit::{SignedVoluntaryExit, VoluntaryExit};
 use ream_consensus_misc::{
-    constants::beacon::DOMAIN_VOLUNTARY_EXIT,
+    constants::beacon::{DOMAIN_VOLUNTARY_EXIT, genesis_validators_root},
     misc::{compute_domain, compute_signing_root},
 };
 use ream_network_spec::networks::beacon_network_spec;
@@ -30,10 +30,11 @@ pub fn sign_voluntary_exit(
             .sign(
                 compute_signing_root(
                     &voluntary_exit,
+                    // EIP-7044: exits are signed with the Capella fork version.
                     compute_domain(
                         DOMAIN_VOLUNTARY_EXIT,
-                        Some(beacon_network_spec().current_fork_version(epoch)),
-                        None,
+                        Some(beacon_network_spec().capella_fork_version),
+                        Some(genesis_validators_root()),
                     ),
                 )
                 .as_ref(),

@@ -1,6 +1,7 @@
 use alloy_primitives::Address;
 use ream_bls::{BLSSignature, PrivateKey, PublicKey, traits::Signable};
 use ream_consensus_misc::misc::{compute_domain, compute_signing_root};
+use ream_network_spec::networks::beacon_network_spec;
 use serde::{Deserialize, Serialize};
 use tree_hash::TreeHash;
 use tree_hash_derive::TreeHash;
@@ -23,7 +24,11 @@ impl ValidatorRegistrationV1 {
         &self,
         private_key: &PrivateKey,
     ) -> anyhow::Result<SignedValidatorRegistrationV1> {
-        let domain = compute_domain(DOMAIN_APPLICATION_BUILDER, None, None);
+        let domain = compute_domain(
+            DOMAIN_APPLICATION_BUILDER,
+            Some(beacon_network_spec().genesis_fork_version),
+            None,
+        );
         let signature = compute_signing_root(self.tree_hash_root(), domain);
         Ok(SignedValidatorRegistrationV1 {
             message: self.clone(),

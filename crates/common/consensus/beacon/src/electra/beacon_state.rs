@@ -22,12 +22,12 @@ use ream_consensus_misc::{
     checkpoint::Checkpoint,
     consolidation_request::ConsolidationRequest,
     constants::beacon::{
-        BASE_REWARD_FACTOR, BEACON_STATE_MERKLE_DEPTH, BLS_WITHDRAWAL_PREFIX, CAPELLA_FORK_VERSION,
-        CHURN_LIMIT_QUOTIENT, COMPOUNDING_WITHDRAWAL_PREFIX, CURRENT_SYNC_COMMITTEE_INDEX,
-        DEPOSIT_CONTRACT_TREE_DEPTH, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER,
-        DOMAIN_BLS_TO_EXECUTION_CHANGE, DOMAIN_DEPOSIT, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
-        DOMAIN_VOLUNTARY_EXIT, EFFECTIVE_BALANCE_INCREMENT, EJECTION_BALANCE,
-        EPOCHS_PER_ETH1_VOTING_PERIOD, EPOCHS_PER_HISTORICAL_VECTOR, EPOCHS_PER_SLASHINGS_VECTOR,
+        BASE_REWARD_FACTOR, BEACON_STATE_MERKLE_DEPTH, BLS_WITHDRAWAL_PREFIX, CHURN_LIMIT_QUOTIENT,
+        COMPOUNDING_WITHDRAWAL_PREFIX, CURRENT_SYNC_COMMITTEE_INDEX, DEPOSIT_CONTRACT_TREE_DEPTH,
+        DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER, DOMAIN_BLS_TO_EXECUTION_CHANGE,
+        DOMAIN_DEPOSIT, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE, DOMAIN_VOLUNTARY_EXIT,
+        EFFECTIVE_BALANCE_INCREMENT, EJECTION_BALANCE, EPOCHS_PER_ETH1_VOTING_PERIOD,
+        EPOCHS_PER_HISTORICAL_VECTOR, EPOCHS_PER_SLASHINGS_VECTOR,
         EPOCHS_PER_SYNC_COMMITTEE_PERIOD, ETH1_ADDRESS_WITHDRAWAL_PREFIX, FAR_FUTURE_EPOCH,
         FINALIZED_CHECKPOINT_INDEX, FULL_EXIT_REQUEST_AMOUNT, GENESIS_EPOCH, GENESIS_SLOT,
         HYSTERESIS_DOWNWARD_MULTIPLIER, HYSTERESIS_QUOTIENT, HYSTERESIS_UPWARD_MULTIPLIER,
@@ -1497,7 +1497,7 @@ impl BeaconState {
         // Fork-agnostic domain since address changes are valid across forks
         let domain = compute_domain(
             DOMAIN_BLS_TO_EXECUTION_CHANGE,
-            None,
+            Some(beacon_network_spec().genesis_fork_version),
             Some(self.genesis_validators_root),
         );
 
@@ -1584,12 +1584,7 @@ impl BeaconState {
             "Validator has not been active long enough"
         );
 
-        // Compute signature domain
-        let domain = compute_domain(
-            DOMAIN_VOLUNTARY_EXIT,
-            Some(CAPELLA_FORK_VERSION),
-            Some(self.genesis_validators_root),
-        );
+        let domain = voluntary_exit_domain(self.genesis_validators_root);
         let signing_root = compute_signing_root(voluntary_exit, domain);
 
         ensure!(
@@ -3724,6 +3719,15 @@ pub fn integer_squareroot(n: u64) -> u64 {
     x
 }
 
+/// EIP-7044: voluntary exits are signed with the network's Capella fork version.
+pub fn voluntary_exit_domain(genesis_validators_root: B256) -> B256 {
+    compute_domain(
+        DOMAIN_VOLUNTARY_EXIT,
+        Some(beacon_network_spec().capella_fork_version),
+        Some(genesis_validators_root),
+    )
+}
+
 pub fn is_valid_deposit_signature(
     public_key: &PublicKey,
     withdrawal_credentials: B256,
@@ -3736,7 +3740,11 @@ pub fn is_valid_deposit_signature(
         amount,
     };
     // Fork-agnostic domain since deposits are valid across forks
-    let domain = compute_domain(DOMAIN_DEPOSIT, None, None);
+    let domain = compute_domain(
+        DOMAIN_DEPOSIT,
+        Some(beacon_network_spec().genesis_fork_version),
+        None,
+    );
     let signing_root = compute_signing_root(deposit_message, domain);
 
     signature
