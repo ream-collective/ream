@@ -45,6 +45,30 @@ fn attester_shuffling_decision_slot(epoch: u64) -> u64 {
     compute_start_slot_at_epoch(epoch.saturating_sub(1)).saturating_sub(1)
 }
 
+/// The later of the store's slot and the wall-clock slot, read `disparity_ms` early as Lighthouse
+/// does. At a slot start the store's tick can wait for the store lock, so a validator client that
+/// asks for the next epoch's proposers right at an epoch start would get 400.
+fn tolerant_current_slot(
+    store_slot: u64,
+    genesis_time: u64,
+    now_ms: u64,
+    slot_duration_ms: u64,
+    disparity_ms: u64,
+) -> u64 {
+    let wall_slot = now_ms
+        .saturating_add(disparity_ms)
+        .saturating_sub(genesis_time.saturating_mul(1000))
+        / slot_duration_ms;
+    store_slot.max(wall_slot)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or_default()
+}
+
 fn validate_proposer_duties_epoch(epoch: u64, current_epoch: u64) -> Result<(), ApiError> {
     if epoch > current_epoch.saturating_add(1) {
         return Err(ApiError::BadRequest(format!(
@@ -69,7 +93,15 @@ async fn proposer_duties(
     let head = beacon_chain
         .head()
         .map_err(|err| ApiError::InternalError(format!("Failed to get head root: {err:?}")))?;
-    validate_proposer_duties_epoch(epoch, compute_epoch_at_slot(head.current_slot))?;
+    let spec = beacon_network_spec();
+    let current_slot = tolerant_current_slot(
+        head.current_slot,
+        head.state.genesis_time,
+        now_ms(),
+        spec.slot_duration_ms,
+        spec.maximum_gossip_clock_disparity,
+    );
+    validate_proposer_duties_epoch(epoch, compute_epoch_at_slot(current_slot))?;
 
     // Convert only after the guard because epoch-to-slot multiplication is unchecked.
     let decision_slot = match dependent_root_kind {
@@ -395,6 +427,32 @@ mod tests {
         assert_eq!(
             attester_shuffling_decision_slot(130_615),
             130_614 * SLOTS_PER_EPOCH - 1
+        );
+    }
+
+    #[test]
+    fn current_slot_follows_the_wall_clock_when_the_store_lags() {
+        let genesis_time = 1_000;
+        let slot_start_ms = |slot: u64| (genesis_time + slot * 12) * 1000;
+
+        // The store has not ticked into slot 64, the first of epoch 2.
+        assert_eq!(
+            tolerant_current_slot(63, genesis_time, slot_start_ms(64) + 100, 12_000, 500),
+            64
+        );
+        // Up to 500 ms early counts as the next slot.
+        assert_eq!(
+            tolerant_current_slot(63, genesis_time, slot_start_ms(64) - 400, 12_000, 500),
+            64
+        );
+        assert_eq!(
+            tolerant_current_slot(63, genesis_time, slot_start_ms(64) - 600, 12_000, 500),
+            63
+        );
+        // A store ahead of the wall clock wins.
+        assert_eq!(
+            tolerant_current_slot(65, genesis_time, slot_start_ms(64), 12_000, 500),
+            65
         );
     }
 
