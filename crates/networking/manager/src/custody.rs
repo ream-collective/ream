@@ -1,6 +1,11 @@
 use std::path::Path;
 
-use ream_consensus_beacon::custody_group::{CustodyAssignment, CustodyConfig};
+use discv5::enr::NodeId;
+use ream_consensus_beacon::{
+    custody_group::{CustodyAssignment, CustodyConfig, get_validators_custody_requirement},
+    electra::beacon_state::BeaconState,
+};
+use ream_consensus_misc::misc::compute_epoch_at_slot;
 use ream_network_spec::networks::beacon_network_spec;
 use ream_p2p::network::beacon::{identity::local_node_id, utils::read_meta_data_from_disk};
 use tracing::warn;
@@ -44,6 +49,88 @@ pub fn local_custody_assignment(
         configured.max(advertised),
         &config,
     )
+}
+
+/// Slots given to join the new subnets before blocks wait for a larger sampled set. Lighthouse
+/// waits 30 s (`CUSTODY_CHANGE_DA_EFFECTIVE_DELAY_SECONDS`) and then switches at the next epoch.
+const CUSTODY_CHANGE_DELAY_SLOTS: u64 = 3;
+
+/// What the node must change after `ValidatorCustody::on_slot`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CustodyChange {
+    /// A larger custody to advertise and subscribe to now.
+    pub raised: Option<CustodyAssignment>,
+    /// The sampled columns blocks wait for from now on.
+    pub sampling_columns: Option<Vec<u64>>,
+}
+
+/// Validator custody (fulu validator.md, "Validator custody"): a node with validators attached
+/// custodies `get_validators_custody_requirement` groups, at least `VALIDATOR_CUSTODY_REQUIREMENT`,
+/// and the count never decreases. The attached validators are those that prepared to propose
+/// through this node, which a validator client does every epoch.
+pub struct ValidatorCustody {
+    node_id: NodeId,
+    config: CustodyConfig,
+    custody_group_count: u64,
+    /// A raised sampled set and the epoch from which blocks wait for it.
+    pending_sampling: Option<(u64, Vec<u64>)>,
+}
+
+impl ValidatorCustody {
+    pub fn new(node_id: NodeId, custody: &CustodyAssignment) -> anyhow::Result<Self> {
+        Ok(Self {
+            node_id,
+            config: CustodyConfig::from_network_spec(&beacon_network_spec())?,
+            custody_group_count: custody.custody_group_count,
+            pending_sampling: None,
+        })
+    }
+
+    /// Raises the custody for `validator_indices`, whose effective balances come from `state`.
+    /// A raise is advertised at once, and blocks wait for its sampled columns from the epoch
+    /// after `CUSTODY_CHANGE_DELAY_SLOTS`, so that gossip has delivered them by then.
+    pub fn on_slot(
+        &mut self,
+        slot: u64,
+        state: &BeaconState,
+        validator_indices: &[u64],
+    ) -> anyhow::Result<CustodyChange> {
+        let mut change = CustodyChange::default();
+        if self
+            .pending_sampling
+            .as_ref()
+            .is_some_and(|(epoch, _)| compute_epoch_at_slot(slot) >= *epoch)
+        {
+            change.sampling_columns = self.pending_sampling.take().map(|(_, columns)| columns);
+        }
+
+        // An index the state does not know yet is skipped until the state includes it.
+        let validator_indices = validator_indices
+            .iter()
+            .copied()
+            .filter(|index| (*index as usize) < state.validators.len())
+            .collect::<Vec<_>>();
+        if validator_indices.is_empty() {
+            return Ok(change);
+        }
+        let required = get_validators_custody_requirement(state, &validator_indices)?;
+        if required <= self.custody_group_count {
+            return Ok(change);
+        }
+
+        let custody = CustodyAssignment::new(self.node_id, required, &self.config)?;
+        self.custody_group_count = required;
+        self.pending_sampling = Some((
+            compute_epoch_at_slot(slot + CUSTODY_CHANGE_DELAY_SLOTS) + 1,
+            custody.sampling_columns.clone(),
+        ));
+        change.raised = Some(custody);
+        Ok(change)
+    }
+
+    pub fn has_pending_sampling(&self) -> bool {
+        self.pending_sampling.is_some()
+    }
 }
 
 #[cfg(test)]

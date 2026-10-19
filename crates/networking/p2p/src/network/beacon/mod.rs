@@ -47,7 +47,7 @@ use ream_discv5::{
     discovery::{Discovery, DiscoveryOutEvent, QueryType},
     subnet::{
         ATTESTATION_BITFIELD_ENR_KEY, ATTESTATION_SUBNET_COUNT, AttestationSubnets,
-        SYNC_COMMITTEE_BITFIELD_ENR_KEY, SyncCommitteeSubnets,
+        CustodyGroupCount, SYNC_COMMITTEE_BITFIELD_ENR_KEY, SyncCommitteeSubnets,
     },
 };
 use ream_executor::ReamExecutor;
@@ -532,6 +532,7 @@ impl Network {
                         P2PMessage::Response(P2PResponse {peer_id, connection_id, stream_id, message}) => {
                             self.swarm.behaviour_mut().req_resp.send_response(peer_id, connection_id, stream_id, *message)
                         },
+                        P2PMessage::RaiseCustody(custody) => self.raise_custody(custody),
                         P2PMessage::Gossip(message) => {
                             match self.swarm.behaviour_mut().gossipsub.publish(message.topic, message.data) {
                                 Ok(_) => {}
@@ -1195,6 +1196,47 @@ impl Network {
             }
             _ => None,
         }
+    }
+
+    /// Advertises `custody` in the ENR `cgc` and the MetaData, subscribes to its sampled column
+    /// subnets and looks for peers covering its sampled columns (fulu validator.md, "Validator
+    /// custody"). The ENR and the MetaData change together, since peers treat a mismatch between
+    /// them as a fault.
+    fn raise_custody(&mut self, custody: CustodyAssignment) {
+        let advertised = self.network_state.meta_data.read().custody_group_count;
+        if custody.custody_group_count <= advertised {
+            return;
+        }
+        let discovery = &mut self.swarm.behaviour_mut().discovery;
+        match discovery.set_custody_group_count(CustodyGroupCount(custody.custody_group_count)) {
+            Ok(_) => *self.network_state.local_enr.write() = discovery.local_enr(),
+            Err(err) => {
+                warn!("Failed to advertise custody group count in ENR: {err:?}");
+                return;
+            }
+        }
+        if let Err(err) = self.network_state.update_meta_data(|meta_data| {
+            meta_data.custody_group_count = custody.custody_group_count;
+        }) {
+            warn!("Failed to advertise custody group count in MetaData: {err:?}");
+        }
+
+        let fork = beacon_network_spec().fork_digest(
+            epoch_at(self.genesis_time, SystemTime::now()),
+            genesis_validators_root(),
+        );
+        for subnet_id in &custody.data_column_subnet_ids {
+            self.subscribe_to_topic(GossipTopic {
+                fork,
+                kind: GossipTopicKind::DataColumnSidecar(*subnet_id),
+            });
+        }
+        self.sampling_columns = custody.sampling_columns;
+        info!(
+            custody_group_count = custody.custody_group_count,
+            sampling_columns = self.sampling_columns.len(),
+            "Raised data column custody"
+        );
     }
 
     /// Returns true if the node is subscribed afterwards, including when it already was.

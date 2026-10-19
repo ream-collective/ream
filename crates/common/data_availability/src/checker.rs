@@ -50,6 +50,19 @@ impl<State> DataAvailabilityChecker<State> {
         &self.required_columns
     }
 
+    /// Replaces the columns a block waits for. Pending blocks keep the columns they received and
+    /// wait for the new ones too.
+    pub fn set_required_columns(&mut self, required_columns: HashSet<u64>) {
+        assert!(
+            !required_columns.is_empty()
+                && required_columns
+                    .iter()
+                    .all(|index| *index < NUMBER_OF_COLUMNS),
+            "data availability checker column set must be non-empty and in range"
+        );
+        self.required_columns = required_columns;
+    }
+
     pub fn insert_pending(
         &mut self,
         block_root: B256,

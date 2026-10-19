@@ -28,7 +28,9 @@ use ream_metrics::{
 use ream_network_spec::networks::beacon_network_spec;
 use ream_p2p::{
     config::NetworkConfig,
-    network::beacon::{Network, ReamNetworkEvent, network_state::NetworkState},
+    network::beacon::{
+        Network, ReamNetworkEvent, identity::local_node_id, network_state::NetworkState,
+    },
 };
 use ream_storage::{
     cache::BeaconCacheDB,
@@ -55,7 +57,7 @@ use crate::{
         spawn_block_lookup_worker,
     },
     config::ManagerConfig,
-    custody::local_custody_assignment,
+    custody::{ValidatorCustody, local_custody_assignment},
     data_availability_fetch::{
         ColumnFetchOutcome, ColumnFetchTracker, fetch_missing_columns, pending_anchor_for_recovery,
     },
@@ -134,6 +136,7 @@ pub struct NetworkManagerService {
     pub blob_retention_epochs: u64,
     /// Column backfill covers what live import samples, so history matches the live range.
     pub backfill_custody: ream_syncer::backfill::ColumnCustody,
+    pub validator_custody: ValidatorCustody,
 }
 
 fn maintain_historical_sidecars(
@@ -364,6 +367,48 @@ fn spawn_column_reconstruction(
     });
 }
 
+/// Raises the custody for the validators that prepared to propose through this node, and makes
+/// blocks wait for the raised sampled set once it takes effect.
+async fn update_validator_custody(
+    validator_custody: &mut ValidatorCustody,
+    beacon_chain: &BeaconChain,
+    p2p_sender: &P2PSender,
+    current_slot: u64,
+) {
+    let validator_indices = beacon_chain
+        .operation_pool()
+        .get_all_proposer_preparations()
+        .into_keys()
+        .collect::<Vec<_>>();
+    if validator_indices.is_empty() && !validator_custody.has_pending_sampling() {
+        return;
+    }
+    let head = match beacon_chain.head() {
+        Ok(head) => head,
+        Err(err) => {
+            debug!("Validator custody waits for the head: {err}");
+            return;
+        }
+    };
+    match validator_custody.on_slot(current_slot, &head.state, &validator_indices) {
+        Ok(change) => {
+            if let Some(custody) = change.raised {
+                info!(
+                    custody_group_count = custody.custody_group_count,
+                    validators = validator_indices.len(),
+                    "Raising data column custody for attached validators"
+                );
+                BEACON_CUSTODY_GROUPS.set(custody.custody_group_count as i64);
+                p2p_sender.raise_custody(custody);
+            }
+            if let Some(sampling_columns) = change.sampling_columns {
+                beacon_chain.set_sampling_columns(sampling_columns).await;
+            }
+        }
+        Err(err) => warn!("Failed to update validator custody: {err:#}"),
+    }
+}
+
 /// Columns built from execution blobs are published in batches of this size, a quarter of them.
 const EXECUTION_COLUMN_PUBLICATION_BATCH_SIZE: usize = (NUMBER_OF_COLUMNS / 4) as usize;
 /// Wait between two batches of columns built from execution blobs.
@@ -533,6 +578,7 @@ impl NetworkManagerService {
         .build();
 
         let custody = local_custody_assignment(&ream_directory, config.supernode)?;
+        let validator_custody = ValidatorCustody::new(local_node_id(&ream_directory)?, &custody)?;
         let custody_group_count = CustodyGroupCount(custody.custody_group_count);
         BEACON_CUSTODY_GROUPS.set(custody_group_count.0 as i64);
         info!(
@@ -629,6 +675,7 @@ impl NetworkManagerService {
                 .blob_retention_epochs
                 .unwrap_or_default()
                 .max(beacon_network_spec().min_epochs_for_blob_sidecars_requests),
+            validator_custody,
         })
     }
 
@@ -651,6 +698,7 @@ impl NetworkManagerService {
             disable_backfill_rate_limiting,
             blob_retention_epochs,
             backfill_custody,
+            mut validator_custody,
             ..
         } = self;
 
@@ -1047,6 +1095,13 @@ impl NetworkManagerService {
                     };
                     match slots {
                         (Ok(current_slot), Ok(finalized_checkpoint), mut pending_roots) => {
+                            update_validator_custody(
+                                &mut validator_custody,
+                                &beacon_chain,
+                                &p2p_sender,
+                                current_slot,
+                            )
+                            .await;
                             match pending_anchor_for_recovery(&beacon_chain, current_slot).await {
                                 Ok(Some(root)) => pending_roots.push(root),
                                 Ok(None) => {},
