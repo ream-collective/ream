@@ -46,7 +46,7 @@ use ream_syncer::{
 };
 use tokio::{
     sync::mpsc,
-    time::{interval, sleep},
+    time::{Instant, MissedTickBehavior, interval, interval_at, sleep},
 };
 use tracing::{debug, error, info, warn};
 use tree_hash::TreeHash;
@@ -385,6 +385,27 @@ fn spawn_execution_column_fetch(
     });
 }
 
+/// Margin after a slot start before the slot tick runs. The tick reads the wall clock in whole
+/// seconds, so it must not run before the slot's first second has begun.
+const SLOT_TICK_DELAY: Duration = Duration::from_millis(20);
+
+/// Time from `now` (since the Unix epoch) until the next slot tick: `SLOT_TICK_DELAY` after the
+/// next slot start, or after genesis before it.
+fn until_next_slot_tick(genesis_time: u64, seconds_per_slot: u64, now: Duration) -> Duration {
+    let genesis = Duration::from_secs(genesis_time);
+    if now < genesis {
+        return genesis - now + SLOT_TICK_DELAY;
+    }
+    let slot_nanos = u128::from(seconds_per_slot) * 1_000_000_000;
+    let into_slot = Duration::from_nanos(((now - genesis).as_nanos() % slot_nanos) as u64);
+    let until_slot_start = if into_slot.is_zero() {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(seconds_per_slot) - into_slot
+    };
+    until_slot_start + SLOT_TICK_DELAY
+}
+
 async fn reconcile_block_lookup_state(
     beacon_chain: &BeaconChain,
     roots: Vec<alloy_primitives::B256>,
@@ -543,9 +564,25 @@ impl NetworkManagerService {
         let mut resync_check_interval = interval(Duration::from_secs(
             SLOTS_PER_EPOCH * beacon_network_spec().seconds_per_slot(),
         ));
-        let mut interval = interval(Duration::from_secs(
-            beacon_network_spec().seconds_per_slot(),
-        ));
+        // The slot tick advances the store's slot and resets the proposer boost, so it runs at
+        // each slot start instead of at the offset the service happened to start at.
+        let seconds_per_slot = beacon_network_spec().seconds_per_slot();
+        let first_slot_tick = match ream_db.genesis_time_provider().get() {
+            Ok(genesis_time) => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("correct time");
+                Instant::now() + until_next_slot_tick(genesis_time, seconds_per_slot, now)
+            }
+            Err(err) => {
+                warn!("Slot tick is not aligned to slot starts, genesis time unavailable: {err}");
+                Instant::now()
+            }
+        };
+        let mut interval = interval_at(first_slot_tick, Duration::from_secs(seconds_per_slot));
+        // A tick delayed by a busy loop is skipped rather than replayed, so later ticks stay at
+        // slot starts.
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut block_import_receiver = beacon_chain.subscribe_block_imports();
         let mut block_import_receiver_active = true;
         let mut block_lookup_coordinator =
@@ -1098,5 +1135,32 @@ impl NetworkManagerService {
                 &column_fetch_tracker,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_slot_tick_runs_just_after_each_slot_start() {
+        let genesis = 1_000;
+        let at = |seconds: u64, millis: u64| {
+            Duration::from_secs(seconds) + Duration::from_millis(millis)
+        };
+        // Mid-slot: wait for the next slot start.
+        assert_eq!(
+            until_next_slot_tick(genesis, 12, at(1_005, 500)),
+            at(6, 520)
+        );
+        // Exactly at a slot start: run now, after the margin.
+        assert_eq!(
+            until_next_slot_tick(genesis, 12, at(1_012, 0)),
+            SLOT_TICK_DELAY
+        );
+        // Just after a slot start: wait for the following one.
+        assert_eq!(until_next_slot_tick(genesis, 12, at(1_012, 1)), at(12, 19));
+        // Before genesis: wait for genesis.
+        assert_eq!(until_next_slot_tick(genesis, 12, at(990, 0)), at(10, 20));
     }
 }
