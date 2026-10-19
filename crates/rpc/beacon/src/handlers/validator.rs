@@ -454,63 +454,53 @@ impl ValidatorLivenessData {
 
 #[post("/validator/liveness/{epoch}")]
 pub async fn post_validator_liveness(
-    db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<BeaconChain>>,
     epoch: Path<u64>,
     validator_indices: Json<Vec<String>>,
 ) -> Result<impl Responder, ApiError> {
     let epoch = epoch.into_inner();
-    let validator_indices = validator_indices.into_inner();
-
-    let slot = epoch * SLOTS_PER_EPOCH;
-    let state = get_state_from_id(ID::Slot(slot), &db).await?;
+    let head = beacon_chain
+        .head()
+        .map_err(|err| ApiError::InternalError(format!("Failed to get head: {err:?}")))?;
+    let current_epoch = compute_epoch_at_slot(head.current_slot);
+    if epoch + 1 < current_epoch || epoch > current_epoch + 1 {
+        return Err(ApiError::BadRequest(format!(
+            "Liveness is only known for epochs {} to {}",
+            current_epoch.saturating_sub(1),
+            current_epoch + 1
+        )));
+    }
 
     let mut liveness_data = Vec::new();
-
-    for validator_index_str in validator_indices {
-        let validator_index: u64 = validator_index_str
+    for validator_index in validator_indices.into_inner() {
+        let validator_index: u64 = validator_index
             .parse()
             .map_err(|err| ApiError::BadRequest(format!("Invalid validator index: {err:?}")))?;
-        let index = validator_index as usize;
-
-        match state.validators.get(index) {
-            Some(_validator) => {
-                let is_live = check_validator_participation(&state, index, epoch)?;
-                liveness_data.push(ValidatorLivenessData::new(validator_index, is_live));
-            }
-            None => continue,
+        if (validator_index as usize) < head.state.validators.len() {
+            liveness_data.push(ValidatorLivenessData::new(
+                validator_index,
+                is_live(&head.state, validator_index as usize, epoch),
+            ));
         }
     }
 
     Ok(HttpResponse::Ok().json(BeaconResponse::new(liveness_data)))
 }
 
-fn check_validator_participation(
-    state: &BeaconState,
-    validator_index: usize,
-    epoch: u64,
-) -> Result<bool, ApiError> {
-    let validator = &state.validators[validator_index];
-    if !validator.is_active_validator(epoch) {
-        return Ok(false);
-    }
-
-    let current_epoch = state.get_current_epoch();
-
-    if epoch == current_epoch {
-        if let Some(participation) = state.current_epoch_participation.get(validator_index) {
-            Ok(*participation > 0)
-        } else {
-            Ok(false)
-        }
-    } else if epoch == current_epoch - 1 {
-        if let Some(participation) = state.previous_epoch_participation.get(validator_index) {
-            Ok(*participation > 0)
-        } else {
-            Ok(false)
-        }
+/// Whether the head state records an attestation by the validator for `epoch`. The state at the
+/// start of an epoch has not seen any of its attestations yet, so the head state is used.
+fn is_live(head_state: &BeaconState, validator_index: usize, epoch: u64) -> bool {
+    let state_epoch = head_state.get_current_epoch();
+    let participation = if epoch == state_epoch {
+        &head_state.current_epoch_participation
+    } else if epoch + 1 == state_epoch {
+        &head_state.previous_epoch_participation
     } else {
-        Ok(validator.is_active_validator(epoch))
-    }
+        return false;
+    };
+    participation
+        .get(validator_index)
+        .is_some_and(|flags| *flags > 0)
 }
 
 fn validator_api_is_syncing(current_slot: u64, head_slot: u64) -> bool {
@@ -1797,10 +1787,13 @@ pub async fn get_aggregate_attestation(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use alloy_primitives::B256;
     use ream_consensus_misc::checkpoint::Checkpoint;
+    use ssz::Decode;
 
-    use super::{attestation_source, validator_api_is_syncing};
+    use super::*;
 
     fn checkpoint(epoch: u64) -> Checkpoint {
         Checkpoint {
@@ -1830,6 +1823,43 @@ mod tests {
             attestation_source(10, previous, current, 9, unrealized),
             checkpoint(7)
         );
+    }
+
+    fn sepolia_state() -> BeaconState {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../../testing/gossip-validation/tests/assets/sepolia/states/\
+             grandparent_state_9552074.ssz_snappy",
+        );
+        let bytes = snap::raw::Decoder::new()
+            .decompress_vec(&std::fs::read(path).unwrap())
+            .unwrap();
+        BeaconState::from_ssz_bytes(&bytes).unwrap()
+    }
+
+    #[test]
+    fn liveness_reads_the_head_state_participation() {
+        let state = sepolia_state();
+        let epoch = state.get_current_epoch();
+        let live = state
+            .previous_epoch_participation
+            .iter()
+            .position(|flags| *flags > 0)
+            .unwrap();
+        let idle = state
+            .previous_epoch_participation
+            .iter()
+            .position(|flags| *flags == 0)
+            .unwrap();
+
+        assert!(is_live(&state, live, epoch - 1));
+        assert!(!is_live(&state, idle, epoch - 1));
+        assert_eq!(
+            is_live(&state, live, epoch),
+            state.current_epoch_participation[live] > 0
+        );
+        assert!(!is_live(&state, live, epoch + 1));
+        assert!(!is_live(&state, live, epoch - 2));
+        assert!(!is_live(&state, state.validators.len(), epoch - 1));
     }
 
     #[test]
