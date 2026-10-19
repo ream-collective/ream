@@ -2,19 +2,21 @@ use actix_web::{
     HttpResponse, Responder, post,
     web::{Data, Json, Path},
 };
+use alloy_primitives::B256;
 use ream_api_types_beacon::{
     id::ValidatorID,
     rewards::{AttestationRewardsData, AttestationRewardsResponse, IdealReward, TotalReward},
 };
-use ream_api_types_common::{error::ApiError, id::ID};
+use ream_api_types_common::error::ApiError;
 use ream_consensus_beacon::electra::beacon_state::BeaconState;
 use ream_consensus_misc::constants::beacon::{
     EFFECTIVE_BALANCE_INCREMENT, GENESIS_EPOCH, PARTICIPATION_FLAG_WEIGHTS, SLOTS_PER_EPOCH,
     TIMELY_HEAD_FLAG_INDEX, TIMELY_SOURCE_FLAG_INDEX, TIMELY_TARGET_FLAG_INDEX, WEIGHT_DENOMINATOR,
 };
-use ream_storage::{db::beacon::BeaconDB, tables::field::REDBField};
-
-use crate::handlers::state::get_state_from_id;
+use ream_storage::{
+    db::beacon::BeaconDB,
+    tables::{field::REDBField, table::REDBTable},
+};
 
 fn compute_ideal_attestation_rewards(state: &BeaconState) -> Result<Vec<IdealReward>, ApiError> {
     let base_reward_per_increment = state.get_base_reward_per_increment();
@@ -173,6 +175,21 @@ fn compute_total_attestation_rewards(
     Ok(total_rewards)
 }
 
+/// Root of the last block in `epoch`. Its last slots can be empty.
+fn latest_block_root_in_epoch(db: &BeaconDB, epoch: u64) -> Result<B256, ApiError> {
+    let start_slot = epoch * SLOTS_PER_EPOCH;
+    for slot in (start_slot..start_slot + SLOTS_PER_EPOCH).rev() {
+        if let Some(block_root) = db.slot_index_provider().get(slot).map_err(|err| {
+            ApiError::InternalError(format!("Failed to get block root for slot {slot}: {err:?}"))
+        })? {
+            return Ok(block_root);
+        }
+    }
+    Err(ApiError::NotFound(format!(
+        "No block found in epoch {epoch}"
+    )))
+}
+
 #[post("/beacon/rewards/attestations/{epoch}")]
 pub async fn post_attestation_rewards(
     db: Data<BeaconDB>,
@@ -188,9 +205,15 @@ pub async fn post_attestation_rewards(
         ));
     }
 
-    // Using the last slot of epoch+1 to capture all attestations including late ones
-    let target_slot = (epoch_value + 2) * SLOTS_PER_EPOCH - 1;
-    let state = get_state_from_id(ID::Slot(target_slot), &db).await?;
+    // The state at the end of epoch + 1 holds every attestation for the epoch, including late ones.
+    let block_root = latest_block_root_in_epoch(&db, epoch_value + 1)?;
+    let state = db
+        .state_provider()
+        .get(block_root)
+        .map_err(|err| ApiError::InternalError(format!("Failed to get state: {err:?}")))?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!("Failed to find state for block {block_root}"))
+        })?;
 
     // Check if the epoch is finalized
     let finalized_checkpoint = db.finalized_checkpoint_provider().get().map_err(|err| {
@@ -248,4 +271,39 @@ pub async fn post_attestation_rewards(
     };
 
     Ok(HttpResponse::Ok().json(response))
+}
+
+#[cfg(test)]
+mod tests {
+    use ream_consensus_beacon::electra::beacon_block::{BeaconBlock, SignedBeaconBlock};
+    use ream_storage::db::ReamDB;
+    use tempdir::TempDir;
+    use tree_hash::TreeHash;
+
+    use super::*;
+
+    #[test]
+    fn rewards_state_skips_empty_slots_at_the_end_of_the_epoch() {
+        let temp_dir = TempDir::new("ream_rpc_beacon_rewards").expect("creates temp directory");
+        let db = ReamDB::new(temp_dir.path().to_path_buf())
+            .expect("creates database")
+            .init_beacon_db()
+            .expect("initializes beacon database");
+        let mut roots = vec![];
+        for slot in [SLOTS_PER_EPOCH + 1, SLOTS_PER_EPOCH + 8] {
+            let block = SignedBeaconBlock {
+                message: BeaconBlock {
+                    slot,
+                    ..Default::default()
+                },
+                signature: Default::default(),
+            };
+            let root = block.message.tree_hash_root();
+            db.block_provider().insert(root, block).unwrap();
+            roots.push(root);
+        }
+
+        assert_eq!(latest_block_root_in_epoch(&db, 1).unwrap(), roots[1]);
+        assert!(latest_block_root_in_epoch(&db, 2).is_err());
+    }
 }
