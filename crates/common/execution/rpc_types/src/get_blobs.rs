@@ -6,7 +6,7 @@ use ssz_derive::{Decode, Encode};
 use ssz_types::{
     FixedVector,
     serde_utils::hex_fixed_vec,
-    typenum::{U32, U131072},
+    typenum::{U128, U131072},
 };
 use tree_hash_derive::TreeHash;
 
@@ -38,5 +38,23 @@ pub struct BlobAndProofV1 {
 #[serde(rename_all = "camelCase")]
 pub struct BlobAndProofV2 {
     pub blob: Blob,
-    pub proofs: FixedVector<KZGProof, U32>,
+    pub proofs: FixedVector<KZGProof, U128>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blob_and_proof_v2_carries_one_proof_per_cell() {
+        let proof = format!("\"0x{}\"", "c0".to_string() + &"00".repeat(47));
+        let json = format!(
+            "{{\"blob\":\"0x{}\",\"proofs\":[{}]}}",
+            "00".repeat(131072),
+            vec![proof.as_str(); 128].join(",")
+        );
+        let blob_and_proof = serde_json::from_str::<BlobAndProofV2>(&json)
+            .expect("an engine_getBlobsV2 entry should decode");
+        assert_eq!(blob_and_proof.proofs.len(), 128);
+    }
 }

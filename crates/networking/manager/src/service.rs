@@ -7,7 +7,11 @@ use std::{
 
 use alloy_primitives::B256;
 use libp2p::PeerId;
+use rand::seq::SliceRandom;
 use ream_chain_beacon::beacon_chain::BeaconChain;
+use ream_consensus_beacon::{
+    data_column_sidecar::NUMBER_OF_COLUMNS, electra::beacon_block::SignedBeaconBlock,
+};
 use ream_consensus_misc::{
     constants::beacon::{NUM_CUSTODY_GROUPS, SLOTS_PER_EPOCH},
     misc::compute_start_slot_at_epoch,
@@ -123,6 +127,8 @@ pub struct NetworkManagerService {
     pub cached_db: Arc<BeaconCacheDB>,
     pub sync_committee_pool: Arc<SyncCommitteePool>,
     pub executor: ReamExecutor,
+    /// Whether gossip blocks fetch their blobs from the execution client.
+    pub fetch_execution_blobs: bool,
 }
 
 struct ReconciledBlockLookupState {
@@ -312,6 +318,72 @@ fn spawn_column_reconstruction(
     });
 }
 
+/// Columns built from execution blobs are published in batches of this size, a quarter of them.
+const EXECUTION_COLUMN_PUBLICATION_BATCH_SIZE: usize = (NUMBER_OF_COLUMNS / 4) as usize;
+/// Wait between two batches of columns built from execution blobs.
+const EXECUTION_COLUMN_PUBLICATION_INTERVAL: Duration = Duration::from_millis(300);
+
+/// Imports the columns of a gossip block from the execution client's blobs on its own task, so
+/// it runs alongside the block's import, then publishes them like reconstructed columns (Fulu p2p
+/// "Distributed Blob Publishing using blobs retrieved from local execution-layer client").
+fn spawn_execution_column_fetch(
+    beacon_chain: &Arc<BeaconChain>,
+    cached_db: &Arc<BeaconCacheDB>,
+    p2p_sender: &P2PSender,
+    signed_block: &SignedBeaconBlock,
+) {
+    if signed_block.message.body.blob_kzg_commitments.is_empty() {
+        return;
+    }
+    let beacon_chain = beacon_chain.clone();
+    let cached_db = cached_db.clone();
+    let p2p_sender = p2p_sender.clone();
+    let signed_block = signed_block.clone();
+    tokio::spawn(async move {
+        let block_root = signed_block.message.tree_hash_root();
+        let columns = match beacon_chain
+            .fetch_columns_from_execution(&signed_block)
+            .await
+        {
+            Ok(columns) if columns.is_empty() => return,
+            Ok(columns) => columns,
+            Err(err) => {
+                warn!(%block_root, "Failed to import data columns from execution blobs: {err:#}");
+                return;
+            }
+        };
+        let finalized_slot = match beacon_chain.db().finalized_checkpoint_provider().get() {
+            Ok(checkpoint) => compute_start_slot_at_epoch(checkpoint.epoch),
+            Err(err) => {
+                error!(%block_root, "Cannot publish data columns from execution blobs: {err}");
+                return;
+            }
+        };
+        // Publish in random batches, so columns that arrive over gossip meanwhile are skipped;
+        // sending every column at once delayed the columns of other blocks (Lighthouse v8.2.0's
+        // `publish_data_columns_gradually`, with its defaults).
+        let mut columns = columns;
+        columns.shuffle(&mut rand::rng());
+        let mut published = 0;
+        for (batch_index, batch) in columns
+            .chunks(EXECUTION_COLUMN_PUBLICATION_BATCH_SIZE)
+            .enumerate()
+        {
+            if batch_index > 0 {
+                sleep(EXECUTION_COLUMN_PUBLICATION_INTERVAL).await;
+            }
+            published += publish_reconstructed_columns(
+                batch.to_vec(),
+                finalized_slot,
+                &cached_db,
+                &p2p_sender,
+            )
+            .await;
+        }
+        debug!(%block_root, published, "Published data columns from execution blobs");
+    });
+}
+
 async fn reconcile_block_lookup_state(
     beacon_chain: &BeaconChain,
     roots: Vec<alloy_primitives::B256>,
@@ -445,6 +517,7 @@ impl NetworkManagerService {
             cached_db,
             sync_committee_pool,
             executor,
+            fetch_execution_blobs: !config.disable_get_blobs,
         })
     }
 
@@ -462,6 +535,7 @@ impl NetworkManagerService {
             network_state,
             block_range_syncer,
             executor,
+            fetch_execution_blobs,
             ..
         } = self;
 
@@ -911,6 +985,11 @@ impl NetworkManagerService {
                                 &cached_db,
                                 &mut pending_item,
                                 &mut unknown_parent_block,
+                                |block| {
+                                    if fetch_execution_blobs {
+                                        spawn_execution_column_fetch(&beacon_chain, &cached_db, &p2p_sender, block);
+                                    }
+                                },
                             ).await;
                             p2p_sender.report_gossip_validation(
                                 message_id,

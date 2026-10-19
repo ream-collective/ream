@@ -114,6 +114,19 @@ impl<State> DataAvailabilityChecker<State> {
         missing
     }
 
+    /// The required columns of `block_root` that have not been received. Every required column
+    /// is missing for a block nothing has been received for yet.
+    pub fn missing_columns_or_all_required(&self, block_root: &B256) -> HashSet<u64> {
+        match self.entries.get(block_root) {
+            Some(entry) => self
+                .required_columns
+                .difference(&entry.received_columns)
+                .copied()
+                .collect(),
+            None => self.required_columns.clone(),
+        }
+    }
+
     /// The received columns of `block_root`, sorted.
     pub fn received_columns(&self, block_root: &B256) -> Vec<u64> {
         let Some(entry) = self.entries.get(block_root) else {

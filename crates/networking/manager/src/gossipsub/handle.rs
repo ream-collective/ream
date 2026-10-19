@@ -5,7 +5,7 @@ pub use libp2p::gossipsub::{Message, MessageAcceptance};
 use ream_chain_beacon::beacon_chain::{BeaconChain, BlockProcessingOutcome};
 use ream_consensus_beacon::{
     blob_sidecar::BlobIdentifier, data_column_sidecar::DATA_COLUMN_SIDECAR_SUBNET_COUNT,
-    single_attestation::SingleAttestation,
+    electra::beacon_block::SignedBeaconBlock, single_attestation::SingleAttestation,
 };
 use ream_consensus_misc::{
     constants::beacon::{MIN_ATTESTATION_INCLUSION_DELAY, genesis_validators_root},
@@ -48,7 +48,7 @@ use crate::{
 
 pub struct UnknownParentGossipBlock {
     pub parent_root: alloy_primitives::B256,
-    pub block: ream_consensus_beacon::electra::beacon_block::SignedBeaconBlock,
+    pub block: SignedBeaconBlock,
 }
 
 pub fn init_gossipsub_config_with_topics(history_length: Option<usize>) -> GossipsubConfig {
@@ -206,13 +206,15 @@ fn dependency_message_acceptance(
     }
 }
 
-/// Dispatches a gossipsub message to its appropriate handler.
+/// Dispatches a gossipsub message to its appropriate handler. `on_valid_block` gets each block
+/// that passed gossip validation, before its import starts.
 pub async fn handle_gossipsub_message(
     message: Message,
     beacon_chain: &BeaconChain,
     cached_db: &BeaconCacheDB,
     pending_item: &mut Option<PendingGossipItem>,
     unknown_parent_block: &mut Option<UnknownParentGossipBlock>,
+    on_valid_block: impl FnOnce(&SignedBeaconBlock),
 ) -> MessageAcceptance {
     match GossipsubMessage::decode(&message.topic, &message.data) {
         Ok(gossip_message) => match gossip_message {
@@ -251,6 +253,7 @@ pub async fn handle_gossipsub_message(
                 let acceptance = dependency_message_acceptance(&validation_result);
                 match validation_result {
                     DependencyValidationResult::Accept => {
+                        on_valid_block(&signed_block);
                         match beacon_chain.process_block(*signed_block).await {
                             Ok(BlockProcessingOutcome::Imported { .. }) => {}
                             Ok(BlockProcessingOutcome::PendingAvailability { .. }) => {}
@@ -809,6 +812,7 @@ mod tests {
             &cached_db,
             &mut pending_item,
             &mut unknown_parent_block,
+            |_| {},
         )
         .await;
 

@@ -15,10 +15,11 @@ use ssz::Encode;
 
 use crate::p2p_sender::P2PSender;
 
-/// Publishes each rebuilt column on its subnet topic and returns how many were published.
+/// Publishes each column the node built itself, by reconstruction or from execution blobs, on its
+/// subnet topic and returns how many were published.
 ///
 /// Two kinds of column are skipped. A column already marked seen passed gossip validation while
-/// reconstruction ran, and gossipsub forwards that copy. A column at or before the finalized slot
+/// the node built it, and gossipsub forwards that copy. A column at or before the finalized slot
 /// is ignored by every peer's gossip validation.
 ///
 /// Published columns are not marked seen. A copy of the same column can be waiting in gossipsub

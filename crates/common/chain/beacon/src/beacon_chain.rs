@@ -11,15 +11,15 @@ use ream_consensus_beacon::{
     attester_slashing::AttesterSlashing,
     data_column_sidecar::{ColumnIdentifier, DataColumnSidecar, NUMBER_OF_COLUMNS},
     electra::{beacon_block::SignedBeaconBlock, beacon_state::BeaconState},
-    matrix_entry::reconstruct_data_column_sidecars,
+    matrix_entry::{data_column_sidecars_from_execution_blobs, reconstruct_data_column_sidecars},
 };
 use ream_consensus_misc::{
     beacon_block_header::SignedBeaconBlockHeader, checkpoint::Checkpoint,
     constants::beacon::genesis_validators_root, misc::compute_epoch_at_slot,
 };
 use ream_events_beacon::{BeaconEvent, BeaconEventSender, event::chain::BlockEvent};
-use ream_execution_engine::ExecutionEngine;
-use ream_execution_rpc_types::forkchoice_update::ForkchoiceStateV1;
+use ream_execution_engine::{ExecutionEngine, engine_trait::ExecutionApi};
+use ream_execution_rpc_types::{forkchoice_update::ForkchoiceStateV1, get_blobs::BlobAndProofV2};
 use ream_fork_choice_beacon::{
     data_availability::PendingBlock,
     handlers::{
@@ -30,9 +30,12 @@ use ream_fork_choice_beacon::{
     store::Store,
 };
 use ream_metrics::{
-    BEACON_BLOCK_PROCESSING_SECONDS, BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_RUN_TOTAL,
+    BEACON_BLOBS_FROM_EL_ERROR_TOTAL, BEACON_BLOBS_FROM_EL_HIT_TOTAL,
+    BEACON_BLOBS_FROM_EL_MISS_TOTAL, BEACON_BLOCK_PROCESSING_SECONDS,
+    BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_RUN_TOTAL,
     BEACON_DATA_AVAILABILITY_RECONSTRUCTIONS_SKIPPED_COMPLETE_TOTAL,
-    BEACON_EXECUTION_FORKCHOICE_UPDATE_SECONDS, BEACON_STORE_LOCK_WAIT_SECONDS,
+    BEACON_DATA_COLUMNS_FROM_EL_IMPORTED_TOTAL, BEACON_EXECUTION_FORKCHOICE_UPDATE_SECONDS,
+    BEACON_STORE_LOCK_WAIT_SECONDS,
 };
 use ream_network_spec::networks::beacon_network_spec;
 use ream_operation_pool::OperationPool;
@@ -615,6 +618,89 @@ impl BeaconChain {
         Ok(recovered)
     }
 
+    /// Imports the columns of a gossip block built from blobs the execution client holds, so the
+    /// block need not wait for them over gossip or for a reconstruction (Fulu p2p "Distributed
+    /// Blob Publishing using blobs retrieved from local execution-layer client"). Returns the
+    /// imported columns, which the caller publishes.
+    ///
+    /// Returns none for a block without blobs, before Fulu, without an execution client, once the
+    /// block is imported, or when the execution client lacks one of the blobs: `engine_getBlobsV2`
+    /// returns all of them or nothing, and the columns then come over gossip as before.
+    pub async fn fetch_columns_from_execution(
+        &self,
+        signed_block: &SignedBeaconBlock,
+    ) -> anyhow::Result<Vec<DataColumnSidecar>> {
+        let Some(execution_engine) = self.execution_engine.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let block = &signed_block.message;
+        if block.body.blob_kzg_commitments.is_empty()
+            || compute_epoch_at_slot(block.slot) < beacon_network_spec().fulu_fork_epoch
+            || self
+                .db
+                .block_provider()
+                .get(block.tree_hash_root())?
+                .is_some()
+        {
+            return Ok(Vec::new());
+        }
+        let versioned_hashes = block
+            .body
+            .blob_kzg_commitments
+            .iter()
+            .map(|commitment| commitment.calculate_versioned_hash())
+            .collect();
+        let blobs_and_proofs = match execution_engine.engine_get_blobs_v2(versioned_hashes).await {
+            Ok(Some(blobs_and_proofs)) => blobs_and_proofs,
+            Ok(None) => {
+                BEACON_BLOBS_FROM_EL_MISS_TOTAL.inc();
+                return Ok(Vec::new());
+            }
+            Err(err) => {
+                BEACON_BLOBS_FROM_EL_ERROR_TOTAL.inc();
+                return Err(err.context("engine_getBlobsV2 failed"));
+            }
+        };
+        BEACON_BLOBS_FROM_EL_HIT_TOTAL.inc();
+        self.import_columns_from_execution_blobs(signed_block, blobs_and_proofs)
+            .await
+    }
+
+    /// Builds the columns of `signed_block` from `blobs_and_proofs` and imports the required ones
+    /// it does not have yet. Returns the imported columns.
+    pub async fn import_columns_from_execution_blobs(
+        &self,
+        signed_block: &SignedBeaconBlock,
+        blobs_and_proofs: Vec<BlobAndProofV2>,
+    ) -> anyhow::Result<Vec<DataColumnSidecar>> {
+        let block_root = signed_block.message.tree_hash_root();
+        let block = signed_block.clone();
+        let columns = tokio::task::spawn_blocking(move || {
+            data_column_sidecars_from_execution_blobs(&block, blobs_and_proofs)
+        })
+        .await??;
+
+        // Read after building, so columns that gossip delivered meanwhile are not stored twice.
+        let missing = {
+            let store = self.store.lock().await;
+            if store.db.block_provider().get(block_root)?.is_some() {
+                return Ok(Vec::new());
+            }
+            store
+                .data_availability_checker
+                .missing_columns_or_all_required(&block_root)
+        };
+        let columns = columns
+            .into_iter()
+            .filter(|column| missing.contains(&column.index))
+            .collect::<Vec<_>>();
+        self.import_data_column_sidecars_if(columns.clone(), |_| Ok(()))
+            .await?;
+        BEACON_DATA_COLUMNS_FROM_EL_IMPORTED_TOTAL.inc_by(columns.len() as u64);
+        debug!(%block_root, imported = columns.len(), "Imported data columns from execution blobs");
+        Ok(columns)
+    }
+
     fn process_block_attestations(
         &self,
         store: &mut Store,
@@ -963,6 +1049,7 @@ mod tests {
     use ream_network_spec::networks::beacon::initialize_test_network_spec;
     use ream_storage::{cache::BeaconCacheDB, db::ReamDB, tables::table::REDBTable};
     use ssz::Decode;
+    use ssz_types::FixedVector;
 
     use super::*;
 
@@ -1268,6 +1355,71 @@ mod tests {
         assert_eq!(
             events.recv().await.unwrap(),
             BlockImportEvent::Imported { block_root: root }
+        );
+    }
+
+    fn execution_blobs_of_default_blob() -> Vec<BlobAndProofV2> {
+        let blob = Blob::default();
+        let (_, proofs) = compute_cells_and_kzg_proofs(&blob, das_context())
+            .expect("test blob should produce cells and proofs");
+        vec![BlobAndProofV2 {
+            blob,
+            proofs: FixedVector::new(proofs).expect("a blob has one proof per cell"),
+        }]
+    }
+
+    #[tokio::test]
+    async fn execution_blobs_import_the_missing_columns_of_a_pending_block() {
+        let mut state = test_beacon_state();
+        let (_data_dir, chain, parent_root) = test_chain_with_anchor(state.clone());
+        state.slot += 1;
+        let (block, columns) =
+            block_with_blob_columns(state.slot, parent_root, state.tree_hash_root());
+        let root = block.message.tree_hash_root();
+        chain
+            .store
+            .lock()
+            .await
+            .data_availability_checker
+            .insert_pending(root, block.clone(), state);
+        // Gossip delivered a few columns first; only the others are imported.
+        chain
+            .import_data_column_sidecars_if(columns[..10].to_vec(), |_| Ok(()))
+            .await
+            .unwrap();
+
+        let mut events = chain.subscribe_block_imports();
+        let imported = chain
+            .import_columns_from_execution_blobs(&block, execution_blobs_of_default_blob())
+            .await
+            .unwrap();
+        let mut imported_indices = imported
+            .iter()
+            .map(|column| column.index)
+            .collect::<Vec<_>>();
+        imported_indices.sort_unstable();
+        assert_eq!(
+            imported_indices,
+            (10..NUMBER_OF_COLUMNS).collect::<Vec<_>>()
+        );
+        assert!(
+            imported
+                .iter()
+                .all(|column| *column == columns[column.index as usize])
+        );
+        assert!(chain.db.block_provider().get(root).unwrap().is_some());
+        assert_eq!(
+            events.recv().await.unwrap(),
+            BlockImportEvent::Imported { block_root: root }
+        );
+
+        // The block is imported, so a late response has nothing to add.
+        assert!(
+            chain
+                .import_columns_from_execution_blobs(&block, execution_blobs_of_default_blob())
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 

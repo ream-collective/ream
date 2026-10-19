@@ -19,4 +19,5 @@ pub struct ManagerConfig {
     pub mev_relay_url: Option<Url>,
     pub blob_retention_epochs: Option<u64>,
     pub gossipsub_history_length: Option<usize>,
+    pub disable_get_blobs: bool,
 }

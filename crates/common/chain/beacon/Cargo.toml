@@ -35,6 +35,7 @@ ream-sync-committee-pool.workspace = true
 
 [dev-dependencies]
 snap.workspace = true
+ssz_types.workspace = true
 tempfile.workspace = true
 
 [lints]
