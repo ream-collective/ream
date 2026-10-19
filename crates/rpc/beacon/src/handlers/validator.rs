@@ -4,7 +4,9 @@ use std::{
 };
 
 use actix_web::{
-    HttpResponse, Responder, get, post,
+    HttpRequest, HttpResponse, Responder, get,
+    http::header,
+    post,
     web::{Data, Json, Path, Query},
 };
 use alloy_primitives::{Address, B64, B256, aliases::B32};
@@ -17,7 +19,11 @@ use ream_api_types_beacon::{
     responses::{BeaconResponse, DataResponse, DataVersionedResponse},
     validator::{ValidatorBalance, ValidatorData, ValidatorStatus},
 };
-use ream_api_types_common::{error::ApiError, id::ID};
+use ream_api_types_common::{
+    content_type::{ContentType, SSZ_CONTENT_TYPE},
+    error::ApiError,
+    id::ID,
+};
 use ream_bls::{BLSSignature, PublicKey, traits::Verifiable};
 use ream_chain_beacon::beacon_chain::{BeaconChain, payload_attributes};
 use ream_consensus_beacon::{
@@ -1296,7 +1302,9 @@ fn check_blobs_bundle(bundle: &BlobsBundle) -> Result<(), ApiError> {
 }
 
 #[get("/validator/blocks/{slot}")]
+#[allow(clippy::too_many_arguments)]
 pub async fn get_blocks_v3(
+    http_request: HttpRequest,
     path: Path<u64>,
     query: Query<BlockQuery>,
     db: Data<BeaconDB>,
@@ -1478,18 +1486,7 @@ pub async fn get_blocks_v3(
             data: ProduceBlockData::Blinded(blinded_block),
         };
 
-        return Ok(HttpResponse::Ok()
-            .insert_header(("Eth-Consensus-Version", fork_name.to_string()))
-            .insert_header(("Eth-Execution-Payload-Blinded", "true"))
-            .insert_header((
-                "Eth-Execution-Payload-Value",
-                response.execution_payload_value.to_string(),
-            ))
-            .insert_header((
-                "Eth-Consensus-Block-Value",
-                consensus_block_value.to_string(),
-            ))
-            .json(response));
+        return Ok(produce_block_response(&http_request, response));
     }
 
     let execution_payload = local_payload.to_execution_payload();
@@ -1582,18 +1579,40 @@ pub async fn get_blocks_v3(
         }),
     };
 
-    Ok(HttpResponse::Ok()
-        .insert_header(("Eth-Consensus-Version", fork_name.to_string()))
-        .insert_header(("Eth-Execution-Payload-Blinded", "false"))
+    Ok(produce_block_response(&http_request, response))
+}
+
+/// The produced block as SSZ when the client prefers it, as Lighthouse's validator client does,
+/// otherwise as JSON. The headers carry what the SSZ body leaves out.
+fn produce_block_response(
+    http_request: &HttpRequest,
+    response: ProduceBlockResponse,
+) -> HttpResponse {
+    let mut builder = HttpResponse::Ok();
+    builder
+        .insert_header(("Eth-Consensus-Version", response.version.clone()))
+        .insert_header((
+            "Eth-Execution-Payload-Blinded",
+            response.execution_payload_blinded.to_string(),
+        ))
         .insert_header((
             "Eth-Execution-Payload-Value",
-            local_execution_value.to_string(),
+            response.execution_payload_value.to_string(),
         ))
         .insert_header((
             "Eth-Consensus-Block-Value",
-            consensus_block_value.to_string(),
-        ))
-        .json(response))
+            response.consensus_block_value.to_string(),
+        ));
+    match ContentType::from(http_request.headers().get(header::ACCEPT)) {
+        ContentType::Ssz => {
+            let body = match &response.data {
+                ProduceBlockData::Full(block_contents) => block_contents.as_ssz_bytes(),
+                ProduceBlockData::Blinded(blinded_block) => blinded_block.as_ssz_bytes(),
+            };
+            builder.content_type(SSZ_CONTENT_TYPE).body(body)
+        }
+        ContentType::Json => builder.json(response),
+    }
 }
 
 #[get("/validator/aggregate_attestation")]
@@ -1737,5 +1756,79 @@ mod tests {
         assert!(!validator_api_is_syncing(100, 36));
         assert!(validator_api_is_syncing(101, 36));
         assert!(!validator_api_is_syncing(36, 100));
+    }
+}
+
+#[cfg(test)]
+mod produce_block_response_tests {
+    use std::path::PathBuf;
+
+    use actix_web::{body::MessageBody, test::TestRequest};
+    use ream_consensus_beacon::electra::beacon_block::SignedBeaconBlock;
+    use ssz::Decode;
+
+    use super::*;
+
+    fn produced_block() -> ProduceBlockResponse {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../../testing/gossip-validation/tests/assets/sepolia/blocks/child_9552076.ssz_snappy",
+        );
+        let bytes = snap::raw::Decoder::new()
+            .decompress_vec(&std::fs::read(path).unwrap())
+            .unwrap();
+        ProduceBlockResponse {
+            version: "fulu".to_string(),
+            execution_payload_blinded: false,
+            execution_payload_value: 7,
+            consensus_block_value: 9,
+            data: ProduceBlockData::Full(FullBlockData {
+                block: SignedBeaconBlock::from_ssz_bytes(&bytes).unwrap().message,
+                kzg_proofs: vec![],
+                blobs: vec![],
+            }),
+        }
+    }
+
+    #[test]
+    fn produced_blocks_are_ssz_when_the_client_prefers_it() {
+        let ssz_request = TestRequest::default()
+            .insert_header((
+                header::ACCEPT,
+                "application/octet-stream;q=1.0,application/json;q=0.9",
+            ))
+            .to_http_request();
+        let response = produce_block_response(&ssz_request, produced_block());
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            SSZ_CONTENT_TYPE
+        );
+        assert_eq!(
+            response.headers().get("eth-consensus-version").unwrap(),
+            "fulu"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("eth-execution-payload-value")
+                .unwrap(),
+            "7"
+        );
+        let body = response.into_body().try_into_bytes().unwrap();
+        let ProduceBlockData::Full(expected) = produced_block().data else {
+            unreachable!()
+        };
+        assert_eq!(
+            FullBlockData::from_ssz_bytes(&body).unwrap().block,
+            expected.block
+        );
+
+        let json_request = TestRequest::default()
+            .insert_header((header::ACCEPT, "application/json"))
+            .to_http_request();
+        let response = produce_block_response(&json_request, produced_block());
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/json"
+        );
     }
 }
