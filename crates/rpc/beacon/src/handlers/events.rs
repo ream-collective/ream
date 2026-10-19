@@ -1,65 +1,40 @@
-use actix_web::{Responder, get, web};
+use std::str::FromStr;
+
+use actix_web::{HttpRequest, Responder, get, web};
 use actix_web_lab::sse;
 use futures::stream;
-use ream_events_beacon::BeaconEvent;
-use serde::{Deserialize, Deserializer};
+use ream_api_types_common::error::ApiError;
+use ream_events_beacon::{BeaconEvent, EventTopic};
 use tokio::sync::broadcast;
 
-#[derive(Deserialize)]
-pub struct EventQuery {
-    #[serde(deserialize_with = "deserialize_topics_array")]
-    topics: Vec<String>,
-}
-
-// The custom deserializer handles:
-// Single string value: ?topics=head → converts to vec!["head"]
-// Array format: ?topics=head&topics=block → converts to vec!["head", "block"]
-
-fn deserialize_topics_array<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    use std::fmt;
-
-    use serde::de::{self, Visitor};
-
-    struct TopicsArrayVisitor;
-
-    impl<'de> Visitor<'de> for TopicsArrayVisitor {
-        type Value = Vec<String>;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            formatter.write_str("a string or an array of strings")
-        }
-
-        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            Ok(vec![value.to_string()])
-        }
-
-        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-        where
-            A: de::SeqAccess<'de>,
-        {
-            let mut vec = Vec::new();
-            while let Some(item) = seq.next_element::<String>()? {
-                vec.push(item);
-            }
-            Ok(vec)
-        }
+/// Reads `topics` given as a comma-separated list, as repeated parameters, or both.
+fn parse_topics(query: &str) -> Result<Vec<String>, ApiError> {
+    let topics = url::form_urlencoded::parse(query.as_bytes())
+        .filter(|(key, _)| key == "topics")
+        .flat_map(|(_, value)| {
+            value
+                .split(',')
+                .map(|topic| topic.trim().to_string())
+                .collect::<Vec<_>>()
+        })
+        .filter(|topic| !topic.is_empty())
+        .collect::<Vec<_>>();
+    if topics.is_empty() {
+        return Err(ApiError::BadRequest("Missing topics".into()));
     }
-
-    deserializer.deserialize_any(TopicsArrayVisitor)
+    for topic in &topics {
+        EventTopic::from_str(topic)
+            .map_err(|err| ApiError::BadRequest(format!("Invalid topic: {err}")))?;
+    }
+    Ok(topics)
 }
 
 #[get("/events")]
 pub async fn get_events(
-    query: web::Query<EventQuery>,
+    request: HttpRequest,
     event_sender: web::Data<broadcast::Sender<BeaconEvent>>,
-) -> impl Responder {
-    let topics = query.topics.clone();
+) -> Result<impl Responder, ApiError> {
+    let topics = parse_topics(request.query_string())?;
 
     let rx = event_sender.subscribe();
 
@@ -97,5 +72,29 @@ pub async fn get_events(
         }
     });
 
-    sse::Sse::from_stream(stream).with_keep_alive(std::time::Duration::from_secs(10))
+    Ok(sse::Sse::from_stream(stream).with_keep_alive(std::time::Duration::from_secs(10)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_topics;
+
+    #[test]
+    fn topics_accept_comma_lists_and_repeated_parameters() {
+        assert_eq!(parse_topics("topics=head").unwrap(), ["head"]);
+        assert_eq!(
+            parse_topics("topics=head,block").unwrap(),
+            ["head", "block"]
+        );
+        assert_eq!(
+            parse_topics("topics=head&topics=block").unwrap(),
+            ["head", "block"]
+        );
+        assert_eq!(
+            parse_topics("topics=head%2Cblock").unwrap(),
+            ["head", "block"]
+        );
+        assert!(parse_topics("topics=nope").is_err());
+        assert!(parse_topics("").is_err());
+    }
 }
