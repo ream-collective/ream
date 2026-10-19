@@ -154,6 +154,14 @@ impl CustodyConfig {
         })
     }
 
+    pub fn number_of_custody_groups(&self) -> u64 {
+        self.number_of_custody_groups
+    }
+
+    pub fn custody_requirement(&self) -> u64 {
+        self.custody_requirement
+    }
+
     pub fn sampling_size(&self, custody_group_count: u64) -> u64 {
         self.samples_per_slot.max(custody_group_count)
     }

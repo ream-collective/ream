@@ -21,4 +21,5 @@ pub struct ManagerConfig {
     pub gossipsub_history_length: Option<usize>,
     pub disable_get_blobs: bool,
     pub target_peers: usize,
+    pub supernode: bool,
 }

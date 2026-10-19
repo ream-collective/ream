@@ -60,7 +60,9 @@ use ream_metrics::{
     ATTESTATION_COMMITTEE_SUBNET, NODE_INFO, NODE_START_TIME_SECONDS, init_node_metrics,
     set_int_gauge_vec,
 };
-use ream_network_manager::{config::ManagerConfig, service::NetworkManagerService};
+use ream_network_manager::{
+    config::ManagerConfig, custody::local_custody_assignment, service::NetworkManagerService,
+};
 use ream_network_spec::networks::{
     beacon_network_spec, lean_network_spec, set_beacon_network_spec, set_lean_network_spec,
 };
@@ -728,6 +730,9 @@ async fn run_beacon_node_inner(
     } else {
         beacon_chain
     };
+    let custody = local_custody_assignment(&beacon_db.data_dir, config.supernode)
+        .expect("Failed to derive the data column custody of the node");
+    let beacon_chain = beacon_chain.with_sampling_columns(custody.sampling_columns);
     let beacon_chain = Arc::new(beacon_chain);
 
     // Warm the BLS key cache so the first blocks after startup don't decompress every key.

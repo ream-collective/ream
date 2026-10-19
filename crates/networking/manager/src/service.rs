@@ -12,10 +12,7 @@ use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::{
     data_column_sidecar::NUMBER_OF_COLUMNS, electra::beacon_block::SignedBeaconBlock,
 };
-use ream_consensus_misc::{
-    constants::beacon::{NUM_CUSTODY_GROUPS, SLOTS_PER_EPOCH},
-    misc::compute_start_slot_at_epoch,
-};
+use ream_consensus_misc::{constants::beacon::SLOTS_PER_EPOCH, misc::compute_start_slot_at_epoch};
 use ream_discv5::{
     config::DiscoveryConfig,
     subnet::{AttestationSubnets, CustodyGroupCount, SyncCommitteeSubnets},
@@ -57,6 +54,7 @@ use crate::{
         spawn_block_lookup_worker,
     },
     config::ManagerConfig,
+    custody::local_custody_assignment,
     data_availability_fetch::{
         ColumnFetchOutcome, ColumnFetchTracker, fetch_missing_columns, pending_anchor_for_recovery,
     },
@@ -455,9 +453,14 @@ impl NetworkManagerService {
         ))
         .build();
 
-        // Ream's DA checker currently runs as a supernode and requires every custody group.
-        let custody_group_count = CustodyGroupCount(NUM_CUSTODY_GROUPS);
+        let custody = local_custody_assignment(&ream_directory, config.supernode)?;
+        let custody_group_count = CustodyGroupCount(custody.custody_group_count);
         BEACON_CUSTODY_GROUPS.set(custody_group_count.0 as i64);
+        info!(
+            custody_group_count = custody.custody_group_count,
+            sampling_columns = custody.sampling_columns.len(),
+            "Data column custody"
+        );
 
         let bootnodes = config
             .bootnodes
@@ -478,7 +481,10 @@ impl NetworkManagerService {
             custody_group_count,
         };
 
-        let gossipsub_config = init_gossipsub_config_with_topics(config.gossipsub_history_length);
+        let gossipsub_config = init_gossipsub_config_with_topics(
+            config.gossipsub_history_length,
+            &custody.data_column_subnet_ids,
+        );
 
         let network_config = NetworkConfig {
             discv5_config,

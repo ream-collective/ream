@@ -8,6 +8,7 @@ use std::{
 
 use alloy_primitives::hex;
 use anyhow::{Context, anyhow};
+use discv5::enr::{CombinedKey, EnrKey, NodeId, k256::ecdsa::SigningKey};
 use libp2p_identity::secp256k1;
 use tracing::{info, warn};
 
@@ -52,6 +53,15 @@ pub fn load_or_create_network_key(data_dir: &Path) -> anyhow::Result<secp256k1::
             key_path.display()
         )
     })
+}
+
+/// The discv5 node id of the beacon network key in `data_dir`, creating the key if it is missing.
+/// It fixes the node's custody groups, so they are known before the network starts.
+pub fn local_node_id(data_dir: &Path) -> anyhow::Result<NodeId> {
+    let keypair = load_or_create_network_key(data_dir)?;
+    let secret = SigningKey::from_slice(&keypair.secret().to_bytes())
+        .map_err(|err| anyhow!("Failed to convert the network key to a signing key: {err:?}"))?;
+    Ok(NodeId::from(CombinedKey::Secp256k1(secret).public()))
 }
 
 /// Returns `Ok(None)` only when the key file does not exist.
@@ -237,6 +247,17 @@ mod tests {
 
     fn peer_id(keypair: &secp256k1::Keypair) -> PeerId {
         PeerId::from_public_key(&Keypair::from(keypair.clone()).public())
+    }
+
+    #[test]
+    fn local_node_id_is_the_node_id_of_the_enr() {
+        let data_dir = TestDataDir::new();
+        let node_id = local_node_id(data_dir.path()).unwrap();
+        let keypair = load_or_create_network_key(data_dir.path()).unwrap();
+        let enr_key =
+            CombinedKey::Secp256k1(SigningKey::from_slice(&keypair.secret().to_bytes()).unwrap());
+        let enr = discv5::Enr::builder().build(&enr_key).unwrap();
+        assert_eq!(node_id, enr.node_id());
     }
 
     #[test]

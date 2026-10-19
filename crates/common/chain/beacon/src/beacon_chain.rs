@@ -21,7 +21,7 @@ use ream_events_beacon::{BeaconEvent, BeaconEventSender, event::chain::BlockEven
 use ream_execution_engine::{ExecutionEngine, engine_trait::ExecutionApi};
 use ream_execution_rpc_types::{forkchoice_update::ForkchoiceStateV1, get_blobs::BlobAndProofV2};
 use ream_fork_choice_beacon::{
-    data_availability::PendingBlock,
+    data_availability::{DataAvailabilityChecker, PendingBlock},
     handlers::{
         OnBlockOutcome, on_attestation, on_attester_slashing, on_block_attestations,
         on_block_with_root, on_gossip_attestation_with_shuffling, on_tick, process_available_block,
@@ -191,6 +191,17 @@ impl BeaconChain {
     /// Intended for test networks that exercise Fulu data flow on an Electra state fixture.
     pub fn force_data_availability_checks(mut self) -> Self {
         self.force_data_availability_checks = true;
+        self
+    }
+
+    /// Makes a block available once these columns, the ones the node samples, are imported. A
+    /// new chain requires every column, as a supernode.
+    pub fn with_sampling_columns(
+        mut self,
+        sampling_columns: impl IntoIterator<Item = u64>,
+    ) -> Self {
+        self.store.get_mut().data_availability_checker =
+            DataAvailabilityChecker::new(sampling_columns.into_iter().collect());
         self
     }
 
@@ -1248,6 +1259,31 @@ mod tests {
         .await
         .expect("preparing a checkpoint state does not take the store lock");
         assert!(checkpoint_states.is_in_memory(target));
+    }
+
+    #[tokio::test]
+    async fn a_block_waits_only_for_the_sampled_columns() {
+        let (_data_dir, chain) = test_chain();
+        assert_eq!(
+            chain
+                .store
+                .lock()
+                .await
+                .data_availability_checker
+                .required_columns()
+                .len() as u64,
+            NUMBER_OF_COLUMNS
+        );
+        let chain = chain.with_sampling_columns([5, 77]);
+        assert_eq!(
+            chain
+                .store
+                .lock()
+                .await
+                .data_availability_checker
+                .required_columns(),
+            &HashSet::from([5, 77])
+        );
     }
 
     #[tokio::test]

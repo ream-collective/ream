@@ -113,6 +113,12 @@ pub struct BeaconNodeConfig {
     )]
     pub target_peers: usize,
 
+    #[arg(
+        long,
+        help = "Custody, sample and serve every data column. Without it the node custodies CUSTODY_REQUIREMENT groups and samples SAMPLES_PER_SLOT groups"
+    )]
+    pub supernode: bool,
+
     #[arg(long = "metrics", help = "Enable metrics", default_value_t = DEFAULT_METRICS_ENABLED)]
     pub enable_metrics: bool,
 
@@ -143,6 +149,7 @@ impl From<BeaconNodeConfig> for ManagerConfig {
             gossipsub_history_length: None,
             disable_get_blobs: config.disable_get_blobs,
             target_peers: config.target_peers,
+            supernode: config.supernode,
         }
     }
 }

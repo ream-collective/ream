@@ -65,7 +65,9 @@ pub async fn publish_reconstructed_columns(
 #[cfg(test)]
 mod tests {
     use ream_consensus_beacon::{
-        data_column_sidecar::{NUMBER_OF_COLUMNS, get_data_column_sidecars},
+        data_column_sidecar::{
+            DATA_COLUMN_SIDECAR_SUBNET_COUNT, NUMBER_OF_COLUMNS, get_data_column_sidecars,
+        },
         electra::beacon_block::SignedBeaconBlock,
     };
     use ream_network_spec::networks::initialize_test_network_spec;
@@ -200,9 +202,12 @@ mod tests {
         // Peers on this node's fork digest dedupe by topic and data, so a copy published on any
         // other topic would get a different message id and reach a different mesh.
         assert!(
-            init_gossipsub_config_with_topics(None)
-                .topics
-                .contains(&message.topic)
+            init_gossipsub_config_with_topics(
+                None,
+                &(0..DATA_COLUMN_SIDECAR_SUBNET_COUNT).collect::<Vec<_>>()
+            )
+            .topics
+            .contains(&message.topic)
         );
         let decoded = GossipsubMessage::decode(&message.topic.into(), &message.data)
             .expect("the published column should decode on its topic");
