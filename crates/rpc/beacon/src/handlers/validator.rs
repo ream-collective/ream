@@ -42,8 +42,8 @@ use ream_consensus_misc::{
     attestation_data::AttestationData,
     checkpoint::Checkpoint,
     constants::beacon::{
-        DOMAIN_RANDAO, MAX_COMMITTEES_PER_SLOT, PROPOSER_REWARD_QUOTIENT, SLOTS_PER_EPOCH,
-        SYNC_COMMITTEE_PROPOSER_REWARD_QUOTIENT, SYNC_COMMITTEE_SIZE,
+        CELLS_PER_EXT_BLOB, DOMAIN_RANDAO, MAX_COMMITTEES_PER_SLOT, PROPOSER_REWARD_QUOTIENT,
+        SLOTS_PER_EPOCH, SYNC_COMMITTEE_PROPOSER_REWARD_QUOTIENT, SYNC_COMMITTEE_SIZE,
         WHISTLEBLOWER_REWARD_QUOTIENT, genesis_validators_root,
     },
     deposit::Deposit,
@@ -58,11 +58,12 @@ use ream_events_beacon::{
     BeaconEvent, contribution_and_proof::SignedContributionAndProof,
     event::sync_committee::ContributionAndProofEvent,
 };
-use ream_execution_engine::{ExecutionEngine, engine_trait::ExecutionApi};
+use ream_execution_engine::ExecutionEngine;
 use ream_execution_rpc_types::{
     execution_payload::WithdrawalV1,
     forkchoice_update::{ForkchoiceStateV1, PayloadAttributesV3},
-    get_payload::Payload,
+    get_blobs::{Blob, BlobAndProofV1},
+    get_payload::{BlobsBundle, Payload},
 };
 use ream_fork_choice_beacon::store::Store;
 use ream_network_manager::{
@@ -1257,6 +1258,26 @@ async fn compare_builder_vs_local(
     }
 }
 
+/// A Fulu bundle carries ``CELLS_PER_EXT_BLOB`` cell proofs per blob, earlier ones one proof.
+fn check_blobs_bundle(bundle: &BlobsBundle) -> Result<(), ApiError> {
+    let commitments = bundle.get_commitments().len();
+    let proofs_per_blob = if bundle.is_fulu() {
+        CELLS_PER_EXT_BLOB as usize
+    } else {
+        1
+    };
+    if bundle.get_blobs().len() != commitments
+        || bundle.get_proofs().len() != commitments * proofs_per_blob
+    {
+        return Err(ApiError::InternalError(format!(
+            "Malformed blobs bundle: {commitments} commitments, {} blobs, {} proofs",
+            bundle.get_blobs().len(),
+            bundle.get_proofs().len()
+        )));
+    }
+    Ok(())
+}
+
 #[get("/validator/blocks/{slot}")]
 pub async fn get_blocks_v3(
     path: Path<u64>,
@@ -1472,15 +1493,11 @@ pub async fn get_blocks_v3(
 
     let execution_payload = local_payload.to_execution_payload();
 
-    let blob_kzg_commitments: Vec<KZGCommitment> = local_payload.blobs_bundle().get_commitments();
-
-    let kzg_proofs: Vec<KZGProof> = local_payload.blobs_bundle().get_proofs();
-
-    if blob_kzg_commitments.len() != kzg_proofs.len() {
-        return Err(ApiError::InternalError(
-            "Mismatch between blob commitments and KZG proofs".into(),
-        ));
-    }
+    let blobs_bundle = local_payload.blobs_bundle();
+    let blob_kzg_commitments: Vec<KZGCommitment> = blobs_bundle.get_commitments();
+    let kzg_proofs: Vec<KZGProof> = blobs_bundle.get_proofs();
+    let blobs: Vec<Blob> = blobs_bundle.get_blobs();
+    check_blobs_bundle(&blobs_bundle)?;
 
     let execution_requests =
         get_execution_requests(local_payload.execution_requests().clone()).unwrap_or_default();
@@ -1521,43 +1538,28 @@ pub async fn get_blocks_v3(
         })?;
     block.state_root = post_state.tree_hash_root();
 
-    let blob_versioned_hashes: Vec<B256> = blob_kzg_commitments
-        .iter()
-        .map(|c| c.calculate_versioned_hash())
-        .collect();
-
-    let blobs_and_proofs = execution_engine
-        .clone()
-        .engine_get_blobs_v1(blob_versioned_hashes)
-        .await
-        .map_err(|err| {
-            ApiError::InternalError(format!(
-                "Failed to fetch blobs from execution engine: {err}"
-            ))
-        })?;
-
-    if blobs_and_proofs.len() != blob_kzg_commitments.len() {
-        return Err(ApiError::InternalError(
-            "Blob count does not match commitments".to_string(),
-        ));
-    }
-
+    // Cache the blobs for the publish path, which builds data columns from them. A Fulu bundle
+    // has cell proofs only, so the blob proof is left empty.
     let block_root = block.tree_hash_root();
     let blobs_and_proofs_provider = db.blobs_and_proofs_provider();
-    let mut blobs = Vec::with_capacity(blobs_and_proofs.len());
-    let mut cached_blobs = Vec::with_capacity(blobs_and_proofs.len());
-    for (index, bap) in blobs_and_proofs.into_iter().enumerate() {
-        let blob_and_proof = bap.expect(
-            "Missing blob and proof from execution engine: expected BlobAndProofV1, got None",
-        );
-
-        cached_blobs.push((
-            BlobIdentifier::new(block_root, index as u64),
-            blob_and_proof.clone(),
-        ));
-
-        blobs.push(blob_and_proof.blob);
-    }
+    let cached_blobs = blobs
+        .iter()
+        .enumerate()
+        .map(|(index, blob)| {
+            let proof = if blobs_bundle.is_fulu() {
+                KZGProof::default()
+            } else {
+                kzg_proofs[index]
+            };
+            (
+                BlobIdentifier::new(block_root, index as u64),
+                BlobAndProofV1 {
+                    blob: blob.clone(),
+                    proof,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
 
     match tokio::task::spawn_blocking(move || blobs_and_proofs_provider.insert_batch(cached_blobs))
         .await
@@ -1623,6 +1625,7 @@ mod tests {
 
     use alloy_primitives::B256;
     use ream_consensus_misc::checkpoint::Checkpoint;
+    use ream_execution_rpc_types::get_payload::{BlobsBundleV1, BlobsBundleV2};
     use ssz::Decode;
 
     use super::*;
@@ -1706,6 +1709,26 @@ mod tests {
         assert!(!is_live(&state, live, epoch + 1));
         assert!(!is_live(&state, live, epoch - 2));
         assert!(!is_live(&state, state.validators.len(), epoch - 1));
+    }
+
+    #[test]
+    fn blobs_bundle_expects_cell_proofs_from_fulu() {
+        let fulu = |proof_count: usize| {
+            BlobsBundle::V2(BlobsBundleV2 {
+                commitments: vec![KZGCommitment::empty_for_testing()].try_into().unwrap(),
+                proofs: vec![KZGProof::default(); proof_count].try_into().unwrap(),
+                blobs: vec![Blob::default()].try_into().unwrap(),
+            })
+        };
+        assert!(check_blobs_bundle(&fulu(CELLS_PER_EXT_BLOB as usize)).is_ok());
+        assert!(check_blobs_bundle(&fulu(1)).is_err());
+
+        let electra = BlobsBundle::V1(BlobsBundleV1 {
+            blobs: vec![Blob::default()].try_into().unwrap(),
+            commitments: vec![KZGCommitment::empty_for_testing()].try_into().unwrap(),
+            proofs: vec![KZGProof::default()].try_into().unwrap(),
+        });
+        assert!(check_blobs_bundle(&electra).is_ok());
     }
 
     #[test]
