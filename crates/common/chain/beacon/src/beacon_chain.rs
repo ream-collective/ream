@@ -393,7 +393,7 @@ impl BeaconChain {
         let attestations_done = started.elapsed();
         store.refresh_fork_choice();
         self.publish_cached_head(&store);
-        let block_event = self.build_block_event(&store, &signed_block, block_root);
+        let block_event = self.build_block_event(&signed_block, block_root);
         drop(store);
         let unlocked = started.elapsed();
 
@@ -545,7 +545,7 @@ impl BeaconChain {
         self.process_block_attestations(store, &signed_block, block_root);
         store.refresh_fork_choice();
         self.publish_cached_head(store);
-        let block_event = self.build_block_event(store, &signed_block, block_root);
+        let block_event = self.build_block_event(&signed_block, block_root);
         Ok((block_root, block_event))
     }
 
@@ -974,23 +974,13 @@ impl BeaconChain {
 
     fn build_block_event(
         &self,
-        store: &Store,
         signed_block: &SignedBeaconBlock,
         block_root: B256,
     ) -> Option<BeaconEvent> {
-        let finalized_checkpoint = store.db.finalized_checkpoint_provider().get().ok();
-        match BlockEvent::from_block(
+        Some(BeaconEvent::Block(BlockEvent::from_block(
             signed_block,
             block_root,
-            finalized_checkpoint,
-            |block_root, epoch| store.get_checkpoint_block(block_root, epoch),
-        ) {
-            Ok(block_event) => Some(BeaconEvent::Block(block_event)),
-            Err(err) => {
-                warn!("Failed to build block event after importing {block_root}: {err:?}");
-                None
-            }
-        }
+        )))
     }
 
     fn publish_block_event(&self, block_event: Option<BeaconEvent>) {
