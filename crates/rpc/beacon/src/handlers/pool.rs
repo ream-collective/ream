@@ -381,7 +381,7 @@ async fn get_head_state(beacon_chain: &BeaconChain) -> Result<Arc<BeaconState>, 
 #[post("/beacon/pool/sync_committees")]
 pub async fn post_sync_committees(
     messages: Json<Vec<SyncCommitteeRequestItem>>,
-    db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<BeaconChain>>,
     sync_committee_pool: Data<Arc<SyncCommitteePool>>,
     p2p_sender: Data<Arc<P2PSender>>,
 ) -> Result<impl Responder, ApiError> {
@@ -398,7 +398,9 @@ pub async fn post_sync_committees(
             continue;
         }
 
-        let state = get_state_from_id(ID::Slot(slot), &db).await?;
+        // Messages are for the current slot, which may have no block yet, so the state at the
+        // message slot may not exist. The head state knows the committee and the fork.
+        let state = get_head_state(beacon_chain.get_ref().as_ref()).await?;
 
         let validator_index = message.validator_index;
 
