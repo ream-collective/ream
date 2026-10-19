@@ -37,6 +37,7 @@ ream-storage.workspace = true
 ream-sync-committee-pool.workspace = true
 
 [dev-dependencies]
+ream-bls.workspace = true
 snap.workspace = true
 ssz_types.workspace = true
 tempfile.workspace = true

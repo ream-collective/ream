@@ -9,9 +9,7 @@ use ream_consensus_beacon::{
     single_attestation::SingleAttestation,
 };
 use ream_consensus_misc::{
-    constants::beacon::{
-        MIN_ATTESTATION_INCLUSION_DELAY, SYNC_COMMITTEE_SIZE, genesis_validators_root,
-    },
+    constants::beacon::{SYNC_COMMITTEE_SIZE, genesis_validators_root},
     misc::compute_epoch_at_slot,
 };
 use ream_execution_rpc_types::get_blobs::BlobAndProofV1;
@@ -208,14 +206,7 @@ async fn import_gossip_attestation(
         .operation_pool()
         .insert_attestation(attestation.clone(), single_attestation.committee_index);
 
-    let should_process_attestation =
-        head.current_slot >= single_attestation.data.slot + MIN_ATTESTATION_INCLUSION_DELAY;
-
-    if should_process_attestation {
-        beacon_chain
-            .process_gossip_attestation(attestation, single_attestation.attester_index)
-            .await?;
-    }
+    beacon_chain.queue_vote(attestation, Some(single_attestation.attester_index));
 
     Ok(())
 }

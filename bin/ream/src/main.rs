@@ -751,6 +751,7 @@ async fn run_beacon_node_inner(
         .expect("Failed to derive the data column custody of the node");
     let beacon_chain = beacon_chain.with_sampling_columns(custody.sampling_columns);
     let beacon_chain = Arc::new(beacon_chain);
+    executor.spawn(beacon_chain.clone().run_vote_application());
 
     // Warm the BLS key cache so the first blocks after startup don't decompress every key.
     if let Ok(head) = beacon_chain.head() {
