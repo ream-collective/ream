@@ -344,9 +344,9 @@ impl Scheduler {
                 .config
                 .max_pending_bytes
                 .saturating_sub(self.config.frontier_reserve_bytes);
-            let over_budget = self.pending_bytes()
-                + (inflight + 1) * self.config.inflight_reserve_bytes
-                > unreserved;
+            let limit =
+                unreserved.saturating_sub((inflight + 1) * self.config.inflight_reserve_bytes);
+            let over_budget = self.pending_bytes() > limit;
 
             let batch = self.batches.entry(epoch).or_insert_with(|| Batch {
                 start_slot,
@@ -359,12 +359,17 @@ impl Scheduler {
                 doubted: Vec::new(),
             });
             if matches!(batch.state, BatchState::Todo) {
-                // Never consume the parent reserve with range data.
-                if over_budget {
+                // Never consume the parent reserve with range data. Batches further down cannot
+                // commit before the one next to the frontier, so they make room for it.
+                if over_budget && epoch != top_epoch {
                     break;
                 }
                 match pick_peer(batch.start_slot, &batch.attempted) {
                     Some(peer_id) => {
+                        if over_budget {
+                            self.evict_to(limit);
+                        }
+                        let batch = self.batches.get_mut(&epoch).expect("inserted above");
                         self.next_sequence += 1;
                         let id = RequestId {
                             generation: self.generation,
@@ -503,12 +508,15 @@ impl Scheduler {
     /// Drops the batches furthest from the frontier until the budget holds. They can be
     /// downloaded again. Even a lone batch must leave the parent reserve available.
     fn evict(&mut self) {
-        while self.pending_bytes()
-            > self
-                .config
+        self.evict_to(
+            self.config
                 .max_pending_bytes
-                .saturating_sub(self.config.frontier_reserve_bytes)
-        {
+                .saturating_sub(self.config.frontier_reserve_bytes),
+        );
+    }
+
+    fn evict_to(&mut self, limit: usize) {
+        while self.pending_bytes() > limit {
             let mut loaded = self.batches.iter().filter_map(|(epoch, batch)| {
                 matches!(&batch.state, BatchState::Have { blocks, .. } if !blocks.is_empty())
                     .then_some(*epoch)
@@ -1357,6 +1365,35 @@ mod tests {
             panic!("no capacity for more downloads")
         });
         assert!(requests.is_empty());
+    }
+
+    #[test]
+    fn full_budget_makes_room_for_the_batch_next_to_the_frontier() {
+        let blocks = chain(0..=160, 0);
+        let block_bytes = blocks[0].1.ssz_bytes_len();
+        // Four loaded batches fit; one more reservation does not.
+        let limits = BackfillConfig {
+            max_inflight: 5,
+            max_pending_bytes: 131 * block_bytes,
+            frontier_reserve_bytes: block_bytes,
+            inflight_reserve_bytes: 8 * block_bytes,
+            ..Default::default()
+        };
+        let mut harness = Harness::new(limits, &blocks[160], 0, 6);
+        // The second failure arrives once the batches below have filled the budget.
+        let mut failures = 0;
+        let step = harness.run(|_, request| match request.kind {
+            RequestKind::Range {
+                start_slot: 128, ..
+            } if failures < 2 => {
+                failures += 1;
+                Outcome::Unavailable
+            }
+            _ => serve(&blocks, request),
+        });
+        assert!(matches!(step, Step::Complete));
+        assert_eq!(harness.committed, blocks[..160]);
+        assert!(harness.scheduler.evicted_batches() > 0);
     }
 
     #[test]
