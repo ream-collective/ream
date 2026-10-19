@@ -519,6 +519,25 @@ fn validator_api_is_syncing(current_slot: u64, head_slot: u64) -> bool {
     current_slot.saturating_sub(head_slot) > SYNC_TOLERANCE_EPOCHS * SLOTS_PER_EPOCH
 }
 
+/// Source checkpoint for an attestation in `target_epoch`, built on a head state in
+/// `state_epoch`. A head state from an earlier epoch has not run the epoch transition yet, so its
+/// justification is the head block's pulled-up (unrealized) one.
+fn attestation_source(
+    state_epoch: u64,
+    previous_justified: Checkpoint,
+    current_justified: Checkpoint,
+    target_epoch: u64,
+    unrealized_justification: Option<Checkpoint>,
+) -> Checkpoint {
+    if target_epoch + 1 == state_epoch {
+        previous_justified
+    } else if target_epoch > state_epoch {
+        unrealized_justification.unwrap_or(current_justified)
+    } else {
+        current_justified
+    }
+}
+
 #[get("/validator/attestation_data")]
 pub async fn get_attestation_data(
     db: Data<BeaconDB>,
@@ -565,11 +584,24 @@ pub async fn get_attestation_data(
     };
 
     let target_epoch = compute_epoch_at_slot(slot);
-    let source_checkpoint = if target_epoch == state.get_previous_epoch() {
-        state.previous_justified_checkpoint
+    let unrealized_justification = if target_epoch > state.get_current_epoch() {
+        db.unrealized_justifications_provider()
+            .get(head_root)
+            .map_err(|err| {
+                ApiError::InternalError(format!(
+                    "Failed to get unrealized justification, error: {err:?}"
+                ))
+            })?
     } else {
-        state.current_justified_checkpoint
+        None
     };
+    let source_checkpoint = attestation_source(
+        state.get_current_epoch(),
+        state.previous_justified_checkpoint,
+        state.current_justified_checkpoint,
+        target_epoch,
+        unrealized_justification,
+    );
     let target_slot = compute_start_slot_at_epoch(target_epoch);
     let target_root = if state.slot <= target_slot {
         beacon_block_root
@@ -1765,7 +1797,40 @@ pub async fn get_aggregate_attestation(
 
 #[cfg(test)]
 mod tests {
-    use super::validator_api_is_syncing;
+    use alloy_primitives::B256;
+    use ream_consensus_misc::checkpoint::Checkpoint;
+
+    use super::{attestation_source, validator_api_is_syncing};
+
+    fn checkpoint(epoch: u64) -> Checkpoint {
+        Checkpoint {
+            epoch,
+            root: B256::repeat_byte(epoch as u8),
+        }
+    }
+
+    #[test]
+    fn attestation_source_uses_pulled_up_justification_in_a_new_epoch() {
+        // Head state in epoch 10 justified 8; its pulled-up justification is 9.
+        let (previous, current, unrealized) = (checkpoint(7), checkpoint(8), Some(checkpoint(9)));
+
+        assert_eq!(
+            attestation_source(10, previous, current, 11, unrealized),
+            checkpoint(9)
+        );
+        assert_eq!(
+            attestation_source(10, previous, current, 11, None),
+            checkpoint(8)
+        );
+        assert_eq!(
+            attestation_source(10, previous, current, 10, unrealized),
+            checkpoint(8)
+        );
+        assert_eq!(
+            attestation_source(10, previous, current, 9, unrealized),
+            checkpoint(7)
+        );
+    }
 
     #[test]
     fn cached_head_sync_check_preserves_the_two_epoch_tolerance() {
