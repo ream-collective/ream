@@ -120,8 +120,14 @@ impl ValidatorService {
         let seconds_per_slot = beacon_network_spec().seconds_per_slot();
         let seconds_per_interval = seconds_per_slot / INTERVALS_PER_SLOT;
 
-        let genesis_instant =
-            UNIX_EPOCH + Duration::from_secs(beacon_network_spec().min_genesis_time);
+        let genesis_time = match self.beacon_api_client.get_genesis().await {
+            Ok(genesis) => genesis.data.genesis_time,
+            Err(err) => {
+                warn!("Failed to get genesis from the beacon node, using the network spec: {err}");
+                beacon_network_spec().genesis_time()
+            }
+        };
+        let genesis_instant = UNIX_EPOCH + Duration::from_secs(genesis_time);
         let elapsed = elapsed_since_genesis(SystemTime::now(), genesis_instant);
 
         let mut intervals = elapsed.as_secs() / seconds_per_interval;
