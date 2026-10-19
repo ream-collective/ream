@@ -7,9 +7,12 @@ use ream_consensus_misc::{
     misc::{compute_epoch_at_slot, compute_signing_root, compute_sync_committee_period},
 };
 use ream_events_beacon::contribution_and_proof::SignedContributionAndProof;
-use ream_storage::cache::{
-    BeaconCacheDB, CacheSyncCommitteeContribution, SyncCommitteeKey, is_non_strict_superset,
-    record_aggregation_bits,
+use ream_storage::{
+    cache::{
+        BeaconCacheDB, CacheSyncCommitteeContribution, SyncCommitteeKey, is_non_strict_superset,
+        record_aggregation_bits,
+    },
+    tables::field::REDBField,
 };
 use ream_validator_beacon::{
     constants::{
@@ -20,17 +23,29 @@ use ream_validator_beacon::{
 };
 use ssz_types::{BitVector, typenum::U128};
 
-use super::result::ValidationResult;
+use super::{
+    result::ValidationResult,
+    sync_committee::{is_current_slot, now_ms},
+};
 
 pub async fn validate_sync_committee_contribution_and_proof(
     beacon_chain: &BeaconChain,
     cached_db: &BeaconCacheDB,
     signed_contribution_and_proof: &SignedContributionAndProof,
 ) -> anyhow::Result<ValidationResult> {
+    // [IGNORE] The contribution's slot is for the current slot (with a
+    // MAXIMUM_GOSSIP_CLOCK_DISPARITY allowance)
+    let slot = signed_contribution_and_proof.message.contribution.slot;
+    let genesis_time = beacon_chain.db().genesis_time_provider().get()?;
+    if !is_current_slot(genesis_time, slot, now_ms()) {
+        return Ok(ValidationResult::Ignore(
+            "Contribution is not from the current slot".to_string(),
+        ));
+    }
+
     let head = beacon_chain.head()?;
     validate_against_state(
         head.state.as_ref(),
-        head.current_slot,
         cached_db,
         signed_contribution_and_proof,
     )
@@ -39,20 +54,11 @@ pub async fn validate_sync_committee_contribution_and_proof(
 
 async fn validate_against_state(
     state: &BeaconState,
-    current_slot: u64,
     cached_db: &BeaconCacheDB,
     signed_contribution_and_proof: &SignedContributionAndProof,
 ) -> anyhow::Result<ValidationResult> {
     let contribution_and_proof = &signed_contribution_and_proof.message;
     let contribution = &contribution_and_proof.contribution;
-
-    // [IGNORE] if contribution.slot is equal to or earlier than the current_slot (with a
-    // MAXIMUM_GOSSIP_CLOCK_DISPARITY allowance)
-    if contribution.slot != current_slot {
-        return Ok(ValidationResult::Ignore(
-            "Contribution is from a future slot".to_string(),
-        ));
-    }
 
     // [REJECT] if contribution.subcommittee_index is out of SYNC_COMMITTEE_SUBNET_COUNT range.
     if contribution.subcommittee_index >= SYNC_COMMITTEE_SUBNET_COUNT {
@@ -383,7 +389,7 @@ mod tests {
             cached_db: &BeaconCacheDB,
             contribution: &SignedContributionAndProof,
         ) -> ValidationResult {
-            validate_against_state(&self.state, self.state.slot, cached_db, contribution)
+            validate_against_state(&self.state, cached_db, contribution)
                 .await
                 .expect("validation runs")
         }
