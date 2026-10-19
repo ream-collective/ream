@@ -26,7 +26,7 @@ use libp2p::{
     futures::StreamExt,
     gossipsub::{
         Event as GossipsubEvent, IdentTopic as Topic, Message, MessageAuthenticity, MessageId,
-        PublishError,
+        PublishError, TopicHash,
     },
     identify,
     multiaddr::Protocol,
@@ -86,7 +86,7 @@ use utils::read_meta_data_from_disk;
 
 use crate::{
     config::{NetworkConfig, PeerLimits},
-    constants::{CUSTODY_DISCOVERY_TARGET_PEERS, PING_INTERVAL_DURATION},
+    constants::{CUSTODY_DISCOVERY_TARGET_PEERS, PING_INTERVAL_DURATION, SUBNET_DISCOVERY_TARGET_PEERS, TARGET_SUBNET_PEERS},
     gossipsub::{
         GossipsubBehaviour,
         beacon::{
@@ -138,6 +138,21 @@ fn enr_subnet_bitfields(enr: &Enr) -> anyhow::Result<(BitVector<U64>, BitVector<
         .ok_or_else(|| anyhow!("Local ENR has no syncnets field"))?
         .map_err(|err| anyhow!("Failed to decode local ENR syncnets: {err:?}"))?;
     Ok((attestation_subnets.0, sync_committee_subnets.0))
+}
+
+/// Duty subnets with fewer than `TARGET_SUBNET_PEERS` peers, in order.
+fn subnets_needing_peers(duty_subnets: &HashMap<u64, u64>, peer_counts: &[usize]) -> Vec<u64> {
+    let mut subnets: Vec<u64> = duty_subnets
+        .keys()
+        .copied()
+        .filter(|subnet_id| {
+            peer_counts
+                .get(*subnet_id as usize)
+                .is_some_and(|count| *count < TARGET_SUBNET_PEERS)
+        })
+        .collect();
+    subnets.sort_unstable();
+    subnets
 }
 
 /// Epoch at `now` for a chain that started at `genesis_time`, counted like the fork choice store.
@@ -258,6 +273,8 @@ pub struct Network {
     peer_score_settings: Option<PeerScoreSettings>,
     /// Subnet topics joined for validator duties, with the last slot each is needed for.
     duty_topics: HashMap<GossipTopic, u64>,
+    /// Attestation subnets validators publish to, with the last slot each is needed for.
+    duty_subnets: HashMap<u64, u64>,
 }
 
 impl Network {
@@ -401,6 +418,7 @@ impl Network {
             backbone_topics: HashMap::new(),
             target_peers: config.target_peers,
             duty_topics: HashMap::new(),
+            duty_subnets: HashMap::new(),
             sampling_columns,
             meta_data_requests: HashMap::new(),
             peer_score_settings,
@@ -595,6 +613,13 @@ impl Network {
                                 warn!("Failed to subscribe to {topic:?} for a validator duty");
                             }
                         }
+                        P2PMessage::AttestationDutySubnets(subnets) => {
+                            for (subnet_id, until_slot) in subnets {
+                                let until = self.duty_subnets.entry(subnet_id).or_insert(until_slot);
+                                *until = (*until).max(until_slot);
+                            }
+                            self.discover_duty_subnet_peers(SystemTime::now());
+                        }
                     }
                 }
                 Some(Ok(peer_id)) = self.peers_to_ping.next() => {
@@ -655,6 +680,7 @@ impl Network {
                         warn!("Failed to sync attestation subnets: {err:?}");
                     }
                     self.expire_duty_topics(SystemTime::now());
+                    self.discover_duty_subnet_peers(SystemTime::now());
                     // Retries a failed fork update and catches a boundary the timer slept past.
                     next_fork_update.set(self.update_fork_enr(SystemTime::now()).map(sleep).into());
 
@@ -1168,6 +1194,62 @@ impl Network {
     /// Starts a bounded discv5 query for peers custodying the groups of sampling columns that no
     /// connected peer covers. Runs from the periodic maintenance tick, and `Discovery` keeps at
     /// most one custody query in flight.
+    /// Starts a discovery query for duty subnets with fewer than `TARGET_SUBNET_PEERS` peers,
+    /// after dropping subnets whose last slot has passed.
+    fn discover_duty_subnet_peers(&mut self, now: SystemTime) {
+        let current_slot = slot_at(self.genesis_time, now);
+        self.duty_subnets
+            .retain(|_, until_slot| *until_slot >= current_slot);
+        if self.duty_subnets.is_empty() {
+            return;
+        }
+        let peer_counts = self.attestation_subnet_peer_counts();
+        let subnets = subnets_needing_peers(&self.duty_subnets, &peer_counts);
+        if subnets.is_empty() {
+            return;
+        }
+        let counts: Vec<usize> = subnets
+            .iter()
+            .map(|subnet_id| peer_counts[*subnet_id as usize])
+            .collect();
+        if self
+            .swarm
+            .behaviour_mut()
+            .discovery
+            .discover_attestation_subnet_peers(subnets.clone(), SUBNET_DISCOVERY_TARGET_PEERS)
+        {
+            info!(
+                "Duty attestation subnets {subnets:?} have {counts:?} peers, discovering peers for them"
+            );
+        }
+    }
+
+    /// Connected peers subscribed to each attestation subnet of the current fork.
+    fn attestation_subnet_peer_counts(&self) -> [usize; ATTESTATION_SUBNET_COUNT] {
+        let fork = beacon_network_spec().fork_digest(
+            beacon_network_spec().current_epoch(),
+            genesis_validators_root(),
+        );
+        let subnet_of: HashMap<TopicHash, usize> = (0..ATTESTATION_SUBNET_COUNT)
+            .map(|subnet_id| {
+                let topic = GossipTopic {
+                    fork,
+                    kind: GossipTopicKind::BeaconAttestation(subnet_id as u64),
+                };
+                (topic.into(), subnet_id)
+            })
+            .collect();
+        let mut counts = [0; ATTESTATION_SUBNET_COUNT];
+        for (_, topics) in self.swarm.behaviour().gossipsub.all_peers() {
+            for topic in topics {
+                if let Some(subnet_id) = subnet_of.get(topic) {
+                    counts[*subnet_id] += 1;
+                }
+            }
+        }
+        counts
+    }
+
     fn discover_custody_peers_if_uncovered(&mut self) {
         if self.sampling_columns.is_empty()
             || self.swarm.behaviour().discovery.custody_query_active()
@@ -2496,6 +2578,20 @@ mod tests {
         assert_eq!(network.enr(), enr);
         assert_eq!(meta_data_seq(&network), seq);
         assert_subnets_consistent(&network, data_dir.path());
+    }
+
+    #[test]
+    fn duty_subnets_with_few_peers_need_discovery() {
+        let mut peer_counts = [TARGET_SUBNET_PEERS; ATTESTATION_SUBNET_COUNT];
+        peer_counts[5] = 0;
+        peer_counts[9] = TARGET_SUBNET_PEERS - 1;
+        let duty_subnets = HashMap::from([(9, 100), (5, 100), (7, 100)]);
+
+        assert_eq!(
+            subnets_needing_peers(&duty_subnets, &peer_counts),
+            vec![5, 9]
+        );
+        assert!(subnets_needing_peers(&HashMap::new(), &peer_counts).is_empty());
     }
 
     #[test]

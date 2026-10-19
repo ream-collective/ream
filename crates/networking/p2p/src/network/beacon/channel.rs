@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use alloy_primitives::B256;
 use libp2p::{
@@ -50,6 +50,9 @@ pub enum P2PMessage {
         topic: GossipTopic,
         until_slot: u64,
     },
+    /// Attestation subnets that validators publish to, with the last slot each is needed for.
+    /// The node looks for peers on them.
+    AttestationDutySubnets(HashMap<u64, u64>),
 }
 
 pub enum P2PRequest {

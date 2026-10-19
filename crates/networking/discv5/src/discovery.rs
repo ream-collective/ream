@@ -7,6 +7,7 @@ use std::{
     time::Instant,
 };
 
+use alloy_primitives::aliases::B32;
 use anyhow::{Result, anyhow};
 use discv5::{
     Discv5, Enr,
@@ -77,6 +78,7 @@ pub struct Discovery {
     /// Whether a custody query is running. Custody queries run one at a time, and a running
     /// general peer query does not block them.
     find_custody_peer_active: bool,
+    find_subnet_peer_active: bool,
     pub started: bool,
     long_lived_attestation_subnets: AttestationSubnets,
     /// Attestation subnets advertised in the local ENR
@@ -203,6 +205,7 @@ impl Discovery {
             discovery_queries: FuturesUnordered::new(),
             find_peer_active: false,
             find_custody_peer_active: false,
+            find_subnet_peer_active: false,
             started: !config.disable_discovery,
             long_lived_attestation_subnets: config.attestation_subnets.clone(),
             current_attestation_subnets: attestation_subnets,
@@ -366,13 +369,30 @@ impl Discovery {
         if !self.started || self.find_peer_active {
             return;
         }
-        if matches!(query, QueryType::CustodyGroupPeers(_)) {
-            warn!("Custody group queries must start through discover_custody_peers");
+        if matches!(
+            query,
+            QueryType::CustodyGroupPeers(_) | QueryType::AttestationSubnetPeers(_)
+        ) {
+            warn!("Custody and attestation subnet queries have their own entry points");
             return;
         }
-        self.find_peer_active = true;
+        self.find_peer_active = self.start_query(query, target_peers);
+    }
 
-        self.start_query(query, target_peers);
+    /// Queries for up to `target_peers` peers on this network that advertise at least one of
+    /// `subnet_ids`. Runs beside general peer queries; returns `false` without starting a query
+    /// while discovery is disabled or another subnet query is running.
+    pub fn discover_attestation_subnet_peers(
+        &mut self,
+        subnet_ids: Vec<u64>,
+        target_peers: usize,
+    ) -> bool {
+        if !self.started || self.find_subnet_peer_active || subnet_ids.is_empty() {
+            return false;
+        }
+        self.find_subnet_peer_active =
+            self.start_query(QueryType::AttestationSubnetPeers(subnet_ids), target_peers);
+        self.find_subnet_peer_active
     }
 
     /// Queries for up to `target_peers` peers that custody at least one of `custody_groups`.
@@ -406,48 +426,41 @@ impl Discovery {
         self.find_custody_peer_active
     }
 
-    fn start_query(&mut self, query: QueryType, target_peers: usize) {
+    /// Returns whether a query started.
+    fn start_query(&mut self, query: QueryType, target_peers: usize) -> bool {
+        let Some(Ok(fork_id)) = self
+            .discv5
+            .local_enr()
+            .get_decodable::<EnrForkId>(ENR_ETH2_KEY)
+        else {
+            warn!("ENR missing or invalid ENR_ETH2_KEY, skipping peer query");
+            return false;
+        };
+        let fork_digest = fork_id.fork_digest;
+        let predicate: Box<dyn Fn(&Enr) -> bool + Send> = match query.clone() {
+            QueryType::Peers => Box::new(move |enr: &Enr| same_network_with_tcp(enr, fork_digest)),
+            QueryType::AttestationSubnetPeers(subnet_ids) => {
+                let on_subnets = attestation_subnet_predicate(subnet_ids);
+                Box::new(move |enr: &Enr| {
+                    same_network_with_tcp(enr, fork_digest) && on_subnets(enr)
+                })
+            }
+            QueryType::SyncCommitteeSubnetPeers(subnet_ids) => {
+                Box::new(sync_committee_subnet_predicate(subnet_ids))
+            }
+            // Started through `discover_custody_peers`.
+            QueryType::CustodyGroupPeers(_) => return false,
+        };
         let query_future = self
             .discv5
-            .find_node_predicate(
-                NodeId::random(),
-                match query.clone() {
-                    QueryType::Peers => {
-                        let Some(Ok(fork_id)) = self
-                            .discv5
-                            .local_enr()
-                            .get_decodable::<EnrForkId>(ENR_ETH2_KEY)
-                        else {
-                            warn!("ENR missing or invalid ENR_ETH2_KEY, skipping peer query");
-                            return;
-                        };
-                        let fork_digest = fork_id.fork_digest;
-
-                        Box::new(move |enr: &Enr| {
-                            enr.get_decodable::<EnrForkId>(ENR_ETH2_KEY)
-                                .and_then(Result::ok)
-                                .map(|id| id.fork_digest == fork_digest)
-                                .unwrap_or(false)
-                                && (enr.tcp4().is_some() || enr.tcp6().is_some())
-                        })
-                    }
-                    QueryType::AttestationSubnetPeers(subnet_ids) => {
-                        Box::new(attestation_subnet_predicate(subnet_ids))
-                    }
-                    QueryType::SyncCommitteeSubnetPeers(subnet_ids) => {
-                        Box::new(sync_committee_subnet_predicate(subnet_ids))
-                    }
-                    // Rejected by `discover_peers`, which is the only caller.
-                    QueryType::CustodyGroupPeers(_) => return,
-                },
-                target_peers,
-            )
+            .find_node_predicate(NodeId::random(), predicate, target_peers)
             .map(move |result| QueryResult {
                 query_type: query,
                 result,
             });
 
         self.discovery_queries.push(Box::pin(query_future));
+        true
     }
 
     fn process_queries(&mut self, cx: &mut Context) -> Option<HashMap<Enr, Option<Instant>>> {
@@ -471,7 +484,7 @@ impl Discovery {
                     }
                 }
                 QueryType::AttestationSubnetPeers(subnet_ids) => {
-                    self.find_peer_active = false;
+                    self.find_subnet_peer_active = false;
                     match query.result {
                         Ok(peers) => {
                             let predicate = attestation_subnet_predicate(subnet_ids);
@@ -671,6 +684,14 @@ fn convert_to_enr(key: Keypair) -> anyhow::Result<CombinedKey> {
     Ok(CombinedKey::Secp256k1(secret))
 }
 
+/// Whether `enr` is on the fork `fork_digest` and has a TCP port to dial.
+fn same_network_with_tcp(enr: &Enr, fork_digest: B32) -> bool {
+    enr.get_decodable::<EnrForkId>(ENR_ETH2_KEY)
+        .and_then(Result::ok)
+        .is_some_and(|id| id.fork_digest == fork_digest)
+        && (enr.tcp4().is_some() || enr.tcp6().is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -795,6 +816,52 @@ mod tests {
             .unwrap();
         let predicate = attestation_subnet_predicate(vec![unadvertised]);
         assert!(!predicate(&local_enr));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn subnet_queries_run_beside_peer_queries() -> anyhow::Result<()> {
+        initialize_test_network_spec();
+        let config = DiscoveryConfig {
+            disable_discovery: false,
+            ..DiscoveryConfig::default()
+        };
+        let mut discovery = Discovery::new(Keypair::generate_secp256k1(), &config, 0).await?;
+
+        assert!(discovery.discover_attestation_subnet_peers(vec![3], 8));
+        assert!(!discovery.discover_attestation_subnet_peers(vec![4], 8));
+        discovery.discover_peers(QueryType::Peers, 8);
+        assert!(discovery.find_peer_active);
+
+        discovery.discovery_queries.clear();
+        discovery.discovery_queries.push(Box::pin(async {
+            QueryResult {
+                query_type: QueryType::AttestationSubnetPeers(vec![3]),
+                result: Ok(vec![]),
+            }
+        }));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let _ = discovery.poll(&mut cx);
+        assert!(discovery.discover_attestation_subnet_peers(vec![4], 8));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_queries_skip_other_networks() -> anyhow::Result<()> {
+        initialize_test_network_spec();
+        let config = DiscoveryConfig {
+            disable_discovery: true,
+            ..DiscoveryConfig::default()
+        };
+        let discovery = Discovery::new(Keypair::generate_secp256k1(), &config, 0).await?;
+        let enr = discovery.local_enr();
+        let fork_digest = enr
+            .get_decodable::<EnrForkId>(ENR_ETH2_KEY)
+            .expect("has eth2 field")?
+            .fork_digest;
+
+        assert!(same_network_with_tcp(&enr, fork_digest));
+        assert!(!same_network_with_tcp(&enr, B32::ZERO));
         Ok(())
     }
 

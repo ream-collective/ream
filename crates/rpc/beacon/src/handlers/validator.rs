@@ -757,8 +757,9 @@ pub async fn post_beacon_committee_subscriptions(
         .head()
         .map_err(|err| ApiError::InternalError(format!("Failed to get head: {err:?}")))?;
     // Subnet to the last slot it is needed for. Only aggregators join a subnet: everyone else
-    // publishes to it without subscribing.
+    // publishes to it without subscribing. The node keeps peers on both.
     let mut subnets: HashMap<u64, u64> = HashMap::new();
+    let mut duty_subnets: HashMap<u64, u64> = HashMap::new();
 
     for sub in subscriptions.into_inner() {
         if sub.committees_at_slot > MAX_COMMITTEES_PER_SLOT {
@@ -791,13 +792,18 @@ pub async fn post_beacon_committee_subscriptions(
             }
         }
 
+        let subnet_id =
+            compute_subnet_for_attestation(sub.committees_at_slot, sub.slot, sub.committee_index);
+        let until_slot = duty_subnets.entry(subnet_id).or_insert(sub.slot);
+        *until_slot = (*until_slot).max(sub.slot);
         if !sub.is_aggregator {
             continue;
         }
-        let subnet_id =
-            compute_subnet_for_attestation(sub.committees_at_slot, sub.slot, sub.committee_index);
         let until_slot = subnets.entry(subnet_id).or_insert(sub.slot);
         *until_slot = (*until_slot).max(sub.slot);
+    }
+    if !duty_subnets.is_empty() {
+        p2p_sender.attestation_duty_subnets(duty_subnets);
     }
 
     let fork = beacon_network_spec().fork_digest(

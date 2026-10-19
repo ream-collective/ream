@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::anyhow;
 use libp2p::{
     PeerId,
@@ -38,6 +40,12 @@ impl P2PSender {
             .send(P2PMessage::SubscribeForDuty { topic, until_slot })
         {
             warn!("Failed to send duty subscription: {err}");
+        }
+    }
+
+    pub fn attestation_duty_subnets(&self, subnets: HashMap<u64, u64>) {
+        if let Err(err) = self.0.send(P2PMessage::AttestationDutySubnets(subnets)) {
+            warn!("Failed to send attestation duty subnets: {err}");
         }
     }
 
