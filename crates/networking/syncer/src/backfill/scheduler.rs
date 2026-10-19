@@ -48,10 +48,10 @@ impl Default for BackfillConfig {
     fn default() -> Self {
         Self {
             max_inflight: 5,
-            max_pending_bytes: 64 * 1024 * 1024,
+            max_pending_bytes: 128 * 1024 * 1024,
             frontier_reserve_bytes: 16 * 1024 * 1024,
             max_response_bytes: 16 * 1024 * 1024,
-            inflight_reserve_bytes: 4 * 1024 * 1024,
+            inflight_reserve_bytes: 16 * 1024 * 1024,
             max_window_epochs: 16,
             batch_retry_answers: 2,
             empty_scan_limit: 2,
