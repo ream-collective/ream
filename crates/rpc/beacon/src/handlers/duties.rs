@@ -40,6 +40,12 @@ fn proposer_shuffling_decision_slot(epoch: u64, fulu_fork_epoch: u64) -> u64 {
     }
 }
 
+/// Returns the slot whose block root fixes the attester shuffling for `epoch`: the last slot of
+/// `epoch - 2`, or genesis for the first two epochs.
+fn attester_shuffling_decision_slot(epoch: u64) -> u64 {
+    compute_start_slot_at_epoch(epoch.saturating_sub(1)).saturating_sub(1)
+}
+
 fn validate_proposer_duties_epoch(epoch: u64, current_epoch: u64) -> Result<(), ApiError> {
     if epoch > current_epoch.saturating_add(1) {
         return Err(ApiError::BadRequest(format!(
@@ -138,11 +144,8 @@ pub async fn get_attester_duties(
     let epoch = epoch.into_inner();
     let start_slot = compute_start_slot_at_epoch(epoch);
     let state = get_state_at_or_before_slot(&db, start_slot).await?;
-    let dependent_root = if epoch == 0 {
-        get_block_root_at_or_before_slot(&db, 0)?
-    } else {
-        get_block_root_at_or_before_slot(&db, start_slot - 1)?
-    };
+    let dependent_root =
+        get_block_root_at_or_before_slot(&db, attester_shuffling_decision_slot(epoch))?;
     let validator_indices = parse_validator_indices(validator_indices.into_inner())?;
     let committees_at_slot = state.get_committee_count_per_slot(epoch);
     let mut duties = vec![];
@@ -332,6 +335,17 @@ mod tests {
     use tree_hash::TreeHash;
 
     use super::*;
+
+    #[test]
+    fn attester_dependent_root_is_last_slot_of_epoch_minus_two() {
+        assert_eq!(attester_shuffling_decision_slot(0), 0);
+        assert_eq!(attester_shuffling_decision_slot(1), 0);
+        assert_eq!(attester_shuffling_decision_slot(2), SLOTS_PER_EPOCH - 1);
+        assert_eq!(
+            attester_shuffling_decision_slot(130_615),
+            130_614 * SLOTS_PER_EPOCH - 1
+        );
+    }
 
     fn test_db() -> (BeaconDB, TempDir) {
         let temp_dir = TempDir::new("ream_rpc_beacon_duties").expect("creates temp directory");
