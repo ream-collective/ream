@@ -196,6 +196,26 @@ impl OperationPool {
             .collect()
     }
 
+    /// The aggregate an aggregator publishes for one committee: the largest attestations first,
+    /// then every vote that does not overlap them.
+    pub fn get_aggregate_attestation(
+        &self,
+        slot: u64,
+        committee_index: u64,
+        attestation_data_root: B256,
+    ) -> Option<Attestation> {
+        let key = AttestationKey {
+            slot,
+            attestation_data_root,
+            committee_index,
+        };
+        let mut group = self.attestations.read().get(&key)?.clone();
+        group.sort_by_key(|attestation| {
+            std::cmp::Reverse(attestation.aggregation_bits.num_set_bits())
+        });
+        aggregate_attestation_group(&group, &HashSet::default())
+    }
+
     pub fn get_all_attestations(&self) -> Vec<Attestation> {
         self.attestations
             .read()
@@ -516,6 +536,26 @@ mod tests {
 
         assert!(aggregate.aggregation_bits.get(0).unwrap());
         assert!(aggregate.aggregation_bits.get(2).unwrap());
+    }
+
+    #[test]
+    fn aggregate_attestation_takes_the_largest_votes_first() {
+        let pool = OperationPool::default();
+        let small = make_attestation(10, 3, 1, 8, &[0]);
+        let large = make_attestation(10, 3, 1, 8, &[0, 1, 2]);
+        let other = make_attestation(10, 3, 1, 8, &[5]);
+        let root = small.data.tree_hash_root();
+        for attestation in [small, large, other] {
+            pool.insert_attestation(attestation, 3);
+        }
+
+        let aggregate = pool.get_aggregate_attestation(10, 3, root).unwrap();
+        let set_bits: Vec<usize> = (0..aggregate.aggregation_bits.len())
+            .filter(|&index| aggregate.aggregation_bits.get(index).unwrap())
+            .collect();
+        assert_eq!(set_bits, vec![0, 1, 2, 5]);
+        assert_eq!(aggregate.aggregation_bits.len(), 8);
+        assert!(pool.get_aggregate_attestation(10, 4, root).is_none());
     }
 
     #[test]
