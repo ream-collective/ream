@@ -35,7 +35,8 @@ use ream_consensus_beacon::{
 };
 use ream_consensus_misc::{
     constants::beacon::{
-        GENESIS_SLOT, WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA, genesis_validators_root,
+        GENESIS_SLOT, SLOTS_PER_HISTORICAL_ROOT, WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA,
+        genesis_validators_root,
     },
     polynomial_commitments::kzg_commitment::KZGCommitment,
 };
@@ -116,7 +117,10 @@ pub async fn get_block_root_from_id(
                 .head_root,
         )),
         ID::Genesis => db.slot_index_provider().get(GENESIS_SLOT),
-        ID::Slot(slot) => db.slot_index_provider().get(slot),
+        ID::Slot(slot) => {
+            return canonical_block_root_at_slot(slot, db, beacon_chain)?
+                .ok_or_else(|| ApiError::NotFound(format!("No canonical block at slot {slot}")));
+        }
         ID::Root(root) => Ok(Some(root)),
     }
     .map_err(|err| {
@@ -125,6 +129,54 @@ pub async fn get_block_root_from_id(
     .ok_or_else(|| ApiError::NotFound(format!("Failed to find `block_root` from {block_id:?}")))?;
 
     Ok(block_root)
+}
+
+/// The canonical block at `slot`, or `None` for an empty slot. Recent slots come from the head
+/// state's block roots, which follow reorgs. Older slots are finalized, so the slot index, which
+/// records every imported block, is right for them.
+pub fn canonical_block_root_at_slot(
+    slot: u64,
+    db: &BeaconDB,
+    beacon_chain: &BeaconChain,
+) -> Result<Option<B256>, ApiError> {
+    let head = beacon_chain
+        .head()
+        .map_err(|err| ApiError::InternalError(format!("Failed to get head, error: {err:?}")))?;
+    let Some(candidate) = latest_block_root_at_or_before(&head.state, head.head_root, slot) else {
+        return db.slot_index_provider().get(slot).map_err(|err| {
+            ApiError::InternalError(format!("Failed to get block root by slot, error: {err:?}"))
+        });
+    };
+    let Some(root) = candidate else {
+        return Ok(None);
+    };
+    let block_slot = db
+        .block_provider()
+        .get(root)
+        .map_err(|err| ApiError::InternalError(format!("Failed to get block, error: {err:?}")))?
+        .map(|block| block.message.slot);
+    Ok((block_slot == Some(slot)).then_some(root))
+}
+
+/// Root of the latest canonical block at or before `slot`, from the head's post-state. `None` if
+/// the slot is older than the state's block roots; `Some(None)` if it is after the head.
+fn latest_block_root_at_or_before(
+    head_state: &BeaconState,
+    head_root: B256,
+    slot: u64,
+) -> Option<Option<B256>> {
+    if slot > head_state.slot {
+        return Some(None);
+    }
+    if slot == head_state.slot {
+        return Some(Some(head_root));
+    }
+    if slot + SLOTS_PER_HISTORICAL_ROOT < head_state.slot {
+        return None;
+    }
+    Some(Some(
+        head_state.block_roots[(slot % SLOTS_PER_HISTORICAL_ROOT) as usize],
+    ))
 }
 
 /// What a slashing pays the proposer, who is also the whistleblower: the whole whistleblower
@@ -1139,5 +1191,48 @@ mod tests {
             .expect("block root resolves to the block's post-state");
 
         assert_eq!(state.slot, fixture_state().slot);
+    }
+
+    /// Slots resolve through the head state's block roots, not through whatever block was
+    /// imported last at that slot.
+    #[test]
+    fn slots_resolve_through_the_head_chain() {
+        let state = fixture_state();
+        let head_root = B256::repeat_byte(7);
+        let head_slot = state.slot;
+
+        assert_eq!(
+            latest_block_root_at_or_before(&state, head_root, head_slot),
+            Some(Some(head_root))
+        );
+        assert_eq!(
+            latest_block_root_at_or_before(&state, head_root, head_slot + 1),
+            Some(None)
+        );
+        let slot = head_slot - 3;
+        assert_eq!(
+            latest_block_root_at_or_before(&state, head_root, slot),
+            Some(Some(
+                state.block_roots[(slot % SLOTS_PER_HISTORICAL_ROOT) as usize]
+            ))
+        );
+        assert_eq!(
+            latest_block_root_at_or_before(
+                &state,
+                head_root,
+                head_slot - SLOTS_PER_HISTORICAL_ROOT
+            ),
+            Some(Some(
+                state.block_roots[(head_slot % SLOTS_PER_HISTORICAL_ROOT) as usize]
+            ))
+        );
+        assert_eq!(
+            latest_block_root_at_or_before(
+                &state,
+                head_root,
+                head_slot - SLOTS_PER_HISTORICAL_ROOT - 1
+            ),
+            None
+        );
     }
 }

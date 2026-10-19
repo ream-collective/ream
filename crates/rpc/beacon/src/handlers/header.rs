@@ -16,7 +16,7 @@ use ream_storage::{db::beacon::BeaconDB, tables::table::REDBTable};
 use serde::{Deserialize, Serialize};
 use tree_hash::TreeHash;
 
-use super::block::get_beacon_block_from_id;
+use super::block::{canonical_block_root_at_slot, get_beacon_block_from_id};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct HeaderData {
@@ -82,7 +82,10 @@ pub async fn get_headers(
         }
     };
 
-    Ok(HttpResponse::Ok().json(BeaconResponse::new(HeaderData::new(root, true, header))))
+    let canonical = is_canonical(root, header.message.slot, &db, &beacon_chain)?;
+    Ok(HttpResponse::Ok().json(BeaconResponse::new(HeaderData::new(
+        root, canonical, header,
+    ))))
 }
 
 /// Called using `/eth/v1/beacon/headers/{block_id}`
@@ -94,12 +97,21 @@ pub async fn get_headers_from_block(
 ) -> Result<impl Responder, ApiError> {
     let block = get_beacon_block_from_id(block_id.into_inner(), &db, &beacon_chain).await?;
     let header = block.signed_header();
+    let root = header.message.tree_hash_root();
+    let canonical = is_canonical(root, header.message.slot, &db, &beacon_chain)?;
 
     Ok(HttpResponse::Ok().json(BeaconResponse::new(HeaderData::new(
-        header.message.tree_hash_root(),
-        true,
-        header,
+        root, canonical, header,
     ))))
+}
+
+fn is_canonical(
+    root: B256,
+    slot: u64,
+    db: &BeaconDB,
+    beacon_chain: &BeaconChain,
+) -> Result<bool, ApiError> {
+    Ok(canonical_block_root_at_slot(slot, db, beacon_chain)? == Some(root))
 }
 
 pub async fn get_header_from_slot(
@@ -107,21 +119,12 @@ pub async fn get_header_from_slot(
     db: &BeaconDB,
     beacon_chain: &BeaconChain,
 ) -> Result<(SignedBeaconBlockHeader, B256), ApiError> {
-    let slot = match slot {
-        Some(slot) => slot,
-        None => db
-            .slot_index_provider()
-            .get_highest_slot()
-            .map_err(|err| {
-                ApiError::InternalError(format!("Failed to get headers, error: {err:?}"))
-            })?
-            .ok_or_else(|| ApiError::NotFound(String::from("Unable to fetch latest slot")))?,
-    };
-
-    let beacon_block = get_beacon_block_from_id(ID::Slot(slot), db, beacon_chain).await?;
+    // Without a slot, the head.
+    let block_id = slot.map_or(ID::Head, ID::Slot);
+    let beacon_block = get_beacon_block_from_id(block_id, db, beacon_chain).await?;
 
     let header = beacon_block.signed_header();
-    let root = header.tree_hash_root();
+    let root = header.message.tree_hash_root();
 
     Ok((header, root))
 }
