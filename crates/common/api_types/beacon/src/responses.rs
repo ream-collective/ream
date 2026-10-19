@@ -198,6 +198,7 @@ impl<T: Serialize + Encode + Decode> SyncCommitteeDutiesResponse<T> {
 #[derive(Debug, Serialize)]
 pub struct BeaconHeadResponse {
     pub root: B256,
+    #[serde(with = "serde_utils::quoted_u64")]
     pub slot: u64,
     pub execution_optimistic: bool,
 }
