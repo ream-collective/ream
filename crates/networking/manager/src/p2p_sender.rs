@@ -5,7 +5,10 @@ use libp2p::{
     swarm::ConnectionId,
 };
 use ream_consensus_beacon::custody_group::CustodyAssignment;
-use ream_p2p::network::beacon::channel::{GossipMessage, P2PMessage, P2PResponse};
+use ream_p2p::{
+    gossipsub::beacon::topics::GossipTopic,
+    network::beacon::channel::{GossipMessage, P2PMessage, P2PResponse},
+};
 use ream_req_resp::{
     beacon::messages::BeaconResponseMessage, error::ReqRespError, handler::RespMessage,
     messages::ResponseMessage,
@@ -26,6 +29,15 @@ impl P2PSender {
     pub fn send_gossip(&self, message: GossipMessage) {
         if let Err(err) = self.0.send(P2PMessage::Gossip(message)) {
             warn!("Failed to send gossip message: {err}");
+        }
+    }
+
+    pub fn subscribe_for_duty(&self, topic: GossipTopic, until_slot: u64) {
+        if let Err(err) = self
+            .0
+            .send(P2PMessage::SubscribeForDuty { topic, until_slot })
+        {
+            warn!("Failed to send duty subscription: {err}");
         }
     }
 

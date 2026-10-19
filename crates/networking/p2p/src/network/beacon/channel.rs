@@ -45,6 +45,11 @@ pub enum P2PMessage {
         propagation_source: PeerId,
         acceptance: MessageAcceptance,
     },
+    /// Join a subnet topic for a validator duty until `until_slot` has passed.
+    SubscribeForDuty {
+        topic: GossipTopic,
+        until_slot: u64,
+    },
 }
 
 pub enum P2PRequest {

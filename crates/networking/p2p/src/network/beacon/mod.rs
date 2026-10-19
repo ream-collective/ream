@@ -590,6 +590,11 @@ impl Network {
                                 trace!("Gossipsub message was not in validation cache: {message_id}");
                             }
                         }
+                        P2PMessage::SubscribeForDuty { topic, until_slot } => {
+                            if !self.subscribe_for_duty(topic, until_slot) {
+                                warn!("Failed to subscribe to {topic:?} for a validator duty");
+                            }
+                        }
                     }
                 }
                 Some(Ok(peer_id)) = self.peers_to_ping.next() => {

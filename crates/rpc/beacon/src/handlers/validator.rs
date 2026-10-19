@@ -65,13 +65,13 @@ use ream_execution_rpc_types::{
     get_payload::Payload,
 };
 use ream_fork_choice_beacon::store::Store;
-use ream_network_manager::gossipsub::validate::sync_committee_contribution_and_proof::get_sync_subcommittee_pubkeys;
+use ream_network_manager::{
+    gossipsub::validate::sync_committee_contribution_and_proof::get_sync_subcommittee_pubkeys,
+    p2p_sender::P2PSender,
+};
 use ream_network_spec::networks::beacon_network_spec;
 use ream_operation_pool::OperationPool;
-use ream_p2p::{
-    gossipsub::beacon::topics::{GossipTopic, GossipTopicKind},
-    network::beacon::Network,
-};
+use ream_p2p::gossipsub::beacon::topics::{GossipTopic, GossipTopicKind};
 use ream_storage::{db::beacon::BeaconDB, tables::table::REDBTable};
 use ream_sync_committee_pool::SyncCommitteePool;
 use ream_validator_beacon::{
@@ -93,7 +93,7 @@ use ssz_types::{
     VariableList,
     typenum::{U1, U8, U16},
 };
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::broadcast;
 use tree_hash::TreeHash;
 
 use super::{duties::head_chain_block_root, state::get_state_from_id};
@@ -796,7 +796,7 @@ pub async fn post_aggregate_and_proofs_v2(
 pub async fn post_beacon_committee_subscriptions(
     beacon_chain: Data<Arc<BeaconChain>>,
     subscriptions: Json<Vec<BeaconCommitteeSubscription>>,
-    network: Data<Mutex<Network>>,
+    p2p_sender: Data<Arc<P2PSender>>,
 ) -> Result<impl Responder, ApiError> {
     let head = beacon_chain
         .head()
@@ -849,17 +849,12 @@ pub async fn post_beacon_committee_subscriptions(
         beacon_network_spec().current_epoch(),
         genesis_validators_root(),
     );
-    let mut network = network.lock().await;
     for (subnet_id, until_slot) in subnets {
         let topic = GossipTopic {
             fork,
             kind: GossipTopicKind::BeaconAttestation(subnet_id),
         };
-        if !network.subscribe_for_duty(topic, until_slot) {
-            return Err(ApiError::InternalError(
-                "Failed to subscribe to attestation subnet".to_string(),
-            ));
-        }
+        p2p_sender.subscribe_for_duty(topic, until_slot);
     }
 
     Ok(HttpResponse::Ok().finish())
@@ -869,7 +864,7 @@ pub async fn post_beacon_committee_subscriptions(
 pub async fn post_sync_committee_subscriptions(
     beacon_chain: Data<Arc<BeaconChain>>,
     subscriptions: Json<Vec<SyncCommitteeSubscription>>,
-    network: Data<Mutex<Network>>,
+    p2p_sender: Data<Arc<P2PSender>>,
 ) -> Result<impl Responder, ApiError> {
     let subscriptions = subscriptions.into_inner();
     if subscriptions.is_empty() {
@@ -924,17 +919,12 @@ pub async fn post_sync_committee_subscriptions(
         beacon_network_spec().current_epoch(),
         genesis_validators_root(),
     );
-    let mut network = network.lock().await;
     for (subnet_id, until_slot) in subnets {
         let topic = GossipTopic {
             fork,
             kind: GossipTopicKind::SyncCommittee(subnet_id),
         };
-        if !network.subscribe_for_duty(topic, until_slot) {
-            return Err(ApiError::InternalError(format!(
-                "Failed to subscribe to sync committee subnet {subnet_id}",
-            )));
-        }
+        p2p_sender.subscribe_for_duty(topic, until_slot);
     }
 
     Ok(HttpResponse::Ok().finish())
