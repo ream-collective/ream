@@ -1374,6 +1374,30 @@ mod tests {
         topics: Vec<GossipTopic>,
         data_dir: &Path,
     ) -> anyhow::Result<Network> {
+        create_network_with_target_peers(
+            socket_address,
+            socket_port,
+            discovery_port,
+            bootnodes,
+            disable_discovery,
+            topics,
+            data_dir,
+            DEFAULT_TARGET_PEERS,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_network_with_target_peers(
+        socket_address: IpAddr,
+        socket_port: u16,
+        discovery_port: u16,
+        bootnodes: Vec<Enr>,
+        disable_discovery: bool,
+        topics: Vec<GossipTopic>,
+        data_dir: &Path,
+        target_peers: usize,
+    ) -> anyhow::Result<Network> {
         let executor = ReamExecutor::new().unwrap();
 
         let discv5_config = discv5::ConfigBuilder::new(discv5::ListenConfig::from_ip(
@@ -1400,7 +1424,7 @@ mod tests {
             },
             data_dir: data_dir.to_path_buf(),
             genesis_time: beacon_network_spec().min_genesis_time,
-            target_peers: DEFAULT_TARGET_PEERS,
+            target_peers,
         };
 
         std::fs::create_dir_all(&config.data_dir)?;
@@ -1740,6 +1764,84 @@ mod tests {
             0
         );
         assert_eq!(custody_discovery_target(usize::MAX, target), 0);
+    }
+
+    #[test]
+    fn inbound_connections_beyond_the_limit_are_denied() {
+        initialize_test_network_spec();
+        let tokio_runtime = Runtime::new().unwrap();
+        let data_dirs = [TestDataDir::new(), TestDataDir::new(), TestDataDir::new()];
+
+        // A target of one peer admits one inbound connection.
+        let mut listener = tokio_runtime
+            .block_on(create_network_with_target_peers(
+                "127.0.0.1".parse().unwrap(),
+                9320,
+                9321,
+                vec![],
+                true,
+                vec![],
+                data_dirs[0].path(),
+                1,
+            ))
+            .unwrap();
+        let mut dialers = [(9322, 9323), (9324, 9325)]
+            .into_iter()
+            .zip(&data_dirs[1..])
+            .map(|((socket_port, discovery_port), data_dir)| {
+                tokio_runtime
+                    .block_on(create_network(
+                        "127.0.0.1".parse().unwrap(),
+                        socket_port,
+                        discovery_port,
+                        vec![],
+                        true,
+                        vec![],
+                        data_dir.path(),
+                    ))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let denied = tokio_runtime.block_on(async {
+            for dialer in &mut dialers {
+                dialer.handle_discovered_peers(HashMap::from([(listener.enr(), None)]));
+            }
+            let [dialer_1, dialer_2] = dialers.as_mut_slice() else {
+                unreachable!("two dialers were created");
+            };
+            let mut denied = 0;
+            let deadline = sleep(Duration::from_secs(10));
+            tokio::pin!(deadline);
+            loop {
+                tokio::select! {
+                    Some(event) = listener.swarm.next() => {
+                        if let SwarmEvent::IncomingConnectionError {
+                            error: libp2p::swarm::ListenError::Denied { .. },
+                            ..
+                        } = &event
+                        {
+                            denied += 1;
+                        }
+                        listener.parse_swarm_event(event).await;
+                    }
+                    Some(event) = dialer_1.swarm.next() => {
+                        dialer_1.parse_swarm_event(event).await;
+                    }
+                    Some(event) = dialer_2.swarm.next() => {
+                        dialer_2.parse_swarm_event(event).await;
+                    }
+                    _ = &mut deadline => break,
+                }
+                if denied > 0 && listener.swarm.connected_peers().count() == 1 {
+                    break;
+                }
+            }
+            denied
+        });
+
+        assert_eq!(listener.swarm.connected_peers().count(), 1);
+        assert!(denied > 0, "the second inbound connection should be denied");
     }
 
     #[test]
