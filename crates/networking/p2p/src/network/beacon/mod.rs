@@ -1423,7 +1423,31 @@ mod tests {
         topics: Vec<GossipTopic>,
         data_dir: &Path,
     ) -> anyhow::Result<Network> {
-        create_network_with_target_peers(
+        create_network_with_custody(
+            socket_address,
+            socket_port,
+            discovery_port,
+            bootnodes,
+            disable_discovery,
+            topics,
+            data_dir,
+            NUM_CUSTODY_GROUPS,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_network_with_custody(
+        socket_address: IpAddr,
+        socket_port: u16,
+        discovery_port: u16,
+        bootnodes: Vec<Enr>,
+        disable_discovery: bool,
+        topics: Vec<GossipTopic>,
+        data_dir: &Path,
+        custody_group_count: u64,
+    ) -> anyhow::Result<Network> {
+        build_network(
             socket_address,
             socket_port,
             discovery_port,
@@ -1432,6 +1456,7 @@ mod tests {
             topics,
             data_dir,
             DEFAULT_TARGET_PEERS,
+            custody_group_count,
         )
         .await
     }
@@ -1446,6 +1471,32 @@ mod tests {
         topics: Vec<GossipTopic>,
         data_dir: &Path,
         target_peers: usize,
+    ) -> anyhow::Result<Network> {
+        build_network(
+            socket_address,
+            socket_port,
+            discovery_port,
+            bootnodes,
+            disable_discovery,
+            topics,
+            data_dir,
+            target_peers,
+            NUM_CUSTODY_GROUPS,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn build_network(
+        socket_address: IpAddr,
+        socket_port: u16,
+        discovery_port: u16,
+        bootnodes: Vec<Enr>,
+        disable_discovery: bool,
+        topics: Vec<GossipTopic>,
+        data_dir: &Path,
+        target_peers: usize,
+        custody_group_count: u64,
     ) -> anyhow::Result<Network> {
         let executor = ReamExecutor::new().unwrap();
 
@@ -1465,7 +1516,7 @@ mod tests {
                 disable_discovery,
                 attestation_subnets: AttestationSubnets::new(),
                 sync_committee_subnets: SyncCommitteeSubnets::new(),
-                custody_group_count: CustodyGroupCount(NUM_CUSTODY_GROUPS),
+                custody_group_count: CustodyGroupCount(custody_group_count),
             },
             gossipsub_config: GossipsubConfig {
                 topics,
@@ -1865,6 +1916,73 @@ mod tests {
         assert_eq!(peer_from_network_2.direction, Direction::Outbound);
         assert_eq!(ream_metrics::BEACON_PEER_COUNT.get(), 1);
         assert_eq!(ream_metrics::LIBP2P_PEERS.get(), 1);
+    }
+
+    #[test]
+    fn a_raised_custody_is_advertised_and_subscribed() {
+        initialize_test_network_spec();
+        let tokio_runtime = Runtime::new().unwrap();
+        let data_dir = TestDataDir::new();
+        let mut network = tokio_runtime.block_on(async {
+            create_network_with_custody(
+                "127.0.0.1".parse().unwrap(),
+                0,
+                0,
+                vec![],
+                true,
+                vec![],
+                data_dir.path(),
+                4,
+            )
+            .await
+            .unwrap()
+        });
+        use ream_discv5::subnet::CUSTODY_GROUP_COUNT_ENR_KEY;
+
+        let custody_config = CustodyConfig::from_network_spec(&beacon_network_spec()).unwrap();
+        let node_id = network.network_state.local_enr.read().node_id();
+        let enr_count = |network: &Network| {
+            network
+                .network_state
+                .local_enr
+                .read()
+                .get_decodable::<CustodyGroupCount>(CUSTODY_GROUP_COUNT_ENR_KEY)
+                .and_then(Result::ok)
+        };
+        let seq_before = network.network_state.meta_data.read().seq_number;
+
+        let raised = CustodyAssignment::new(node_id, 64, &custody_config).unwrap();
+        tokio_runtime.block_on(async { network.raise_custody(raised.clone()) });
+        assert_eq!(enr_count(&network), Some(CustodyGroupCount(64)));
+        let meta_data = network.network_state.meta_data.read().clone();
+        assert_eq!(meta_data.custody_group_count, 64);
+        assert_eq!(meta_data.seq_number, seq_before + 1);
+        assert_eq!(network.sampling_columns, raised.sampling_columns);
+        let subscribed = network
+            .subscribed_topics
+            .lock()
+            .iter()
+            .filter_map(|topic| match topic.kind {
+                GossipTopicKind::DataColumnSidecar(subnet_id) => Some(subnet_id),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        assert!(
+            raised
+                .data_column_subnet_ids
+                .iter()
+                .all(|subnet_id| subscribed.contains(subnet_id))
+        );
+
+        // A smaller custody changes nothing: the count never decreases.
+        let lower = CustodyAssignment::new(node_id, 8, &custody_config).unwrap();
+        tokio_runtime.block_on(async { network.raise_custody(lower) });
+        assert_eq!(enr_count(&network), Some(CustodyGroupCount(64)));
+        assert_eq!(
+            network.network_state.meta_data.read().custody_group_count,
+            64
+        );
+        assert_eq!(network.sampling_columns, raised.sampling_columns);
     }
 
     #[test]

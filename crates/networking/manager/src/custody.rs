@@ -86,14 +86,13 @@ impl ValidatorCustody {
         })
     }
 
-    /// Raises the custody for `validator_indices`, whose effective balances come from `state`.
-    /// A raise is advertised at once, and blocks wait for its sampled columns from the epoch
-    /// after `CUSTODY_CHANGE_DELAY_SLOTS`, so that gossip has delivered them by then.
+    /// Raises the custody to `validator_custody_requirement` when it is larger. A raise is
+    /// advertised at once, and blocks wait for its sampled columns from the epoch after
+    /// `CUSTODY_CHANGE_DELAY_SLOTS`, so that gossip has delivered them by then.
     pub fn on_slot(
         &mut self,
         slot: u64,
-        state: &BeaconState,
-        validator_indices: &[u64],
+        validator_custody_requirement: Option<u64>,
     ) -> anyhow::Result<CustodyChange> {
         let mut change = CustodyChange::default();
         if self
@@ -104,16 +103,9 @@ impl ValidatorCustody {
             change.sampling_columns = self.pending_sampling.take().map(|(_, columns)| columns);
         }
 
-        // An index the state does not know yet is skipped until the state includes it.
-        let validator_indices = validator_indices
-            .iter()
-            .copied()
-            .filter(|index| (*index as usize) < state.validators.len())
-            .collect::<Vec<_>>();
-        if validator_indices.is_empty() {
+        let Some(required) = validator_custody_requirement else {
             return Ok(change);
-        }
-        let required = get_validators_custody_requirement(state, &validator_indices)?;
+        };
         if required <= self.custody_group_count {
             return Ok(change);
         }
@@ -133,6 +125,24 @@ impl ValidatorCustody {
     }
 }
 
+/// `get_validators_custody_requirement` for the attached validators, from their effective
+/// balances in `state`. Returns `None` without validators. An index the state does not know yet
+/// is skipped until the state includes it.
+pub fn attached_validators_custody_requirement(
+    state: &BeaconState,
+    validator_indices: &[u64],
+) -> anyhow::Result<Option<u64>> {
+    let validator_indices = validator_indices
+        .iter()
+        .copied()
+        .filter(|index| (*index as usize) < state.validators.len())
+        .collect::<Vec<_>>();
+    if validator_indices.is_empty() {
+        return Ok(None);
+    }
+    get_validators_custody_requirement(state, &validator_indices).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -143,6 +153,79 @@ mod tests {
     use ssz::Encode;
 
     use super::*;
+
+    #[test]
+    fn attached_validators_raise_the_custody_from_the_next_epoch() {
+        initialize_test_network_spec();
+        let spec = beacon_network_spec();
+        let data_dir = tempfile::tempdir().unwrap();
+        let node_id = local_node_id(data_dir.path()).unwrap();
+        let custody = local_custody_assignment(data_dir.path(), false).unwrap();
+        let mut validator_custody = ValidatorCustody::new(node_id, &custody).unwrap();
+
+        // No validators: nothing changes.
+        assert_eq!(
+            validator_custody.on_slot(64, None).unwrap(),
+            CustodyChange::default()
+        );
+
+        // The first validators raise the advertised count at once.
+        let change = validator_custody
+            .on_slot(64, Some(spec.validator_custody_requirement))
+            .unwrap();
+        let raised = change.raised.expect("the custody grows");
+        assert_eq!(
+            raised.custody_group_count,
+            spec.validator_custody_requirement
+        );
+        assert_eq!(change.sampling_columns, None);
+        // The same requirement does not raise it again.
+        assert_eq!(
+            validator_custody
+                .on_slot(65, Some(spec.validator_custody_requirement))
+                .unwrap(),
+            CustodyChange::default()
+        );
+
+        // Blocks wait for the larger sampled set from the epoch after the delay: slot 64 + 3 is
+        // in epoch 2, so the set applies from epoch 3.
+        assert_eq!(
+            validator_custody
+                .on_slot(95, None)
+                .unwrap()
+                .sampling_columns,
+            None
+        );
+        assert_eq!(
+            validator_custody
+                .on_slot(96, None)
+                .unwrap()
+                .sampling_columns,
+            Some(raised.sampling_columns.clone())
+        );
+        assert!(!validator_custody.has_pending_sampling());
+
+        // A lower requirement never lowers the count, and a larger one raises it again.
+        assert_eq!(
+            validator_custody
+                .on_slot(97, Some(spec.custody_requirement))
+                .unwrap(),
+            CustodyChange::default()
+        );
+        let all = validator_custody
+            .on_slot(97, Some(spec.number_of_custody_groups))
+            .unwrap()
+            .raised
+            .expect("the custody grows to every group");
+        assert_eq!(all.sampling_columns, (0..128).collect::<Vec<_>>());
+        // Sampled columns only grow, so blocks keep waiting for every column they waited for.
+        assert!(
+            raised
+                .sampling_columns
+                .iter()
+                .all(|column| all.sampling_columns.contains(column))
+        );
+    }
 
     #[test]
     fn a_node_custodies_the_requirement_unless_it_is_a_supernode() {

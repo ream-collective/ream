@@ -57,7 +57,9 @@ use crate::{
         spawn_block_lookup_worker,
     },
     config::ManagerConfig,
-    custody::{ValidatorCustody, local_custody_assignment},
+    custody::{
+        ValidatorCustody, attached_validators_custody_requirement, local_custody_assignment,
+    },
     data_availability_fetch::{
         ColumnFetchOutcome, ColumnFetchTracker, fetch_missing_columns, pending_anchor_for_recovery,
     },
@@ -390,7 +392,8 @@ async fn update_validator_custody(
             return;
         }
     };
-    match validator_custody.on_slot(current_slot, &head.state, &validator_indices) {
+    let requirement = attached_validators_custody_requirement(&head.state, &validator_indices);
+    match requirement.and_then(|requirement| validator_custody.on_slot(current_slot, requirement)) {
         Ok(change) => {
             if let Some(custody) = change.raised {
                 info!(
