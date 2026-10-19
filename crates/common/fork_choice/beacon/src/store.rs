@@ -1373,13 +1373,12 @@ pub fn get_current_slot_from_db(db: &BeaconDB) -> anyhow::Result<u64> {
 /// not hold the [`Store`] can walk ancestry.
 pub fn get_ancestor_from_db(db: &BeaconDB, mut root: B256, slot: u64) -> anyhow::Result<B256> {
     loop {
-        let block = db
+        let (block_slot, parent_root) = db
             .block_provider()
-            .get(root)?
-            .ok_or(anyhow!("Failed to find beacon_block_provider()"))?
-            .message;
-        if block.slot > slot {
-            root = block.parent_root;
+            .slot_and_parent_root(root)?
+            .ok_or(anyhow!("Failed to find beacon_block_provider()"))?;
+        if block_slot > slot {
+            root = parent_root;
         } else {
             return Ok(root);
         }

@@ -630,6 +630,44 @@ mod tests {
     }
 
     #[test]
+    fn block_lookups_read_cached_and_stored_blocks() {
+        let dir = TempDir::new("ream_block_lookups").unwrap();
+        let root = alloy_primitives::B256::repeat_byte(0x31);
+        let mut block = signed_block();
+        block.message.slot = 7;
+        block.message.parent_root = alloy_primitives::B256::repeat_byte(0x30);
+        {
+            let db = ReamDB::new(dir.path().to_path_buf())
+                .unwrap()
+                .init_beacon_db()
+                .unwrap();
+            commit_block_rows(&db, root, &block).unwrap();
+            assert!(db.block_provider().contains_key(root).unwrap());
+            assert_eq!(
+                db.block_provider().slot_and_parent_root(root).unwrap(),
+                Some((7, block.message.parent_root))
+            );
+        }
+
+        // Reopened, the block is only on disk.
+        let db = ReamDB::new(dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap();
+        let missing = alloy_primitives::B256::repeat_byte(0x32);
+        assert!(db.block_provider().contains_key(root).unwrap());
+        assert!(!db.block_provider().contains_key(missing).unwrap());
+        assert_eq!(
+            db.block_provider().slot_and_parent_root(root).unwrap(),
+            Some((7, block.message.parent_root))
+        );
+        assert_eq!(
+            db.block_provider().slot_and_parent_root(missing).unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn block_import_transaction_commits_all_tables_together() {
         let dir = TempDir::new("ream_atomic_block_import_success").unwrap();
         let db = ReamDB::new(dir.path().to_path_buf())
