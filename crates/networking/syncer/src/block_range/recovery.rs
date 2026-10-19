@@ -99,7 +99,7 @@ pub(super) fn is_processable_connection_point(
     if store.db.block_provider().get(parent_root)?.is_none() {
         return Ok(false);
     }
-    if store.db.state_provider().get(parent_root)?.is_none() {
+    if !store.db.state_provider().contains_key(parent_root)? {
         return Ok(false);
     }
     let finalized_checkpoint = store.db.finalized_checkpoint_provider().get()?;

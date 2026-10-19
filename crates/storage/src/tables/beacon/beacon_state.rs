@@ -839,6 +839,31 @@ mod tests {
         );
     }
 
+    /// `contains_key` answers from the summary. `get` of a state that is not stored whole replays
+    /// blocks and hashes the state, which callers that only need existence must not pay for.
+    #[test]
+    fn contains_key_does_not_rebuild_the_state() {
+        let dir = TempDir::new("ream_contains_key").unwrap();
+        let db = ReamDB::new(dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap();
+        let states = db.state_provider();
+        let anchor = sepolia_state();
+        let anchor_root = B256::repeat_byte(1);
+        let child_root = B256::repeat_byte(2);
+        insert_block_for_state(&db, anchor_root, &anchor);
+        states.insert_shared(anchor_root, anchor.clone()).unwrap();
+        // No block for the child: it cannot be rebuilt, so only a lookup that skips the rebuild
+        // succeeds.
+        let child = child_of(anchor_root, &anchor, anchor.slot + 1);
+        states.insert_shared(child_root, child).unwrap();
+        assert!(!states.is_stored_whole(child_root).unwrap());
+        assert!(states.get_shared(child_root).is_err());
+        assert!(states.contains_key(child_root).unwrap());
+        assert!(!states.contains_key(B256::repeat_byte(3)).unwrap());
+    }
+
     /// With a cache, the inserted state is shared from memory and nothing stays pending once a
     /// synchronous write finishes.
     #[test]

@@ -280,7 +280,7 @@ pub(crate) fn ensure_pending_item_is_importable_with_store(
         current_slot,
         finalized_slot,
         store.db.block_provider().get(parent_root)?.is_some(),
-        store.db.state_provider().get(parent_root)?.is_some(),
+        store.db.state_provider().contains_key(parent_root)?,
     )?;
 
     #[cfg(not(feature = "disable_ancestor_validation"))]
@@ -298,7 +298,7 @@ pub(crate) fn ensure_pending_item_is_importable_with_store(
             AvailabilityEntryStatus::PendingBlock | AvailabilityEntryStatus::Complete
         )
         && !(store.db.block_provider().get(block_root)?.is_some()
-            && store.db.state_provider().get(block_root)?.is_some())
+            && store.db.state_provider().contains_key(block_root)?)
     {
         bail!("column's block is neither pending data availability nor imported");
     }
