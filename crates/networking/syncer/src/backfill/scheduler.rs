@@ -330,6 +330,7 @@ impl Scheduler {
         let top_epoch = (frontier_slot - 1) / SLOTS_PER_EPOCH;
         let lowest_epoch = self.lowest_epoch(target_slot);
         let mut epoch = top_epoch;
+        let mut past_awaited = false;
         while epoch >= lowest_epoch && top_epoch - epoch < self.config.max_window_epochs {
             let start_slot = (epoch * SLOTS_PER_EPOCH).max(self.floor_slot);
             let end_slot = ((epoch + 1) * SLOTS_PER_EPOCH).min(frontier_slot);
@@ -358,16 +359,20 @@ impl Scheduler {
                 by_root_only: false,
                 doubted: Vec::new(),
             });
+            // The batch `advance` waits on: the first one not answered as empty.
+            let awaited = !past_awaited;
+            past_awaited |=
+                !matches!(&batch.state, BatchState::Have { blocks, .. } if blocks.is_empty());
             if matches!(batch.state, BatchState::Todo) {
                 // Never consume the parent reserve with range data. Batches further down cannot
-                // commit before the one next to the frontier, so they make room for it.
-                if over_budget && epoch != top_epoch {
+                // commit before the awaited one, so they make room for it.
+                if over_budget && !awaited {
                     break;
                 }
                 match pick_peer(batch.start_slot, &batch.attempted) {
                     Some(peer_id) => {
                         if over_budget {
-                            self.evict_to(limit);
+                            self.evict_to(limit, epoch);
                         }
                         let batch = self.batches.get_mut(&epoch).expect("inserted above");
                         self.next_sequence += 1;
@@ -512,15 +517,20 @@ impl Scheduler {
             self.config
                 .max_pending_bytes
                 .saturating_sub(self.config.frontier_reserve_bytes),
+            u64::MAX,
         );
     }
 
-    fn evict_to(&mut self, limit: usize) {
+    /// Evicts only batches below `below_epoch`.
+    fn evict_to(&mut self, limit: usize, below_epoch: u64) {
         while self.pending_bytes() > limit {
-            let mut loaded = self.batches.iter().filter_map(|(epoch, batch)| {
-                matches!(&batch.state, BatchState::Have { blocks, .. } if !blocks.is_empty())
-                    .then_some(*epoch)
-            });
+            let mut loaded = self
+                .batches
+                .range(..below_epoch)
+                .filter_map(|(epoch, batch)| {
+                    matches!(&batch.state, BatchState::Have { blocks, .. } if !blocks.is_empty())
+                        .then_some(*epoch)
+                });
             let Some(furthest) = loaded.next() else {
                 return;
             };
@@ -1394,6 +1404,61 @@ mod tests {
         assert!(matches!(step, Step::Complete));
         assert_eq!(harness.committed, blocks[..160]);
         assert!(harness.scheduler.evicted_batches() > 0);
+    }
+
+    #[test]
+    fn full_budget_makes_room_below_an_epoch_left_to_by_root() {
+        // The small epoch under the oversized one keeps the budget between the admission and
+        // eviction limits once it has to be asked again.
+        let blocks = chain((0..=257).chain(288..=320), 0);
+        let block_bytes = blocks[0].1.ssz_bytes_len();
+        let limits = BackfillConfig {
+            max_inflight: 5,
+            max_pending_bytes: 131 * block_bytes,
+            frontier_reserve_bytes: block_bytes,
+            inflight_reserve_bytes: 8 * block_bytes,
+            ..Default::default()
+        };
+        let anchor = blocks.len() - 1;
+        let mut harness = Harness::new(limits, &blocks[anchor], 0, 6);
+        let is_top = |request: &Request| {
+            matches!(
+                request.kind,
+                RequestKind::Range {
+                    start_slot: 288,
+                    ..
+                }
+            )
+        };
+        // The epoch next to the frontier is oversized and answers last, after the budget filled.
+        for _ in 0..2 {
+            for _ in 0..100 {
+                harness.pump();
+                let Some(index) = harness.queue.iter().position(|request| !is_top(request)) else {
+                    break;
+                };
+                let request = harness.queue.remove(index).expect("queued");
+                let outcome = serve(&blocks, &request);
+                harness.answer(request, outcome);
+            }
+            let index = harness
+                .queue
+                .iter()
+                .position(is_top)
+                .expect("top epoch in flight");
+            let request = harness.queue.remove(index).expect("queued");
+            harness.answer(request, Outcome::TooLarge);
+        }
+        let step = harness.run(|_, request| {
+            if is_top(request) {
+                Outcome::TooLarge
+            } else {
+                serve(&blocks, request)
+            }
+        });
+        assert!(matches!(step, Step::Complete));
+        assert_eq!(harness.committed, blocks[..anchor]);
+        assert!(harness.bans.is_empty());
     }
 
     #[test]
