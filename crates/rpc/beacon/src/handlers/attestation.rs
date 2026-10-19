@@ -18,6 +18,8 @@ use ream_storage::{
     tables::{field::REDBField, table::REDBTable},
 };
 
+use crate::handlers::run_blocking;
+
 fn compute_ideal_attestation_rewards(state: &BeaconState) -> Result<Vec<IdealReward>, ApiError> {
     let base_reward_per_increment = state.get_base_reward_per_increment();
     let active_increments = state.get_total_active_balance() / EFFECTIVE_BALANCE_INCREMENT;
@@ -205,8 +207,20 @@ pub async fn post_attestation_rewards(
         ));
     }
 
+    let db = db.get_ref().clone();
+    let validator_ids = validator_ids.into_inner();
+    let response =
+        run_blocking(move || attestation_rewards(&db, epoch_value, validator_ids.as_ref())).await?;
+    Ok(HttpResponse::Ok().json(response))
+}
+
+fn attestation_rewards(
+    db: &BeaconDB,
+    epoch_value: u64,
+    validator_ids: Option<&Vec<ValidatorID>>,
+) -> Result<AttestationRewardsResponse, ApiError> {
     // The state at the end of epoch + 1 holds every attestation for the epoch, including late ones.
-    let block_root = latest_block_root_in_epoch(&db, epoch_value + 1)?;
+    let block_root = latest_block_root_in_epoch(db, epoch_value + 1)?;
     let state = db
         .state_provider()
         .get(block_root)
@@ -259,18 +273,16 @@ pub async fn post_attestation_rewards(
     };
 
     // Compute total rewards for all eligible validators (with optional filtering)
-    let total_rewards = compute_total_attestation_rewards(&state, &deltas, validator_ids.as_ref())?;
+    let total_rewards = compute_total_attestation_rewards(&state, &deltas, validator_ids)?;
 
-    let response = AttestationRewardsResponse {
+    Ok(AttestationRewardsResponse {
         execution_optimistic: false,
         finalized: is_finalized,
         data: AttestationRewardsData {
             ideal_rewards,
             total_rewards,
         },
-    };
-
-    Ok(HttpResponse::Ok().json(response))
+    })
 }
 
 #[cfg(test)]

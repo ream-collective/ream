@@ -58,7 +58,7 @@ use ssz::{Decode, Encode};
 use tracing::{error, info, warn};
 use tree_hash::TreeHash;
 
-use crate::handlers::{representation::checkpoint_response, state::get_state_by_block_root};
+use crate::handlers::{representation::checkpoint_response, run_blocking, state::get_state_by_block_root};
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct BlockRewards {
@@ -316,17 +316,6 @@ pub async fn get_block_root(
 }
 
 /// Block, and its post-state, for a block id. A root here is a block root, not a state root.
-async fn get_block_and_state_from_id(
-    block_id: ID,
-    db: &BeaconDB,
-    beacon_chain: &BeaconChain,
-) -> Result<(SignedBeaconBlock, BeaconState), ApiError> {
-    let block_root = get_block_root_from_id(block_id.clone(), db, beacon_chain).await?;
-    let beacon_block = get_beacon_block_from_id(ID::Root(block_root), db, beacon_chain).await?;
-    let beacon_state = get_state_by_block_root(db, block_root)?;
-    Ok((beacon_block, beacon_state))
-}
-
 /// Standard path of the block rewards endpoint.
 #[get("/beacon/rewards/blocks/{block_id}")]
 pub async fn get_rewards_blocks(
@@ -353,14 +342,23 @@ async fn block_rewards(
     beacon_chain: &BeaconChain,
 ) -> Result<HttpResponse, ApiError> {
     let beacon_block = get_beacon_block_from_id(block_id, db, beacon_chain).await?;
-    let beacon_state = get_block_pre_state(db, &beacon_block)?;
+    let db = db.clone();
+    let response = run_blocking(move || compute_block_rewards(&db, &beacon_block)).await?;
+    Ok(HttpResponse::Ok().json(BeaconResponse::new(response)))
+}
+
+fn compute_block_rewards(
+    db: &BeaconDB,
+    beacon_block: &SignedBeaconBlock,
+) -> Result<BlockRewards, ApiError> {
+    let beacon_state = get_block_pre_state(db, beacon_block)?;
 
     // Same order as `process_operations`.
     let mut slashed = HashSet::new();
     let proposer_slashing_reward =
-        get_proposer_slashing_rewards(&beacon_state, &beacon_block, &mut slashed);
+        get_proposer_slashing_rewards(&beacon_state, beacon_block, &mut slashed);
     let attester_slashing_reward =
-        get_attester_slashing_rewards(&beacon_state, &beacon_block, &mut slashed);
+        get_attester_slashing_rewards(&beacon_state, beacon_block, &mut slashed);
     let attestation_reward = beacon_state
         .attestations_proposer_reward(&beacon_block.message.body.attestations)
         .map_err(|err| {
@@ -381,16 +379,14 @@ async fn block_rewards(
         + proposer_slashing_reward
         + attester_slashing_reward;
 
-    let response = BlockRewards {
+    Ok(BlockRewards {
         proposer_index: beacon_block.message.proposer_index,
         total,
         attestations: attestation_reward,
         sync_aggregate: sync_aggregate_reward,
         proposer_slashings: proposer_slashing_reward,
         attester_slashings: attester_slashing_reward,
-    };
-
-    Ok(HttpResponse::Ok().json(BeaconResponse::new(response)))
+    })
 }
 
 /// Called by `/blocks/<block_id>` to get the Beacon Block.
@@ -417,19 +413,34 @@ pub async fn post_sync_committee_rewards(
     block_id: Path<ID>,
     validators: Json<Vec<ValidatorID>>,
 ) -> Result<impl Responder, ApiError> {
-    let (beacon_block, beacon_state) =
-        get_block_and_state_from_id(block_id.into_inner(), &db, &beacon_chain).await?;
+    let block_root = get_block_root_from_id(block_id.into_inner(), &db, &beacon_chain).await?;
+    let beacon_block = get_beacon_block_from_id(ID::Root(block_root), &db, &beacon_chain).await?;
+    let db = db.get_ref().clone();
+    let validators = validators.into_inner();
+    let reward_data = run_blocking(move || {
+        let beacon_state = get_state_by_block_root(&db, block_root)?;
+        sync_committee_rewards(&beacon_state, &beacon_block, &validators)
+    })
+    .await?;
 
-    let sync_committee_rewards_map =
-        match beacon_state.compute_sync_committee_rewards(&beacon_block) {
-            Ok(rewards) => rewards,
-            Err(err) => {
-                error!("Failed to compute sync committee rewards, error: {err:?}");
-                return Err(ApiError::InternalError(format!(
-                    "Failed to compute sync committee rewards, error: {err:?}"
-                )));
-            }
-        };
+    Ok(HttpResponse::Ok().json(BeaconResponse::new(reward_data)))
+}
+
+fn sync_committee_rewards(
+    beacon_state: &BeaconState,
+    beacon_block: &SignedBeaconBlock,
+    validators: &[ValidatorID],
+) -> Result<Option<Vec<ValidatorSyncCommitteeReward>>, ApiError> {
+    let sync_committee_rewards_map = match beacon_state.compute_sync_committee_rewards(beacon_block)
+    {
+        Ok(rewards) => rewards,
+        Err(err) => {
+            error!("Failed to compute sync committee rewards, error: {err:?}");
+            return Err(ApiError::InternalError(format!(
+                "Failed to compute sync committee rewards, error: {err:?}"
+            )));
+        }
+    };
     let sync_committee_rewards: Vec<ValidatorSyncCommitteeReward> = sync_committee_rewards_map
         .into_iter()
         .map(|(validator_index, reward)| ValidatorSyncCommitteeReward {
@@ -461,7 +472,7 @@ pub async fn post_sync_committee_rewards(
         )
     };
 
-    Ok(HttpResponse::Ok().json(BeaconResponse::new(reward_data)))
+    Ok(reward_data)
 }
 
 #[get("/beacon/blind_block/{block_id}")]
@@ -1186,9 +1197,10 @@ mod tests {
             None,
         );
 
-        let (_, state) = get_block_and_state_from_id(ID::Root(block_root), &db, &beacon_chain)
+        let resolved = get_block_root_from_id(ID::Root(block_root), &db, &beacon_chain)
             .await
-            .expect("block root resolves to the block's post-state");
+            .expect("block root resolves");
+        let state = get_state_by_block_root(&db, resolved).expect("block's post-state");
 
         assert_eq!(state.slot, fixture_state().slot);
     }
