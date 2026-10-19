@@ -111,6 +111,7 @@ pub struct BeaconChain {
     cached_head: RwLock<Option<CachedHead>>,
     db: BeaconDB,
     operation_pool: Arc<OperationPool>,
+    sync_committee_pool: Arc<SyncCommitteePool>,
     pub execution_engine: Option<ExecutionEngine>,
     pub event_sender: Option<broadcast::Sender<BeaconEvent>>,
     block_import_sender: broadcast::Sender<BlockImportEvent>,
@@ -140,6 +141,7 @@ impl BeaconChain {
 
         let read_db = db.clone();
         let read_operation_pool = operation_pool.clone();
+        let read_sync_committee_pool = sync_committee_pool.clone();
         let mut store = Store::new(db, operation_pool, Some(sync_committee_pool));
         if let Err(err) = store.enable_fork_choice_tree() {
             warn!(
@@ -160,6 +162,7 @@ impl BeaconChain {
             cached_head: RwLock::new(cached_head),
             db: read_db,
             operation_pool: read_operation_pool,
+            sync_committee_pool: read_sync_committee_pool,
             execution_engine,
             event_sender,
             block_import_sender,
@@ -194,6 +197,10 @@ impl BeaconChain {
     /// these never wait for the store lock.
     pub fn db(&self) -> &BeaconDB {
         &self.db
+    }
+
+    pub fn sync_committee_pool(&self) -> &Arc<SyncCommitteePool> {
+        &self.sync_committee_pool
     }
 
     pub fn operation_pool(&self) -> &Arc<OperationPool> {

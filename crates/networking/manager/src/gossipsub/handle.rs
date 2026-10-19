@@ -1,6 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::ensure;
+use anyhow::{anyhow, ensure};
 use libp2p::PeerId;
 pub use libp2p::gossipsub::{Message, MessageAcceptance};
 use ream_chain_beacon::beacon_chain::{BeaconChain, BlockProcessingOutcome};
@@ -9,7 +9,9 @@ use ream_consensus_beacon::{
     single_attestation::SingleAttestation,
 };
 use ream_consensus_misc::{
-    constants::beacon::{MIN_ATTESTATION_INCLUSION_DELAY, genesis_validators_root},
+    constants::beacon::{
+        MIN_ATTESTATION_INCLUSION_DELAY, SYNC_COMMITTEE_SIZE, genesis_validators_root,
+    },
     misc::compute_epoch_at_slot,
 };
 use ream_execution_rpc_types::get_blobs::BlobAndProofV1;
@@ -25,7 +27,10 @@ use ream_storage::{
     tables::{field::REDBField, table::CustomTable},
 };
 use ream_validator_beacon::{
-    attestation::single_attestation_to_attestation, blob_sidecars::compute_subnet_for_blob_sidecar,
+    attestation::single_attestation_to_attestation,
+    blob_sidecars::compute_subnet_for_blob_sidecar,
+    constants::SYNC_COMMITTEE_SUBNET_COUNT,
+    sync_committee::{SyncCommitteeMessage, compute_sync_committee_period},
 };
 use tracing::{debug, error, info, trace, warn};
 use tree_hash::TreeHash;
@@ -50,6 +55,48 @@ use crate::{
     },
     timing::{ColumnSource, log_block_proposer, log_columns_received},
 };
+
+/// Adds an accepted sync committee message to the pool that sync committee contributions are
+/// built from.
+fn import_sync_committee_message(
+    beacon_chain: &BeaconChain,
+    message: &SyncCommitteeMessage,
+    subnet_id: u64,
+) -> anyhow::Result<()> {
+    let head = beacon_chain.head()?;
+    let state = head.state.as_ref();
+    let public_key = &state
+        .validators
+        .get(message.validator_index as usize)
+        .ok_or_else(|| anyhow!("Validator {} not found", message.validator_index))?
+        .public_key;
+    let sync_committee = if compute_sync_committee_period(compute_epoch_at_slot(message.slot))
+        == compute_sync_committee_period(state.get_current_epoch())
+    {
+        &state.current_sync_committee
+    } else {
+        &state.next_sync_committee
+    };
+    let subcommittee_size = (SYNC_COMMITTEE_SIZE / SYNC_COMMITTEE_SUBNET_COUNT) as usize;
+    let positions = sync_committee
+        .public_keys
+        .iter()
+        .enumerate()
+        .filter(|(position, key)| {
+            *key == public_key && (position / subcommittee_size) as u64 == subnet_id
+        })
+        .map(|(position, _)| (message.clone(), position % subcommittee_size));
+
+    let pool = beacon_chain.sync_committee_pool();
+    pool.aggregate_messages(
+        message.slot,
+        message.beacon_block_root,
+        subnet_id,
+        positions,
+    );
+    pool.insert_sync_committee_message(message.clone(), subnet_id);
+    Ok(())
+}
 
 pub struct UnknownParentGossipBlock {
     pub parent_root: alloy_primitives::B256,
@@ -401,7 +448,14 @@ async fn dispatch_gossipsub_message(
                     Ok(validation_result) => {
                         let acceptance = accepted_message_acceptance(&validation_result);
                         match validation_result {
-                            ValidationResult::Accept => {}
+                            ValidationResult::Accept => {
+                                if let Err(err) = beacon_chain
+                                    .import_aggregate(aggregate_and_proof.message.aggregate)
+                                    .await
+                                {
+                                    warn!("Failed to import gossip aggregate: {err}");
+                                }
+                            }
                             ValidationResult::Reject(reason) => {
                                 info!("Aggregate and proof rejected: {reason}");
                             }
@@ -429,7 +483,15 @@ async fn dispatch_gossipsub_message(
                     Ok(validation_result) => {
                         let acceptance = accepted_message_acceptance(&validation_result);
                         match validation_result {
-                            ValidationResult::Accept => {}
+                            ValidationResult::Accept => {
+                                if let Err(err) = import_sync_committee_message(
+                                    beacon_chain,
+                                    &sync_committee,
+                                    subnet_id,
+                                ) {
+                                    warn!("Failed to import gossip sync committee message: {err}");
+                                }
+                            }
                             ValidationResult::Reject(reason) => {
                                 info!("Sync committee message rejected: {reason}");
                             }
@@ -461,8 +523,17 @@ async fn dispatch_gossipsub_message(
                     Ok(validation_result) => {
                         let acceptance = accepted_message_acceptance(&validation_result);
                         match validation_result {
-                            ValidationResult::Accept => {}
-
+                            ValidationResult::Accept => {
+                                let contribution =
+                                    signed_contribution_and_proof.message.contribution;
+                                beacon_chain.operation_pool().insert_sync_contribution(
+                                    contribution.slot,
+                                    contribution.beacon_block_root,
+                                    contribution.subcommittee_index,
+                                    contribution.aggregation_bits,
+                                    contribution.signature,
+                                );
+                            }
                             ValidationResult::Reject(reason) => {
                                 info!("Sync committee contribution and proof rejected: {reason}");
                             }
