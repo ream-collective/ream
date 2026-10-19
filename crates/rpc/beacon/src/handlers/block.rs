@@ -11,7 +11,7 @@ use alloy_primitives::B256;
 use anyhow::anyhow;
 use futures::StreamExt;
 use ream_api_types_beacon::{
-    block::BroadcastValidation,
+    block::{BroadcastValidation, SignedBlockContents},
     id::ValidatorID,
     responses::{
         BeaconResponse, BeaconVersionedResponse, DataResponse, ETH_CONSENSUS_VERSION_HEADER,
@@ -35,6 +35,7 @@ use ream_consensus_beacon::{
 use ream_consensus_misc::constants::beacon::{
     GENESIS_SLOT, WHISTLEBLOWER_REWARD_QUOTIENT, genesis_validators_root,
 };
+use ream_execution_rpc_types::get_blobs::Blob;
 use ream_network_manager::p2p_sender::P2PSender;
 use ream_network_spec::networks::beacon_network_spec;
 use ream_p2p::{
@@ -567,6 +568,7 @@ async fn read_ssz_payload(payload: Payload) -> Result<actix_web::web::Bytes, Api
 /// Publishes a validated block to the network and processes it
 async fn publish_and_process_block(
     signed_block: SignedBeaconBlock,
+    blobs: Vec<Blob>,
     beacon_chain: Data<Arc<BeaconChain>>,
     p2p_sender: Data<Arc<P2PSender>>,
 ) -> Result<HttpResponse, ApiError> {
@@ -593,6 +595,7 @@ async fn publish_and_process_block(
 
     broadcast_data_column_sidecars(
         signed_block.clone(),
+        blobs,
         beacon_chain.as_ref(),
         p2p_sender.as_ref(),
     )
@@ -628,18 +631,29 @@ fn build_and_store_data_column_sidecars(
     signed_block: &SignedBeaconBlock,
     block_root: B256,
     commitment_count: usize,
+    published_blobs: Vec<Blob>,
     blobs_and_proofs_provider: &BlobsAndProofsTable,
     column_sidecars_provider: &ColumnSidecarsTable,
 ) -> anyhow::Result<Vec<DataColumnSidecar>> {
+    // Blobs sent with the block are used as they are; otherwise those cached at production.
+    let use_published = published_blobs.len() == commitment_count;
+    let mut published_blobs = published_blobs.into_iter();
     let mut cells_and_kzg_proofs = Vec::with_capacity(commitment_count);
     for index in 0..commitment_count as u64 {
-        let blob = blobs_and_proofs_provider
-            .get(BlobIdentifier::new(block_root, index))
-            .map_err(|err| {
-                anyhow!("Failed to read cached blob {index} for block {block_root:?}: {err}")
-            })?
-            .ok_or_else(|| anyhow!("No cached blob {index} for block {block_root:?}"))?
-            .blob;
+        let blob = match published_blobs.next().filter(|_| use_published) {
+            Some(blob) => blob,
+            None => {
+                blobs_and_proofs_provider
+                    .get(BlobIdentifier::new(block_root, index))
+                    .map_err(|err| {
+                        anyhow!(
+                            "Failed to read cached blob {index} for block {block_root:?}: {err}"
+                        )
+                    })?
+                    .ok_or_else(|| anyhow!("No cached blob {index} for block {block_root:?}"))?
+                    .blob
+            }
+        };
 
         cells_and_kzg_proofs.push(compute_cells_and_kzg_proofs(&blob, das_context()).map_err(
             |err| anyhow!("Failed to compute cells/KZG proofs for blob {index}: {err}"),
@@ -663,6 +677,7 @@ fn build_and_store_data_column_sidecars(
 /// Builds and gossips `DataColumnSidecar`s for a just-broadcast block, if it carries blobs.
 async fn broadcast_data_column_sidecars(
     signed_block: SignedBeaconBlock,
+    published_blobs: Vec<Blob>,
     beacon_chain: &BeaconChain,
     p2p_sender: &P2PSender,
 ) {
@@ -685,6 +700,7 @@ async fn broadcast_data_column_sidecars(
             &signed_block,
             block_root,
             commitment_count,
+            published_blobs,
             &blobs_and_proofs_provider,
             &column_sidecars_provider,
         )
@@ -746,10 +762,13 @@ pub async fn post_beacon_block(
 ) -> Result<impl Responder, ApiError> {
     validate_consensus_version_header(&http_request)?;
 
+    let is_json = http_request
+        .headers()
+        .get(actix_web::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"));
     let body = read_ssz_payload(payload).await?;
-
-    let signed_block = SignedBeaconBlock::from_ssz_bytes(&body)
-        .map_err(|err| ApiError::BadRequest(format!("Failed to decode SSZ block: {err:?}")))?;
+    let (signed_block, blobs) = decode_published_block(&body, is_json)?;
 
     // Validate based on broadcast_validation level
     validate_block_for_broadcast(
@@ -761,7 +780,43 @@ pub async fn post_beacon_block(
     .await
     .map_err(|err| ApiError::BadRequest(format!("Block validation failed: {err}")))?;
 
-    publish_and_process_block(signed_block, beacon_chain, p2p_sender).await
+    publish_and_process_block(signed_block, blobs, beacon_chain, p2p_sender).await
+}
+
+/// The block and blobs of a published block. Deneb and later send `SignedBlockContents`, as SSZ
+/// or JSON. A bare signed block, as Ream's validator client sends, is accepted too; its blobs
+/// then come from the cache filled when the block was produced.
+fn decode_published_block(
+    body: &[u8],
+    is_json: bool,
+) -> Result<(SignedBeaconBlock, Vec<Blob>), ApiError> {
+    let contents = if is_json {
+        serde_json::from_slice::<SignedBlockContents>(body)
+            .map_err(|err| err.to_string())
+            .or_else(|contents_err| {
+                serde_json::from_slice::<SignedBeaconBlock>(body)
+                    .map(|signed_block| SignedBlockContents {
+                        signed_block,
+                        kzg_proofs: vec![],
+                        blobs: vec![],
+                    })
+                    .map_err(|err| format!("{contents_err}; as a bare block: {err}"))
+            })
+    } else {
+        SignedBlockContents::from_ssz_bytes(body)
+            .map_err(|err| format!("{err:?}"))
+            .or_else(|contents_err| {
+                SignedBeaconBlock::from_ssz_bytes(body)
+                    .map(|signed_block| SignedBlockContents {
+                        signed_block,
+                        kzg_proofs: vec![],
+                        blobs: vec![],
+                    })
+                    .map_err(|err| format!("{contents_err}; as a bare block: {err:?}"))
+            })
+    }
+    .map_err(|err| ApiError::BadRequest(format!("Failed to decode block: {err}")))?;
+    Ok((contents.signed_block, contents.blobs))
 }
 
 /// POST /eth/v2/beacon/blinded_blocks
@@ -851,7 +906,7 @@ pub async fn post_blinded_beacon_block(
 
     info!("Publishing assembled block from blinded block: slot={slot}, block_root={block_root:?}",);
 
-    publish_and_process_block(signed_block, beacon_chain, p2p_sender).await
+    publish_and_process_block(signed_block, vec![], beacon_chain, p2p_sender).await
 }
 
 #[cfg(test)]
@@ -862,6 +917,46 @@ mod tests {
     use ssz::Decode;
 
     use super::*;
+
+    fn sepolia_block() -> SignedBeaconBlock {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../../testing/gossip-validation/tests/assets/sepolia/blocks/child_9552076.ssz_snappy",
+        );
+        let bytes = snap::raw::Decoder::new()
+            .decompress_vec(&std::fs::read(path).unwrap())
+            .unwrap();
+        SignedBeaconBlock::from_ssz_bytes(&bytes).unwrap()
+    }
+
+    /// Lighthouse's validator client publishes `SignedBlockContents` as SSZ.
+    #[test]
+    fn published_blocks_decode_as_contents_or_bare_blocks() {
+        let signed_block = sepolia_block();
+        let contents = SignedBlockContents {
+            signed_block: signed_block.clone(),
+            kzg_proofs: vec![],
+            blobs: vec![Blob::default()],
+        };
+
+        for (body, is_json) in [
+            (contents.as_ssz_bytes(), false),
+            (serde_json::to_vec(&contents).unwrap(), true),
+        ] {
+            let (block, blobs) = decode_published_block(&body, is_json).unwrap();
+            assert_eq!(block, signed_block);
+            assert_eq!(blobs, vec![Blob::default()]);
+        }
+        for (body, is_json) in [
+            (signed_block.as_ssz_bytes(), false),
+            (serde_json::to_vec(&signed_block).unwrap(), true),
+        ] {
+            let (block, blobs) = decode_published_block(&body, is_json).unwrap();
+            assert_eq!(block, signed_block);
+            assert!(blobs.is_empty());
+        }
+        assert!(decode_published_block(b"{}", true).is_err());
+        assert!(decode_published_block(&[0; 8], false).is_err());
+    }
 
     #[test]
     fn genesis_time_is_the_chain_genesis_not_min_genesis_time() {

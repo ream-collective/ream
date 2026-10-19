@@ -1,5 +1,6 @@
 use ream_consensus_beacon::electra::{
-    beacon_block::BeaconBlock, blinded_beacon_block::BlindedBeaconBlock,
+    beacon_block::{BeaconBlock, SignedBeaconBlock},
+    blinded_beacon_block::BlindedBeaconBlock,
 };
 use ream_consensus_misc::polynomial_commitments::kzg_proof::KZGProof;
 use ream_execution_rpc_types::get_blobs::Blob;
@@ -35,6 +36,14 @@ pub struct ProduceBlockResponse {
 pub enum ProduceBlockData {
     Full(FullBlockData),
     Blinded(BlindedBeaconBlock),
+}
+
+/// The body of `POST /eth/v2/beacon/blocks` from Deneb: the block with its blobs and proofs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct SignedBlockContents {
+    pub signed_block: SignedBeaconBlock,
+    pub kzg_proofs: Vec<KZGProof>,
+    pub blobs: Vec<Blob>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
