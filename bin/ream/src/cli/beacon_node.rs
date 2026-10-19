@@ -109,7 +109,8 @@ pub struct BeaconNodeConfig {
     #[arg(
         long,
         help = "Peers to keep connected. Connections are limited to 90% of it inbound, 110% outbound and 130% in total",
-        default_value_t = DEFAULT_TARGET_PEERS
+        default_value_t = DEFAULT_TARGET_PEERS,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
     )]
     pub target_peers: usize,
 
