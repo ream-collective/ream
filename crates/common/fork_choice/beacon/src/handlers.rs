@@ -351,15 +351,26 @@ fn is_same_dependent_root(
 /// Runs ``on_attestation`` with ``is_from_block`` for the attestations of a block whose
 /// ``state_transition`` succeeded, returning one result per attestation.
 ///
-/// ``state_transition`` already verified each attestation's signature against the same committees
-/// the target state yields, so the signature is not verified again here. Each target checkpoint
-/// state is read once per block: decoding it costs as much as the rest of the work for one
-/// attestation.
+/// ``state_transition`` already verified each attestation's signature with the committees of the
+/// block's own chain. A target whose checkpoint state has the same shuffling has the same
+/// committees, so they are read from the block's post-state and the signature is not verified
+/// again, as Prysm's `handleBlockAttestations` does; building that checkpoint state can mean
+/// epoch processing. This covers targets on the block's chain and, when an epoch's first block
+/// came late, targets naming an earlier block of that chain. A target on a fork that split before
+/// the shuffling decision slot can have other committees, so its committee comes from its
+/// checkpoint state and the signature is verified against it, as the spec does. Each such
+/// checkpoint state is read once per block.
 pub fn on_block_attestations(
     store: &mut Store,
     block_root: B256,
     attestations: &[Attestation],
 ) -> Vec<anyhow::Result<()>> {
+    let block_state = store
+        .db
+        .state_provider()
+        .get_shared(block_root)
+        .ok()
+        .flatten();
     let mut target_states: HashMap<Checkpoint, Arc<BeaconState>> = HashMap::new();
     let mut votes = Vec::new();
     let mut results = Vec::with_capacity(attestations.len());
@@ -367,6 +378,20 @@ pub fn on_block_attestations(
         let attesting_indices = (|| {
             store.validate_on_attestation(attestation, true)?;
             let target = attestation.data.target;
+            if let Some(block_state) = block_state.as_ref()
+                && shares_target_shuffling(
+                    store,
+                    block_state.get_current_epoch(),
+                    block_root,
+                    target,
+                )?
+            {
+                return anyhow::Ok(
+                    block_state
+                        .get_indexed_attestation(attestation)?
+                        .attesting_indices,
+                );
+            }
             let target_state = match target_states.entry(target) {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => entry.insert(
@@ -378,14 +403,7 @@ pub fn on_block_attestations(
                 ),
             };
             let indexed_attestation = target_state.get_indexed_attestation(attestation)?;
-            // The spec verifies the signature against the target state. state_transition already
-            // verified it with the committees of the block's own chain, which are the target
-            // state's committees when the target is that chain's checkpoint. A target on another
-            // fork can have a different shuffling, so the same bits name other validators.
-            let target_on_block_chain = store
-                .get_ancestor(block_root, compute_start_slot_at_epoch(target.epoch))?
-                == target.root;
-            if !target_on_block_chain {
+            if !is_on_chain_of(store, block_root, target)? {
                 ensure!(
                     target_state.is_valid_indexed_attestation(&indexed_attestation)?,
                     "Attestation signature must be valid for the target state"
@@ -405,6 +423,12 @@ pub fn on_block_attestations(
         }
     }
     results
+}
+
+/// Whether `target` is the checkpoint of the chain ending at `block_root`: its block is that
+/// chain's ancestor at the target epoch's start slot.
+pub fn is_on_chain_of(store: &Store, block_root: B256, target: Checkpoint) -> anyhow::Result<bool> {
+    Ok(store.get_ancestor(block_root, compute_start_slot_at_epoch(target.epoch))? == target.root)
 }
 
 /// Run ``on_attester_slashing`` immediately upon receiving a new ``AttesterSlashing``
@@ -603,7 +627,7 @@ mod tests {
     use tempdir::TempDir;
 
     use super::{
-        Store, ensure_only_attester, get_proposer_boost_root, get_time_at_slot,
+        Store, ensure_only_attester, get_proposer_boost_root, get_time_at_slot, is_on_chain_of,
         is_same_dependent_root, shares_target_shuffling,
     };
 
@@ -678,6 +702,76 @@ mod tests {
             is_same_dependent_root(&store, head_root, candidate_root, current_slot, head_root)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn block_attestation_targets_are_matched_to_the_block_chain() {
+        initialize_test_network_spec();
+        let temp_dir = TempDir::new("ream_block_attestation_targets").unwrap();
+        let db = ReamDB::new(temp_dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap();
+        let slots_per_epoch = ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH;
+        let checkpoint_root = B256::repeat_byte(0x11);
+        let block_root = B256::repeat_byte(0x12);
+        let fork_checkpoint_root = B256::repeat_byte(0x21);
+        for (root, signed_block) in [
+            (checkpoint_root, block(slots_per_epoch, B256::ZERO)),
+            (block_root, block(slots_per_epoch + 5, checkpoint_root)),
+            (fork_checkpoint_root, block(slots_per_epoch, B256::ZERO)),
+        ] {
+            db.block_provider().insert(root, signed_block).unwrap();
+        }
+        let store = Store::new(db, Arc::new(OperationPool::default()), None);
+        let target = |root| Checkpoint { epoch: 1, root };
+
+        // The block's chain has `checkpoint_root` at epoch 1's start slot.
+        assert!(is_on_chain_of(&store, block_root, target(checkpoint_root)).unwrap());
+        assert!(!is_on_chain_of(&store, block_root, target(fork_checkpoint_root)).unwrap());
+    }
+
+    #[test]
+    fn a_target_before_a_late_first_block_shares_the_block_shuffling() {
+        initialize_test_network_spec();
+        let temp_dir = TempDir::new("ream_late_first_block_target").unwrap();
+        let db = ReamDB::new(temp_dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap();
+        let slots_per_epoch = ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH;
+        // Epoch 2's shuffling is decided at slot 31. Some attesters missed epoch 2's first block
+        // and named the last block of epoch 1 as their target.
+        let decision_root = B256::repeat_byte(0x11);
+        let last_epoch_one_root = B256::repeat_byte(0x12);
+        let first_epoch_two_root = B256::repeat_byte(0x13);
+        let block_root = B256::repeat_byte(0x14);
+        for (root, signed_block) in [
+            (decision_root, block(slots_per_epoch - 1, B256::ZERO)),
+            (
+                last_epoch_one_root,
+                block(2 * slots_per_epoch - 1, decision_root),
+            ),
+            (
+                first_epoch_two_root,
+                block(2 * slots_per_epoch, last_epoch_one_root),
+            ),
+            (
+                block_root,
+                block(2 * slots_per_epoch + 6, first_epoch_two_root),
+            ),
+        ] {
+            db.block_provider().insert(root, signed_block).unwrap();
+        }
+        let store = Store::new(db, Arc::new(OperationPool::default()), None);
+        let late_target = Checkpoint {
+            epoch: 2,
+            root: last_epoch_one_root,
+        };
+
+        // Not the block chain's checkpoint, yet the same shuffling.
+        assert!(!is_on_chain_of(&store, block_root, late_target).unwrap());
+        assert!(shares_target_shuffling(&store, 2, block_root, late_target).unwrap());
     }
 
     #[test]
