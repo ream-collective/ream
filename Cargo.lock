@@ -6674,6 +6674,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "snap",
  "ssz_types",
  "tempdir",
  "thiserror 2.0.19",

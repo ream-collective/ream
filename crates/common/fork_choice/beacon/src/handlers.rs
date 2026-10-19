@@ -142,6 +142,28 @@ pub async fn on_block_with_root(
         state_transition_ms = (transitioned - state_loaded).as_millis() as u64,
         "timing: on_block"
     );
+    // The checkpoint state of the block's epoch is at hand in two cases: the block is at the
+    // epoch's first slot, and then its post-state is that checkpoint state; or the first slot was
+    // skipped, and then the epoch-start state is the parent's checkpoint state. Its fork choice
+    // balances are cached for when the checkpoint becomes justified.
+    let block_epoch = compute_epoch_at_slot(block_slot);
+    if block_slot == compute_start_slot_at_epoch(block_epoch) {
+        store.cache_fork_choice_balances(
+            Checkpoint {
+                epoch: block_epoch,
+                root: block_root,
+            },
+            &state,
+        );
+    } else if let Some(epoch_start_state) = &epoch_start_state {
+        store.cache_fork_choice_balances(
+            Checkpoint {
+                epoch: block_epoch,
+                root: parent_root,
+            },
+            epoch_start_state,
+        );
+    }
     if let Some(epoch_start_state) = epoch_start_state {
         store.db.checkpoint_states_provider().insert_shared(
             Checkpoint {
