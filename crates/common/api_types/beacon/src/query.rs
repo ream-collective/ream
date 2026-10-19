@@ -1,6 +1,9 @@
 use alloy_primitives::B256;
 use ream_peer::{ConnectionState, Direction};
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{DeserializeOwned, value::StrDeserializer},
+};
 
 use super::id::ValidatorID;
 use crate::validator::ValidatorStatus;
@@ -30,8 +33,29 @@ pub struct ParentRootQuery {
     pub parent_root: Option<B256>,
 }
 
+/// Reads a list given as `?key=a,b`, `?key=a&key=b`, or both. Use with
+/// `actix_web_lab::extract::Query`, which accepts repeated keys.
+fn comma_separated<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: DeserializeOwned,
+{
+    let Some(values) = Option::<Vec<String>>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    values
+        .iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| T::deserialize(StrDeserializer::<D::Error>::new(value)))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
 #[derive(Default, Debug, Deserialize)]
 pub struct IdQuery {
+    #[serde(default, deserialize_with = "comma_separated")]
     pub id: Option<Vec<ValidatorID>>,
 }
 
@@ -42,6 +66,7 @@ pub struct BlobSidecarQuery {
 
 #[derive(Default, Debug, Deserialize)]
 pub struct StatusQuery {
+    #[serde(default, deserialize_with = "comma_separated")]
     pub status: Option<Vec<ValidatorStatus>>,
 }
 
