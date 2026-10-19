@@ -16,7 +16,6 @@ use redb::{
 use snap::raw::{Decoder, Encoder};
 use ssz::{Decode, Encode};
 use tracing::{info, warn};
-use tree_hash::TreeHash;
 
 use crate::{
     cache::BeaconCacheDB,
@@ -524,7 +523,8 @@ impl BeaconStateTable {
             .expect("a rebuild always has at least the requested block")
             .message
             .state_root;
-        let actual = state.tree_hash_root();
+        // The replay keeps the parent's root caches, so this rehashes only what changed.
+        let actual = state.state_root();
         if actual != expected {
             return Err(StoreError::StateCorruption(format!(
                 "replayed state {block_root} has root {actual}, expected {expected}"
@@ -545,7 +545,7 @@ impl BeaconStateTable {
             ))
         })?;
         let expected = block.message.state_root;
-        let actual = state.tree_hash_root();
+        let actual = state.state_root();
         if actual != expected {
             return Err(StoreError::StateCorruption(format!(
                 "whole state {block_root} has root {actual}, expected {expected}"
@@ -749,6 +749,7 @@ mod tests {
     use ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH;
     use ream_network_spec::networks::{SEPOLIA, set_beacon_network_spec};
     use tempdir::TempDir;
+    use tree_hash::TreeHash;
 
     use super::*;
     use crate::{
