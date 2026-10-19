@@ -86,7 +86,7 @@ use utils::read_meta_data_from_disk;
 
 use crate::{
     config::{NetworkConfig, PeerLimits},
-    constants::{CUSTODY_DISCOVERY_TARGET_PEERS, PING_INTERVAL_DURATION, SUBNET_DISCOVERY_TARGET_PEERS, TARGET_SUBNET_PEERS},
+    constants::{CUSTODY_DISCOVERY_TARGET_PEERS, PING_INTERVAL_DURATION, SUBNET_DISCOVERY_TARGET_PEERS, TARGET_SUBNET_PEERS, SLOW_PEER_DROPPED_MESSAGES, SLOW_PEER_STRIKES, SLOW_PEER_WINDOW},
     gossipsub::{
         GossipsubBehaviour,
         beacon::{
@@ -138,6 +138,29 @@ fn enr_subnet_bitfields(enr: &Enr) -> anyhow::Result<(BitVector<U64>, BitVector<
         .ok_or_else(|| anyhow!("Local ENR has no syncnets field"))?
         .map_err(|err| anyhow!("Failed to decode local ENR syncnets: {err:?}"))?;
     Ok((attestation_subnets.0, sync_committee_subnets.0))
+}
+
+/// Counts a heartbeat in which `dropped` messages to `peer_id` were dropped because its send queue
+/// was full. Returns true once the peer has been slow for `SLOW_PEER_STRIKES` heartbeats in a row,
+/// each within `SLOW_PEER_WINDOW` of the last, and forgets it.
+fn record_slow_heartbeat(
+    slow_peers: &mut HashMap<PeerId, (u32, Instant)>,
+    peer_id: PeerId,
+    dropped: usize,
+    now: Instant,
+) -> bool {
+    slow_peers.retain(|_, (_, last)| now.duration_since(*last) < SLOW_PEER_WINDOW);
+    if dropped <= SLOW_PEER_DROPPED_MESSAGES {
+        return false;
+    }
+    let (strikes, last) = slow_peers.entry(peer_id).or_insert((0, now));
+    *strikes += 1;
+    *last = now;
+    if *strikes < SLOW_PEER_STRIKES {
+        return false;
+    }
+    slow_peers.remove(&peer_id);
+    true
 }
 
 /// Duty subnets with fewer than `TARGET_SUBNET_PEERS` peers, in order.
@@ -275,6 +298,8 @@ pub struct Network {
     duty_topics: HashMap<GossipTopic, u64>,
     /// Attestation subnets validators publish to, with the last slot each is needed for.
     duty_subnets: HashMap<u64, u64>,
+    /// Slow heartbeats per peer whose gossipsub send queue overflows, with the last one's time.
+    slow_peers: HashMap<PeerId, (u32, Instant)>,
 }
 
 impl Network {
@@ -419,6 +444,7 @@ impl Network {
             target_peers: config.target_peers,
             duty_topics: HashMap::new(),
             duty_subnets: HashMap::new(),
+            slow_peers: HashMap::new(),
             sampling_columns,
             meta_data_requests: HashMap::new(),
             peer_score_settings,
@@ -1313,6 +1339,21 @@ impl Network {
             }
             GossipsubEvent::Unsubscribed { peer_id, topic } => {
                 trace!("Peer {peer_id} unsubscribed from topic: {topic:?}");
+                None
+            }
+            GossipsubEvent::SlowPeer {
+                peer_id,
+                failed_messages,
+            } => {
+                if record_slow_heartbeat(
+                    &mut self.slow_peers,
+                    peer_id,
+                    failed_messages.total_queue_full(),
+                    Instant::now(),
+                ) {
+                    info!("Disconnecting peer {peer_id}: its gossipsub send queue stays full");
+                    let _ = self.swarm.disconnect_peer_id(peer_id);
+                }
                 None
             }
             _ => None,
@@ -2578,6 +2619,50 @@ mod tests {
         assert_eq!(network.enr(), enr);
         assert_eq!(meta_data_seq(&network), seq);
         assert_subnets_consistent(&network, data_dir.path());
+    }
+
+    #[test]
+    fn peers_with_a_full_send_queue_for_ten_heartbeats_are_dropped() {
+        let mut slow_peers = HashMap::new();
+        let peer = PeerId::random();
+        let start = Instant::now();
+        let heartbeat = |n: u64| start + Duration::from_millis(700 * n);
+
+        // Small drops do not count.
+        assert!(!record_slow_heartbeat(
+            &mut slow_peers,
+            peer,
+            SLOW_PEER_DROPPED_MESSAGES,
+            start
+        ));
+        for n in 0..SLOW_PEER_STRIKES as u64 - 1 {
+            assert!(!record_slow_heartbeat(
+                &mut slow_peers,
+                peer,
+                50,
+                heartbeat(n)
+            ));
+        }
+        // A quiet minute resets the count.
+        let later = heartbeat(SLOW_PEER_STRIKES as u64) + SLOW_PEER_WINDOW;
+        assert!(!record_slow_heartbeat(&mut slow_peers, peer, 50, later));
+        assert_eq!(slow_peers[&peer].0, 1);
+
+        for n in 1..SLOW_PEER_STRIKES as u64 - 1 {
+            assert!(!record_slow_heartbeat(
+                &mut slow_peers,
+                peer,
+                50,
+                later + Duration::from_millis(700 * n)
+            ));
+        }
+        assert!(record_slow_heartbeat(
+            &mut slow_peers,
+            peer,
+            50,
+            later + Duration::from_secs(10)
+        ));
+        assert!(slow_peers.is_empty());
     }
 
     #[test]

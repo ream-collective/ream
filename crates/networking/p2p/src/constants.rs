@@ -12,6 +12,11 @@ pub const DEFAULT_TARGET_PEERS: usize = 200;
 pub const TARGET_SUBNET_PEERS: usize = 3;
 /// Peers requested from one attestation subnet discv5 query.
 pub const SUBNET_DISCOVERY_TARGET_PEERS: usize = 8;
+/// Messages a peer's full gossipsub send queue may drop in one heartbeat before it counts as slow.
+pub const SLOW_PEER_DROPPED_MESSAGES: usize = 10;
+/// Slow heartbeats, each within `SLOW_PEER_WINDOW` of the last, after which a peer is dropped.
+pub const SLOW_PEER_STRIKES: u32 = 10;
+pub const SLOW_PEER_WINDOW: Duration = Duration::from_secs(60);
 /// Peers requested from one custody discv5 query. Queries start at most once per maintenance
 /// tick, so this also bounds how many custody peers are dialed per tick.
 pub const CUSTODY_DISCOVERY_TARGET_PEERS: usize = 8;
