@@ -1322,11 +1322,7 @@ pub async fn get_blocks_v3(
         ApiError::InternalError(format!("Failed to get expected withdrawals: {err}"))
     })?;
 
-    let forkchoice_state = ForkchoiceStateV1 {
-        head_block_hash: state.latest_execution_payload_header.block_hash,
-        safe_block_hash: state.current_justified_checkpoint.root,
-        finalized_block_hash: state.finalized_checkpoint.root,
-    };
+    let forkchoice_state = beacon_chain.forkchoice_state_for(&head);
 
     let payload_attribute = PayloadAttributesV3 {
         timestamp: state.compute_timestamp_at_slot(slot),

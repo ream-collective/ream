@@ -494,14 +494,19 @@ impl BeaconChain {
             .inspect_err(|err| warn!("Failed to read head for forkchoice update: {err}"))
             .ok()?;
 
-        Some(ForkchoiceStateV1 {
+        Some(self.forkchoice_state_for(&head))
+    }
+
+    /// Engine API block hashes for a head snapshot.
+    pub fn forkchoice_state_for(&self, head: &CachedHead) -> ForkchoiceStateV1 {
+        ForkchoiceStateV1 {
             head_block_hash: Self::execution_block_hash(&self.db, head.head_root),
             safe_block_hash: Self::execution_block_hash(&self.db, head.justified_checkpoint.root),
             finalized_block_hash: Self::execution_block_hash(
                 &self.db,
                 head.finalized_checkpoint.root,
             ),
-        })
+        }
     }
 
     /// Updates the execution head without rolling back an accepted consensus import on failure.
@@ -1406,6 +1411,47 @@ mod tests {
             None,
         );
         (data_dir, chain)
+    }
+
+    #[test]
+    fn forkchoice_state_uses_execution_block_hashes() {
+        let (_data_dir, chain) = test_chain();
+        let mut roots = Vec::new();
+        for (slot, hash) in [
+            (1, B256::repeat_byte(0x11)),
+            (2, B256::repeat_byte(0x22)),
+            (3, B256::repeat_byte(0x33)),
+        ] {
+            let mut block = empty_block();
+            block.message.slot = slot;
+            block.message.body.execution_payload.block_hash = hash;
+            let root = block.message.tree_hash_root();
+            chain.db.block_provider().insert(root, block).unwrap();
+            roots.push(root);
+        }
+        let head = CachedHead {
+            head_root: roots[2],
+            head_slot: 3,
+            state: Arc::new(fixture_state()),
+            current_slot: 3,
+            justified_checkpoint: Checkpoint {
+                epoch: 0,
+                root: roots[1],
+            },
+            finalized_checkpoint: Checkpoint {
+                epoch: 0,
+                root: roots[0],
+            },
+        };
+
+        let forkchoice_state = chain.forkchoice_state_for(&head);
+
+        assert_eq!(forkchoice_state.head_block_hash, B256::repeat_byte(0x33));
+        assert_eq!(forkchoice_state.safe_block_hash, B256::repeat_byte(0x22));
+        assert_eq!(
+            forkchoice_state.finalized_block_hash,
+            B256::repeat_byte(0x11)
+        );
     }
 
     fn test_chain_with_anchor(anchor_state: BeaconState) -> (tempfile::TempDir, BeaconChain, B256) {
