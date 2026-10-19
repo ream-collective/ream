@@ -25,15 +25,17 @@ const PARENT_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct BackfillConfig {
-    /// Concurrent range requests. The request for the parent of the frontier is not counted.
+    /// Concurrent requests, including the parent request.
     pub max_inflight: usize,
     /// Retained SSZ payload budget, including reservations for downloads and verification.
     /// Codec buffers, one queued callback per request and Rust object overhead are separate.
     pub max_pending_bytes: usize,
     /// Share reserved for a single parent response, so oversized ranges cannot block progress.
     pub frontier_reserve_bytes: usize,
-    /// Hard limit for a range response, reserved until verification finishes.
+    /// Hard limit for a range response while receiving.
     pub max_response_bytes: usize,
+    /// Budget reserved per range in flight until it is verified.
+    pub inflight_reserve_bytes: usize,
     /// Lowest epoch below the frontier that may be requested ahead of it.
     pub max_window_epochs: u64,
     /// Answers collected for a batch that does not connect before its parent is asked by root.
@@ -45,10 +47,11 @@ pub struct BackfillConfig {
 impl Default for BackfillConfig {
     fn default() -> Self {
         Self {
-            max_inflight: 2,
+            max_inflight: 5,
             max_pending_bytes: 64 * 1024 * 1024,
             frontier_reserve_bytes: 16 * 1024 * 1024,
             max_response_bytes: 16 * 1024 * 1024,
+            inflight_reserve_bytes: 4 * 1024 * 1024,
             max_window_epochs: 16,
             batch_retry_answers: 2,
             empty_scan_limit: 2,
@@ -302,13 +305,7 @@ impl Scheduler {
             && self.parent_retry_at.is_none_or(|retry_at| now >= retry_at)
             && self
                 .pending_bytes()
-                .saturating_add(
-                    downloads.saturating_mul(
-                        self.config
-                            .max_response_bytes
-                            .max(self.config.frontier_reserve_bytes),
-                    ),
-                )
+                .saturating_add(downloads.saturating_mul(self.config.inflight_reserve_bytes))
                 .saturating_add(self.config.frontier_reserve_bytes)
                 <= self.config.max_pending_bytes
         {
@@ -347,8 +344,9 @@ impl Scheduler {
                 .config
                 .max_pending_bytes
                 .saturating_sub(self.config.frontier_reserve_bytes);
-            let over_budget =
-                self.pending_bytes() + (inflight + 1) * self.config.max_response_bytes > unreserved;
+            let over_budget = self.pending_bytes()
+                + (inflight + 1) * self.config.inflight_reserve_bytes
+                > unreserved;
 
             let batch = self.batches.entry(epoch).or_insert_with(|| Batch {
                 start_slot,
@@ -1042,7 +1040,7 @@ mod tests {
             max_inflight: 4,
             max_pending_bytes: 3 * batch_bytes,
             frontier_reserve_bytes: batch_bytes,
-            max_response_bytes: 0,
+            inflight_reserve_bytes: 0,
             ..Default::default()
         };
         let mut harness = Harness::new(limits, &blocks[320], 0, 6);
@@ -1088,7 +1086,7 @@ mod tests {
             // Lookahead is admitted on an estimate of zero, so responses overshoot the budget.
             max_pending_bytes: 2 * batch_bytes,
             frontier_reserve_bytes: 0,
-            max_response_bytes: 0,
+            inflight_reserve_bytes: 0,
             ..Default::default()
         };
         let mut harness = Harness::new(limits, &blocks[160], 0, 6);
@@ -1313,7 +1311,7 @@ mod tests {
         let limits = BackfillConfig {
             max_pending_bytes: 4 * block_bytes,
             frontier_reserve_bytes: block_bytes,
-            max_response_bytes: block_bytes,
+            inflight_reserve_bytes: block_bytes,
             ..config(2)
         };
         let mut harness = Harness::new(limits, &blocks[65], 0, 3);
@@ -1355,7 +1353,7 @@ mod tests {
         let mut scheduler = Scheduler::new(BackfillConfig::default(), frontier_at(&blocks[100]), 0);
         // These requests are no longer represented in the scheduler's batches, but their
         // completed responses are still waiting in the driver's JoinSet.
-        let requests = scheduler.next_requests_with_downloads(Instant::now(), 0, 3, &mut |_, _| {
+        let requests = scheduler.next_requests_with_downloads(Instant::now(), 0, 5, &mut |_, _| {
             panic!("no capacity for more downloads")
         });
         assert!(requests.is_empty());
@@ -1367,7 +1365,7 @@ mod tests {
         let mut limits = config(1);
         limits.max_pending_bytes = blocks[0].1.ssz_bytes_len() * 2;
         limits.frontier_reserve_bytes = blocks[0].1.ssz_bytes_len();
-        limits.max_response_bytes = 0; // Exercise eviction independently of receive admission.
+        limits.inflight_reserve_bytes = 0; // Exercise eviction independently of admission.
         let mut harness = Harness::new(limits, &blocks[32], 0, 1);
         harness.pump();
         let request = harness.queue.pop_front().unwrap();
