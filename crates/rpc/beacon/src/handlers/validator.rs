@@ -1465,7 +1465,7 @@ pub async fn get_blocks_v3(
             slot,
             proposer_index,
             parent_root: state.latest_block_header.tree_hash_root(),
-            state_root: state.tree_hash_root(),
+            state_root: state.state_root(),
             body: blinded_beacon_block_body,
         };
 
@@ -1536,7 +1536,7 @@ pub async fn get_blocks_v3(
         .map_err(|err| {
             ApiError::InternalError(format!("Failed to compute post-state root: {err}"))
         })?;
-    block.state_root = post_state.tree_hash_root();
+    block.state_root = post_state.state_root();
 
     // Cache the blobs for the publish path, which builds data columns from them. A Fulu bundle
     // has cell proofs only, so the blob proof is left empty.
