@@ -116,7 +116,7 @@ pub struct BeaconNodeConfig {
 
     #[arg(
         long,
-        help = "Custody, sample and serve every data column. Without it the node custodies CUSTODY_REQUIREMENT groups and samples SAMPLES_PER_SLOT groups"
+        help = "Custody, sample and serve every data column. Without it the node custodies CUSTODY_REQUIREMENT groups and samples SAMPLES_PER_SLOT groups. A data dir that advertised more groups keeps them. Set it on a node with validators attached, which must custody at least VALIDATOR_CUSTODY_REQUIREMENT groups"
     )]
     pub supernode: bool,
 
