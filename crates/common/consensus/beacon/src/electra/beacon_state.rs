@@ -2434,6 +2434,14 @@ impl BeaconState {
     }
 
     pub fn process_randao(&mut self, body: &BeaconBlockBody) -> anyhow::Result<()> {
+        self.process_randao_inner(body, true)
+    }
+
+    fn process_randao_inner(
+        &mut self,
+        body: &BeaconBlockBody,
+        verify_signature: bool,
+    ) -> anyhow::Result<()> {
         let epoch = self.get_current_epoch();
 
         // Verify RANDAO reveal
@@ -2441,13 +2449,15 @@ impl BeaconState {
             .validators
             .get(self.get_beacon_proposer_index(None)? as usize)
         {
-            let signing_root =
-                compute_signing_root(epoch, self.get_domain(DOMAIN_RANDAO, Some(epoch)));
-            ensure!(
-                body.randao_reveal
-                    .verify(&proposer.public_key, signing_root.as_ref())?,
-                "BLS Signature verification failed!"
-            );
+            if verify_signature {
+                let signing_root =
+                    compute_signing_root(epoch, self.get_domain(DOMAIN_RANDAO, Some(epoch)));
+                ensure!(
+                    body.randao_reveal
+                        .verify(&proposer.public_key, signing_root.as_ref())?,
+                    "BLS Signature verification failed!"
+                );
+            }
 
             // Mix in RANDAO reveal
             let mix = xor(
@@ -3193,18 +3203,31 @@ impl BeaconState {
         block: &BeaconBlock,
         execution_engine: &Option<impl ExecutionApi>,
     ) -> anyhow::Result<()> {
+        self.process_proposed_block(block, execution_engine, true)
+            .await
+    }
+
+    /// ``process_block`` for a block being produced. Without ``verify_randao`` the reveal is
+    /// mixed in unchecked, as ``skip_randao_verification`` requires.
+    pub async fn process_proposed_block(
+        &mut self,
+        block: &BeaconBlock,
+        execution_engine: &Option<impl ExecutionApi>,
+        verify_randao: bool,
+    ) -> anyhow::Result<()> {
         self.process_block_header(block)?;
         self.process_withdrawals(&block.body.execution_payload)?;
         self.process_execution_payload(&block.body, execution_engine)
             .await?;
-        self.process_block_after_execution_payload(&block.body)
+        self.process_block_after_execution_payload(&block.body, verify_randao)
     }
 
     fn process_block_after_execution_payload(
         &mut self,
         body: &BeaconBlockBody,
+        verify_randao: bool,
     ) -> anyhow::Result<()> {
-        self.process_randao(body)?;
+        self.process_randao_inner(body, verify_randao)?;
         self.process_eth1_data(body)?;
         self.process_operations(body)?;
         self.process_sync_aggregate(&body.sync_aggregate)?;
@@ -3228,7 +3251,7 @@ impl BeaconState {
         self.verify_execution_payload_consistency(&block.body)?;
         self.latest_execution_payload_header =
             block.body.execution_payload.to_execution_payload_header();
-        self.process_block_after_execution_payload(&block.body)
+        self.process_block_after_execution_payload(&block.body, true)
     }
 
     pub async fn state_transition(
@@ -3799,6 +3822,26 @@ mod tests {
             .decompress_vec(&std::fs::read(path).unwrap())
             .unwrap();
         BeaconState::from_ssz_bytes(&bytes).unwrap()
+    }
+
+    #[test]
+    fn randao_reveal_is_mixed_in_unchecked_when_verification_is_skipped() {
+        let state = sepolia_state();
+        let epoch = state.get_current_epoch();
+        let body = BeaconBlockBody {
+            randao_reveal: BLSSignature::infinity(),
+            ..Default::default()
+        };
+
+        assert!(state.clone().process_randao(&body).is_err());
+
+        let mut skipped = state.clone();
+        skipped.process_randao_inner(&body, false).unwrap();
+        let expected = xor(
+            state.get_randao_mix(epoch).as_slice(),
+            hash(body.randao_reveal.to_slice()).as_slice(),
+        );
+        assert_eq!(skipped.get_randao_mix(epoch), expected);
     }
 
     /// Two sibling blocks from the same proposer carry the same RANDAO reveal. If one of them

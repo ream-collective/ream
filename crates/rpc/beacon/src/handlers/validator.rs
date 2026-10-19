@@ -1510,7 +1510,11 @@ pub async fn get_blocks_v3(
     };
     let mut post_state = state.clone();
     post_state
-        .process_block(&block, &Option::<ExecutionEngine>::None)
+        .process_proposed_block(
+            &block,
+            &Option::<ExecutionEngine>::None,
+            !skip_randao_verification,
+        )
         .await
         .map_err(|err| {
             ApiError::InternalError(format!("Failed to compute post-state root: {err}"))
