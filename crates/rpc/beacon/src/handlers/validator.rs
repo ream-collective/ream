@@ -7,7 +7,7 @@ use actix_web::{
     HttpResponse, Responder, get, post,
     web::{Data, Json, Path, Query},
 };
-use alloy_primitives::{Address, B256, aliases::B32};
+use alloy_primitives::{Address, B64, B256, aliases::B32};
 use ream_api_types_beacon::{
     block::{FullBlockData, ProduceBlockData, ProduceBlockResponse},
     committee::{BeaconCommitteeSubscription, SyncCommitteeSubscription},
@@ -19,7 +19,7 @@ use ream_api_types_beacon::{
 };
 use ream_api_types_common::{error::ApiError, id::ID};
 use ream_bls::{BLSSignature, PublicKey, traits::Verifiable};
-use ream_chain_beacon::beacon_chain::BeaconChain;
+use ream_chain_beacon::beacon_chain::{BeaconChain, payload_attributes};
 use ream_consensus_beacon::{
     attestation::Attestation,
     attester_slashing::AttesterSlashing,
@@ -60,7 +60,6 @@ use ream_events_beacon::{
 };
 use ream_execution_engine::ExecutionEngine;
 use ream_execution_rpc_types::{
-    execution_payload::WithdrawalV1,
     forkchoice_update::{ForkchoiceStateV1, PayloadAttributesV3},
     get_blobs::{Blob, BlobAndProofV1},
     get_payload::{BlobsBundle, Payload},
@@ -1180,7 +1179,25 @@ async fn get_local_execution_payload(
     fork_name: ForkName,
     forkchoice_state: ForkchoiceStateV1,
     payload_attribute: PayloadAttributesV3,
+    prepared_payload_id: Option<B64>,
 ) -> Result<(Payload, u64), ApiError> {
+    if let Some(payload_id) = prepared_payload_id {
+        match execution_engine
+            .engine_get_payload(&fork_name, payload_id)
+            .await
+        {
+            Ok(payload) => {
+                let execution_value: u64 = (*payload.block_value()).try_into().map_err(|err| {
+                    ApiError::InternalError(format!("Block value too large: {err}"))
+                })?;
+                return Ok((payload, execution_value));
+            }
+            Err(err) => {
+                tracing::warn!("Prepared payload is not available, building a new one: {err}")
+            }
+        }
+    }
+
     let result = execution_engine
         .engine_forkchoice_updated_v3(
             ForkchoiceStateV1 {
@@ -1339,28 +1356,11 @@ pub async fn get_blocks_v3(
         .get_proposer_preparation(proposer_index)
         .unwrap_or(Address::ZERO);
 
-    let (withdrawals, _) = state.get_expected_withdrawals().map_err(|err| {
-        ApiError::InternalError(format!("Failed to get expected withdrawals: {err}"))
-    })?;
-
     let forkchoice_state = beacon_chain.forkchoice_state_for(&head);
-
-    let payload_attribute = PayloadAttributesV3 {
-        timestamp: state.compute_timestamp_at_slot(slot),
-        prev_randao: state.get_randao_mix(epoch),
-        suggested_fee_recipient: fee_recipient,
-        withdrawals: withdrawals
-            .into_iter()
-            .map(WithdrawalV1::from)
-            .collect::<Vec<_>>()
-            .try_into()
-            .map_err(|err| {
-                ApiError::InternalError(format!(
-                    "Failed to convert withdrawals to VariableList: {err:?}"
-                ))
-            })?,
-        parent_beacon_block_root: state.latest_block_header.tree_hash_root(),
-    };
+    let prepared_payload_id = beacon_chain.prepared_payload_id(slot, head.head_root, fee_recipient);
+    let payload_attribute = payload_attributes(&state, slot, fee_recipient).map_err(|err| {
+        ApiError::InternalError(format!("Failed to build payload attributes: {err}"))
+    })?;
 
     let Some(execution_engine) = execution_engine.get_ref().as_ref() else {
         return Err(ApiError::InternalError(
@@ -1373,6 +1373,7 @@ pub async fn get_blocks_v3(
         fork_name,
         forkchoice_state,
         payload_attribute,
+        prepared_payload_id,
     )
     .await?;
 
