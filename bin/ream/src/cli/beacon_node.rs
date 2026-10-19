@@ -4,7 +4,7 @@ use clap::Parser;
 use ream_consensus_misc::checkpoint::Checkpoint;
 use ream_network_manager::config::ManagerConfig;
 use ream_network_spec::{cli::beacon_network_parser, networks::BeaconNetworkSpec};
-use ream_p2p::bootnodes::Bootnodes;
+use ream_p2p::{bootnodes::Bootnodes, constants::DEFAULT_TARGET_PEERS};
 use url::Url;
 
 use crate::cli::constants::{
@@ -106,6 +106,13 @@ pub struct BeaconNodeConfig {
     )]
     pub disable_get_blobs: bool,
 
+    #[arg(
+        long,
+        help = "Peers to keep connected. Connections are limited to 90% of it inbound, 110% outbound and 130% in total",
+        default_value_t = DEFAULT_TARGET_PEERS
+    )]
+    pub target_peers: usize,
+
     #[arg(long = "metrics", help = "Enable metrics", default_value_t = DEFAULT_METRICS_ENABLED)]
     pub enable_metrics: bool,
 
@@ -135,6 +142,7 @@ impl From<BeaconNodeConfig> for ManagerConfig {
             blob_retention_epochs: config.blob_retention_epochs,
             gossipsub_history_length: None,
             disable_get_blobs: config.disable_get_blobs,
+            target_peers: config.target_peers,
         }
     }
 }

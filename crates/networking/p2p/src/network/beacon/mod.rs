@@ -21,8 +21,7 @@ use discv5::Enr;
 use futures::future::OptionFuture;
 use identity::{ENR_FILE_NAME, load_or_create_network_key};
 use libp2p::{
-    Multiaddr, PeerId, Swarm, SwarmBuilder,
-    connection_limits::{self, ConnectionLimits},
+    Multiaddr, PeerId, Swarm, SwarmBuilder, connection_limits,
     core::ConnectedPoint,
     futures::StreamExt,
     gossipsub::{
@@ -84,8 +83,8 @@ use tracing::{debug, error, info, trace, warn};
 use utils::read_meta_data_from_disk;
 
 use crate::{
-    config::NetworkConfig,
-    constants::{CUSTODY_DISCOVERY_TARGET_PEERS, PING_INTERVAL_DURATION, TARGET_PEER_COUNT},
+    config::{NetworkConfig, PeerLimits},
+    constants::{CUSTODY_DISCOVERY_TARGET_PEERS, PING_INTERVAL_DURATION},
     gossipsub::{
         GossipsubBehaviour,
         beacon::topics::{GossipTopic, GossipTopicKind},
@@ -166,9 +165,9 @@ fn status_is_plausible(status: &Status, current_epoch: u64) -> bool {
 
 /// Peers a custody query may still ask for given `active_peers` connected or connecting peers. It
 /// is `CUSTODY_DISCOVERY_TARGET_PEERS` at most, and zero once the active count is that many above
-/// `TARGET_PEER_COUNT`, so uncovered groups cannot grow the peer set without bound.
-fn custody_discovery_target(active_peers: usize) -> usize {
-    (TARGET_PEER_COUNT + CUSTODY_DISCOVERY_TARGET_PEERS)
+/// `target_peers`, so uncovered groups cannot grow the peer set without bound.
+fn custody_discovery_target(active_peers: usize, target_peers: usize) -> usize {
+    (target_peers + CUSTODY_DISCOVERY_TARGET_PEERS)
         .saturating_sub(active_peers)
         .min(CUSTODY_DISCOVERY_TARGET_PEERS)
 }
@@ -242,6 +241,8 @@ pub struct Network {
     genesis_time: u64,
     /// Backbone subnet topics joined by `sync_attestation_subnets`, which only leaves these
     backbone_topics: HashMap<u64, GossipTopic>,
+    /// Peers the node keeps; discovery runs while fewer are connected or connecting.
+    target_peers: usize,
 }
 
 impl Network {
@@ -288,14 +289,9 @@ impl Network {
             .map_err(|err| anyhow!("Failed to create gossipsub behaviour: {err:?}"))?
         };
 
-        let connection_limits = {
-            let limits = ConnectionLimits::default()
-                .with_max_pending_incoming(Some(5))
-                .with_max_pending_outgoing(Some(16))
-                .with_max_established_per_peer(Some(1));
-
-            connection_limits::Behaviour::new(limits)
-        };
+        let connection_limits = connection_limits::Behaviour::new(
+            PeerLimits::from_target_peers(config.target_peers).connection_limits(),
+        );
 
         let identify = {
             let local_public_key = local_key.public();
@@ -373,6 +369,7 @@ impl Network {
             bootnodes: config.discv5_config.bootnodes.clone(),
             genesis_time: config.genesis_time,
             backbone_topics: HashMap::new(),
+            target_peers: config.target_peers,
             sampling_columns,
             meta_data_requests: HashMap::new(),
         };
@@ -621,7 +618,7 @@ impl Network {
                     // Retries a failed fork update and catches a boundary the timer slept past.
                     next_fork_update.set(self.update_fork_enr(SystemTime::now()).map(sleep).into());
 
-                    if active_peer_count < TARGET_PEER_COUNT {
+                    if active_peer_count < self.target_peers {
                         info!("Active peer count is below target: {active_peer_count}, discovering more peers");
                         self.swarm
                             .behaviour_mut()
@@ -1142,7 +1139,7 @@ impl Network {
                 )
             })
             .count();
-        let target_peers = custody_discovery_target(active_peers);
+        let target_peers = custody_discovery_target(active_peers, self.target_peers);
         if target_peers == 0 {
             return;
         }
@@ -1319,6 +1316,7 @@ mod tests {
     use super::*;
     use crate::{
         config::NetworkConfig,
+        constants::DEFAULT_TARGET_PEERS,
         gossipsub::beacon::{configurations::GossipsubConfig, topics::GossipTopicKind},
         network::beacon::identity::{NETWORK_KEY_FILE_NAME, test_utils::TestDataDir},
     };
@@ -1402,6 +1400,7 @@ mod tests {
             },
             data_dir: data_dir.to_path_buf(),
             genesis_time: beacon_network_spec().min_genesis_time,
+            target_peers: DEFAULT_TARGET_PEERS,
         };
 
         std::fs::create_dir_all(&config.data_dir)?;
@@ -1726,17 +1725,21 @@ mod tests {
 
     #[test]
     fn custody_discovery_stops_above_the_target_peer_count() {
-        assert_eq!(custody_discovery_target(0), CUSTODY_DISCOVERY_TARGET_PEERS);
+        let target = DEFAULT_TARGET_PEERS;
         assert_eq!(
-            custody_discovery_target(TARGET_PEER_COUNT),
+            custody_discovery_target(0, target),
             CUSTODY_DISCOVERY_TARGET_PEERS
         );
-        assert_eq!(custody_discovery_target(TARGET_PEER_COUNT + 5), 3);
         assert_eq!(
-            custody_discovery_target(TARGET_PEER_COUNT + CUSTODY_DISCOVERY_TARGET_PEERS),
+            custody_discovery_target(target, target),
+            CUSTODY_DISCOVERY_TARGET_PEERS
+        );
+        assert_eq!(custody_discovery_target(target + 5, target), 3);
+        assert_eq!(
+            custody_discovery_target(target + CUSTODY_DISCOVERY_TARGET_PEERS, target),
             0
         );
-        assert_eq!(custody_discovery_target(usize::MAX), 0);
+        assert_eq!(custody_discovery_target(usize::MAX, target), 0);
     }
 
     #[test]

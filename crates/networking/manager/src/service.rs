@@ -485,6 +485,7 @@ impl NetworkManagerService {
             gossipsub_config,
             data_dir: ream_directory,
             genesis_time: ream_db.genesis_time_provider().get()?,
+            target_peers: config.target_peers,
         };
 
         let (manager_sender, manager_receiver) = mpsc::unbounded_channel();
