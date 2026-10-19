@@ -60,6 +60,7 @@ use ream_events_beacon::{
 };
 use ream_execution_engine::{ExecutionEngine, engine_trait::ExecutionApi};
 use ream_execution_rpc_types::{
+    execution_payload::WithdrawalV1,
     forkchoice_update::{ForkchoiceStateV1, PayloadAttributesV3},
     get_payload::Payload,
 };
@@ -1331,11 +1332,16 @@ pub async fn get_blocks_v3(
         timestamp: state.compute_timestamp_at_slot(slot),
         prev_randao: state.get_randao_mix(epoch),
         suggested_fee_recipient: fee_recipient,
-        withdrawals: withdrawals.try_into().map_err(|err| {
-            ApiError::InternalError(format!(
-                "Failed to convert withdrawals to VariableList: {err}"
-            ))
-        })?,
+        withdrawals: withdrawals
+            .into_iter()
+            .map(WithdrawalV1::from)
+            .collect::<Vec<_>>()
+            .try_into()
+            .map_err(|err| {
+                ApiError::InternalError(format!(
+                    "Failed to convert withdrawals to VariableList: {err:?}"
+                ))
+            })?,
         parent_beacon_block_root: state.latest_block_header.tree_hash_root(),
     };
 

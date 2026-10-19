@@ -11,8 +11,9 @@ use ream_consensus_misc::{
     withdrawal_request::WithdrawalRequest,
 };
 use ream_execution_engine::ExecutionEngine;
-use ream_execution_rpc_types::forkchoice_update::{
-    ForkchoiceStateV1, ForkchoiceUpdateResult, PayloadAttributesV3,
+use ream_execution_rpc_types::{
+    execution_payload::WithdrawalV1,
+    forkchoice_update::{ForkchoiceStateV1, ForkchoiceUpdateResult, PayloadAttributesV3},
 };
 use ssz::Decode;
 use ssz_types::{
@@ -102,9 +103,14 @@ pub async fn prepare_execution_payload(
                 timestamp: state.compute_timestamp_at_slot(state.slot),
                 prev_randao: state.get_randao_mix(state.get_current_epoch()),
                 suggested_fee_recipient,
-                withdrawals: withdrawals.try_into().map_err(|err| {
-                    anyhow!("Failed to convert withdrawals list to VariableList {err:?}")
-                })?,
+                withdrawals: withdrawals
+                    .into_iter()
+                    .map(WithdrawalV1::from)
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .map_err(|err| {
+                        anyhow!("Failed to convert withdrawals list to VariableList {err:?}")
+                    })?,
                 parent_beacon_block_root: state.latest_block_header.tree_hash_root(),
             }),
         )
