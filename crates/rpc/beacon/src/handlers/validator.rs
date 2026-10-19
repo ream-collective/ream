@@ -7,7 +7,7 @@ use actix_web::{
     HttpResponse, Responder, get, post,
     web::{Data, Json, Path, Query},
 };
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, B256, U256, aliases::B32};
 use ream_api_types_beacon::{
     block::{FullBlockData, ProduceBlockData, ProduceBlockResponse},
     committee::{BeaconCommitteeSubscription, SyncCommitteeSubscription},
@@ -42,8 +42,7 @@ use ream_consensus_misc::{
     attestation_data::AttestationData,
     checkpoint::Checkpoint,
     constants::beacon::{
-        DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
-        MAX_COMMITTEES_PER_SLOT, PROPOSER_REWARD_QUOTIENT, SLOTS_PER_EPOCH,
+        DOMAIN_RANDAO, MAX_COMMITTEES_PER_SLOT, PROPOSER_REWARD_QUOTIENT, SLOTS_PER_EPOCH,
         SYNC_COMMITTEE_PROPOSER_REWARD_QUOTIENT, SYNC_COMMITTEE_SIZE,
         WHISTLEBLOWER_REWARD_QUOTIENT, genesis_validators_root,
     },
@@ -66,13 +65,19 @@ use ream_execution_rpc_types::{
 };
 use ream_fork_choice_beacon::store::Store;
 use ream_network_manager::{
-    gossipsub::validate::sync_committee_contribution_and_proof::get_sync_subcommittee_pubkeys,
+    gossipsub::validate::{
+        aggregate_and_proof::validate_aggregate_and_proof, result::ValidationResult,
+        sync_committee_contribution_and_proof::validate_sync_committee_contribution_and_proof,
+    },
     p2p_sender::P2PSender,
 };
 use ream_network_spec::networks::beacon_network_spec;
 use ream_operation_pool::OperationPool;
-use ream_p2p::gossipsub::beacon::topics::{GossipTopic, GossipTopicKind};
-use ream_storage::{db::beacon::BeaconDB, tables::table::REDBTable};
+use ream_p2p::{
+    gossipsub::beacon::topics::{GossipTopic, GossipTopicKind},
+    network::beacon::channel::GossipMessage,
+};
+use ream_storage::{cache::BeaconCacheDB, db::beacon::BeaconDB, tables::table::REDBTable};
 use ream_sync_committee_pool::SyncCommitteePool;
 use ream_validator_beacon::{
     aggregate_and_proof::SignedAggregateAndProof,
@@ -81,19 +86,17 @@ use ream_validator_beacon::{
         builder_bid::SignedBuilderBid, builder_client::BuilderClient,
         validator_registration::SignedValidatorRegistrationV1,
     },
-    constants::{
-        DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_SELECTION_PROOF,
-        DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, SYNC_COMMITTEE_SUBNET_COUNT,
-    },
+    constants::SYNC_COMMITTEE_SUBNET_COUNT,
     execution_requests::get_execution_requests,
-    sync_committee::{SyncAggregatorSelectionData, is_sync_committee_aggregator},
 };
 use serde::Serialize;
+use ssz::Encode;
 use ssz_types::{
     VariableList,
     typenum::{U1, U8, U16},
 };
 use tokio::sync::broadcast;
+use tracing::{debug, warn};
 use tree_hash::TreeHash;
 
 use super::{duties::head_chain_block_root, state::get_state_from_id};
@@ -683,113 +686,65 @@ pub async fn get_sync_committee_contribution(
 
 #[post("/validator/aggregate_and_proofs")]
 pub async fn post_aggregate_and_proofs_v2(
-    db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<BeaconChain>>,
+    cached_db: Data<Arc<BeaconCacheDB>>,
+    p2p_sender: Data<Arc<P2PSender>>,
     aggregates: Json<Vec<SignedAggregateAndProof>>,
 ) -> Result<impl Responder, ApiError> {
-    for signed_aggregate in aggregates.into_inner() {
-        let aggregate_and_proof = signed_aggregate.message;
-        let attestation = aggregate_and_proof.aggregate.clone();
-        let slot = attestation.data.slot;
-        let state = get_state_from_id(ID::Slot(slot), &db).await?;
-
-        let aggregator_index = aggregate_and_proof.aggregator_index as usize;
-
-        let aggregator = state
-            .validators
-            .get(aggregator_index)
-            .ok_or_else(|| ApiError::NotFound("Aggregator not found".to_string()))?;
-
-        let committee = state
-            .get_beacon_committee(attestation.data.slot, attestation.data.index)
-            .map_err(|err| {
-                ApiError::InternalError(format!("Failed due to internal error: {err}"))
-            })?;
-
-        if !committee.contains(&(aggregator_index as u64)) {
-            return Err(ApiError::BadRequest(
-                "Aggregator not part of the committee".to_string(),
-            ));
+    let mut failures = vec![];
+    for (index, signed_aggregate) in aggregates.into_inner().into_iter().enumerate() {
+        match validate_aggregate_and_proof(&signed_aggregate, &beacon_chain, &cached_db).await {
+            Ok(ValidationResult::Accept) => {}
+            Ok(ValidationResult::Ignore(reason)) => {
+                debug!("Aggregate and proof {index} not published: {reason}");
+                continue;
+            }
+            Ok(ValidationResult::Reject(reason)) => {
+                failures.push(IndexedFailure {
+                    index,
+                    message: reason,
+                });
+                continue;
+            }
+            Err(err) => {
+                failures.push(IndexedFailure {
+                    index,
+                    message: err.to_string(),
+                });
+                continue;
+            }
         }
 
-        let aggregator_selection_domain =
-            state.get_domain(DOMAIN_SELECTION_PROOF, Some(compute_epoch_at_slot(slot)));
-        let aggregator_selection_signing_root =
-            compute_signing_root(attestation.data.slot, aggregator_selection_domain);
-
-        if !aggregate_and_proof
-            .selection_proof
-            .verify(
-                &aggregator.public_key,
-                aggregator_selection_signing_root.as_ref(),
-            )
-            .map_err(|err| {
-                ApiError::InternalError(format!("Failed due to internal error: {err}"))
-            })?
+        p2p_sender.send_gossip(GossipMessage {
+            topic: GossipTopic {
+                fork: current_fork_digest(),
+                kind: GossipTopicKind::AggregateAndProof,
+            },
+            data: signed_aggregate.as_ssz_bytes(),
+        });
+        if let Err(err) = beacon_chain
+            .import_aggregate(signed_aggregate.message.aggregate)
+            .await
         {
-            return Err(ApiError::BadRequest(
-                "Aggregator selection proof is not valid".to_string(),
-            ));
-        }
-
-        let committee_pub_keys: Vec<&PublicKey> = committee
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| attestation.aggregation_bits.get(*i).unwrap_or(false))
-            .map(|(i, _)| &state.validators[committee[i] as usize].public_key)
-            .collect();
-
-        if committee_pub_keys.is_empty() {
-            return Err(ApiError::BadRequest(
-                "No aggregation bits set in the attestation".into(),
-            ));
-        }
-
-        let aggregate_signature_domain =
-            state.get_domain(DOMAIN_BEACON_ATTESTER, Some(attestation.data.target.epoch));
-        let aggregate_signature_signing_root =
-            compute_signing_root(&attestation.data, aggregate_signature_domain);
-
-        if !attestation
-            .signature
-            .fast_aggregate_verify(
-                committee_pub_keys,
-                aggregate_signature_signing_root.as_ref(),
-            )
-            .map_err(|err| {
-                ApiError::InternalError(format!("Failed due to internal error: {err}"))
-            })?
-        {
-            return Err(ApiError::BadRequest(
-                "Aggregated signature verification failed".to_string(),
-            ));
-        }
-
-        let aggregate_proof_domain = state.get_domain(
-            DOMAIN_AGGREGATE_AND_PROOF,
-            Some(compute_epoch_at_slot(attestation.data.slot)),
-        );
-        let aggregate_proof_signing_root =
-            compute_signing_root(aggregate_and_proof, aggregate_proof_domain);
-
-        if !signed_aggregate
-            .signature
-            .verify(
-                &aggregator.public_key,
-                aggregate_proof_signing_root.as_ref(),
-            )
-            .map_err(|err| {
-                ApiError::InternalError(format!("Failed due to internal error: {err}"))
-            })?
-        {
-            return Err(ApiError::BadRequest(
-                "Aggregate proof verification failed".to_string(),
-            ));
+            warn!("Failed to import published aggregate {index}: {err}");
         }
     }
 
-    Ok(HttpResponse::Ok().json(serde_json::json!({
-        "data": "success"
-    })))
+    if !failures.is_empty() {
+        return Ok(HttpResponse::BadRequest().json(serde_json::json!({
+            "code": 400,
+            "message": "some failures",
+            "failures": failures
+        })));
+    }
+    Ok(HttpResponse::Ok().finish())
+}
+
+fn current_fork_digest() -> B32 {
+    beacon_network_spec().fork_digest(
+        beacon_network_spec().current_epoch(),
+        genesis_validators_root(),
+    )
 }
 
 #[post("/validator/beacon_committee_subscriptions")]
@@ -1017,149 +972,72 @@ pub async fn post_register_validator(
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct ContributionAndProofFailure {
+struct IndexedFailure {
     index: usize,
     message: String,
 }
 
-fn validate_signed_contribution_and_proof(
-    signed_contribution_and_proof: &SignedContributionAndProof,
-    state: &BeaconState,
-) -> Result<(), String> {
-    let contribution_and_proof = &signed_contribution_and_proof.message;
-    let contribution = &contribution_and_proof.contribution;
-    let epoch = compute_epoch_at_slot(contribution.slot);
-
-    if contribution.subcommittee_index >= SYNC_COMMITTEE_SUBNET_COUNT {
-        return Err("The subcommittee index is out of range".to_string());
-    }
-
-    if contribution.aggregation_bits.num_set_bits() == 0 {
-        return Err("The contribution has no participants".to_string());
-    }
-
-    if !is_sync_committee_aggregator(&contribution_and_proof.selection_proof) {
-        return Err("The selection proof is not a valid aggregator".to_string());
-    }
-
-    let aggregator_index = usize::try_from(contribution_and_proof.aggregator_index)
-        .map_err(|err| format!("Invalid aggregator index: {err:?}"))?;
-
-    let validator = state
-        .validators
-        .get(aggregator_index)
-        .ok_or_else(|| "Aggregator not found".to_string())?;
-
-    let sync_committee_validators =
-        get_sync_subcommittee_pubkeys(state, contribution.subcommittee_index);
-
-    if !sync_committee_validators.contains(&validator.public_key) {
-        return Err("The aggregator is not in the subcommittee".to_string());
-    }
-
-    let selection_data = SyncAggregatorSelectionData {
-        slot: contribution.slot,
-        subcommittee_index: contribution.subcommittee_index,
-    };
-
-    let selection_proof_valid = contribution_and_proof
-        .selection_proof
-        .verify(
-            &validator.public_key,
-            compute_signing_root(
-                selection_data,
-                state.get_domain(DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, Some(epoch)),
-            )
-            .as_slice(),
-        )
-        .map_err(|err| format!("Selection proof verification error: {err:?}"))?;
-
-    if !selection_proof_valid {
-        return Err("The selection proof is not a valid signature".to_string());
-    }
-
-    let participant_pubkeys = sync_committee_validators
-        .iter()
-        .zip(contribution.aggregation_bits.iter())
-        .filter_map(|(public_key, participated)| participated.then_some(public_key))
-        .collect::<Vec<&PublicKey>>();
-
-    let sync_committee_valid = contribution
-        .signature
-        .fast_aggregate_verify(
-            participant_pubkeys,
-            compute_signing_root(
-                contribution.beacon_block_root,
-                state.get_domain(DOMAIN_SYNC_COMMITTEE, Some(epoch)),
-            )
-            .as_ref(),
-        )
-        .map_err(|err| format!("Sync committee signature verification error: {err:?}"))?;
-
-    if !sync_committee_valid {
-        return Err("The aggregate signature is not valid".to_string());
-    }
-
-    let contribution_and_proof_valid = signed_contribution_and_proof
-        .signature
-        .verify(
-            &validator.public_key,
-            compute_signing_root(
-                contribution_and_proof,
-                state.get_domain(DOMAIN_CONTRIBUTION_AND_PROOF, Some(epoch)),
-            )
-            .as_slice(),
-        )
-        .map_err(|err| format!("Contribution and proof signature verification error: {err:?}"))?;
-
-    if !contribution_and_proof_valid {
-        return Err("The aggregator signature is not valid".to_string());
-    }
-
-    Ok(())
-}
-
 #[post("/validator/contribution_and_proofs")]
 pub async fn post_contribution_and_proofs(
-    db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<BeaconChain>>,
+    cached_db: Data<Arc<BeaconCacheDB>>,
+    p2p_sender: Data<Arc<P2PSender>>,
     operation_pool: Data<Arc<OperationPool>>,
     event_sender: Data<broadcast::Sender<BeaconEvent>>,
     contributions: Json<Vec<SignedContributionAndProof>>,
 ) -> Result<impl Responder, ApiError> {
-    let store = Store::new(db.get_ref().clone(), operation_pool.get_ref().clone(), None);
-
-    if store.is_syncing_for_validator_api().map_err(|err| {
-        ApiError::InternalError(format!("Failed to check syncing status, err: {err:?}"))
-    })? {
-        return Err(ApiError::UnderSyncing);
-    }
-
-    let highest_slot = db
-        .slot_index_provider()
-        .get_highest_slot()
-        .map_err(|err| ApiError::InternalError(format!("Failed to get highest slot: {err:?}")))?
-        .ok_or_else(|| ApiError::NotFound("Failed to find highest slot".to_string()))?;
-
-    let state = get_state_from_id(ID::Slot(highest_slot), &db).await?;
-    let contributions = contributions.into_inner();
-    let mut failures = Vec::new();
-
-    for (index, signed_contribution_and_proof) in contributions.iter().enumerate() {
-        match validate_signed_contribution_and_proof(signed_contribution_and_proof, &state) {
-            Ok(()) => {
-                let event = BeaconEvent::ContributionAndProof(ContributionAndProofEvent {
-                    message: signed_contribution_and_proof.message.clone(),
-                    signature: signed_contribution_and_proof.signature.clone(),
+    let mut failures = vec![];
+    for (index, signed_contribution_and_proof) in contributions.into_inner().into_iter().enumerate()
+    {
+        match validate_sync_committee_contribution_and_proof(
+            &beacon_chain,
+            &cached_db,
+            &signed_contribution_and_proof,
+        )
+        .await
+        {
+            Ok(ValidationResult::Accept) => {}
+            Ok(ValidationResult::Ignore(reason)) => {
+                debug!("Contribution and proof {index} not published: {reason}");
+                continue;
+            }
+            Ok(ValidationResult::Reject(reason)) => {
+                failures.push(IndexedFailure {
+                    index,
+                    message: reason,
                 });
-                let _ = event_sender.send(event);
+                continue;
             }
             Err(err) => {
-                failures.push(ContributionAndProofFailure {
+                failures.push(IndexedFailure {
                     index,
-                    message: err,
+                    message: err.to_string(),
                 });
+                continue;
             }
         }
+
+        p2p_sender.send_gossip(GossipMessage {
+            topic: GossipTopic {
+                fork: current_fork_digest(),
+                kind: GossipTopicKind::SyncCommitteeContributionAndProof,
+            },
+            data: signed_contribution_and_proof.as_ssz_bytes(),
+        });
+        let contribution = &signed_contribution_and_proof.message.contribution;
+        operation_pool.insert_sync_contribution(
+            contribution.slot,
+            contribution.beacon_block_root,
+            contribution.subcommittee_index,
+            contribution.aggregation_bits.clone(),
+            contribution.signature.clone(),
+        );
+        let _ = event_sender.send(BeaconEvent::ContributionAndProof(
+            ContributionAndProofEvent {
+                message: signed_contribution_and_proof.message,
+                signature: signed_contribution_and_proof.signature,
+            },
+        ));
     }
 
     if !failures.is_empty() {
@@ -1169,8 +1047,7 @@ pub async fn post_contribution_and_proofs(
             "failures": failures
         })));
     }
-
-    Ok(HttpResponse::Ok().body("success"))
+    Ok(HttpResponse::Ok().finish())
 }
 
 #[derive(serde::Deserialize)]

@@ -4,7 +4,7 @@ use std::{
 };
 
 use alloy_primitives::B256;
-use anyhow::anyhow;
+use anyhow::{anyhow, bail};
 use parking_lot::RwLock;
 use ream_consensus_beacon::{
     attestation::Attestation,
@@ -14,8 +14,10 @@ use ream_consensus_beacon::{
     matrix_entry::{data_column_sidecars_from_execution_blobs, reconstruct_data_column_sidecars},
 };
 use ream_consensus_misc::{
-    beacon_block_header::SignedBeaconBlockHeader, checkpoint::Checkpoint,
-    constants::beacon::genesis_validators_root, misc::compute_epoch_at_slot,
+    beacon_block_header::SignedBeaconBlockHeader,
+    checkpoint::Checkpoint,
+    constants::beacon::{MIN_ATTESTATION_INCLUSION_DELAY, genesis_validators_root},
+    misc::{compute_epoch_at_slot, get_committee_indices},
 };
 use ream_events_beacon::{BeaconEvent, BeaconEventSender, event::chain::BlockEvent};
 use ream_execution_engine::{ExecutionEngine, engine_trait::ExecutionApi};
@@ -792,6 +794,20 @@ impl BeaconChain {
         self.publish_cached_head(&store);
         drop(store);
         self.update_execution_forkchoice(false).await;
+        Ok(())
+    }
+
+    /// Adds a validated aggregate to the operation pool and, once its slot has passed, to fork
+    /// choice.
+    pub async fn import_aggregate(&self, aggregate: Attestation) -> anyhow::Result<()> {
+        let [committee_index] = get_committee_indices(&aggregate.committee_bits)[..] else {
+            bail!("Aggregate must have exactly one committee bit set");
+        };
+        self.operation_pool
+            .insert_attestation(aggregate.clone(), committee_index);
+        if self.head()?.current_slot >= aggregate.data.slot + MIN_ATTESTATION_INCLUSION_DELAY {
+            self.process_attestation(aggregate, false).await?;
+        }
         Ok(())
     }
 
