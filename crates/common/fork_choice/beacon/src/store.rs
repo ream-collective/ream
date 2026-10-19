@@ -1,7 +1,10 @@
 use std::{
     cmp::Ordering,
     collections::VecDeque,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    },
     time::{Duration, Instant},
 };
 
@@ -253,6 +256,8 @@ pub struct Store {
     /// instead of rebuilding the checkpoint state under the store lock (Lighthouse's
     /// `BalancesCache`).
     fork_choice_balances: VecDeque<(Checkpoint, Arc<ForkChoiceBalances>)>,
+    /// Set while a background thread prunes voluntary exits against a finalized state.
+    pruning_voluntary_exits: Arc<AtomicBool>,
 }
 
 impl Store {
@@ -271,6 +276,7 @@ impl Store {
             fork_choice: None,
             fork_choice_retry: RetryBackoff::new(),
             fork_choice_balances: VecDeque::with_capacity(FORK_CHOICE_BALANCES_CACHE_SIZE),
+            pruning_voluntary_exits: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -744,26 +750,51 @@ impl Store {
         }
     }
 
+    /// Drops voluntary exits of validators that exited by the finalized state of `finalized_root`.
+    /// The finalized state is usually no longer cached, and loading it took ~12 s on mainnet, so a
+    /// background thread loads it instead of the caller under the store lock. While one runs, a
+    /// later finalization is skipped; the next one catches up.
+    fn prune_voluntary_exits_in_background(&self, finalized_root: B256) {
+        if self
+            .pruning_voluntary_exits
+            .swap(true, AtomicOrdering::AcqRel)
+        {
+            return;
+        }
+        let db = self.db.clone();
+        let operation_pool = self.operation_pool.clone();
+        let running = self.pruning_voluntary_exits.clone();
+        let spawned = std::thread::Builder::new()
+            .name("prune-voluntary-exits".to_string())
+            .spawn(move || {
+                match db.state_provider().get_shared(finalized_root) {
+                    Ok(Some(state)) => operation_pool.clean_signed_voluntary_exits(&state),
+                    Ok(None) => {}
+                    Err(err) => warn!("Failed to load the finalized state to prune exits: {err:?}"),
+                }
+                running.store(false, AtomicOrdering::Release);
+            });
+        if let Err(err) = spawned {
+            warn!("Failed to start pruning voluntary exits: {err}");
+            self.pruning_voluntary_exits
+                .store(false, AtomicOrdering::Release);
+        }
+    }
+
     /// Apply cleanup derived from an already committed finalized checkpoint.
     pub(crate) fn apply_finalization_side_effects(
         &mut self,
         finalized_checkpoint: Checkpoint,
     ) -> anyhow::Result<()> {
-        if let Some(state) = self
-            .db
-            .state_provider()
-            .get_shared(finalized_checkpoint.root)?
-        {
-            self.operation_pool.clean_signed_voluntary_exits(&state);
-            self.operation_pool
-                .clean_proposer_preparations(self.get_current_store_epoch()?);
+        self.prune_voluntary_exits_in_background(finalized_checkpoint.root);
+        self.operation_pool
+            .clean_proposer_preparations(self.get_current_store_epoch()?);
 
-            if let Some(block) = self.db.block_provider().get(finalized_checkpoint.root)? {
-                for signed_bls_to_execution_change in block.message.body.bls_to_execution_changes {
-                    self.operation_pool.remove_signed_bls_to_execution_change(
-                        signed_bls_to_execution_change.tree_hash_root(),
-                    );
-                }
+        if let Some(block) = self.db.block_provider().get(finalized_checkpoint.root)? {
+            for signed_bls_to_execution_change in block.message.body.bls_to_execution_changes {
+                self.operation_pool.remove_signed_bls_to_execution_change(
+                    signed_bls_to_execution_change.tree_hash_root(),
+                );
             }
         }
 
@@ -1496,6 +1527,73 @@ mod tests {
                 .map(|(_, cached)| cached.as_ref()),
             Some(&expected)
         );
+    }
+
+    #[test]
+    fn finalized_exits_are_pruned_without_holding_the_caller() {
+        use ream_consensus_beacon::voluntary_exit::{SignedVoluntaryExit, VoluntaryExit};
+
+        ream_network_spec::networks::initialize_test_network_spec();
+        let (db, _temp_dir) = test_db();
+        let operation_pool = Arc::new(OperationPool::default());
+        let store = Store::new(db, operation_pool.clone(), None);
+        let state = test_beacon_state();
+        let finalized_epoch = state.finalized_checkpoint.epoch;
+        let exited = state
+            .validators
+            .iter()
+            .position(|validator| validator.exit_epoch < finalized_epoch)
+            .expect("the test state has an exited validator") as u64;
+        let active = state
+            .validators
+            .iter()
+            .position(|validator| validator.exit_epoch >= finalized_epoch)
+            .expect("the test state has an active validator") as u64;
+        for validator_index in [exited, active] {
+            operation_pool.insert_signed_voluntary_exit(SignedVoluntaryExit {
+                message: VoluntaryExit {
+                    epoch: 0,
+                    validator_index,
+                },
+                signature: Default::default(),
+            });
+        }
+        // A state is read back only when its block commits to its root.
+        let root = B256::repeat_byte(9);
+        store
+            .db
+            .block_provider()
+            .insert(
+                root,
+                SignedBeaconBlock {
+                    message: BeaconBlock {
+                        slot: state.slot,
+                        parent_root: state.latest_block_header.parent_root,
+                        state_root: state.tree_hash_root(),
+                        ..Default::default()
+                    },
+                    signature: Default::default(),
+                },
+            )
+            .unwrap();
+        store
+            .db
+            .state_provider()
+            .insert_shared(root, Arc::new(state))
+            .unwrap();
+
+        store.prune_voluntary_exits_in_background(root);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while store.pruning_voluntary_exits.load(AtomicOrdering::Acquire) {
+            assert!(Instant::now() < deadline, "pruning did not finish");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let remaining = operation_pool
+            .get_signed_voluntary_exits()
+            .into_iter()
+            .map(|exit| exit.message.validator_index)
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, [active]);
     }
 
     #[test]
