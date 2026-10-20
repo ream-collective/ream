@@ -99,6 +99,19 @@ impl CheckpointWrites {
     }
 }
 
+/// How `BeaconDB::close` left a database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseClose {
+    /// Its last handle was dropped: the database is closed.
+    Closed(&'static str),
+    /// Other handles were still held, so its allocator state was saved instead. The next open
+    /// loads it and skips the repair.
+    AllocatorStateSaved {
+        name: &'static str,
+        other_handles: usize,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub struct BeaconDB {
     pub db: Arc<Database>,
@@ -240,6 +253,46 @@ impl BeaconDB {
             cache.stop_vote_flush_timer()?;
         }
         self.flush_pending_writes()
+    }
+
+    /// Closes both databases, so the next start opens them without a repair, and returns how.
+    ///
+    /// A redb database is closed when its last handle is dropped: it then saves its allocator
+    /// state and flushes the file. Otherwise the next open repairs it, reading the whole file,
+    /// minutes on mainnet. Tasks that are still stopping can hold handles, so this waits up to
+    /// `wait` for them. A database still held after that gets a last commit that saves its
+    /// allocator state (a quick-repair commit). The next open loads that state instead of
+    /// repairing, as long as nothing commits after it. Call it last, after `shutdown_storage`.
+    pub fn close(self, wait: Duration) -> Result<Vec<DatabaseClose>, crate::errors::StoreError> {
+        let BeaconDB { db, votes_db, .. } = self;
+        let deadline = std::time::Instant::now() + wait;
+        let mut closes = Vec::new();
+        for (name, database) in [("ream.redb", db), ("fork_choice_votes.redb", votes_db)] {
+            let mut database = database;
+            let close = loop {
+                match Arc::try_unwrap(database) {
+                    Ok(database) => {
+                        drop(database);
+                        break DatabaseClose::Closed(name);
+                    }
+                    Err(shared) if std::time::Instant::now() >= deadline => {
+                        let mut write_txn = shared.begin_write()?;
+                        write_txn.set_quick_repair(true);
+                        write_txn.commit()?;
+                        break DatabaseClose::AllocatorStateSaved {
+                            name,
+                            other_handles: Arc::strong_count(&shared) - 1,
+                        };
+                    }
+                    Err(shared) => {
+                        database = shared;
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            };
+            closes.push(close);
+        }
+        Ok(closes)
     }
 
     /// Writes pending votes at least once per `flush_interval` while any are pending, even when
