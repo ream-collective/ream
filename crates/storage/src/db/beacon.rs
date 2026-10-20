@@ -190,6 +190,9 @@ impl BeaconDB {
         if FAIL_NEXT_BLOCK_IMPORT_COMMIT.with(|fail| fail.replace(false)) {
             return Err(std::io::Error::other("injected block import commit failure").into());
         }
+        if let Some(finalized) = record.checkpoints.finalized {
+            super::beacon_canonical::record_finalized(&write_txn, finalized.root)?;
+        }
         write_txn.commit()?;
         Ok(())
     }
@@ -205,6 +208,9 @@ impl BeaconDB {
         let mut write_txn = self.db.begin_write()?;
         write_txn.set_durability(Durability::Immediate)?;
         checkpoints.write(&write_txn)?;
+        if let Some(finalized) = checkpoints.finalized {
+            super::beacon_canonical::record_finalized(&write_txn, finalized.root)?;
+        }
         write_txn.commit()?;
         Ok(())
     }

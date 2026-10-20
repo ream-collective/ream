@@ -1,6 +1,7 @@
 pub mod beacon;
 pub mod beacon_backfill;
 mod beacon_bootstrap;
+mod beacon_canonical;
 mod beacon_columns;
 pub mod lean;
 
@@ -113,6 +114,7 @@ impl ReamDB {
     pub fn init_beacon_db(&self) -> Result<BeaconDB, StoreError> {
         let write_txn = self.db.begin_write()?;
 
+        write_txn.open_table(crate::db::beacon_canonical::CANONICAL_ROOTS)?;
         write_txn.open_table(crate::tables::beacon::backfill::BOOTSTRAP)?;
         write_txn.open_multimap_table(
             crate::tables::beacon::column_roots_by_slot::COLUMN_ROOTS_BY_SLOT,
@@ -151,6 +153,9 @@ impl ReamDB {
             bootstrap_cache: self.bootstrap_cache.clone(),
         };
         beacon_db.migrate_column_index()?;
+        if let Ok(finalized) = beacon_db.finalized_checkpoint_provider().get() {
+            beacon_db.record_finalized_canonical(finalized.root)?;
+        }
         Ok(beacon_db)
     }
 

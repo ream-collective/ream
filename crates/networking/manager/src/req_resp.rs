@@ -146,26 +146,29 @@ pub async fn handle_req_resp_message(
                 return;
             }
 
-            // Slots at or below the checkpoint origin are indexed only by backfill, which
-            // commits a hash chain ending at the origin, so the index is canonical there.
-            // TODO: above the origin the index also holds blocks of abandoned forks.
-            for slot in start_slot..end_slot_exclusive {
-                let block_root = match ream_db.slot_index_provider().get(slot) {
-                    Ok(Some(block_root)) => block_root,
-                    Ok(None) => {
-                        trace!("No block root found for slot {slot}");
-                        continue;
-                    }
-                    Err(err) => {
-                        p2p_sender.send_error_response(
-                            peer_id,
-                            connection_id,
-                            stream_id,
-                            &format!("Failed to read slot index for slot {slot}: {err:?}"),
-                        );
-                        return;
-                    }
-                };
+            let head = network_state.status.read().head_root;
+            let head = if head == alloy_primitives::B256::ZERO {
+                match &mode {
+                    BackfillMode::Checkpoint(meta) => meta.origin.root,
+                    _ => head,
+                }
+            } else {
+                head
+            };
+            let roots = match ream_db.canonical_roots_in_range(head, start_slot, end_slot_exclusive)
+            {
+                Ok(roots) => roots,
+                Err(err) => {
+                    p2p_sender.send_error_response(
+                        peer_id,
+                        connection_id,
+                        stream_id,
+                        &format!("Failed to read canonical history: {err:?}"),
+                    );
+                    return;
+                }
+            };
+            for (_slot, block_root) in roots {
                 let Ok(Some(block)) = ream_db.block_provider().get(block_root) else {
                     trace!("No block found for root {block_root}");
                     p2p_sender.send_error_response(
@@ -430,24 +433,29 @@ pub async fn handle_req_resp_message(
                 return;
             }
 
-            for slot in start_slot..end_slot_exclusive {
-                let block_root = match ream_db.slot_index_provider().get(slot) {
-                    Ok(Some(block_root)) => block_root,
-                    Ok(None) => {
-                        trace!("No block root found for slot {slot}");
-                        continue;
-                    }
-                    Err(err) => {
-                        p2p_sender.send_error_response(
-                            peer_id,
-                            connection_id,
-                            stream_id,
-                            &format!("Failed to read slot index for slot {slot}: {err:?}"),
-                        );
-                        return;
-                    }
-                };
-
+            let head = network_state.status.read().head_root;
+            let head = if head == alloy_primitives::B256::ZERO {
+                match &mode {
+                    BackfillMode::Checkpoint(meta) => meta.origin.root,
+                    _ => head,
+                }
+            } else {
+                head
+            };
+            let roots = match ream_db.canonical_roots_in_range(head, start_slot, end_slot_exclusive)
+            {
+                Ok(roots) => roots,
+                Err(err) => {
+                    p2p_sender.send_error_response(
+                        peer_id,
+                        connection_id,
+                        stream_id,
+                        &format!("Failed to read canonical history: {err:?}"),
+                    );
+                    return;
+                }
+            };
+            for (_slot, block_root) in roots {
                 for &column_index in &columns {
                     let column_identifier = ColumnIdentifier::new(block_root, column_index);
                     let Ok(Some(column_sidecar)) =

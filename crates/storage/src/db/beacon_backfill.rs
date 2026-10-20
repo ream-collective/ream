@@ -94,6 +94,11 @@ impl BeaconDB {
                 slot_index
                     .insert(block.message.slot, *root)
                     .map_err(StoreError::from)?;
+                write
+                    .open_table(super::beacon_canonical::CANONICAL_ROOTS)
+                    .map_err(StoreError::from)?
+                    .insert(block.message.slot, *root)
+                    .map_err(StoreError::from)?;
             }
 
             meta.blocks.frontier = Frontier {
