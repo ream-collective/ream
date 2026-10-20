@@ -18,6 +18,8 @@ use ream_consensus_beacon::{
     electra::beacon_block::SignedBeaconBlock,
 };
 use ream_consensus_lean::block::SignedBlock as ActiveBlock;
+use ream_consensus_misc::constants::beacon::genesis_validators_root;
+use ream_network_spec::networks::beacon::beacon_network_spec;
 use snap::{read::FrameDecoder, write::FrameEncoder};
 use ssz::{Decode, Encode};
 use ssz_types::{VariableList, typenum::U256};
@@ -44,6 +46,20 @@ use crate::{
     messages::{RequestMessage, ResponseMessage},
     protocol_id::{ProtocolId, SupportedProtocol},
 };
+
+fn is_unsupported_block_fork(context_bytes: B32) -> bool {
+    let network_spec = beacon_network_spec();
+    [
+        0,
+        network_spec.altair_fork_epoch,
+        network_spec.bellatrix_fork_epoch,
+        network_spec.capella_fork_epoch,
+        network_spec.deneb_fork_epoch,
+    ]
+    .into_iter()
+    .filter(|epoch| *epoch < network_spec.electra_fork_epoch)
+    .any(|epoch| network_spec.fork_digest(epoch, genesis_validators_root()) == context_bytes)
+}
 
 #[derive(Debug, Clone)]
 pub struct OutboundReqRespProtocol {
@@ -182,6 +198,17 @@ impl Decoder for OutboundSSZSnappyCodec {
                 self.length = None;
                 let context_bytes = self.context_bytes.take();
                 if ResponseCode::Success == response_code {
+                    if let SupportedProtocol::Beacon(
+                        BeaconSupportedProtocol::BeaconBlocksByRangeV2
+                        | BeaconSupportedProtocol::BeaconBlocksByRootV2,
+                    ) = self.protocol.protocol
+                        && let Some(context_bytes) = context_bytes
+                        && is_unsupported_block_fork(context_bytes)
+                    {
+                        return Ok(Some(RespMessage::Error(ReqRespError::UnsupportedFork(
+                            context_bytes,
+                        ))));
+                    }
                     match self.protocol.protocol {
                         SupportedProtocol::Beacon(beacon_supported_protocol) => {
                             let response_message = match beacon_supported_protocol {

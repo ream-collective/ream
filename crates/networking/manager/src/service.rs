@@ -40,6 +40,7 @@ use ream_storage::{
 };
 use ream_sync_committee_pool::SyncCommitteePool;
 use ream_syncer::{
+    backfill::BackfillSyncer,
     block_range::BlockRangeSyncer,
     unknown_parent_lookups::{MAX_LOOKUPS, UnknownBlockMeta, UnknownParentLookupCoordinator},
 };
@@ -583,6 +584,22 @@ impl NetworkManagerService {
         let mut syncer_active = true;
         // Kept alive (not dropped) once synced, so the periodic re-check can restart it later.
         let mut idle_syncer: Option<BlockRangeSyncer> = None;
+        // Historical blocks are only downloaded while forward sync has nothing to do.
+        let backfill = BackfillSyncer::spawn(
+            ream_db.clone(),
+            p2p_sender.0.clone(),
+            network_state.clone(),
+            executor.clone(),
+        )
+        .unwrap_or_else(|err| {
+            error!("Failed to start block backfill: {err}");
+            None
+        });
+        let set_backfill_running = |running: bool| {
+            if let Some(backfill) = &backfill {
+                backfill.set_running(running);
+            }
+        };
         loop {
             tokio::select! {
                 // Drive unknown-parent lookup actions and results.
@@ -813,6 +830,7 @@ impl NetworkManagerService {
                             }
                             if block_range_syncer.is_synced_to_head_slot().await {
                                 idle_syncer = Some(block_range_syncer);
+                                set_backfill_running(true);
                             } else {
                                 syncer_handle = block_range_syncer.start();
                                 syncer_active = true;
@@ -843,6 +861,7 @@ impl NetworkManagerService {
                     if block_range_syncer.is_synced_to_head_slot().await {
                         idle_syncer = Some(block_range_syncer);
                     } else {
+                        set_backfill_running(false);
                         syncer_handle = block_range_syncer.start();
                         syncer_active = true;
                     }
