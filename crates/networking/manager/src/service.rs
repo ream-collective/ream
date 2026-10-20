@@ -877,6 +877,13 @@ impl NetworkManagerService {
                         error!("Failed to process gossipsub tick: {err}");
                     }
 
+                    // Head, finality, fork digest and historical coverage all move after
+                    // startup; peers pick who to ask from what we advertise.
+                    match beacon_chain.build_status_request().await {
+                        Ok(status) => *network_state.status.write() = status,
+                        Err(err) => warn!("Failed to refresh Status: {err}"),
+                    }
+
                     // Started ahead of genesis: p2p, discovery and the HTTP API all stay up so
                     // the gossip mesh is formed by slot 0. `on_tick` is a no-op until then, but
                     // announce the wait so a node that looks idle is visibly just early.

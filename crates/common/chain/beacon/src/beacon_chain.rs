@@ -924,10 +924,15 @@ impl BeaconChain {
             head_slot: head.head_slot,
             earliest_available_slot: match self.db.cached_backfill_mode()? {
                 ream_storage::tables::beacon::backfill::BackfillMode::Checkpoint(meta) => meta
-                    .sidecars
-                    .frontier
-                    .unwrap_or_else(|| meta.origin.slot.saturating_add(1))
-                    .max(meta.blocks.frontier.oldest_block_slot),
+                    .earliest_available_slot(
+                        // The clock of the persisted genesis, which a devnet may start later
+                        // than the spec's minimum genesis time.
+                        beacon_network_spec().data_column_retention_start_slot(
+                            compute_epoch_at_slot(
+                                ream_fork_choice_beacon::store::get_current_slot_from_db(&self.db)?,
+                            ),
+                        ),
+                    ),
                 ream_storage::tables::beacon::backfill::BackfillMode::GenesisSynced => 0,
                 // Historical serving policy for legacy databases remains a separate change.
                 ream_storage::tables::beacon::backfill::BackfillMode::Legacy => 0,

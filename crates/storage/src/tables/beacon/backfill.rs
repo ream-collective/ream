@@ -18,6 +18,30 @@ pub struct BackfillMeta {
     pub sidecars: SidecarCoverage,
 }
 
+impl BackfillMeta {
+    /// First slot from which every required sidecar at or below the origin is held. Above the
+    /// origin, forward import only accepts blocks whose sidecars are already durable.
+    pub fn sidecars_available_from(&self) -> u64 {
+        self.sidecars
+            .frontier
+            .unwrap_or_else(|| self.origin.slot.saturating_add(1))
+    }
+
+    /// The Status `earliest_available_slot`: the oldest block held, unless required sidecars
+    /// are still missing inside the retention window starting at `sidecar_retention_start_slot`,
+    /// in which case it is the slot from which blocks and sidecars are both complete.
+    ///
+    /// Unconfirmed anchor sidecars always count as missing: anchor recovery confirms them
+    /// itself once the anchor leaves the window.
+    pub fn earliest_available_slot(&self, sidecar_retention_start_slot: u64) -> u64 {
+        let blocks_from = self.blocks.frontier.oldest_block_slot;
+        match self.sidecars.frontier {
+            Some(sidecars_from) if sidecars_from <= sidecar_retention_start_slot => blocks_from,
+            _ => blocks_from.max(self.sidecars_available_from()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct Origin {
     pub slot: u64,
@@ -141,5 +165,49 @@ mod tests {
         }
         assert!(BlockBackfillState::from_ssz_bytes(&[9; 9]).is_err());
         assert!(BlockBackfillState::from_ssz_bytes(&[0, 1, 0, 0, 0, 0, 0, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn earliest_available_slot_never_covers_missing_sidecars_in_retention() {
+        let mut meta = BackfillMeta {
+            revision: 0,
+            origin: Origin {
+                slot: 640,
+                root: B256::repeat_byte(1),
+                state_root: B256::repeat_byte(2),
+            },
+            blocks: BlockCoverage {
+                frontier: Frontier {
+                    oldest_block_slot: 640,
+                    oldest_block_root: B256::repeat_byte(1),
+                    oldest_block_parent: B256::repeat_byte(4),
+                },
+                state: BlockBackfillState::InProgress,
+            },
+            sidecars: SidecarCoverage { frontier: None },
+        };
+
+        // Anchor sidecars pending: nothing at or below the origin is complete yet.
+        assert_eq!(meta.earliest_available_slot(320), 641);
+        meta.sidecars.frontier = Some(640);
+        assert_eq!(meta.earliest_available_slot(320), 640);
+
+        // Blocks backfilled below sidecar coverage inside the retention window do not lower it.
+        meta.blocks.frontier.oldest_block_slot = 400;
+        assert_eq!(meta.earliest_available_slot(320), 640);
+        // Once sidecar coverage reaches the start of the window, the oldest block counts.
+        meta.sidecars.frontier = Some(320);
+        assert_eq!(meta.earliest_available_slot(320), 400);
+        meta.blocks.frontier.oldest_block_slot = 100;
+        assert_eq!(meta.earliest_available_slot(320), 100);
+
+        // The origin is older than the window, or Fulu is not active: only blocks matter.
+        meta.sidecars.frontier = Some(640);
+        assert_eq!(meta.earliest_available_slot(641), 100);
+        assert_eq!(meta.earliest_available_slot(u64::MAX), 100);
+        // Until anchor recovery confirms the anchor, it is never advertised.
+        meta.sidecars.frontier = None;
+        assert_eq!(meta.earliest_available_slot(641), 641);
+        assert_eq!(meta.earliest_available_slot(u64::MAX), 641);
     }
 }

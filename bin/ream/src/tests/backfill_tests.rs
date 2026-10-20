@@ -312,13 +312,20 @@ fn backfill_commits_verified_history_down_to_genesis_only_while_running() {
         highest_slot_before
     );
 
-    // No request reached above the anchor.
+    // No request reached above the anchor, and the whole history is now advertised.
     assert!(
         requested_ranges
             .lock()
             .expect("lock is not poisoned")
             .iter()
             .all(|(start, count)| start + count <= anchor_slot)
+    );
+    let spec = beacon_e2e_dev_spec();
+    assert_eq!(
+        meta.earliest_available_slot(
+            spec.data_column_retention_start_slot(compute_epoch_at_slot(anchor_slot))
+        ),
+        0
     );
 
     // A finished backfill is not started again after a restart.

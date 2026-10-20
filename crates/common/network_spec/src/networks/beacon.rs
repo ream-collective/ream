@@ -227,6 +227,13 @@ impl BeaconNetworkSpec {
             .saturating_mul(ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH)
     }
 
+    /// First slot whose data column sidecars must still be served at `current_epoch`.
+    pub fn data_column_retention_start_slot(&self, current_epoch: u64) -> u64 {
+        self.fulu_fork_epoch
+            .max(current_epoch.saturating_sub(self.min_epochs_for_data_column_sidecars_requests))
+            .saturating_mul(ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH)
+    }
+
     pub fn oldest_supported_block_slot(&self) -> u64 {
         self.electra_fork_epoch
             .saturating_mul(ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH)
@@ -710,6 +717,28 @@ mod backfill_tests {
             spec.epoch_duration(),
             Duration::from_secs(6 * SLOTS_PER_EPOCH)
         );
+    }
+
+    #[test]
+    fn data_column_retention_starts_at_fulu_then_slides() {
+        let mut spec = (**DEV).clone();
+        spec.fulu_fork_epoch = 10;
+        spec.min_epochs_for_data_column_sidecars_requests = 4;
+        assert_eq!(
+            spec.data_column_retention_start_slot(12),
+            10 * SLOTS_PER_EPOCH
+        );
+        assert_eq!(
+            spec.data_column_retention_start_slot(14),
+            10 * SLOTS_PER_EPOCH
+        );
+        assert_eq!(
+            spec.data_column_retention_start_slot(20),
+            16 * SLOTS_PER_EPOCH
+        );
+        // Before Fulu no data column is required.
+        spec.fulu_fork_epoch = u64::MAX;
+        assert_eq!(spec.data_column_retention_start_slot(20), u64::MAX);
     }
 }
 

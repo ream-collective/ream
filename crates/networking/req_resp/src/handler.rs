@@ -71,6 +71,7 @@ impl RespMessage {
                 ReqRespError::RemoteError { code, .. } => Some(*code),
                 ReqRespError::Disconnected
                 | ReqRespError::UnsupportedProtocol
+                | ReqRespError::ResourceUnavailable(_)
                 | ReqRespError::StreamTimedOut(_)
                 | ReqRespError::TokioTimedOut(_) => Some(ResponseCode::ResourceUnavailable),
             },
