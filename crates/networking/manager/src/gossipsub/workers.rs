@@ -312,6 +312,9 @@ where
                 let Some(work) = receiver.lock().await.recv().await else {
                     return;
                 };
+                // The next worker was just woken into this thread's LIFO slot, which other threads
+                // cannot steal; without a yield the pool runs one handler at a time.
+                tokio::task::yield_now().await;
                 handle(work).await;
             }
         });
@@ -406,6 +409,35 @@ mod tests {
         drop(sender);
         assert!(tasks.join_next().await.expect("a worker ends").is_ok());
         assert_eq!(handled.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn workers_handle_queued_messages_in_parallel() {
+        let (sender, receiver) = mpsc::channel::<()>(64);
+        let running = Arc::new(AtomicUsize::new(0));
+        let most_running = Arc::new(AtomicUsize::new(0));
+        let (now, max) = (running.clone(), most_running.clone());
+        let mut tasks = spawn_workers(4, receiver, move |()| {
+            let (now, max) = (now.clone(), max.clone());
+            async move {
+                max.fetch_max(now.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                // Validation is synchronous work that holds the thread.
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                now.fetch_sub(1, Ordering::SeqCst);
+            }
+        });
+        // Messages arrive one by one, faster than one handler keeps up with.
+        for _ in 0..40 {
+            sender.send(()).await.expect("workers are running");
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        drop(sender);
+        while tasks.join_next().await.is_some() {}
+        assert!(
+            most_running.load(Ordering::SeqCst) >= 3,
+            "at most {} handlers ran at once",
+            most_running.load(Ordering::SeqCst)
+        );
     }
 
     fn topic_hash(kind: GossipTopicKind) -> libp2p::gossipsub::TopicHash {
