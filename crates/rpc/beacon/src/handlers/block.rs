@@ -58,7 +58,9 @@ use ssz::{Decode, Encode};
 use tracing::{error, info, warn};
 use tree_hash::TreeHash;
 
-use crate::handlers::{representation::checkpoint_response, run_blocking, state::get_state_by_block_root};
+use crate::handlers::{
+    representation::checkpoint_response, run_blocking, state::get_state_by_block_root,
+};
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct BlockRewards {
