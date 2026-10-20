@@ -128,7 +128,9 @@ pub struct BlockCache {
     block_roots_in_progress: HashSet<B256>,
     blob_identifiers_in_progress: HashSet<BlobIdentifier>,
     column_ranges_to_fetch: Vec<Range>,
-    column_ranges_in_progress: HashSet<Range>,
+    /// Column range requests in flight per range. A range is split across peers by custody, so
+    /// it stays in progress until every request for it has returned.
+    column_ranges_in_progress: HashMap<Range, usize>,
     data_column_identifiers_in_progress: HashSet<ColumnIdentifier>,
     attempts: HashMap<RequestKey, AttemptState>,
     coverage_anchor: Option<CoverageAnchor>,
@@ -148,7 +150,7 @@ impl BlockCache {
             block_roots_in_progress: HashSet::new(),
             blob_identifiers_in_progress: HashSet::new(),
             column_ranges_to_fetch: vec![],
-            column_ranges_in_progress: HashSet::new(),
+            column_ranges_in_progress: HashMap::new(),
             data_column_identifiers_in_progress: HashSet::new(),
             attempts: HashMap::new(),
             coverage_anchor: None,
@@ -548,11 +550,16 @@ impl BlockCache {
     }
 
     pub fn mark_column_range_in_progress(&mut self, range: Range) {
-        self.column_ranges_in_progress.insert(range);
+        *self.column_ranges_in_progress.entry(range).or_default() += 1;
     }
 
     pub fn remove_column_range_in_progress(&mut self, range: &Range) {
-        self.column_ranges_in_progress.remove(range);
+        if let Some(in_flight) = self.column_ranges_in_progress.get_mut(range) {
+            *in_flight -= 1;
+            if *in_flight == 0 {
+                self.column_ranges_in_progress.remove(range);
+            }
+        }
     }
 
     pub fn extend_data_column_identifiers_in_progress(&mut self, identifiers: &[ColumnIdentifier]) {
@@ -870,6 +877,22 @@ impl BlockCache {
             }
         }
         expected
+    }
+
+    /// The required columns of the blocks in `range` that are neither cached nor requested yet.
+    pub fn unrequested_column_identifiers_in_range(
+        &self,
+        range: Range,
+        required_columns: &HashSet<u64>,
+    ) -> Vec<ColumnIdentifier> {
+        self.expected_column_identifiers_in_range(range, required_columns)
+            .into_iter()
+            .filter(|identifier| {
+                !self
+                    .data_column_identifiers_in_progress
+                    .contains(identifier)
+            })
+            .collect()
     }
 
     pub fn block_slot(&self, block_root: B256) -> Option<u64> {
