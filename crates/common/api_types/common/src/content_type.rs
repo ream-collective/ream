@@ -22,9 +22,60 @@ impl ContentType {
 
 impl From<Option<&ActixHeaderValue>> for ContentType {
     fn from(header_value: Option<&ActixHeaderValue>) -> Self {
-        match header_value.and_then(|h| h.to_str().ok()) {
-            Some(s) if s.split(';').any(|p| p.trim() == SSZ_CONTENT_TYPE) => ContentType::Ssz,
-            _ => ContentType::Json,
+        let Some(value) = header_value.and_then(|h| h.to_str().ok()) else {
+            return ContentType::Json;
+        };
+        let mut json_quality = 0.0_f32;
+        let mut ssz_quality = 0.0_f32;
+        for range in value.split(',') {
+            let mut parts = range.split(';').map(str::trim);
+            let media_type = parts.next().unwrap_or_default();
+            let quality = parts
+                .find_map(|part| part.strip_prefix("q="))
+                .map_or(1.0, |value| value.parse::<f32>().unwrap_or(0.0));
+            let quality = if (0.0..=1.0).contains(&quality) {
+                quality
+            } else {
+                0.0
+            };
+            match media_type {
+                JSON_CONTENT_TYPE => json_quality = json_quality.max(quality),
+                SSZ_CONTENT_TYPE => ssz_quality = ssz_quality.max(quality),
+                _ => {}
+            }
         }
+        if ssz_quality > 0.0 && ssz_quality >= json_quality {
+            ContentType::Ssz
+        } else {
+            ContentType::Json
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selects_the_preferred_supported_representation() {
+        for (accept, ssz) in [
+            ("application/octet-stream", true),
+            (
+                "application/octet-stream;q=1.0,application/json;q=0.9",
+                true,
+            ),
+            ("application/json,application/octet-stream;q=0.5", false),
+            ("application/octet-stream;q=0", false),
+            ("application/octet-stream;q=NaN", false),
+            ("*/*", false),
+        ] {
+            let header = ActixHeaderValue::from_str(accept).unwrap();
+            assert_eq!(
+                matches!(ContentType::from(Some(&header)), ContentType::Ssz),
+                ssz,
+                "{accept}"
+            );
+        }
+        assert!(matches!(ContentType::from(None), ContentType::Json));
     }
 }

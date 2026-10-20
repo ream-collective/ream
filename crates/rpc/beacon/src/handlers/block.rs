@@ -56,7 +56,7 @@ use ssz::{Decode, Encode};
 use tracing::{error, info, warn};
 use tree_hash::TreeHash;
 
-use crate::handlers::state::get_state_from_id;
+use crate::handlers::{representation::checkpoint_response, state::get_state_from_id};
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct BlockRewards {
@@ -276,13 +276,18 @@ pub async fn get_block_rewards(
 /// Called by `/blocks/<block_id>` to get the Beacon Block.
 #[get("/beacon/blocks/{block_id}")]
 pub async fn get_block_from_id(
+    request: HttpRequest,
     db: Data<BeaconDB>,
     beacon_chain: Data<Arc<BeaconChain>>,
     block_id: Path<ID>,
 ) -> Result<impl Responder, ApiError> {
     let beacon_block = get_beacon_block_from_id(block_id.into_inner(), &db, &beacon_chain).await?;
 
-    Ok(HttpResponse::Ok().json(BeaconVersionedResponse::new(beacon_block)))
+    Ok(checkpoint_response(
+        &request,
+        beacon_block.message.slot,
+        beacon_block,
+    ))
 }
 
 #[post("/beacon/rewards/sync_committee/{block_id}")]
