@@ -146,7 +146,7 @@ impl BackfillSyncer {
             network_state,
             executor,
             BackfillConfig::default(),
-            false,
+            true,
         )
     }
 
