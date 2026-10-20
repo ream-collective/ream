@@ -22,6 +22,8 @@ pub struct ManagerConfig {
     pub gossipsub_history_length: Option<usize>,
     pub disable_get_blobs: bool,
     pub target_peers: usize,
+    /// Leaves gossipsub peer scoring off.
+    pub disable_peer_scoring: bool,
     pub supernode: bool,
     pub backfill_config: BackfillConfig,
     pub disable_backfill_rate_limiting: bool,

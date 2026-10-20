@@ -13,6 +13,7 @@ use ream_consensus_misc::{
     misc::compute_epoch_at_slot,
 };
 use ream_execution_rpc_types::get_blobs::BlobAndProofV1;
+use ream_metrics::{BEACON_GOSSIP_VALIDATION_TOTAL, inc_int_counter_vec};
 use ream_network_spec::networks::beacon_network_spec;
 use ream_p2p::gossipsub::beacon::{
     configurations::GossipsubConfig,
@@ -217,7 +218,8 @@ fn dependency_message_acceptance(
 }
 
 /// Dispatches a gossipsub message to its appropriate handler. `on_valid_block` gets each block
-/// that passed gossip validation, before its import starts.
+/// that passed gossip validation, before its import starts. The result is counted by topic kind:
+/// gossipsub scores peers down for every REJECT, so the count shows how often that happens.
 pub async fn handle_gossipsub_message(
     message: Message,
     beacon_chain: &BeaconChain,
@@ -225,6 +227,35 @@ pub async fn handle_gossipsub_message(
     pending_item: &mut Option<PendingGossipItem>,
     unknown_parent_block: &mut Option<UnknownParentGossipBlock>,
     propagation_source: PeerId,
+    on_valid_block: impl FnOnce(&SignedBeaconBlock),
+) -> MessageAcceptance {
+    let topic = GossipTopic::from_topic_hash(&message.topic)
+        .map(|topic| topic.kind.metric_label())
+        .unwrap_or("unknown");
+    let acceptance = dispatch_gossipsub_message(
+        message,
+        beacon_chain,
+        cached_db,
+        pending_item,
+        unknown_parent_block,
+        on_valid_block,
+    )
+    .await;
+    let result = match acceptance {
+        MessageAcceptance::Accept => "accept",
+        MessageAcceptance::Ignore => "ignore",
+        MessageAcceptance::Reject => "reject",
+    };
+    inc_int_counter_vec(&BEACON_GOSSIP_VALIDATION_TOTAL, &[topic, result]);
+    acceptance
+}
+
+async fn dispatch_gossipsub_message(
+    message: Message,
+    beacon_chain: &BeaconChain,
+    cached_db: &BeaconCacheDB,
+    pending_item: &mut Option<PendingGossipItem>,
+    unknown_parent_block: &mut Option<UnknownParentGossipBlock>,
     on_valid_block: impl FnOnce(&SignedBeaconBlock),
 ) -> MessageAcceptance {
     match GossipsubMessage::decode(&message.topic, &message.data) {

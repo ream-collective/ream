@@ -136,6 +136,12 @@ pub struct BeaconNodeConfig {
 
     #[arg(
         long,
+        help = "Turn off gossipsub peer scoring. Without it peers that send invalid messages or deliver too few are scored down, and below the thresholds are no longer gossiped to, published to or listened to"
+    )]
+    pub disable_peer_scoring: bool,
+
+    #[arg(
+        long,
         help = "Custody, sample and serve every data column. Without it the node custodies CUSTODY_REQUIREMENT groups and samples SAMPLES_PER_SLOT groups. A data dir that advertised more groups keeps them. Set it on a node with validators attached, which must custody at least VALIDATOR_CUSTODY_REQUIREMENT groups"
     )]
     pub supernode: bool,
@@ -170,6 +176,7 @@ impl From<BeaconNodeConfig> for ManagerConfig {
             gossipsub_history_length: None,
             disable_get_blobs: config.disable_get_blobs,
             target_peers: config.target_peers,
+            disable_peer_scoring: config.disable_peer_scoring,
             supernode: config.supernode,
             backfill_config: ream_network_manager::config::BackfillConfig {
                 max_inflight: config.backfill_max_inflight,

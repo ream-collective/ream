@@ -51,7 +51,9 @@ use ream_discv5::{
     },
 };
 use ream_executor::ReamExecutor;
-use ream_metrics::set_peer_count;
+use ream_metrics::{
+    BEACON_GOSSIPSUB_LOWEST_PEER_SCORE, BEACON_GOSSIPSUB_PEERS_BY_SCORE, set_peer_count,
+};
 use ream_network_spec::networks::beacon_network_spec;
 use ream_peer::{ConnectionState, Direction};
 use ream_req_resp::{
@@ -87,7 +89,13 @@ use crate::{
     constants::{CUSTODY_DISCOVERY_TARGET_PEERS, PING_INTERVAL_DURATION},
     gossipsub::{
         GossipsubBehaviour,
-        beacon::topics::{GossipTopic, GossipTopicKind},
+        beacon::{
+            scoring::{
+                GOSSIP_THRESHOLD, GRAYLIST_THRESHOLD, PUBLISH_THRESHOLD, PeerScoreSettings,
+                peer_score_thresholds,
+            },
+            topics::{GossipTopic, GossipTopicKind},
+        },
         snappy::SnappyTransform,
     },
     network::misc::{Executor, build_transport, peer_id_from_enr},
@@ -134,11 +142,14 @@ fn enr_subnet_bitfields(enr: &Enr) -> anyhow::Result<(BitVector<U64>, BitVector<
 
 /// Epoch at `now` for a chain that started at `genesis_time`, counted like the fork choice store.
 /// Before genesis this is epoch 0, so the mesh for the first backbone subnets forms early.
-fn epoch_at(genesis_time: u64, now: SystemTime) -> u64 {
+/// The slot at `now` for a chain that started at `genesis_time`, 0 before genesis.
+fn slot_at(genesis_time: u64, now: SystemTime) -> u64 {
     let now = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    compute_epoch_at_slot(
-        now.saturating_sub(genesis_time) / beacon_network_spec().seconds_per_slot(),
-    )
+    now.saturating_sub(genesis_time) / beacon_network_spec().seconds_per_slot()
+}
+
+fn epoch_at(genesis_time: u64, now: SystemTime) -> u64 {
+    compute_epoch_at_slot(slot_at(genesis_time, now))
 }
 
 /// Time from `now` until `epoch` starts on the clock of [`epoch_at`], so once it has elapsed
@@ -243,6 +254,8 @@ pub struct Network {
     backbone_topics: HashMap<u64, GossipTopic>,
     /// Peers the node keeps; discovery runs while fewer are connected or connecting.
     target_peers: usize,
+    /// Gossipsub peer scoring settings, `None` when scoring is off.
+    peer_score_settings: Option<PeerScoreSettings>,
 }
 
 impl Network {
@@ -278,15 +291,30 @@ impl Network {
 
         let req_resp = ReqResp::new(Chain::Beacon);
 
+        let peer_score_settings = config.active_validators.map(|active_validators| {
+            PeerScoreSettings::new(
+                config.gossipsub_config.config.mesh_n(),
+                active_validators,
+                slot_at(config.genesis_time, SystemTime::now()),
+            )
+        });
+
         let gossipsub = {
             let snappy_transform =
                 SnappyTransform::new(config.gossipsub_config.config.max_transmit_size());
-            GossipsubBehaviour::new_with_transform(
+            let mut gossipsub = GossipsubBehaviour::new_with_transform(
                 MessageAuthenticity::Anonymous,
                 config.gossipsub_config.config.clone(),
                 snappy_transform,
             )
-            .map_err(|err| anyhow!("Failed to create gossipsub behaviour: {err:?}"))?
+            .map_err(|err| anyhow!("Failed to create gossipsub behaviour: {err:?}"))?;
+            // Topics get their score parameters as they are subscribed to.
+            if let Some(settings) = &peer_score_settings {
+                gossipsub
+                    .with_peer_score(settings.peer_score_params(&[]), peer_score_thresholds())
+                    .map_err(|err| anyhow!("Invalid gossipsub peer score parameters: {err}"))?;
+            }
+            gossipsub
         };
 
         let connection_limits = connection_limits::Behaviour::new(
@@ -372,6 +400,7 @@ impl Network {
             target_peers: config.target_peers,
             sampling_columns,
             meta_data_requests: HashMap::new(),
+            peer_score_settings,
         };
 
         network.start_network_worker(config).await?;
@@ -578,6 +607,7 @@ impl Network {
                     }
                 }
                 _ = status_interval.tick() => {
+                    self.record_peer_scores();
                     let now = Instant::now();
                     let mut peer_table = self.network_state.peer_table.write();
 
@@ -1239,6 +1269,56 @@ impl Network {
         );
     }
 
+    /// Records how connected peers stand against the gossipsub score thresholds.
+    fn record_peer_scores(&self) {
+        if self.peer_score_settings.is_none() {
+            return;
+        }
+        let gossipsub = &self.swarm.behaviour().gossipsub;
+        let mut bands: HashMap<&'static str, i64> = [
+            "graylisted",
+            "below_publish",
+            "below_gossip",
+            "negative",
+            "non_negative",
+        ]
+        .into_iter()
+        .map(|band| (band, 0))
+        .collect();
+        let mut lowest = f64::INFINITY;
+        for peer_id in gossipsub
+            .all_peers()
+            .map(|(peer_id, _)| *peer_id)
+            .collect::<Vec<_>>()
+        {
+            let Some(score) = gossipsub.peer_score(&peer_id) else {
+                continue;
+            };
+            lowest = lowest.min(score);
+            let band = if score < GRAYLIST_THRESHOLD {
+                "graylisted"
+            } else if score < PUBLISH_THRESHOLD {
+                "below_publish"
+            } else if score < GOSSIP_THRESHOLD {
+                "below_gossip"
+            } else if score < 0.0 {
+                "negative"
+            } else {
+                "non_negative"
+            };
+            *bands.entry(band).or_default() += 1;
+        }
+        for (band, peers) in &bands {
+            BEACON_GOSSIPSUB_PEERS_BY_SCORE
+                .with_label_values(&[band])
+                .set(*peers);
+        }
+        if lowest.is_finite() {
+            BEACON_GOSSIPSUB_LOWEST_PEER_SCORE.set(lowest.round() as i64);
+        }
+        debug!(?bands, lowest, "Gossipsub peer scores");
+    }
+
     /// Returns true if the node is subscribed afterwards, including when it already was.
     pub fn subscribe_to_topic(&mut self, topic: GossipTopic) -> bool {
         match self
@@ -1249,6 +1329,17 @@ impl Network {
         {
             Ok(_) => {
                 self.subscribed_topics.lock().insert(topic);
+                if let Some(params) = self
+                    .peer_score_settings
+                    .and_then(|settings| settings.topic_score_params(&topic.kind))
+                    && let Err(err) = self
+                        .swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .set_topic_params(Topic::from(topic), params)
+                {
+                    warn!("Could not set the score parameters of {topic}: {err}");
+                }
                 true
             }
             Err(err) => {
@@ -1525,6 +1616,8 @@ mod tests {
             data_dir: data_dir.to_path_buf(),
             genesis_time: beacon_network_spec().min_genesis_time,
             target_peers,
+            // Scoring runs in the network tests as it does on a live node.
+            active_validators: Some(64),
         };
 
         std::fs::create_dir_all(&config.data_dir)?;

@@ -138,6 +138,29 @@ pub enum GossipTopicKind {
     DataColumnSidecar(u64),
 }
 
+impl GossipTopicKind {
+    /// The topic's name without its subnet, for metric labels.
+    pub fn metric_label(&self) -> &'static str {
+        match self {
+            GossipTopicKind::BeaconBlock => "beacon_block",
+            GossipTopicKind::AggregateAndProof => "beacon_aggregate_and_proof",
+            GossipTopicKind::VoluntaryExit => "voluntary_exit",
+            GossipTopicKind::ProposerSlashing => "proposer_slashing",
+            GossipTopicKind::AttesterSlashing => "attester_slashing",
+            GossipTopicKind::BeaconAttestation(_) => "beacon_attestation",
+            GossipTopicKind::SyncCommittee(_) => "sync_committee",
+            GossipTopicKind::SyncCommitteeContributionAndProof => {
+                "sync_committee_contribution_and_proof"
+            }
+            GossipTopicKind::BlsToExecutionChange => "bls_to_execution_change",
+            GossipTopicKind::LightClientFinalityUpdate => "light_client_finality_update",
+            GossipTopicKind::LightClientOptimisticUpdate => "light_client_optimistic_update",
+            GossipTopicKind::BlobSidecar(_) => "blob_sidecar",
+            GossipTopicKind::DataColumnSidecar(_) => "data_column_sidecar",
+        }
+    }
+}
+
 impl std::fmt::Display for GossipTopicKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
