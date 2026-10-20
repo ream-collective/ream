@@ -10,7 +10,7 @@ use ream_api_types_beacon::{
     responses::DutiesResponse,
 };
 use ream_api_types_common::error::ApiError;
-use ream_chain_beacon::beacon_chain::BeaconChain;
+use ream_chain_beacon::beacon_chain::{BeaconChain, CachedHead};
 use ream_consensus_beacon::electra::beacon_state::BeaconState;
 use ream_consensus_misc::{
     constants::beacon::{MIN_SEED_LOOKAHEAD, SLOTS_PER_EPOCH},
@@ -85,9 +85,13 @@ async fn proposer_duties(
         }
     };
     let start_slot = compute_start_slot_at_epoch(epoch);
-    let (state, state_block_root) =
-        get_canonical_state_and_block_root_at_or_before_slot(&store, head.head_root, start_slot)
-            .await?;
+    let (state, state_block_root) = duties_state(
+        &store,
+        &head,
+        start_slot,
+        head.state.determines_proposers_of(epoch),
+    )
+    .await?;
     let dependent_root = if state.slot <= decision_slot {
         state_block_root
     } else {
@@ -150,10 +154,13 @@ pub async fn get_attester_duties(
         Arc::new(OperationPool::default()),
         None,
     );
-    let start_slot = compute_start_slot_at_epoch(epoch);
-    let (state, _) =
-        get_canonical_state_and_block_root_at_or_before_slot(&store, head.head_root, start_slot)
-            .await?;
+    let (state, _) = duties_state(
+        &store,
+        &head,
+        compute_start_slot_at_epoch(epoch),
+        head.state.determines_committees_of(epoch),
+    )
+    .await?;
     let dependent_root = attester_dependent_root(&store, head.head_root, epoch)?;
     let validator_indices = parse_validator_indices(validator_indices.into_inner())?;
     let committees_at_slot = state.get_committee_count_per_slot(epoch);
@@ -251,6 +258,23 @@ fn parse_validator_indices(
             }),
         })
         .collect()
+}
+
+/// The head state when it fixes the duties (its current and next epoch); loading another state
+/// clones the whole registry, about 0.5 s on Hoodi.
+async fn duties_state(
+    store: &Store,
+    head: &CachedHead,
+    start_slot: u64,
+    head_state_fixes_duties: bool,
+) -> Result<(Arc<BeaconState>, B256), ApiError> {
+    if head_state_fixes_duties {
+        return Ok((head.state.clone(), head.head_root));
+    }
+    let (state, block_root) =
+        get_canonical_state_and_block_root_at_or_before_slot(store, head.head_root, start_slot)
+            .await?;
+    Ok((Arc::new(state), block_root))
 }
 
 /// Resolves from fork-choice head so an overwritten slot index cannot select a side fork.
