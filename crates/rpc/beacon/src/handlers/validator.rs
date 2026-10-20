@@ -1067,8 +1067,20 @@ pub async fn post_contribution_and_proofs(
 struct BlockQuery {
     randao_reveal: BLSSignature,
     graffiti: Option<B256>,
-    skip_randao_verification: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_flag")]
+    skip_randao_verification: bool,
     builder_boost_factor: Option<u64>,
+}
+
+/// A query flag the beacon API sends without a value; `true` and `false` are accepted too.
+fn deserialize_flag<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    match <String as serde::Deserialize>::deserialize(deserializer)?.as_str() {
+        "" | "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(serde::de::Error::custom(format!(
+            "expected no value, `true` or `false`, got `{other}`"
+        ))),
+    }
 }
 
 fn verify_randao_reveal(
@@ -1317,7 +1329,7 @@ pub async fn get_blocks_v3(
     let query_params = query.into_inner();
     let randao_reveal = query_params.randao_reveal;
     let graffiti = query_params.graffiti.unwrap_or_default();
-    let skip_randao_verification = query_params.skip_randao_verification.unwrap_or(false);
+    let skip_randao_verification = query_params.skip_randao_verification;
     let builder_boost_factor = query_params.builder_boost_factor.unwrap_or(100);
 
     let head = beacon_chain
@@ -1729,6 +1741,23 @@ mod tests {
         assert!(!is_live(&state, live, epoch + 1));
         assert!(!is_live(&state, live, epoch - 2));
         assert!(!is_live(&state, state.validators.len(), epoch - 1));
+    }
+
+    #[test]
+    fn block_query_accepts_the_bare_skip_randao_flag() {
+        let infinity = format!("0xc0{}", "0".repeat(190));
+        let parse = |flag: &str| {
+            actix_web::web::Query::<BlockQuery>::from_query(&format!(
+                "randao_reveal={infinity}{flag}"
+            ))
+            .map(|query| query.skip_randao_verification)
+        };
+        assert!(!parse("").expect("no flag"));
+        assert!(parse("&skip_randao_verification").expect("bare flag"));
+        assert!(parse("&skip_randao_verification=").expect("empty flag"));
+        assert!(parse("&skip_randao_verification=true").expect("true"));
+        assert!(!parse("&skip_randao_verification=false").expect("false"));
+        assert!(parse("&skip_randao_verification=yes").is_err());
     }
 
     #[test]
