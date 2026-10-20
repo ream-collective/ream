@@ -6,4 +6,5 @@ pub mod gossipsub;
 pub mod p2p_sender;
 pub mod req_resp;
 pub mod service;
+pub mod timing;
 pub mod unknown_parent_lookup;

@@ -299,6 +299,7 @@ impl GossipLookupHarness {
             &self.cached_db,
             &mut pending_item,
             &mut unknown_parent_block,
+            libp2p::PeerId::random(),
             |_| {},
         )
         .await;
@@ -1237,6 +1238,7 @@ async fn test_unknown_parent_block_imports_after_parent_arrives() {
         &harness.cached_db,
         &mut pending_item,
         &mut unknown_parent_block,
+        libp2p::PeerId::random(),
         |_| {},
     )
     .await;

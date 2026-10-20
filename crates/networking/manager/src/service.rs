@@ -69,6 +69,7 @@ use crate::{
     },
     p2p_sender::P2PSender,
     req_resp::handle_req_resp_message,
+    timing::{ColumnSource, log_columns_received},
     unknown_parent_lookup::{
         BlocksByRootRefusals, UnknownParentLookupUpdate, apply_unknown_parent_update,
         fallback_lookup_peer, spawn_unknown_parent_action,
@@ -286,6 +287,18 @@ fn spawn_column_reconstruction(
                     if rebuilt.is_empty() {
                         return;
                     }
+                    if let (Ok(genesis_time), Some(first)) = (
+                        beacon_chain.db().genesis_time_provider().get(),
+                        rebuilt.first(),
+                    ) {
+                        log_columns_received(
+                            genesis_time,
+                            first.signed_block_header.message.slot,
+                            rebuilt.iter().map(|column| column.index),
+                            ColumnSource::Reconstructed,
+                            None,
+                        );
+                    }
                     let finalized_slot =
                         match beacon_chain.db().finalized_checkpoint_provider().get() {
                             Ok(checkpoint) => compute_start_slot_at_epoch(checkpoint.epoch),
@@ -351,6 +364,15 @@ fn spawn_execution_column_fetch(
                 return;
             }
         };
+        if let Ok(genesis_time) = beacon_chain.db().genesis_time_provider().get() {
+            log_columns_received(
+                genesis_time,
+                signed_block.message.slot,
+                columns.iter().map(|column| column.index),
+                ColumnSource::ExecutionLayer,
+                None,
+            );
+        }
         let finalized_slot = match beacon_chain.db().finalized_checkpoint_provider().get() {
             Ok(checkpoint) => compute_start_slot_at_epoch(checkpoint.epoch),
             Err(err) => {
@@ -1055,6 +1077,7 @@ impl NetworkManagerService {
                                 &cached_db,
                                 &mut pending_item,
                                 &mut unknown_parent_block,
+                                propagation_source,
                                 |block| {
                                     if fetch_execution_blobs {
                                         spawn_execution_column_fetch(&beacon_chain, &cached_db, &p2p_sender, block);
