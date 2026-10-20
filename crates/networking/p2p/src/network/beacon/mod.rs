@@ -699,7 +699,6 @@ impl Network {
                 self.peers_to_ping.remove(&peer_id);
                 None
             }
-            // We only handle this for incoming connections
             SwarmEvent::ConnectionEstablished {
                 peer_id, endpoint, ..
             } => {
@@ -711,16 +710,16 @@ impl Network {
                         Direction::Inbound,
                         None,
                     );
-                } else {
-                    // send status request to the peer
-                    let status_message =
-                        BeaconRequestMessage::Status(self.network_state.status.read().clone());
-                    self.send_request(peer_id, status_message);
-                    let ping_message = BeaconRequestMessage::Ping(Ping::new(
-                        self.network_state.meta_data.read().seq_number,
-                    ));
-                    self.send_request(peer_id, ping_message);
                 }
+                // Both ends initiate Status. Some clients wait for our request before they
+                // consider the connection ready, including when they dialed us.
+                let status_message =
+                    BeaconRequestMessage::Status(self.network_state.status.read().clone());
+                self.send_request(peer_id, status_message);
+                let ping_message = BeaconRequestMessage::Ping(Ping::new(
+                    self.network_state.meta_data.read().seq_number,
+                ));
+                self.send_request(peer_id, ping_message);
                 None
             }
             SwarmEvent::ConnectionClosed {
@@ -1751,6 +1750,8 @@ mod tests {
         let peer_id_network_1 = network_1.peer_id();
         let peer_id_network_2 = network_2.peer_id();
 
+        let mut inbound_initiated_status = false;
+        let inbound_ready = std::sync::atomic::AtomicBool::new(false);
         tokio_runtime.block_on(async {
             let peers = HashMap::from([(network_1.enr(), None)]);
             network_2.handle_discovered_peers(peers);
@@ -1763,6 +1764,7 @@ mod tests {
                         connection_id,
                         message: BeaconRequestMessage::Status(status) ,
                     }) = network_1.parse_swarm_event(event).await {
+                                inbound_ready.store(true, std::sync::atomic::Ordering::Relaxed);
                                 network_1
                                     .swarm
                                     .behaviour_mut()
@@ -1778,8 +1780,14 @@ mod tests {
 
             let network_2_poll_task =  async   {
                 while let Some(event) = network_2.swarm.next().await {
-                    network_2.parse_swarm_event(event).await;
-                    if matches!(
+                    if let Some(ReamNetworkEvent::RequestMessage {
+                        message: BeaconRequestMessage::Status(_), ..
+                    }) = network_2.parse_swarm_event(event).await {
+                        inbound_initiated_status = true;
+                    }
+                    if inbound_initiated_status
+                        && inbound_ready.load(std::sync::atomic::Ordering::Relaxed)
+                        && matches!(
                         network_2.cached_peer(&peer_id_network_1),
                         Some(peer) if peer.state == ConnectionState::Connected && peer.direction == Direction::Outbound
                     ) {
@@ -1797,6 +1805,10 @@ mod tests {
         }
        );
 
+        assert!(
+            inbound_initiated_status,
+            "inbound connection must initiate Status"
+        );
         let peer_from_network_1 = network_1
             .cached_peer(&peer_id_network_2)
             .expect("network_1 peer exists");
