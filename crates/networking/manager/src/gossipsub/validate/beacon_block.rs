@@ -149,6 +149,26 @@ async fn validate_block_with_parent(
     }
 }
 
+/// Whether `parent_state` can check `block` without advancing to the block's slot. From Fulu the
+/// state's proposer lookahead holds the proposers of its epoch and the next one (EIP-7917), so a
+/// block in either epoch needs no epoch processing to find its proposer. The proposer's key, the
+/// payload timestamp and the blob limit do not depend on the advance.
+fn parent_state_serves_block(parent_state: &BeaconState, block: &SignedBeaconBlock) -> bool {
+    parent_state_serves_block_from(parent_state, block, beacon_network_spec().fulu_fork_epoch)
+}
+
+fn parent_state_serves_block_from(
+    parent_state: &BeaconState,
+    block: &SignedBeaconBlock,
+    fulu_fork_epoch: u64,
+) -> bool {
+    let parent_epoch = parent_state.get_current_epoch();
+    parent_epoch >= fulu_fork_epoch
+        && block.message.slot >= parent_state.slot
+        && compute_epoch_at_slot(block.message.slot) <= parent_epoch + 1
+        && block.message.body.bls_to_execution_changes.is_empty()
+}
+
 async fn validate_beacon_block(
     beacon_chain: &BeaconChain,
     cached_db: &BeaconCacheDB,
@@ -229,15 +249,26 @@ async fn validate_beacon_block(
     // can only check that the child is newer than finality and points to that exact pending block.
     // Finality can advance while it waits; release repeats the normal walk after parent import.
 
-    let mut state = state.clone();
-    if let Err(err) = state.process_slots(block.message.slot) {
-        return Ok(ValidationResult::Ignore(format!(
-            "Could not advance parent state to block slot: {err:?}"
-        )));
-    }
+    // The parent state serves as is when its proposer lookahead covers the block's slot. Advancing
+    // it copies the whole state and, for the first block of an epoch, runs epoch processing (~0.5 s
+    // on mainnet). BLS-to-execution changes still use the advanced state, since epoch processing
+    // can add the validators they name.
+    let advanced_state;
+    let state = if parent_state_serves_block(state, block) {
+        state
+    } else {
+        let mut advanced = state.clone();
+        if let Err(err) = advanced.process_slots(block.message.slot) {
+            return Ok(ValidationResult::Ignore(format!(
+                "Could not advance parent state to block slot: {err:?}"
+            )));
+        }
+        advanced_state = advanced;
+        &advanced_state
+    };
 
     // [REJECT] The block is proposed by the expected proposer_index for the block's slot.
-    if state.get_beacon_proposer_index(None)? != block.message.proposer_index {
+    if state.get_beacon_proposer_index(Some(block.message.slot))? != block.message.proposer_index {
         return Ok(ValidationResult::Reject(
             "Proposer index is incorrect".to_string(),
         ));
@@ -334,9 +365,17 @@ fn blob_commitment_count_is_valid(block: &SignedBeaconBlock, schedule: &[BlobPar
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use ream_consensus_beacon::{
+        bls_to_execution_change::{BLSToExecutionChange, SignedBLSToExecutionChange},
+        electra::beacon_block::BeaconBlock,
+    };
     use ream_consensus_misc::{
         constants::beacon::SLOTS_PER_EPOCH, polynomial_commitments::kzg_commitment::KZGCommitment,
     };
+    use ream_network_spec::networks::initialize_test_network_spec;
+    use ssz::Decode;
 
     use super::*;
 
@@ -379,5 +418,74 @@ mod tests {
             .try_into()
             .expect("test commitments fit the SSZ bound");
         assert!(!blob_commitment_count_is_valid(&block, &[]));
+    }
+
+    fn parent_state() -> BeaconState {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../../testing/gossip-validation/tests/assets/sepolia/states/\
+             parent_state_9552075.ssz_snappy",
+        );
+        let bytes = snap::raw::Decoder::new()
+            .decompress_vec(&std::fs::read(path).unwrap())
+            .unwrap();
+        BeaconState::from_ssz_bytes(&bytes).unwrap()
+    }
+
+    fn block_at(slot: u64) -> SignedBeaconBlock {
+        SignedBeaconBlock {
+            message: BeaconBlock {
+                slot,
+                ..Default::default()
+            },
+            signature: Default::default(),
+        }
+    }
+
+    #[test]
+    fn the_parent_lookahead_names_the_proposer_of_the_next_epoch() {
+        initialize_test_network_spec();
+        let parent = parent_state();
+        let epoch = parent.get_current_epoch();
+        let next_epoch_start = compute_start_slot_at_epoch(epoch + 1);
+        for slot in [parent.slot + 1, next_epoch_start, next_epoch_start + 31] {
+            let block = block_at(slot);
+            assert!(parent_state_serves_block_from(&parent, &block, 0));
+            let mut advanced = parent.clone();
+            advanced.process_slots(slot).unwrap();
+            assert_eq!(
+                parent.get_beacon_proposer_index(Some(slot)).unwrap(),
+                advanced.get_beacon_proposer_index(None).unwrap(),
+                "slot {slot}"
+            );
+        }
+
+        // Two epochs ahead is outside the lookahead, so the state is advanced.
+        assert!(!parent_state_serves_block_from(
+            &parent,
+            &block_at(compute_start_slot_at_epoch(epoch + 2)),
+            0
+        ));
+        // Before Fulu the lookahead is not kept.
+        assert!(!parent_state_serves_block_from(
+            &parent,
+            &block_at(parent.slot + 1),
+            epoch + 1
+        ));
+        // A BLS-to-execution change can name a validator that epoch processing adds.
+        let mut with_change = block_at(parent.slot + 1);
+        with_change
+            .message
+            .body
+            .bls_to_execution_changes
+            .push(SignedBLSToExecutionChange {
+                message: BLSToExecutionChange {
+                    validator_index: 0,
+                    from_bls_public_key: Default::default(),
+                    to_execution_address: Default::default(),
+                },
+                signature: Default::default(),
+            })
+            .unwrap();
+        assert!(!parent_state_serves_block_from(&parent, &with_change, 0));
     }
 }
