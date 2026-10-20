@@ -102,6 +102,26 @@ pub struct BeaconNodeConfig {
 
     #[arg(
         long,
+        default_value_t = 5,
+        help = "Maximum concurrent requests per backfill pass"
+    )]
+    pub backfill_max_inflight: usize,
+
+    #[arg(
+        long,
+        default_value_t = 134_217_728,
+        help = "Maximum pending SSZ bytes per backfill pass"
+    )]
+    pub backfill_max_pending_bytes: usize,
+
+    #[arg(
+        long,
+        help = "Allow backfill verification and commits throughout the slot"
+    )]
+    pub disable_backfill_rate_limiting: bool,
+
+    #[arg(
+        long,
         help = "Do not fetch the blobs of gossip blocks from the execution client with engine_getBlobsV2"
     )]
     pub disable_get_blobs: bool,
@@ -151,6 +171,12 @@ impl From<BeaconNodeConfig> for ManagerConfig {
             disable_get_blobs: config.disable_get_blobs,
             target_peers: config.target_peers,
             supernode: config.supernode,
+            backfill_config: ream_network_manager::config::BackfillConfig {
+                max_inflight: config.backfill_max_inflight,
+                max_pending_bytes: config.backfill_max_pending_bytes,
+                ..Default::default()
+            },
+            disable_backfill_rate_limiting: config.disable_backfill_rate_limiting,
         }
     }
 }

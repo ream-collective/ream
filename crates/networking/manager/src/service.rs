@@ -128,6 +128,38 @@ pub struct NetworkManagerService {
     pub executor: ReamExecutor,
     /// Whether gossip blocks fetch their blobs from the execution client.
     pub fetch_execution_blobs: bool,
+    pub backfill_config: ream_syncer::backfill::scheduler::BackfillConfig,
+    pub disable_backfill_rate_limiting: bool,
+    pub blob_retention_epochs: u64,
+}
+
+fn maintain_historical_sidecars(
+    db: &BeaconDB,
+    current_slot: u64,
+    finalized_slot: u64,
+    blob_retention_epochs: u64,
+) -> anyhow::Result<()> {
+    let spec = beacon_network_spec();
+    let da_start = spec.data_column_retention_start_slot(current_slot / SLOTS_PER_EPOCH);
+    let removed = db.prune_columns(da_start, finalized_slot, 256)?;
+    ream_metrics::BEACON_COLUMNS_PRUNED_TOTAL.inc_by(removed as u64);
+    if removed > 0 {
+        info!(removed, "Pruned historical data columns");
+    }
+    if let ream_storage::tables::beacon::backfill::BackfillMode::Checkpoint(meta) =
+        db.cached_backfill_mode()?
+        && meta
+            .sidecars
+            .frontier
+            .is_some_and(|slot| slot < da_start.min(meta.origin.slot))
+    {
+        match db.advance_sidecar_retention(meta.revision, da_start) {
+            Ok(_) | Err(ream_storage::db::beacon_backfill::CommitError::Conflict { .. }) => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    db.prune_old_blobs(current_slot, blob_retention_epochs)?;
+    Ok(())
 }
 
 struct ReconciledBlockLookupState {
@@ -461,6 +493,7 @@ impl NetworkManagerService {
         sync_committee_pool: Arc<SyncCommitteePool>,
         cached_db: Arc<BeaconCacheDB>,
     ) -> anyhow::Result<Self> {
+        config.backfill_config.validate()?;
         // Initialize the KZG trusted setup before validating data column sidecars to avoid delaying
         // the first gossipsub validation decision.
         executor
@@ -547,6 +580,12 @@ impl NetworkManagerService {
             sync_committee_pool,
             executor,
             fetch_execution_blobs: !config.disable_get_blobs,
+            backfill_config: config.backfill_config,
+            disable_backfill_rate_limiting: config.disable_backfill_rate_limiting,
+            blob_retention_epochs: config
+                .blob_retention_epochs
+                .unwrap_or_default()
+                .max(beacon_network_spec().min_epochs_for_blob_sidecars_requests),
         })
     }
 
@@ -565,6 +604,9 @@ impl NetworkManagerService {
             block_range_syncer,
             executor,
             fetch_execution_blobs,
+            backfill_config,
+            disable_backfill_rate_limiting,
+            blob_retention_epochs,
             ..
         } = self;
 
@@ -604,6 +646,8 @@ impl NetworkManagerService {
         let (unknown_parent_update_sender, mut unknown_parent_update_receiver) =
             mpsc::channel(MAX_LOOKUPS);
         let mut column_fetch_tracker = ColumnFetchTracker::default();
+        let mut maintenance_epoch = None;
+        let mut maintenance_task: Option<tokio::task::JoinHandle<anyhow::Result<()>>> = None;
         let (column_fetch_done_sender, mut column_fetch_done_receiver) =
             mpsc::unbounded_channel::<(B256, PeerId, ColumnFetchOutcome)>();
         let (pending_item_sender, mut pending_item_receiver) =
@@ -629,11 +673,13 @@ impl NetworkManagerService {
         // Kept alive (not dropped) once synced, so the periodic re-check can restart it later.
         let mut idle_syncer: Option<BlockRangeSyncer> = None;
         // Historical blocks are only downloaded while forward sync has nothing to do.
-        let backfill = BackfillSyncer::spawn(
+        let backfill = BackfillSyncer::spawn_with_config(
             ream_db.clone(),
             p2p_sender.0.clone(),
             network_state.clone(),
             executor.clone(),
+            backfill_config,
+            !disable_backfill_rate_limiting,
         )
         .unwrap_or_else(|err| {
             error!("Failed to start block backfill: {err}");
@@ -963,6 +1009,22 @@ impl NetworkManagerService {
                             }
                             let finalized_slot =
                                 compute_start_slot_at_epoch(finalized_checkpoint.epoch);
+                            if maintenance_task.as_ref().is_some_and(|task| task.is_finished())
+                                && let Some(task) = maintenance_task.take() {
+                                    match task.await {
+                                        Ok(Ok(())) => {},
+                                        result => { warn!(?result, "Column retention maintenance failed"); maintenance_epoch = None; },
+                                    }
+                            }
+                            let epoch = current_slot / SLOTS_PER_EPOCH;
+                            if maintenance_task.is_none() && maintenance_epoch != Some(epoch) {
+                                maintenance_epoch = Some(epoch);
+                                let db = ream_db.clone();
+                                maintenance_task = Some(executor.spawn_blocking(move || {
+                                    maintain_historical_sidecars(&db, current_slot, finalized_slot, blob_retention_epochs)
+                                }));
+                            }
+
                             let pruned_pending = block_lookup_coordinator.prune(
                                 current_slot,
                                 finalized_slot,

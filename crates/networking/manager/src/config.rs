@@ -1,6 +1,7 @@
 use std::{net::IpAddr, path::PathBuf};
 
 use ream_p2p::bootnodes::Bootnodes;
+pub use ream_syncer::backfill::scheduler::BackfillConfig;
 use url::Url;
 
 pub struct ManagerConfig {
@@ -22,4 +23,6 @@ pub struct ManagerConfig {
     pub disable_get_blobs: bool,
     pub target_peers: usize,
     pub supernode: bool,
+    pub backfill_config: BackfillConfig,
+    pub disable_backfill_rate_limiting: bool,
 }
