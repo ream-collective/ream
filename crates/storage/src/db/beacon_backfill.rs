@@ -65,6 +65,12 @@ impl BeaconDB {
         }
 
         self.update_backfill_meta(expected_revision, |write, meta| {
+            if meta.blocks.state != BlockBackfillState::InProgress {
+                return Ok(Err(CommitError::Invalid(format!(
+                    "block backfill already ended as {:?}",
+                    meta.blocks.state
+                ))));
+            }
             let frontier = &meta.blocks.frontier;
             if *highest_root != frontier.oldest_block_parent {
                 return Ok(Err(CommitError::NotConnected));
@@ -114,7 +120,51 @@ impl BeaconDB {
             ));
         }
         self.update_backfill_meta(expected_revision, |_, meta| {
+            if meta.blocks.state != BlockBackfillState::InProgress {
+                return Ok(Err(CommitError::Invalid(format!(
+                    "block backfill already ended as {:?}",
+                    meta.blocks.state
+                ))));
+            }
             meta.blocks.state = state;
+            Ok(Ok(()))
+        })
+    }
+
+    /// The caller has verified and durably published every required column in the newly covered
+    /// interval. This axis remains writable after block backfill has completed.
+    pub fn commit_sidecar_coverage(
+        &self,
+        expected_revision: u64,
+        new_frontier: u64,
+    ) -> Result<BackfillMeta, CommitError> {
+        self.update_backfill_meta(expected_revision, |_, meta| {
+            let Some(previous) = meta.sidecars.frontier else {
+                return Ok(Err(CommitError::Invalid(
+                    "anchor sidecars are pending".to_string(),
+                )));
+            };
+            if new_frontier >= previous || new_frontier < meta.blocks.frontier.oldest_block_slot {
+                return Ok(Err(CommitError::Invalid(
+                    "invalid sidecar frontier".to_string(),
+                )));
+            }
+            meta.sidecars.frontier = Some(new_frontier);
+            Ok(Ok(()))
+        })
+    }
+
+    /// Forget coverage outside the moving retention window without changing advertised history.
+    /// Coverage is bounded by the origin; a pending anchor belongs to anchor recovery.
+    pub fn advance_sidecar_retention(
+        &self,
+        expected_revision: u64,
+        da_start: u64,
+    ) -> Result<BackfillMeta, CommitError> {
+        self.update_backfill_meta(expected_revision, |_, meta| {
+            if let Some(previous) = meta.sidecars.frontier {
+                meta.sidecars.frontier = Some(previous.max(da_start.min(meta.origin.slot)));
+            }
             Ok(Ok(()))
         })
     }
@@ -160,12 +210,6 @@ impl BeaconDB {
                 expected: expected_revision,
                 found: meta.revision,
             });
-        }
-        if meta.blocks.state != BlockBackfillState::InProgress {
-            return Err(CommitError::Invalid(format!(
-                "block backfill already ended as {:?}",
-                meta.blocks.state
-            )));
         }
 
         update(&write, &mut meta)??;
@@ -273,6 +317,31 @@ mod tests {
             BackfillMode::Checkpoint(meta) => meta,
             mode => panic!("unexpected mode {mode:?}"),
         }
+    }
+
+    #[test]
+    fn sidecar_progress_and_retention_remain_writable_after_block_completion() {
+        let dir = TempDir::new("sidecar_commit").unwrap();
+        let blocks = chain(&[10, 20]);
+        let db = checkpoint_db(&dir, &blocks[1]);
+        db.confirm_anchor_sidecars(blocks[1].0).unwrap();
+        let meta = meta(&db);
+        let done = db
+            .commit_historical_blocks(meta.revision, &blocks[..1], 10)
+            .unwrap();
+        assert_eq!(done.blocks.state, BlockBackfillState::BlocksComplete);
+        let covered = db.commit_sidecar_coverage(done.revision, 10).unwrap();
+        assert!(matches!(
+            db.commit_sidecar_coverage(done.revision, 10),
+            Err(CommitError::Conflict { .. })
+        ));
+        let advertised = covered.earliest_available_slot(15);
+        let pruned = db.advance_sidecar_retention(covered.revision, 15).unwrap();
+        assert_eq!(pruned.sidecars.frontier, Some(15));
+        assert_eq!(pruned.earliest_available_slot(15), advertised);
+        let expired = db.advance_sidecar_retention(pruned.revision, 99).unwrap();
+        assert_eq!(expired.sidecars.frontier, Some(20));
+        db.backfill_mode().unwrap();
     }
 
     #[test]

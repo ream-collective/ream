@@ -3,7 +3,7 @@ use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::anyhow;
 use ream_consensus_beacon::electra::{beacon_block::SignedBeaconBlock, beacon_state::BeaconState};
 use ream_consensus_misc::{checkpoint::Checkpoint, constants::beacon::SLOTS_PER_EPOCH};
-use redb::{Database, Durability, ReadableDatabase, WriteTransaction};
+use redb::{Database, Durability, WriteTransaction};
 
 use crate::{
     cache::BeaconCacheDB,
@@ -306,6 +306,7 @@ impl BeaconDB {
 
     pub fn column_sidecars_provider(&self) -> ColumnSidecarsTable {
         ColumnSidecarsTable {
+            db: self.db.clone(),
             data_dir: self.data_dir.clone(),
         }
     }
@@ -436,25 +437,39 @@ impl BeaconDB {
         current_slot: u64,
         min_retention_epochs: u64,
     ) -> anyhow::Result<usize> {
-        let min_retention_slots = min_retention_epochs * SLOTS_PER_EPOCH;
-        let min_slot_to_retain = current_slot.saturating_sub(min_retention_slots);
-
-        // Collect all block roots that should be retained
+        let min_retention_slots = min_retention_epochs.saturating_mul(SLOTS_PER_EPOCH);
+        let finalized_slot = self
+            .finalized_checkpoint_provider()
+            .get()?
+            .epoch
+            .saturating_mul(SLOTS_PER_EPOCH);
+        let cutoff = current_slot
+            .saturating_sub(min_retention_slots)
+            .min(finalized_slot);
         let mut blocks_to_retain = HashSet::new();
-
-        let read_txn = self.db.begin_read()?;
-        let slot_index_table = read_txn.open_table(
-            crate::tables::beacon::slot_index::BeaconSlotIndexTable::TABLE_DEFINITION,
-        )?;
-
-        // Iterate through all slots from min_slot_to_retain to current
-        for item in slot_index_table.range(min_slot_to_retain..)? {
-            let (_, block_root) = item?;
-            blocks_to_retain.insert(block_root.value());
+        // slot_index omits abandoned forks. Inspect only roots with blob files, retaining recent
+        // fork blocks and roots not imported yet, rather than treating either as old history.
+        for entry in std::fs::read_dir(
+            self.data_dir
+                .join(crate::tables::beacon::blobs_and_proofs::BLOB_FOLDER_NAME),
+        )? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(root) = name
+                .to_str()
+                .and_then(|name| name.split('_').next())
+                .and_then(|root| root.parse::<alloy_primitives::B256>().ok())
+            else {
+                continue;
+            };
+            if self
+                .block_provider()
+                .get(root)?
+                .is_none_or(|block| block.message.slot >= cutoff)
+            {
+                blocks_to_retain.insert(root);
+            }
         }
-
-        drop(slot_index_table);
-        drop(read_txn);
 
         // Prune blobs not in the retention set
         let pruned_count = self

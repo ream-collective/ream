@@ -104,6 +104,28 @@ pub(crate) fn remove_published<T>(
     Ok(value)
 }
 
+/// Deletes a root's columns under the publication lock, with one directory flush. The caller
+/// retains its durable index on error and retries this operation after restart.
+pub(crate) fn remove_published_batch(paths: &[PathBuf]) -> Result<usize, StoreError> {
+    let _writer = WRITER.lock().unwrap_or_else(|err| err.into_inner());
+    let mut removed = 0;
+    for path in paths {
+        match fs::remove_file(path) {
+            Ok(()) => removed += 1,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+        PENDING
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .remove(path);
+    }
+    if let Some(path) = paths.first() {
+        File::open(path.parent().expect("sidecar parent"))?.sync_all()?;
+    }
+    Ok(removed)
+}
+
 fn remove_and_sync(path: &Path) -> std::io::Result<()> {
     match fs::remove_file(path) {
         Ok(()) => {}

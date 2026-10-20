@@ -1,19 +1,25 @@
-use std::{io::Read, path::PathBuf};
+use std::{io::Read, path::PathBuf, sync::Arc};
 
 use ream_consensus_beacon::data_column_sidecar::{ColumnIdentifier, DataColumnSidecar};
+use redb::{Database, Durability, ReadableTable};
 use snap::raw::{Decoder, Encoder};
 use ssz::{Decode, Encode};
+use tree_hash::TreeHash;
 
+use super::column_roots_by_slot::{
+    COLUMN_MAINTENANCE, COLUMN_ROOTS_BY_SLOT, COLUMN_WRITER, PRUNED_BEFORE,
+};
 use crate::{errors::StoreError, tables::table::CustomTable};
 
 pub(crate) const COLUMN_FOLDER_NAME: &str = "beacon_columns";
 
 pub struct ColumnSidecarsTable {
     pub data_dir: PathBuf,
+    pub db: Arc<Database>,
 }
 
 impl ColumnSidecarsTable {
-    pub fn prepare_insert(
+    pub(crate) fn prepare_insert(
         &self,
         key: ColumnIdentifier,
         value: DataColumnSidecar,
@@ -23,9 +29,31 @@ impl ColumnSidecarsTable {
     }
 
     pub fn insert_batch(&self, columns: Vec<DataColumnSidecar>) -> Result<(), StoreError> {
-        use tree_hash::TreeHash;
         let started = std::time::Instant::now();
         let count = columns.len();
+        let _writer = COLUMN_WRITER.lock().unwrap_or_else(|err| err.into_inner());
+        let mut write = self.db.begin_write()?;
+        write.set_durability(Durability::Immediate)?;
+        let floor = write
+            .open_table(COLUMN_MAINTENANCE)?
+            .get(PRUNED_BEFORE)?
+            .map(|value| value.value())
+            .unwrap_or_default();
+        let columns = columns
+            .into_iter()
+            .filter(|column| column.signed_block_header.message.slot >= floor)
+            .collect::<Vec<_>>();
+        {
+            let mut index = write.open_multimap_table(COLUMN_ROOTS_BY_SLOT)?;
+            for column in &columns {
+                index.insert(
+                    column.signed_block_header.message.slot,
+                    column.signed_block_header.message.tree_hash_root(),
+                )?;
+            }
+        }
+        // Index first: a crash may leave an entry without files, never files invisible to prune.
+        write.commit()?;
         let prepared = columns
             .into_iter()
             .map(|column| {
@@ -73,7 +101,12 @@ impl CustomTable for ColumnSidecarsTable {
     }
 
     fn insert(&self, key: Self::Key, value: Self::Value) -> Result<(), StoreError> {
-        self.prepare_insert(key, value)?.publish()
+        if key.block_root != value.signed_block_header.message.tree_hash_root()
+            || key.index != value.index
+        {
+            return Err(std::io::Error::other("Column identifier does not match sidecar").into());
+        }
+        self.insert_batch(vec![value])
     }
 
     fn remove(&self, key: Self::Key) -> Result<Option<Self::Value>, StoreError> {
@@ -92,10 +125,7 @@ mod tests {
 
     use crate::{
         errors::StoreError,
-        tables::{
-            beacon::column_sidecars::{COLUMN_FOLDER_NAME, ColumnSidecarsTable},
-            table::CustomTable,
-        },
+        tables::{beacon::column_sidecars::COLUMN_FOLDER_NAME, table::CustomTable},
     };
 
     #[test]
@@ -105,9 +135,8 @@ mod tests {
         let column_dir = tmp_dir.path().to_path_buf().join(COLUMN_FOLDER_NAME);
         fs::create_dir_all(&column_dir)?;
 
-        let table = ColumnSidecarsTable {
-            data_dir: tmp_dir.path().to_path_buf(),
-        };
+        let db = crate::db::ReamDB::new(tmp_dir.path().to_path_buf())?.init_beacon_db()?;
+        let table = db.column_sidecars_provider();
 
         let key = ColumnIdentifier::default();
 
