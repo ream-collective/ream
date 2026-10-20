@@ -137,15 +137,24 @@ pub async fn get_proposer_duties_v2(
 
 #[post("/validator/duties/attester/{epoch}")]
 pub async fn get_attester_duties(
-    db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<BeaconChain>>,
     epoch: Path<u64>,
     validator_indices: Json<Vec<ValidatorIndexRequest>>,
 ) -> Result<impl Responder, ApiError> {
     let epoch = epoch.into_inner();
+    let head = beacon_chain
+        .head()
+        .map_err(|err| ApiError::InternalError(format!("Failed to get head root: {err:?}")))?;
+    let store = Store::new(
+        beacon_chain.db().clone(),
+        Arc::new(OperationPool::default()),
+        None,
+    );
     let start_slot = compute_start_slot_at_epoch(epoch);
-    let state = get_state_at_or_before_slot(&db, start_slot).await?;
-    let dependent_root =
-        get_block_root_at_or_before_slot(&db, attester_shuffling_decision_slot(epoch))?;
+    let (state, _) =
+        get_canonical_state_and_block_root_at_or_before_slot(&store, head.head_root, start_slot)
+            .await?;
+    let dependent_root = attester_dependent_root(&store, head.head_root, epoch)?;
     let validator_indices = parse_validator_indices(validator_indices.into_inner())?;
     let committees_at_slot = state.get_committee_count_per_slot(epoch);
     let mut duties = vec![];
@@ -253,6 +262,16 @@ async fn get_canonical_state_and_block_root_at_or_before_slot(
     let block_root = get_block_root_at_or_before_slot_from_head(store, head_root, slot)?;
 
     get_state_and_block_root(&store.db, block_root, slot).await
+}
+
+/// The head chain's block at the attester shuffling decision slot. The slot index keeps a
+/// reorged-out block when the slot is empty on the head chain, so it is not used here.
+fn attester_dependent_root(store: &Store, head_root: B256, epoch: u64) -> Result<B256, ApiError> {
+    get_block_root_at_or_before_slot_from_head(
+        store,
+        head_root,
+        attester_shuffling_decision_slot(epoch),
+    )
 }
 
 fn get_block_root_at_or_before_slot_from_head(
@@ -437,6 +456,37 @@ mod tests {
             get_block_root_at_or_before_slot_from_head(&store, canonical_root, 100)
                 .expect("resolves canonical ancestor"),
             canonical_root
+        );
+    }
+
+    #[test]
+    fn attester_dependent_root_skips_a_reorged_block_at_an_empty_slot() {
+        let (db, _temp_dir) = test_db();
+        let anchor = block(0, B256::ZERO, B256::repeat_byte(1));
+        let anchor_root = anchor.message.tree_hash_root();
+        // The block at the decision slot of epoch 2 lost a reorg; the head chain skips the slot.
+        let reorged = block(SLOTS_PER_EPOCH - 1, anchor_root, B256::repeat_byte(2));
+        let reorged_root = reorged.message.tree_hash_root();
+        let head = block(SLOTS_PER_EPOCH, anchor_root, B256::repeat_byte(3));
+        let head_root = head.message.tree_hash_root();
+        for (root, block) in [
+            (anchor_root, anchor),
+            (reorged_root, reorged),
+            (head_root, head),
+        ] {
+            db.block_provider()
+                .insert(root, block)
+                .expect("stores block");
+        }
+        assert_eq!(
+            get_block_root_at_or_before_slot(&db, SLOTS_PER_EPOCH - 1).expect("reads slot index"),
+            reorged_root
+        );
+
+        let store = Store::new(db, Arc::new(OperationPool::default()), None);
+        assert_eq!(
+            attester_dependent_root(&store, head_root, 2).expect("resolves dependent root"),
+            anchor_root
         );
     }
 }
