@@ -14,20 +14,18 @@ use std::{
 use alloy_primitives::B256;
 use anyhow::ensure;
 use libp2p::PeerId;
-use ream_chain_beacon::beacon_chain::BeaconChain;
+use ream_chain_beacon::{beacon_chain::BeaconChain, historical_columns::is_valid_rpc_column};
 use ream_consensus_beacon::{
     custody_group::PeerCustodyGroups,
     data_column_sidecar::{ColumnIdentifier, DataColumnSidecar},
 };
 use ream_p2p::network::beacon::channel::{P2PCallbackResponse, P2PMessage, P2PRequest};
-use ream_polynomial_commitments::handlers::verify_data_column_sidecar_kzg_proofs;
 use ream_req_resp::beacon::messages::{
     BeaconResponseMessage, data_column_sidecars::DataColumnsByRootIdentifier,
 };
 use ream_storage::tables::table::{CustomTable, REDBTable};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
-use tree_hash::TreeHash;
 
 use crate::{block_lookup::ensure_pending_item_is_importable_with_store, p2p_sender::P2PSender};
 
@@ -385,10 +383,9 @@ pub async fn pending_anchor_for_recovery(
         .get(root)?
         .ok_or_else(|| anyhow::anyhow!("Missing checkpoint anchor"))?;
     let spec = ream_network_spec::networks::beacon_network_spec();
-    let epoch = ream_consensus_misc::misc::compute_epoch_at_slot(block.message.slot);
     let current_epoch = ream_consensus_misc::misc::compute_epoch_at_slot(current_slot);
     if block.message.body.blob_kzg_commitments.is_empty()
-        || epoch < current_epoch.saturating_sub(spec.min_epochs_for_data_column_sidecars_requests)
+        || block.message.slot < spec.data_column_retention_start_slot(current_epoch)
     {
         let db = chain.db().clone();
         tokio::task::spawn_blocking(move || db.confirm_anchor_sidecars(root)).await??;
@@ -483,26 +480,6 @@ async fn fetch_anchor_columns(
     let db = chain.db().clone();
     tokio::task::spawn_blocking(move || db.confirm_anchor_sidecars(root)).await??;
     Ok(ColumnFetchOutcome::Complete)
-}
-
-/// Applies the checks that are meaningful for a column obtained over req/resp. Gossip-only
-/// conditions such as subnet placement and arrival timing are deliberately not applied: the block
-/// is already past the head, so they would reject every honest response.
-fn is_valid_rpc_column(
-    sidecar: &DataColumnSidecar,
-    expected_root: B256,
-    expected_header: &ream_consensus_misc::beacon_block_header::SignedBeaconBlockHeader,
-) -> bool {
-    if sidecar.signed_block_header.message.tree_hash_root() != expected_root {
-        return false;
-    }
-    if &sidecar.signed_block_header != expected_header {
-        return false;
-    }
-    if !sidecar.verify() || !sidecar.verify_inclusion_proof() {
-        return false;
-    }
-    verify_data_column_sidecar_kzg_proofs(sidecar).unwrap_or(false)
 }
 
 #[derive(Debug)]

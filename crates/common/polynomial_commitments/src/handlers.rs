@@ -140,3 +140,43 @@ pub fn verify_data_column_sidecar_kzg_proofs(sidecar: &DataColumnSidecar) -> any
         &sidecar.kzg_proofs,
     )
 }
+
+/// Verify multiple columns with at most 4096 cells per KZG batch. Keeping the bound explicit
+/// avoids materializing an epoch of cells on the blocking worker.
+pub fn verify_data_column_sidecars_kzg_proofs(
+    sidecars: &[DataColumnSidecar],
+) -> anyhow::Result<bool> {
+    let mut offset = 0;
+    while offset < sidecars.len() {
+        let mut end = offset;
+        let mut cell_count = 0;
+        while end < sidecars.len() && cell_count + sidecars[end].column.len() <= 4096 {
+            cell_count += sidecars[end].column.len();
+            end += 1;
+        }
+        if end == offset {
+            bail!("Column exceeds KZG batch cell limit");
+        }
+        let mut commitments = Vec::with_capacity(cell_count);
+        let mut indices = Vec::with_capacity(cell_count);
+        let mut cells = Vec::with_capacity(cell_count);
+        let mut proofs = Vec::with_capacity(cell_count);
+        for column in &sidecars[offset..end] {
+            commitments.extend(column.kzg_commitments.iter().cloned());
+            indices.extend(std::iter::repeat_n(column.index, column.column.len()));
+            cells.extend(column.column.iter().cloned());
+            proofs.extend(column.kzg_proofs.iter().cloned());
+        }
+        if !verify_cell_kzg_proof_batch(
+            &VariableList::new(commitments)
+                .map_err(|err| anyhow!("Invalid commitment batch: {err:?}"))?,
+            &indices,
+            &VariableList::new(cells).map_err(|err| anyhow!("Invalid cell batch: {err:?}"))?,
+            &VariableList::new(proofs).map_err(|err| anyhow!("Invalid proof batch: {err:?}"))?,
+        )? {
+            return Ok(false);
+        }
+        offset = end;
+    }
+    Ok(true)
+}

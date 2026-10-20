@@ -59,6 +59,20 @@ impl Default for BackfillConfig {
     }
 }
 
+impl BackfillConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.max_inflight > 0
+                && self.max_pending_bytes
+                    >= self
+                        .frontier_reserve_bytes
+                        .saturating_add(self.inflight_reserve_bytes),
+            "Backfill budget must fit a frontier response and one range response, with at least one request in flight"
+        );
+        Ok(())
+    }
+}
+
 /// Identifies a request. A response whose generation is not the current one belongs to a
 /// paused session and is dropped before it is judged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
