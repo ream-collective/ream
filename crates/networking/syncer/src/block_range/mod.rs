@@ -84,6 +84,9 @@ fn range_sync_delay(delay: Duration) -> Duration {
 const RECOVERY_ATTEMPT_COOLDOWN: Duration = Duration::from_secs(30);
 
 const CANDIDATE_EXHAUSTION_TIMEOUT: Duration = Duration::from_secs(60);
+/// Column indices asked of one peer per column range. A range of 128 columns then goes to at least
+/// four peers, so a slow or rate-limiting peer holds up a quarter of it instead of all of it.
+const MAX_COLUMNS_PER_RANGE_REQUEST: usize = 32;
 
 fn should_abort_for_candidate_exhaustion(elapsed: Duration, tasks_in_flight: bool) -> bool {
     elapsed >= CANDIDATE_EXHAUSTION_TIMEOUT && !tasks_in_flight
@@ -1113,9 +1116,13 @@ impl BlockRangeSyncer {
                     if columns.is_empty() {
                         continue;
                     }
-                    let (assignments, uncovered) = self
-                        .peer_manager
-                        .split_columns_across_idle_peers(&candidate_peers, &excluded, columns);
+                    let (assignments, uncovered) =
+                        self.peer_manager.split_columns_across_idle_peers(
+                            &candidate_peers,
+                            &excluded,
+                            columns,
+                            MAX_COLUMNS_PER_RANGE_REQUEST,
+                        );
                     if assignments.is_empty() {
                         self.peer_manager.update_peer_set();
                         info!("No idle peers available for data column range sync.");
