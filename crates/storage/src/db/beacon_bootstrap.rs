@@ -183,10 +183,8 @@ impl BeaconDB {
             "Block frontier is after origin"
         );
         if let Some(sidecar) = meta.sidecars.frontier {
-            ensure!(
-                f.oldest_block_slot <= sidecar && sidecar <= meta.origin.slot,
-                "Invalid backfill coverage"
-            );
+            // A custody increase restarts coverage above the origin.
+            ensure!(f.oldest_block_slot <= sidecar, "Invalid backfill coverage");
         }
         let origin = self
             .block_provider()

@@ -3,7 +3,7 @@
 use alloy_primitives::B256;
 use anyhow::anyhow;
 use ream_consensus_beacon::electra::beacon_block::SignedBeaconBlock;
-use redb::{Durability, ReadableTable};
+use redb::{Durability, ReadableDatabase, ReadableTable};
 use ssz::{Decode, Encode};
 
 use super::beacon::BeaconDB;
@@ -13,6 +13,7 @@ use crate::{
         beacon::{
             backfill::{
                 BOOTSTRAP, BackfillMeta, BackfillMode, BlockBackfillState, Frontier, MARKER, META,
+                SIDECAR_CUSTODY,
             },
             beacon_block::BeaconBlockTable,
             slot_index::BeaconSlotIndexTable,
@@ -159,8 +160,59 @@ impl BeaconDB {
         })
     }
 
+    /// Columns recorded for the sidecar coverage, or `None` before the first record.
+    pub fn sidecar_custody(&self) -> Result<Option<Vec<u64>>, StoreError> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(BOOTSTRAP)?;
+        let Some(raw) = table.get(SIDECAR_CUSTODY)? else {
+            return Ok(None);
+        };
+        Ok(Some(Vec::<u64>::from_ssz_bytes(raw.value())?))
+    }
+
+    /// Records `columns` as the custody of the sidecar coverage. When a column was not held
+    /// before, history below `boundary` lacks it: coverage restarts at `boundary` and column
+    /// backfill fetches it again. The first record trusts the existing coverage.
+    pub fn align_sidecar_custody(
+        &self,
+        columns: &[u64],
+        boundary: u64,
+    ) -> Result<Option<BackfillMeta>, CommitError> {
+        let mut columns = columns.to_vec();
+        columns.sort_unstable();
+        columns.dedup();
+        let stored = self.sidecar_custody()?;
+        if stored.as_ref() == Some(&columns) {
+            return Ok(None);
+        }
+        let grew = stored
+            .as_ref()
+            .is_some_and(|stored| columns.iter().any(|index| !stored.contains(index)));
+        for _ in 0..3 {
+            let BackfillMode::Checkpoint(meta) = self.cached_backfill_mode()? else {
+                return Ok(None);
+            };
+            match self.update_backfill_meta(meta.revision, |write, meta| {
+                if grew {
+                    meta.sidecars.frontier = Some(boundary);
+                }
+                write
+                    .open_table(BOOTSTRAP)?
+                    .insert(SIDECAR_CUSTODY, columns.as_ssz_bytes().as_slice())?;
+                Ok(Ok(()))
+            }) {
+                Ok(meta) => return Ok(Some(meta)),
+                Err(CommitError::Conflict { .. }) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Err(CommitError::Invalid(
+            "backfill metadata kept changing".to_string(),
+        ))
+    }
+
     /// Forget coverage outside the moving retention window without changing advertised history.
-    /// Coverage is bounded by the origin; a pending anchor belongs to anchor recovery.
+    /// Coverage below the origin is bounded by it; a pending anchor belongs to anchor recovery.
     pub fn advance_sidecar_retention(
         &self,
         expected_revision: u64,
@@ -322,6 +374,28 @@ mod tests {
             BackfillMode::Checkpoint(meta) => meta,
             mode => panic!("unexpected mode {mode:?}"),
         }
+    }
+
+    #[test]
+    fn custody_growth_restarts_sidecar_coverage_at_the_boundary() {
+        let dir = TempDir::new("sidecar_custody").unwrap();
+        let blocks = chain(&[10, 20]);
+        let db = checkpoint_db(&dir, &blocks[1]);
+        db.confirm_anchor_sidecars(blocks[1].0).unwrap();
+        let first = db.align_sidecar_custody(&[5, 1], 40).unwrap().unwrap();
+        assert_eq!(first.sidecars.frontier, Some(20));
+        assert_eq!(db.sidecar_custody().unwrap(), Some(vec![1, 5]));
+        assert!(db.align_sidecar_custody(&[1, 5], 40).unwrap().is_none());
+        let fewer = db.align_sidecar_custody(&[1], 40).unwrap().unwrap();
+        assert_eq!(fewer.sidecars.frontier, Some(20));
+        let grown = db.align_sidecar_custody(&[1, 9], 40).unwrap().unwrap();
+        assert_eq!(grown.sidecars.frontier, Some(40));
+        assert_eq!(grown.earliest_available_slot(15), 40);
+        assert_eq!(db.sidecar_custody().unwrap(), Some(vec![1, 9]));
+        // Coverage above the origin survives a reload and moves down as columns are committed.
+        db.backfill_mode().unwrap();
+        let moved = db.commit_sidecar_coverage(grown.revision, 20).unwrap();
+        assert_eq!(moved.sidecars.frontier, Some(20));
     }
 
     #[test]

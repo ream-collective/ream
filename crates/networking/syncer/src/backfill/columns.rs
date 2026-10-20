@@ -33,12 +33,13 @@ use ream_storage::{
     db::{beacon::BeaconDB, beacon_backfill::CommitError},
     tables::{
         beacon::backfill::{BackfillMeta, BackfillMode},
+        field::REDBField,
         table::REDBTable,
     },
 };
 use ssz::Encode;
 use tokio::{
-    sync::{mpsc, watch},
+    sync::{Semaphore, mpsc, watch},
     task::JoinSet,
     time::{sleep, timeout},
 };
@@ -73,6 +74,13 @@ fn plan_batch(
     let floor = da_start.max(meta.blocks.frontier.oldest_block_slot);
     if to <= floor {
         return Ok(None);
+    }
+    // Above the origin the canonical index only knows finalized slots.
+    if to > meta.origin.slot {
+        let finalized = db.finalized_checkpoint_provider().get()?;
+        if to > finalized.epoch * ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH + 1 {
+            return Ok(None);
+        }
     }
     let Some(mut root) = db.canonical_root_before(to)? else {
         return Ok(None);
@@ -265,6 +273,8 @@ impl ColumnBackfill {
         let planned = batches.len();
         let started = Instant::now();
         let load = Mutex::new(Load::default());
+        // One request budget for every batch of the step.
+        let permits = Arc::new(Semaphore::new(self.config.max_inflight));
         let mut assigned = Vec::new();
         for batch in batches {
             match self.assign(&batch, banned, requests, &load) {
@@ -272,11 +282,10 @@ impl ColumnBackfill {
                 None => break,
             }
         }
-        let fetched =
-            futures::future::join_all(assigned.iter().map(|(batch, peers, groups)| {
-                self.fetch(batch, peers, groups.clone(), banned, &load)
-            }))
-            .await;
+        let fetched = futures::future::join_all(assigned.iter().map(|(batch, peers, groups)| {
+            self.fetch(batch, peers, groups.clone(), banned, &load, &permits)
+        }))
+        .await;
         let mut downloaded = Vec::new();
         let mut complete = true;
         for ((batch, ..), result) in assigned.into_iter().zip(fetched) {
@@ -411,6 +420,7 @@ impl ColumnBackfill {
         groups: Groups,
         banned: &HashMap<PeerId, Instant>,
         load: &Mutex<Load>,
+        permits: &Arc<Semaphore>,
     ) -> anyhow::Result<(Option<Responses>, Vec<(PeerId, String)>)> {
         let mut responses = Responses::new();
         let mut faults = Vec::<(PeerId, String)>::new();
@@ -425,10 +435,7 @@ impl ColumnBackfill {
             .map(|(peer, columns)| (peer, columns, None::<Vec<B256>>, 1))
             .collect::<VecDeque<_>>();
         loop {
-            while tasks.len() < self.config.max_inflight {
-                let Some((peer, columns, roots, attempt)) = queue.pop_front() else {
-                    break;
-                };
+            while let Some((peer, columns, roots, attempt)) = queue.pop_front() {
                 *tried.entry(peer).or_default() += 1;
                 let sender = self.sender.clone();
                 let (blocks, limit, by_root) = match &roots {
@@ -456,7 +463,9 @@ impl ColumnBackfill {
                     }
                 };
                 let range = batch.from..batch.to;
+                let permits = permits.clone();
                 tasks.spawn(async move {
+                    let _permit = permits.acquire_owned().await;
                     let started = Instant::now();
                     let response = receive_columns(
                         sender,
@@ -1157,6 +1166,149 @@ mod tests {
                 .is_none()
         );
     }
+    #[test]
+    fn coverage_above_the_origin_waits_for_finality() {
+        let fixture = fixture();
+        let base = fixture.meta.blocks.frontier.oldest_block_slot;
+        let fulu = beacon_network_spec().fulu_fork_epoch;
+        let mut grown = fixture.meta.clone();
+        grown.sidecars.frontier = Some(base + 5);
+        let finalize = |epoch| {
+            fixture
+                .db
+                .finalized_checkpoint_provider()
+                .insert(ream_consensus_misc::checkpoint::Checkpoint {
+                    epoch,
+                    root: B256::ZERO,
+                })
+                .unwrap();
+        };
+        finalize(fulu);
+        assert!(
+            plan_batch(&fixture.db, &grown, base, 128 * 1024 * 1024, 8)
+                .unwrap()
+                .is_none()
+        );
+        finalize(fulu + 1);
+        let batch = plan_batch(&fixture.db, &grown, base, 128 * 1024 * 1024, 8)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (batch.from, batch.to, batch.blocks.len()),
+            (base, base + 5, 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn max_inflight_bounds_requests_across_batches() {
+        let fixture = fixture();
+        let second = add_supernode(&fixture.network);
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (serve_active, serve_peak) = (active.clone(), peak.clone());
+        let columns = fixture.columns.clone();
+        let server = tokio::spawn(async move {
+            while let Some(P2PMessage::Request(P2PRequest::DataColumnRange {
+                start,
+                count,
+                columns: indices,
+                callback,
+                ..
+            })) = receiver.recv().await
+            {
+                let now = serve_active.fetch_add(1, Ordering::SeqCst) + 1;
+                serve_peak.fetch_max(now, Ordering::SeqCst);
+                let selected = columns
+                    .iter()
+                    .filter(|column| {
+                        (start..start + count).contains(&column.signed_block_header.message.slot)
+                            && indices.contains(&column.index)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let serve_active = serve_active.clone();
+                tokio::spawn(async move {
+                    sleep(Duration::from_millis(50)).await;
+                    for column in selected {
+                        let response = BeaconResponseMessage::DataColumnSidecarsByRange(column);
+                        let _ = callback
+                            .send(Ok(P2PCallbackResponse::ResponseMessage(Arc::new(response))))
+                            .await;
+                    }
+                    serve_active.fetch_sub(1, Ordering::SeqCst);
+                    let _ = callback.send(Ok(P2PCallbackResponse::EndOfStream)).await;
+                });
+            }
+        });
+        let driver = ColumnBackfill {
+            db: fixture.db.clone(),
+            sender,
+            network: fixture.network.clone(),
+            config: BackfillConfig {
+                max_inflight: 1,
+                ..BackfillConfig::default()
+            },
+            rate_limit: false,
+            custody: ColumnCustody {
+                group_count: 2,
+                columns: vec![0, 1],
+            },
+        };
+        let base = fixture.meta.blocks.frontier.oldest_block_slot;
+        let batch = |from: u64, slot: u64| {
+            let (root, block) = fixture
+                .db
+                .block_provider()
+                .get(
+                    fixture
+                        .columns
+                        .iter()
+                        .find(|column| column.signed_block_header.message.slot == slot)
+                        .unwrap()
+                        .signed_block_header
+                        .message
+                        .tree_hash_root(),
+                )
+                .unwrap()
+                .map(|block| (block.message.tree_hash_root(), block))
+                .unwrap();
+            Batch {
+                from,
+                to: from + 2,
+                blocks: BTreeMap::from([(root, block)]),
+                max_bytes: (2048 + 48 + 48 + 512) * 2,
+            }
+        };
+        let (upper, lower) = (batch(base + 2, base + 3), batch(base, base + 1));
+        let first = fixture.network.connected_peers()[0].peer_id;
+        let peers = fixture.network.connected_peers();
+        let load = Mutex::new(Load::default());
+        let permits = Arc::new(Semaphore::new(1));
+        let banned = HashMap::new();
+        let (a, b) = tokio::join!(
+            driver.fetch(
+                &upper,
+                &peers,
+                Groups::from([(first, vec![0, 1])]),
+                &banned,
+                &load,
+                &permits
+            ),
+            driver.fetch(
+                &lower,
+                &peers,
+                Groups::from([(second, vec![0, 1])]),
+                &banned,
+                &load,
+                &permits
+            ),
+        );
+        assert!(a.unwrap().0.is_some() && b.unwrap().0.is_some());
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
     #[test]
     fn queued_batches_are_contiguous() {
         let fixture = fixture();
