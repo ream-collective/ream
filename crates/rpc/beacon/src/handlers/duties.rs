@@ -192,6 +192,7 @@ pub async fn get_attester_duties(
                 public_key: validator.public_key.clone(),
                 validator_index,
                 committee_index,
+                committee_length: committee.len() as u64,
                 committees_at_slot,
                 validator_committee_index: validator_committee_index as u64,
                 slot,
