@@ -920,12 +920,34 @@ impl BeaconChain {
         }
         let started = std::time::Instant::now();
         self.prepare_checkpoint_state(target).await;
+        let advanced = started.elapsed();
+        // The epoch processing changed every balance, participation flag and inactivity score.
+        // The state's root caches, shared with the states made from it, still hold the values
+        // before it, so the next block would rehash them all to check its state root. Hashing
+        // the advanced state now leaves that block only its own changes. The epoch's total
+        // active balance and shuffling are computed now for the same reason.
+        let ready = match self.db.checkpoint_states_provider().in_memory(target) {
+            Some(state) => {
+                let warmed = tokio::task::spawn_blocking(move || {
+                    state.state_root();
+                    state.get_total_active_balance();
+                    state.get_beacon_committee(state.slot, 0).is_ok()
+                })
+                .await;
+                if let Err(err) = &warmed {
+                    warn!("Warming the advanced state's caches failed: {err}");
+                }
+                true
+            }
+            None => false,
+        };
         debug!(
             target: "ream::timing",
             slot = head.head_slot,
             epoch = next_epoch,
-            ready = self.db.checkpoint_states_provider().is_in_memory(target),
-            elapsed_ms = started.elapsed().as_millis() as u64,
+            ready,
+            advance_ms = advanced.as_millis() as u64,
+            warm_ms = (started.elapsed() - advanced).as_millis() as u64,
             "timing: state advance"
         );
     }
