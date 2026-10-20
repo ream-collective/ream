@@ -36,6 +36,10 @@ pub enum ReqRespError {
     #[error("Raw error message {0}")]
     RawError(String),
 
+    /// We do not hold the requested data. Sent to the peer as `ResourceUnavailable`.
+    #[error("Resource unavailable: {0}")]
+    ResourceUnavailable(String),
+
     /// The response is tagged with a valid fork digest of this network that predates the forks
     /// we can decode. Not evidence of a faulty peer.
     #[error("Response belongs to unsupported fork {0}")]

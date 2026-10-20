@@ -341,3 +341,36 @@ impl From<ResponseCode> for u8 {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol_id::SupportedProtocol;
+
+    #[test]
+    fn resource_unavailable_uses_code_three_without_fork_context() {
+        for protocol in [
+            BeaconSupportedProtocol::BeaconBlocksByRangeV2,
+            BeaconSupportedProtocol::DataColumnSidecarsByRangeV1,
+        ] {
+            let mut codec = InboundSSZSnappyCodec {
+                protocol: ProtocolId::new(SupportedProtocol::Beacon(protocol)),
+            };
+            let mut bytes = BytesMut::new();
+            let error = ReqRespError::ResourceUnavailable("Backfilling".to_string());
+            let expected_message = error.to_string();
+            codec.encode(RespMessage::Error(error), &mut bytes).unwrap();
+            assert_eq!(bytes.get_u8(), 3);
+            let mut length = Uvi::<usize>::default();
+            assert_eq!(
+                length.decode(&mut bytes).unwrap(),
+                Some(expected_message.len())
+            );
+            let mut message = String::new();
+            FrameDecoder::new(bytes.as_ref())
+                .read_to_string(&mut message)
+                .unwrap();
+            assert_eq!(message, expected_message);
+        }
+    }
+}

@@ -91,6 +91,25 @@ impl P2PSender {
         }
     }
 
+    pub fn send_resource_unavailable(
+        &self,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        stream_id: u64,
+        error: &str,
+    ) {
+        if let Err(err) = self.0.send(P2PMessage::Response(P2PResponse {
+            peer_id,
+            connection_id,
+            stream_id,
+            message: Box::new(RespMessage::Error(ReqRespError::ResourceUnavailable(
+                error.to_string(),
+            ))),
+        })) {
+            warn!("Failed to send resource-unavailable response: {err}");
+        }
+    }
+
     pub fn send_invalid_request(
         &self,
         peer_id: PeerId,
