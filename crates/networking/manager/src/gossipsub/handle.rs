@@ -4,8 +4,8 @@ use anyhow::ensure;
 pub use libp2p::gossipsub::{Message, MessageAcceptance};
 use ream_chain_beacon::beacon_chain::{BeaconChain, BlockProcessingOutcome};
 use ream_consensus_beacon::{
-    blob_sidecar::BlobIdentifier, data_column_sidecar::DATA_COLUMN_SIDECAR_SUBNET_COUNT,
-    electra::beacon_block::SignedBeaconBlock, single_attestation::SingleAttestation,
+    blob_sidecar::BlobIdentifier, electra::beacon_block::SignedBeaconBlock,
+    single_attestation::SingleAttestation,
 };
 use ream_consensus_misc::{
     constants::beacon::{MIN_ATTESTATION_INCLUSION_DELAY, genesis_validators_root},
@@ -51,7 +51,12 @@ pub struct UnknownParentGossipBlock {
     pub block: SignedBeaconBlock,
 }
 
-pub fn init_gossipsub_config_with_topics(history_length: Option<usize>) -> GossipsubConfig {
+/// The gossipsub topics a beacon node subscribes to, with the data column subnets in
+/// `data_column_subnet_ids`, those of the columns it samples.
+pub fn init_gossipsub_config_with_topics(
+    history_length: Option<usize>,
+    data_column_subnet_ids: &[u64],
+) -> GossipsubConfig {
     let mut gossipsub_config = history_length.map_or_else(
         GossipsubConfig::default,
         GossipsubConfig::with_history_length,
@@ -124,10 +129,10 @@ pub fn init_gossipsub_config_with_topics(history_length: Option<usize>) -> Gossi
         }
     }
 
-    for subnet_id in 0..DATA_COLUMN_SIDECAR_SUBNET_COUNT {
+    for subnet_id in data_column_subnet_ids {
         topics.push(GossipTopic {
             fork: fork_digest,
-            kind: GossipTopicKind::DataColumnSidecar(subnet_id),
+            kind: GossipTopicKind::DataColumnSidecar(*subnet_id),
         });
     }
 
@@ -753,6 +758,22 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn data_column_topics_are_the_sampled_subnets() {
+        ream_network_spec::networks::initialize_test_network_spec();
+        let config = init_gossipsub_config_with_topics(None, &[3, 70]);
+        let mut subnets = config
+            .topics
+            .iter()
+            .filter_map(|topic| match topic.kind {
+                GossipTopicKind::DataColumnSidecar(subnet_id) => Some(subnet_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        subnets.sort_unstable();
+        assert_eq!(subnets, [3, 70]);
+    }
 
     /// Kept alongside the chain so the dir isn't dropped (and cleaned up) until the test ends.
     fn test_beacon_chain() -> (TempDir, BeaconChain) {

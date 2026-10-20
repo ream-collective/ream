@@ -60,7 +60,9 @@ use ream_metrics::{
     ATTESTATION_COMMITTEE_SUBNET, NODE_INFO, NODE_START_TIME_SECONDS, init_node_metrics,
     set_int_gauge_vec,
 };
-use ream_network_manager::{config::ManagerConfig, service::NetworkManagerService};
+use ream_network_manager::{
+    config::ManagerConfig, custody::local_custody_assignment, service::NetworkManagerService,
+};
 use ream_network_spec::networks::{
     beacon_network_spec, lean_network_spec, set_beacon_network_spec, set_lean_network_spec,
 };
@@ -728,6 +730,9 @@ async fn run_beacon_node_inner(
     } else {
         beacon_chain
     };
+    let custody = local_custody_assignment(&beacon_db.data_dir, config.supernode)
+        .expect("Failed to derive the data column custody of the node");
+    let beacon_chain = beacon_chain.with_sampling_columns(custody.sampling_columns);
     let beacon_chain = Arc::new(beacon_chain);
 
     // Warm the BLS key cache so the first blocks after startup don't decompress every key.
@@ -1220,7 +1225,7 @@ mod tests {
     };
     use ream_bls::{BLSSignature, PrivateKey, PublicKey};
     use ream_consensus_beacon::{
-        data_column_sidecar::{ColumnIdentifier, NUMBER_OF_COLUMNS},
+        data_column_sidecar::ColumnIdentifier,
         electra::{
             beacon_block::{BeaconBlock, SignedBeaconBlock},
             beacon_block_body::BeaconBlockBody,
@@ -1257,7 +1262,10 @@ mod tests {
     use ream_mock_execution_engine::{
         MockExecutionServer, block_generator::genesis_execution_payload,
     };
-    use ream_network_spec::networks::{BeaconNetworkSpec, DEV, set_beacon_network_spec};
+    use ream_network_manager::custody::local_custody_assignment;
+    use ream_network_spec::networks::{
+        BeaconNetworkSpec, DEV, beacon_network_spec, set_beacon_network_spec,
+    };
     use ream_storage::{
         db::ReamDB,
         dir::setup_data_dir,
@@ -2038,16 +2046,22 @@ mod tests {
         statuses
     }
 
-    async fn wait_for_all_data_column_sidecars(db: &ReamDB, block_root: B256) {
+    /// Waits until the node of `db` stores every column it samples for `block_root`. A custody
+    /// node receives only the subnets of its sampled columns, so it stores no others unless it
+    /// proposed the block.
+    async fn wait_for_sampled_data_column_sidecars(db: &ReamDB, block_root: B256, supernode: bool) {
         let beacon_db = db
             .init_beacon_db()
             .expect("unable to init Ream Beacon Database for inspection");
+        let sampling_columns = local_custody_assignment(&beacon_db.data_dir, supernode)
+            .expect("the custody of a running node should be derivable")
+            .sampling_columns;
         let column_sidecars_provider = beacon_db.column_sidecars_provider();
 
         let start = Instant::now();
         let timeout_duration = Duration::from_secs(30);
         loop {
-            let missing_index = (0..NUMBER_OF_COLUMNS).find(|&index| {
+            let missing_index = sampling_columns.iter().copied().find(|&index| {
                 column_sidecars_provider
                     .get(ColumnIdentifier::new(block_root, index))
                     .expect("column sidecar lookup should not error")
@@ -2063,6 +2077,20 @@ mod tests {
             );
             sleep(Duration::from_millis(250)).await;
         }
+    }
+
+    /// Asserts that the node on `http_port` advertises `expected` custody groups in its MetaData.
+    async fn assert_advertised_custody_group_count(http_port: u16, expected: u64) {
+        let identity = wait_for_beacon_identity(http_port).await;
+        let custody_group_count = &identity["data"]["metadata"]["custody_group_count"];
+        let custody_group_count = custody_group_count
+            .as_u64()
+            .or_else(|| custody_group_count.as_str()?.parse().ok())
+            .unwrap_or_else(|| panic!("identity should contain a custody group count: {identity}"));
+        assert_eq!(
+            custody_group_count, expected,
+            "node on port {http_port} advertises the wrong custody group count"
+        );
     }
 
     async fn wait_for_head_slot_at_least(http_port: u16, min_slot: u64) -> (u64, String) {
@@ -3463,9 +3491,16 @@ mod tests {
             // complete the pending availability check.
             wait_for_head_slot_at_least(node_2_http_port, target_slot).await;
 
-            // Verify that all columns were persisted on both nodes as well.
-            wait_for_all_data_column_sidecars(&node_1_db_for_check, block_root).await;
-            wait_for_all_data_column_sidecars(&node_2_db_for_check, block_root).await;
+            // Both nodes run in custody mode, the default. Each must store the columns it samples.
+            wait_for_sampled_data_column_sidecars(&node_1_db_for_check, block_root, false).await;
+            wait_for_sampled_data_column_sidecars(&node_2_db_for_check, block_root, false).await;
+            for http_port in [node_1_http_port, node_2_http_port] {
+                assert_advertised_custody_group_count(
+                    http_port,
+                    beacon_network_spec().custody_requirement,
+                )
+                .await;
+            }
 
             if wait_for_finality {
                 // Start the finality timeout only once the chain has reached the same minimum
@@ -3675,6 +3710,9 @@ mod tests {
                 beacon_node_config_from_args(port_offset + 1, Some(node_1_enr.clone()));
             node_2_config.execution_endpoint = Some(execution_endpoint.clone());
             node_2_config.execution_jwt_secret = Some(jwt_secret_path.clone());
+            // A node forwards only the subnets it subscribes to. node_2 is the only path from
+            // node_1 to node_3, so it subscribes to all of them, whatever columns node_3 samples.
+            node_2_config.supernode = true;
             let node_2_http_port = node_2_config.http_port;
             let node_2_handle = spawn_beacon_test_node_with_gossipsub_history(
                 node_2_config,
@@ -3749,14 +3787,19 @@ mod tests {
                 .parse()
                 .expect("root should be a valid B256");
 
-            // node_3 has no direct link to node_1 (the proposer), so it reaching the same head
-            // and storing every column proves node_2 actually forwarded the gossip onward.
+            // node_3 has no direct link to node_1, so it reaching the same head and storing the
+            // columns it samples proves node_2 actually forwarded the gossip onward.
             wait_for_head_slot_at_least(node_2_http_port, target_slot).await;
             wait_for_head_slot_at_least(node_3_http_port, target_slot).await;
 
-            wait_for_all_data_column_sidecars(&node_1_db_for_check, block_root).await;
-            wait_for_all_data_column_sidecars(&node_2_db_for_check, block_root).await;
-            wait_for_all_data_column_sidecars(&node_3_db_for_check, block_root).await;
+            wait_for_sampled_data_column_sidecars(&node_1_db_for_check, block_root, false).await;
+            wait_for_sampled_data_column_sidecars(&node_2_db_for_check, block_root, true).await;
+            wait_for_sampled_data_column_sidecars(&node_3_db_for_check, block_root, false).await;
+            assert_advertised_custody_group_count(
+                node_2_http_port,
+                beacon_network_spec().number_of_custody_groups,
+            )
+            .await;
 
             let node_1_finished = node_1_handle.is_finished();
             let node_2_finished = node_2_handle.is_finished();

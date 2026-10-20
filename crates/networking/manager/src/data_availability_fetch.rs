@@ -17,7 +17,7 @@ use libp2p::PeerId;
 use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::{
     custody_group::PeerCustodyGroups,
-    data_column_sidecar::{ColumnIdentifier, DataColumnSidecar, NUMBER_OF_COLUMNS},
+    data_column_sidecar::{ColumnIdentifier, DataColumnSidecar},
 };
 use ream_p2p::network::beacon::channel::{P2PCallbackResponse, P2PMessage, P2PRequest};
 use ream_polynomial_commitments::handlers::verify_data_column_sidecar_kzg_proofs;
@@ -417,9 +417,21 @@ async fn fetch_anchor_columns(
     let header = block.signed_header();
     let stored_header = header.clone();
     let db = chain.db().clone();
+    // The anchor needs the columns the node samples, as any block does.
+    let mut sampling_columns = chain
+        .store
+        .lock()
+        .await
+        .data_availability_checker
+        .required_columns()
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    sampling_columns.sort_unstable();
     let missing = tokio::task::spawn_blocking(move || {
         let provider = db.column_sidecars_provider();
-        (0..NUMBER_OF_COLUMNS)
+        sampling_columns
+            .into_iter()
             .filter_map(
                 |index| match provider.get(ColumnIdentifier::new(root, index)) {
                     Ok(Some(column))

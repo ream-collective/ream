@@ -20,4 +20,6 @@ pub struct ManagerConfig {
     pub blob_retention_epochs: Option<u64>,
     pub gossipsub_history_length: Option<usize>,
     pub disable_get_blobs: bool,
+    pub target_peers: usize,
+    pub supernode: bool,
 }

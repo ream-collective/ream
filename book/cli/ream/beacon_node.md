@@ -45,6 +45,10 @@ Options:
           Number of epochs to retain blob sidecars. Defaults to network spec value (4096 epochs for mainnet, ~18 days)
       --disable-get-blobs
           Do not fetch the blobs of gossip blocks from the execution client with engine_getBlobsV2
+      --target-peers <TARGET_PEERS>
+          Peers to keep connected. Connections are limited to 90% of it inbound, 110% outbound and 130% in total [default: 200]
+      --supernode
+          Custody, sample and serve every data column. Without it the node custodies CUSTODY_REQUIREMENT groups and samples SAMPLES_PER_SLOT groups. A data dir that advertised more groups keeps them. Set it on a node with validators attached, which must custody at least VALIDATOR_CUSTODY_REQUIREMENT groups
       --metrics
           Enable metrics
       --metrics-address <METRICS_ADDRESS>

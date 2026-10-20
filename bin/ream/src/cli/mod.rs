@@ -198,9 +198,20 @@ mod tests {
                 );
                 assert_eq!(config.socket_port, 9001);
                 assert_eq!(config.discovery_port, 9002);
+                assert_eq!(config.target_peers, 200);
+                assert!(!config.supernode);
             }
             _ => unreachable!("This test should only validate the beacon node cli"),
         }
+    }
+
+    #[test]
+    fn test_cli_beacon_node_rejects_zero_target_peers() {
+        // A target of zero would deny every connection, bootnodes included.
+        let err =
+            Cli::try_parse_from(["program", "beacon_node", "--target-peers", "0"]).unwrap_err();
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]
