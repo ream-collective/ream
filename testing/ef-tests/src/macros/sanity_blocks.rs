@@ -67,10 +67,51 @@ macro_rules! test_sanity_blocks {
                                 panic!("Missing test asset for block {i}");
                             };
 
+                            // ``on_block`` starts a block in a later epoch from its parent state
+                            // advanced to that epoch's first slot when that state was built ahead
+                            // of time. That path must reach the same post-state.
+                            let block_epoch = ream_consensus_misc::misc::compute_epoch_at_slot(
+                                signed_block.message.slot,
+                            );
+                            let mut advanced = (state.get_current_epoch() < block_epoch)
+                                .then(|| {
+                                    let mut advanced = state.clone();
+                                    advanced
+                                        .process_slots(
+                                            ream_consensus_misc::misc::compute_start_slot_at_epoch(
+                                                block_epoch,
+                                            ),
+                                        )
+                                        .ok()
+                                        .map(|()| advanced)
+                                })
+                                .flatten();
+
                             result = state
                                 .state_transition(&signed_block, true, &mock_engine)
                                 .await
                                 .map_err(|err| err.to_string());
+
+                            if let Some(advanced) = &mut advanced {
+                                let advanced_result = advanced
+                                    .state_transition_from_epoch_start(
+                                        &signed_block,
+                                        true,
+                                        &mock_engine,
+                                    )
+                                    .await;
+                                assert_eq!(
+                                    advanced_result.is_ok(),
+                                    result.is_ok(),
+                                    "advanced pre-state disagrees on block {i} in case {case_name}"
+                                );
+                                if result.is_ok() {
+                                    assert!(
+                                        *advanced == state,
+                                        "advanced pre-state gives another post-state for block {i} in case {case_name}"
+                                    );
+                                }
+                            }
                         }
 
                         let expected_post = utils::read_ssz_snappy::<BeaconState>(&case_dir.join("post.ssz_snappy"));

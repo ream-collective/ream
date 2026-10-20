@@ -897,6 +897,39 @@ impl BeaconChain {
         self.checkpoint_state_locks.lock().remove(&target);
     }
 
+    /// Advances the head state to the first slot of `next_epoch` before that epoch's first block
+    /// comes, as Lighthouse's state advance timer does late in each slot. The advanced state is the
+    /// head's checkpoint state of `next_epoch`, so ``on_block`` starts the next block from it
+    /// instead of running the epoch processing, about 1 s on mainnet, while the block waits.
+    ///
+    /// Only a head in the epoch before `next_epoch` is advanced: an older head means the node is
+    /// syncing, and the state would be stale by the time it is used.
+    pub async fn advance_head_to_next_epoch(&self, next_epoch: u64) {
+        let Ok(head) = self.head() else {
+            return;
+        };
+        if compute_epoch_at_slot(head.head_slot) + 1 != next_epoch {
+            return;
+        }
+        let target = Checkpoint {
+            epoch: next_epoch,
+            root: head.head_root,
+        };
+        if self.db.checkpoint_states_provider().is_in_memory(target) {
+            return;
+        }
+        let started = std::time::Instant::now();
+        self.prepare_checkpoint_state(target).await;
+        debug!(
+            target: "ream::timing",
+            slot = head.head_slot,
+            epoch = next_epoch,
+            ready = self.db.checkpoint_states_provider().is_in_memory(target),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "timing: state advance"
+        );
+    }
+
     /// Builds `target`'s checkpoint state on a blocking thread and keeps it in memory.
     async fn build_checkpoint_state(&self, target: Checkpoint) {
         let Ok(_regen) = self.checkpoint_state_regen.acquire().await else {
@@ -913,7 +946,7 @@ impl BeaconChain {
                 epoch = target.epoch,
                 root = %target.root,
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "Prepared attestation target checkpoint state"
+                "Prepared checkpoint state"
             ),
             Ok(Err(err)) => debug!(
                 epoch = target.epoch,
@@ -1250,6 +1283,39 @@ mod tests {
             vec![root]
         );
         assert!(chain.reserve_unannounced_reconstructions().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_head_state_is_advanced_only_into_the_epoch_after_it() {
+        let state = test_beacon_state();
+        let epoch = compute_epoch_at_slot(state.slot);
+        let (_data_dir, chain, anchor_root) =
+            test_chain_with_anchor_and_cache(state, Some(Arc::new(BeaconCacheDB::new())));
+        let checkpoint_states = chain.db.checkpoint_states_provider();
+        let checkpoint = |epoch| Checkpoint {
+            epoch,
+            root: anchor_root,
+        };
+
+        // Two epochs ahead means the node is behind; the state would be stale when used.
+        chain.advance_head_to_next_epoch(epoch + 2).await;
+        assert!(!checkpoint_states.is_in_memory(checkpoint(epoch + 2)));
+
+        // The store lock stays held: the advance must not wait for it.
+        let _store = chain.store.lock().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            chain.advance_head_to_next_epoch(epoch + 1),
+        )
+        .await
+        .expect("the state advance does not take the store lock");
+        let advanced = checkpoint_states
+            .in_memory(checkpoint(epoch + 1))
+            .expect("the head state is advanced into the next epoch");
+        assert_eq!(
+            advanced.slot,
+            ream_consensus_misc::misc::compute_start_slot_at_epoch(epoch + 1)
+        );
     }
 
     #[tokio::test]
