@@ -5,7 +5,9 @@ use libp2p::{
     gossipsub::{Message, MessageAcceptance, MessageId, TopicHash},
 };
 use ream_chain_beacon::beacon_chain::BeaconChain;
-use ream_consensus_beacon::data_column_sidecar::NUMBER_OF_COLUMNS;
+use ream_consensus_beacon::{
+    data_column_sidecar::NUMBER_OF_COLUMNS, electra::beacon_block::SignedBeaconBlock,
+};
 use ream_metrics::BEACON_GOSSIP_PENDING_ITEMS_DROPPED_TOTAL;
 use ream_p2p::gossipsub::beacon::topics::{GossipTopic, GossipTopicKind};
 use ream_storage::cache::BeaconCacheDB;
@@ -15,7 +17,7 @@ use tokio::{
 };
 use tracing::{debug, error};
 
-use super::handle::handle_gossipsub_message;
+use super::handle::{UnknownParentGossipBlock, handle_gossipsub_message};
 use crate::{block_lookup::PendingGossipItem, p2p_sender::P2PSender};
 
 /// Messages waiting for a worker. A full queue sheds new messages as IGNORE, which does not
@@ -29,6 +31,26 @@ const GOSSIP_QUEUE_CAPACITY: usize = 16_384;
 /// that do not fit are dropped: once the block is pending availability, its missing columns are
 /// fetched by root.
 pub const PENDING_ITEM_QUEUE_CAPACITY: usize = 2 * NUMBER_OF_COLUMNS as usize;
+
+/// Gossip blocks waiting for a block worker. About two epochs of blocks; a full queue sheds new
+/// blocks as IGNORE, and a missed block is found again by its children's parent lookup.
+const BLOCK_QUEUE_CAPACITY: usize = 64;
+
+/// Tasks validating and importing gossip blocks. Import takes the store lock, so blocks still
+/// import one at a time, but a second worker lets a new block be validated while an old one loads
+/// a parent state from disk: one such block once held the manager loop 29 s, and the blocks of
+/// the next four slots behind it.
+pub const BLOCK_WORKERS: usize = 2;
+
+/// A gossip block whose parent is unknown, with the peer that sent it, for the manager loop to
+/// look up.
+pub struct UnknownParentWork {
+    pub block: UnknownParentGossipBlock,
+    pub propagation_source: PeerId,
+}
+
+/// Called with each gossip block that passed validation, before its import starts.
+pub type OnValidBlock = Arc<dyn Fn(&SignedBeaconBlock) + Send + Sync>;
 
 /// How many gossip messages all [`GossipWorkers`] pools may handle at once. Validation runs BLS
 /// and KZG checks synchronously, so each handler at work can hold a runtime thread; the budget is
@@ -68,9 +90,18 @@ pub fn is_data_column(topic: &TopicHash) -> bool {
     )
 }
 
-/// Whether a message on `topic` is handled by a [`GossipWorkers`] task. Blocks and their sidecars
-/// stay on the manager loop, which tracks their lookups and availability; every other topic is
-/// validated against shared state only, so its messages can be handled concurrently.
+/// Whether `topic` carries beacon blocks or blob sidecars, which go to the block workers.
+pub fn is_gossip_block(topic: &TopicHash) -> bool {
+    matches!(
+        GossipTopic::from_topic_hash(topic).map(|topic| topic.kind),
+        Ok(GossipTopicKind::BeaconBlock | GossipTopicKind::BlobSidecar(_))
+    )
+}
+
+/// Whether a message on `topic` is handled by the shared [`GossipWorkers`] pools. Blocks and their
+/// sidecars have their own workers, which hand lookups and availability back to the manager loop;
+/// every other topic is validated against shared state only, so its messages can be handled
+/// concurrently.
 pub fn is_handled_concurrently(topic: &TopicHash) -> bool {
     match GossipTopic::from_topic_hash(topic) {
         Ok(topic) => !matches!(
@@ -147,6 +178,70 @@ impl GossipWorkers {
                     work.propagation_source,
                     acceptance,
                 );
+            }
+        });
+        Self {
+            sender,
+            p2p_sender,
+            tasks,
+        }
+    }
+
+    /// Starts [`BLOCK_WORKERS`] tasks for gossip blocks and blob sidecars, outside the shared
+    /// budget so that blocks never wait behind attestations. Work only the manager loop can do
+    /// goes back to it: blocks with an unknown parent to `unknown_parents`, and blocks whose
+    /// parent waits on availability to `pending_items`. Both are sent with backpressure rather
+    /// than dropped.
+    pub fn start_blocks(
+        beacon_chain: Arc<BeaconChain>,
+        cached_db: Arc<BeaconCacheDB>,
+        p2p_sender: P2PSender,
+        pending_items: mpsc::Sender<PendingGossipItem>,
+        unknown_parents: mpsc::Sender<UnknownParentWork>,
+        on_valid_block: OnValidBlock,
+    ) -> Self {
+        let (sender, receiver) = mpsc::channel::<GossipWork>(BLOCK_QUEUE_CAPACITY);
+        let worker_p2p_sender = p2p_sender.clone();
+        let tasks = spawn_workers(BLOCK_WORKERS, receiver, move |work: GossipWork| {
+            let beacon_chain = beacon_chain.clone();
+            let cached_db = cached_db.clone();
+            let p2p_sender = worker_p2p_sender.clone();
+            let pending_items = pending_items.clone();
+            let unknown_parents = unknown_parents.clone();
+            let on_valid_block = on_valid_block.clone();
+            async move {
+                let mut pending_item = None;
+                let mut unknown_parent_block = None;
+                let acceptance = handle_gossipsub_message(
+                    work.message,
+                    &beacon_chain,
+                    &cached_db,
+                    &mut pending_item,
+                    &mut unknown_parent_block,
+                    |block| on_valid_block(block),
+                )
+                .await;
+                p2p_sender.report_gossip_validation(
+                    work.message_id,
+                    work.propagation_source,
+                    acceptance,
+                );
+                if let Some(block) = unknown_parent_block
+                    && unknown_parents
+                        .send(UnknownParentWork {
+                            block,
+                            propagation_source: work.propagation_source,
+                        })
+                        .await
+                        .is_err()
+                {
+                    debug!("Manager loop stopped, dropping an unknown-parent block");
+                }
+                if let Some(item) = pending_item
+                    && pending_items.send(item).await.is_err()
+                {
+                    debug!("Manager loop stopped, dropping a pending block");
+                }
             }
         });
         Self {
@@ -244,8 +339,40 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{
-        GossipWorkerBudget, is_data_column, is_handled_concurrently, spawn_workers, try_forward,
+        BLOCK_WORKERS, GossipWorkerBudget, is_data_column, is_gossip_block,
+        is_handled_concurrently, spawn_workers, try_forward,
     };
+
+    #[tokio::test]
+    async fn a_slow_block_does_not_hold_the_next_one() {
+        let (sender, receiver) = mpsc::channel::<Option<tokio::sync::oneshot::Receiver<()>>>(4);
+        let (done_sender, mut done) = mpsc::channel::<&'static str>(4);
+        let _tasks = spawn_workers(BLOCK_WORKERS, receiver, move |work| {
+            let done_sender = done_sender.clone();
+            async move {
+                match work {
+                    Some(release) => {
+                        let _ = release.await;
+                        let _ = done_sender.send("slow").await;
+                    }
+                    None => {
+                        let _ = done_sender.send("fast").await;
+                    }
+                }
+            }
+        });
+        let (release, slow) = tokio::sync::oneshot::channel();
+        sender.send(Some(slow)).await.unwrap();
+        sender.send(None).await.unwrap();
+
+        // The second item finishes while the first is still held.
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), done.recv())
+            .await
+            .expect("the next item is handled while the slow one waits");
+        assert_eq!(first, Some("fast"));
+        release.send(()).unwrap();
+        assert_eq!(done.recv().await, Some("slow"));
+    }
 
     #[tokio::test]
     async fn a_panicking_worker_is_reported() {
@@ -291,7 +418,19 @@ mod tests {
     }
 
     #[test]
-    fn blocks_and_sidecars_stay_on_the_manager_loop() {
+    fn blocks_and_sidecars_have_their_own_workers() {
+        assert!(is_gossip_block(&topic_hash(GossipTopicKind::BeaconBlock)));
+        assert!(is_gossip_block(&topic_hash(GossipTopicKind::BlobSidecar(
+            0
+        ))));
+        assert!(!is_gossip_block(&topic_hash(
+            GossipTopicKind::DataColumnSidecar(3)
+        )));
+        assert!(!is_gossip_block(&topic_hash(
+            GossipTopicKind::BeaconAttestation(5)
+        )));
+        assert!(!is_gossip_block(&IdentTopic::new("unknown").hash()));
+
         assert!(!is_handled_concurrently(&topic_hash(
             GossipTopicKind::BeaconBlock
         )));

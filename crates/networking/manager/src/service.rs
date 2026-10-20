@@ -61,10 +61,12 @@ use crate::{
     },
     gossipsub::{
         cross_seed::publish_reconstructed_columns,
-        handle::{handle_gossipsub_message, init_gossipsub_config_with_topics},
+        handle::{
+            UnknownParentGossipBlock, handle_gossipsub_message, init_gossipsub_config_with_topics,
+        },
         workers::{
-            GossipWorkerBudget, GossipWorkers, PENDING_ITEM_QUEUE_CAPACITY, is_data_column,
-            is_handled_concurrently,
+            GossipWorkerBudget, GossipWorkers, OnValidBlock, PENDING_ITEM_QUEUE_CAPACITY,
+            is_data_column, is_gossip_block, is_handled_concurrently,
         },
     },
     p2p_sender::P2PSender,
@@ -404,6 +406,56 @@ fn until_next_slot_tick(genesis_time: u64, seconds_per_slot: u64, now: Duration)
     until_slot_start + SLOT_TICK_DELAY
 }
 
+/// Starts a lookup for the parent of `unknown`, a gossip block whose parent is not known, from
+/// `propagation_source` or, if that peer refused blocks by root, another peer.
+fn start_unknown_parent_lookup(
+    unknown: UnknownParentGossipBlock,
+    propagation_source: PeerId,
+    network_state: &NetworkState,
+    lookup_refusals: &BlocksByRootRefusals,
+    unknown_parent_lookups: &mut UnknownParentLookupCoordinator<SignedBeaconBlock, PeerId>,
+) {
+    let meta = UnknownBlockMeta {
+        block_root: unknown.block.message.tree_hash_root(),
+        parent_root: unknown.parent_root,
+        slot: unknown.block.message.slot,
+    };
+    let before = unknown_parent_lookups.len();
+    // A source that refused blocks by root cannot serve the parent.
+    let lookup_peer = if lookup_refusals.contains(&propagation_source) {
+        fallback_lookup_peer(
+            network_state,
+            lookup_refusals,
+            &[propagation_source],
+            meta.parent_root,
+        )
+        .unwrap_or(propagation_source)
+    } else {
+        propagation_source
+    };
+    let outcome = unknown_parent_lookups.insert_gossip_block(meta, unknown.block, lookup_peer);
+    match outcome {
+        ream_syncer::unknown_parent_lookups::InsertOutcome::Inserted => {
+            let created = unknown_parent_lookups.len().saturating_sub(before);
+            if created > 0 {
+                inc_int_counter_vec_by(
+                    &BEACON_BLOCK_LOOKUP_EVENTS_TOTAL,
+                    created as u64,
+                    &[UNKNOWN_PARENT_LOOKUP, "created"],
+                );
+            }
+        }
+        ream_syncer::unknown_parent_lookups::InsertOutcome::Duplicate => {}
+        ream_syncer::unknown_parent_lookups::InsertOutcome::Rejected(error) => {
+            inc_int_counter_vec(
+                &BEACON_BLOCK_LOOKUP_EVENTS_TOTAL,
+                &[UNKNOWN_PARENT_LOOKUP, "rejected"],
+            );
+            warn!(block_root = ?meta.block_root, ?error, "Rejected unknown-parent lookup");
+        }
+    }
+}
+
 async fn reconcile_block_lookup_state(
     beacon_chain: &BeaconChain,
     roots: Vec<alloy_primitives::B256>,
@@ -620,8 +672,27 @@ impl NetworkManagerService {
             beacon_chain.clone(),
             cached_db.clone(),
             p2p_sender.clone(),
-            pending_item_sender,
+            pending_item_sender.clone(),
             &gossip_worker_budget,
+        );
+        let (unknown_parent_sender, mut unknown_parent_receiver) = mpsc::channel(MAX_LOOKUPS);
+        let on_valid_block: OnValidBlock = {
+            let beacon_chain = beacon_chain.clone();
+            let cached_db = cached_db.clone();
+            let p2p_sender = p2p_sender.clone();
+            Arc::new(move |block| {
+                if fetch_execution_blobs {
+                    spawn_execution_column_fetch(&beacon_chain, &cached_db, &p2p_sender, block);
+                }
+            })
+        };
+        let mut block_workers = GossipWorkers::start_blocks(
+            beacon_chain.clone(),
+            cached_db.clone(),
+            p2p_sender.clone(),
+            pending_item_sender,
+            unknown_parent_sender,
+            on_valid_block,
         );
         let mut syncer_handle = block_range_syncer.start();
         // Avoid polling a completed JoinHandle after the syncer has caught up.
@@ -1015,6 +1086,24 @@ impl NetworkManagerService {
                     error!("A gossip worker stopped: {err}");
                     return;
                 }
+                Some(err) = block_workers.stopped() => {
+                    // A block worker also stops only by panicking.
+                    if err.is_panic() {
+                        std::panic::resume_unwind(err.into_panic());
+                    }
+                    error!("A gossip block worker stopped: {err}");
+                    return;
+                }
+                // Blocks the block workers found without a known parent.
+                Some(work) = unknown_parent_receiver.recv() => {
+                    start_unknown_parent_lookup(
+                        work.block,
+                        work.propagation_source,
+                        &network_state,
+                        &lookup_refusals,
+                        &mut unknown_parent_lookups,
+                    );
+                }
                 Some(err) = column_workers.stopped() => {
                     // A column worker also stops only by panicking.
                     if err.is_panic() {
@@ -1046,6 +1135,11 @@ impl NetworkManagerService {
                         {
                             gossip_workers.submit(message, message_id, propagation_source);
                         }
+                        ReamNetworkEvent::GossipsubMessage { propagation_source, message_id, message }
+                            if is_gossip_block(&message.topic) =>
+                        {
+                            block_workers.submit(message, message_id, propagation_source);
+                        }
                         ReamNetworkEvent::GossipsubMessage { propagation_source, message_id, message } => {
                             let mut pending_item = None;
                             let mut unknown_parent_block = None;
@@ -1068,49 +1162,13 @@ impl NetworkManagerService {
                             );
 
                             if let Some(unknown) = unknown_parent_block {
-                                let meta = UnknownBlockMeta {
-                                    block_root: unknown.block.message.tree_hash_root(),
-                                    parent_root: unknown.parent_root,
-                                    slot: unknown.block.message.slot,
-                                };
-                                let before = unknown_parent_lookups.len();
-                                // A source that refused blocks by root cannot serve the parent.
-                                let lookup_peer = if lookup_refusals.contains(&propagation_source) {
-                                    fallback_lookup_peer(
-                                        &network_state,
-                                        &lookup_refusals,
-                                        &[propagation_source],
-                                        meta.parent_root,
-                                    )
-                                    .unwrap_or(propagation_source)
-                                } else {
-                                    propagation_source
-                                };
-                                let outcome = unknown_parent_lookups.insert_gossip_block(
-                                    meta,
-                                    unknown.block,
-                                    lookup_peer,
+                                start_unknown_parent_lookup(
+                                    unknown,
+                                    propagation_source,
+                                    &network_state,
+                                    &lookup_refusals,
+                                    &mut unknown_parent_lookups,
                                 );
-                                match outcome {
-                                    ream_syncer::unknown_parent_lookups::InsertOutcome::Inserted => {
-                                        let created = unknown_parent_lookups.len().saturating_sub(before);
-                                        if created > 0 {
-                                            inc_int_counter_vec_by(
-                                                &BEACON_BLOCK_LOOKUP_EVENTS_TOTAL,
-                                                created as u64,
-                                                &[UNKNOWN_PARENT_LOOKUP, "created"],
-                                            );
-                                        }
-                                    }
-                                    ream_syncer::unknown_parent_lookups::InsertOutcome::Duplicate => {}
-                                    ream_syncer::unknown_parent_lookups::InsertOutcome::Rejected(error) => {
-                                        inc_int_counter_vec(
-                                            &BEACON_BLOCK_LOOKUP_EVENTS_TOTAL,
-                                            &[UNKNOWN_PARENT_LOOKUP, "rejected"],
-                                        );
-                                        warn!(block_root = ?meta.block_root, ?error, "Rejected unknown-parent lookup");
-                                    }
-                                }
                             }
 
                             if let Some(item) = pending_item {
