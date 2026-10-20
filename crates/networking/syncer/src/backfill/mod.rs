@@ -122,6 +122,23 @@ impl Peers {
     }
 }
 
+/// The columns this node keeps for every block in the DA window.
+#[derive(Debug, Clone)]
+pub struct ColumnCustody {
+    pub group_count: u64,
+    /// Sorted and deduplicated.
+    pub columns: Vec<u64>,
+}
+
+impl ColumnCustody {
+    pub fn all() -> Self {
+        Self {
+            group_count: ream_consensus_misc::constants::beacon::NUM_CUSTODY_GROUPS,
+            columns: (0..ream_consensus_beacon::data_column_sidecar::NUMBER_OF_COLUMNS).collect(),
+        }
+    }
+}
+
 pub struct BackfillSyncer {
     db: BeaconDB,
     p2p_sender: mpsc::UnboundedSender<P2PMessage>,
@@ -147,6 +164,7 @@ impl BackfillSyncer {
             executor,
             BackfillConfig::default(),
             true,
+            ColumnCustody::all(),
         )
     }
 
@@ -157,8 +175,13 @@ impl BackfillSyncer {
         executor: ReamExecutor,
         config: BackfillConfig,
         rate_limit: bool,
+        custody: ColumnCustody,
     ) -> anyhow::Result<Option<BackfillHandle>> {
         config.validate()?;
+        anyhow::ensure!(
+            !custody.columns.is_empty(),
+            "Column custody must not be empty"
+        );
         match db.cached_backfill_mode()? {
             BackfillMode::Checkpoint(meta) => {
                 BEACON_BACKFILL_BLOCK_FRONTIER_SLOT
@@ -170,7 +193,7 @@ impl BackfillSyncer {
                     .data_column_retention_start_slot(compute_epoch_at_slot(current_slot));
                 let columns_complete = meta.sidecars.frontier.is_some_and(|slot| slot <= da_start);
                 ream_metrics::BEACON_CUSTODY_GROUPS_BACKFILLED.set(if columns_complete {
-                    ream_consensus_beacon::data_column_sidecar::NUMBER_OF_COLUMNS as i64
+                    custody.group_count as i64
                 } else {
                     0
                 });
@@ -195,6 +218,7 @@ impl BackfillSyncer {
             network: network_state.clone(),
             config: config.clone(),
             rate_limit,
+            custody,
         };
         let column_running = running_receiver.clone();
         executor.spawn(async move { columns.run(column_running).await });

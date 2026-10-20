@@ -131,6 +131,8 @@ pub struct NetworkManagerService {
     pub backfill_config: ream_syncer::backfill::scheduler::BackfillConfig,
     pub disable_backfill_rate_limiting: bool,
     pub blob_retention_epochs: u64,
+    /// Column backfill covers what live import samples, so history matches the live range.
+    pub backfill_custody: ream_syncer::backfill::ColumnCustody,
 }
 
 fn maintain_historical_sidecars(
@@ -582,6 +584,10 @@ impl NetworkManagerService {
             fetch_execution_blobs: !config.disable_get_blobs,
             backfill_config: config.backfill_config,
             disable_backfill_rate_limiting: config.disable_backfill_rate_limiting,
+            backfill_custody: ream_syncer::backfill::ColumnCustody {
+                group_count: custody.custody_group_count,
+                columns: custody.sampling_columns.clone(),
+            },
             blob_retention_epochs: config
                 .blob_retention_epochs
                 .unwrap_or_default()
@@ -607,6 +613,7 @@ impl NetworkManagerService {
             backfill_config,
             disable_backfill_rate_limiting,
             blob_retention_epochs,
+            backfill_custody,
             ..
         } = self;
 
@@ -680,6 +687,7 @@ impl NetworkManagerService {
             executor.clone(),
             backfill_config,
             !disable_backfill_rate_limiting,
+            backfill_custody,
         )
         .unwrap_or_else(|err| {
             error!("Failed to start block backfill: {err}");
