@@ -145,6 +145,19 @@ impl ColumnBackfill {
                 }
                 continue;
             }
+            if let Ok(BackfillMode::Checkpoint(meta)) = self.db.cached_backfill_mode()
+                && let Ok(slot) = get_current_slot_from_db(&self.db)
+                && meta.sidecars.frontier.is_some_and(|frontier| {
+                    frontier
+                        <= beacon_network_spec().data_column_retention_start_slot(
+                            slot / ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH,
+                        )
+                })
+            {
+                ream_metrics::BEACON_CUSTODY_GROUPS_BACKFILLED.set(NUMBER_OF_COLUMNS as i64);
+                info!(frontier_slot = ?meta.sidecars.frontier, "Column backfill complete");
+                return;
+            }
             // Dropping the batch future drops every callback and aborts its download tasks.
             let active = running.clone();
             let result = tokio::select! {
@@ -300,13 +313,17 @@ impl ColumnBackfill {
                                 continue;
                             }
                             let one = Arc::new(BTreeMap::from([(*root, block.clone())]));
+                            let limit = (block.message.body.blob_kzg_commitments.len()
+                                * (2048 + 48 + 48)
+                                + 512)
+                                * missing.len();
                             match receive_columns(
                                 self.sender.clone(),
                                 replacement,
                                 batch.from..batch.from + 1,
                                 missing,
                                 one.clone(),
-                                batch.max_bytes,
+                                limit,
                                 true,
                             )
                             .await

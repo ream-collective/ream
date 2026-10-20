@@ -168,9 +168,13 @@ impl BackfillSyncer {
                 let current_slot = get_current_slot_from_db(&db)?;
                 let da_start = beacon_network_spec()
                     .data_column_retention_start_slot(compute_epoch_at_slot(current_slot));
-                if meta.blocks.state != BlockBackfillState::InProgress
-                    && meta.sidecars.frontier.is_some_and(|slot| slot <= da_start)
-                {
+                let columns_complete = meta.sidecars.frontier.is_some_and(|slot| slot <= da_start);
+                ream_metrics::BEACON_CUSTODY_GROUPS_BACKFILLED.set(if columns_complete {
+                    ream_consensus_beacon::data_column_sidecar::NUMBER_OF_COLUMNS as i64
+                } else {
+                    0
+                });
+                if meta.blocks.state != BlockBackfillState::InProgress && columns_complete {
                     return Ok(None);
                 }
             }
