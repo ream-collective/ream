@@ -182,17 +182,6 @@ impl BackfillSyncer {
             !custody.columns.is_empty(),
             "Column custody must not be empty"
         );
-        if let BackfillMode::Checkpoint(before) = db.cached_backfill_mode()?
-            && let Some(after) = db
-                .align_sidecar_custody(&custody.columns, get_current_slot_from_db(&db)? + 1)
-                .map_err(|err| anyhow!("{err}"))?
-            && after.sidecars.frontier != before.sidecars.frontier
-        {
-            info!(
-                frontier_slot = ?after.sidecars.frontier,
-                "Custody columns grew, backfilling them for the retention window"
-            );
-        }
         match db.cached_backfill_mode()? {
             BackfillMode::Checkpoint(meta) => {
                 BEACON_BACKFILL_BLOCK_FRONTIER_SLOT

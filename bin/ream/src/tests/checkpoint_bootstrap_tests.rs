@@ -512,6 +512,8 @@ async fn pending_anchor_recovers_from_partial_peer_responses_after_restart() {
             }),
         )
         .unwrap();
+    // A fresh bootstrap holds no columns, so the first startup records its custody as is.
+    assert_eq!(beacon_db.sidecar_custody().unwrap(), Some(Vec::new()));
     let path = beacon_db.data_dir.clone();
     drop(beacon_db);
     drop(db);

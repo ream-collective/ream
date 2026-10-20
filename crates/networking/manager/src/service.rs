@@ -32,7 +32,7 @@ use ream_p2p::{
 };
 use ream_storage::{
     cache::BeaconCacheDB,
-    db::beacon::BeaconDB,
+    db::{beacon::BeaconDB, beacon_backfill::CustodyAlignment},
     tables::{field::REDBField, table::REDBTable},
 };
 use ream_sync_committee_pool::SyncCommitteePool;
@@ -518,6 +518,21 @@ impl NetworkManagerService {
             sampling_columns = custody.sampling_columns.len(),
             "Data column custody"
         );
+        match ream_db.align_sidecar_custody(
+            &custody.sampling_columns,
+            ream_fork_choice_beacon::store::get_current_slot_from_db(&ream_db)? + 1,
+            custody.custody_group_count <= beacon_network_spec().custody_requirement,
+        )? {
+            CustodyAlignment::Restarted(meta) => info!(
+                frontier_slot = ?meta.sidecars.frontier,
+                "Custody columns grew, backfilling them for the retention window"
+            ),
+            CustodyAlignment::Missing => anyhow::bail!(
+                "Custody grew beyond the columns this genesis-synced history holds. Keep the \
+                 previous custody, or resync from a checkpoint with --purge-db"
+            ),
+            CustodyAlignment::Unchanged | CustodyAlignment::Recorded => {}
+        }
 
         let bootnodes = config
             .bootnodes

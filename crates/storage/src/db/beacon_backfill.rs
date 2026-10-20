@@ -22,6 +22,17 @@ use crate::{
     },
 };
 
+/// How the stored history relates to the node custody.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustodyAlignment {
+    Unchanged,
+    Recorded,
+    /// Coverage restarted for columns the history lacks.
+    Restarted(BackfillMeta),
+    /// Genesis-synced history lacks columns and has no coverage to restart.
+    Missing,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CommitError {
     /// Metadata moved since the caller read it. Re-read and re-evaluate; nothing was written.
@@ -170,27 +181,55 @@ impl BeaconDB {
         Ok(Some(Vec::<u64>::from_ssz_bytes(raw.value())?))
     }
 
-    /// Records `columns` as the custody of the sidecar coverage. When a column was not held
-    /// before, history below `boundary` lacks it: coverage restarts at `boundary` and column
-    /// backfill fetches it again. The first record trusts the existing coverage.
+    /// Records `columns` as the custody of the stored history. A column not held before is
+    /// missing below `boundary`: checkpoint coverage restarts there so column backfill fetches
+    /// it, while genesis-synced history has no coverage to restart and reports `Missing`.
+    ///
+    /// Databases bootstrapped before the record existed are trusted only with `minimum` custody:
+    /// custody never drops below it nor decreases, so every earlier run held the same columns.
     pub fn align_sidecar_custody(
         &self,
         columns: &[u64],
         boundary: u64,
-    ) -> Result<Option<BackfillMeta>, CommitError> {
+        minimum: bool,
+    ) -> Result<CustodyAlignment, CommitError> {
         let mut columns = columns.to_vec();
         columns.sort_unstable();
         columns.dedup();
         let stored = self.sidecar_custody()?;
         if stored.as_ref() == Some(&columns) {
-            return Ok(None);
+            return Ok(CustodyAlignment::Unchanged);
         }
-        let grew = stored
-            .as_ref()
-            .is_some_and(|stored| columns.iter().any(|index| !stored.contains(index)));
+        let grew = match &stored {
+            None => !minimum,
+            // A fresh bootstrap holds no history yet.
+            Some(stored) if stored.is_empty() => false,
+            Some(stored) => columns.iter().any(|index| !stored.contains(index)),
+        };
+        let mode = self.cached_backfill_mode()?;
+        // Legacy databases predate coverage metadata and are not backfilled.
+        if mode == BackfillMode::Legacy {
+            return Ok(CustodyAlignment::Unchanged);
+        }
+        if !matches!(mode, BackfillMode::Checkpoint(_)) {
+            if grew {
+                return Ok(CustodyAlignment::Missing);
+            }
+            let mut write = self.db.begin_write().map_err(StoreError::from)?;
+            write
+                .set_durability(Durability::Immediate)
+                .map_err(StoreError::from)?;
+            write
+                .open_table(BOOTSTRAP)
+                .map_err(StoreError::from)?
+                .insert(SIDECAR_CUSTODY, columns.as_ssz_bytes().as_slice())
+                .map_err(StoreError::from)?;
+            write.commit().map_err(StoreError::from)?;
+            return Ok(CustodyAlignment::Recorded);
+        }
         for _ in 0..3 {
             let BackfillMode::Checkpoint(meta) = self.cached_backfill_mode()? else {
-                return Ok(None);
+                break;
             };
             match self.update_backfill_meta(meta.revision, |write, meta| {
                 if grew {
@@ -201,7 +240,8 @@ impl BeaconDB {
                     .insert(SIDECAR_CUSTODY, columns.as_ssz_bytes().as_slice())?;
                 Ok(Ok(()))
             }) {
-                Ok(meta) => return Ok(Some(meta)),
+                Ok(meta) if grew => return Ok(CustodyAlignment::Restarted(meta)),
+                Ok(_) => return Ok(CustodyAlignment::Recorded),
                 Err(CommitError::Conflict { .. }) => continue,
                 Err(err) => return Err(err),
             }
@@ -376,19 +416,43 @@ mod tests {
         }
     }
 
+    fn set_custody_record(db: &BeaconDB, columns: &[u64]) {
+        let write = db.db.begin_write().unwrap();
+        write
+            .open_table(BOOTSTRAP)
+            .unwrap()
+            .insert(SIDECAR_CUSTODY, columns.to_vec().as_ssz_bytes().as_slice())
+            .unwrap();
+        write.commit().unwrap();
+    }
+
     #[test]
     fn custody_growth_restarts_sidecar_coverage_at_the_boundary() {
         let dir = TempDir::new("sidecar_custody").unwrap();
         let blocks = chain(&[10, 20]);
         let db = checkpoint_db(&dir, &blocks[1]);
         db.confirm_anchor_sidecars(blocks[1].0).unwrap();
-        let first = db.align_sidecar_custody(&[5, 1], 40).unwrap().unwrap();
-        assert_eq!(first.sidecars.frontier, Some(20));
+        set_custody_record(&db, &[]);
+        assert_eq!(
+            db.align_sidecar_custody(&[5, 1], 40, false).unwrap(),
+            CustodyAlignment::Recorded
+        );
+        assert_eq!(meta(&db).sidecars.frontier, Some(20));
         assert_eq!(db.sidecar_custody().unwrap(), Some(vec![1, 5]));
-        assert!(db.align_sidecar_custody(&[1, 5], 40).unwrap().is_none());
-        let fewer = db.align_sidecar_custody(&[1], 40).unwrap().unwrap();
-        assert_eq!(fewer.sidecars.frontier, Some(20));
-        let grown = db.align_sidecar_custody(&[1, 9], 40).unwrap().unwrap();
+        assert_eq!(
+            db.align_sidecar_custody(&[1, 5], 40, false).unwrap(),
+            CustodyAlignment::Unchanged
+        );
+        assert_eq!(
+            db.align_sidecar_custody(&[1], 40, false).unwrap(),
+            CustodyAlignment::Recorded
+        );
+        assert_eq!(meta(&db).sidecars.frontier, Some(20));
+        let CustodyAlignment::Restarted(grown) =
+            db.align_sidecar_custody(&[1, 9], 40, false).unwrap()
+        else {
+            panic!("custody growth must restart coverage");
+        };
         assert_eq!(grown.sidecars.frontier, Some(40));
         assert_eq!(grown.earliest_available_slot(15), 40);
         assert_eq!(db.sidecar_custody().unwrap(), Some(vec![1, 9]));
@@ -396,6 +460,59 @@ mod tests {
         db.backfill_mode().unwrap();
         let moved = db.commit_sidecar_coverage(grown.revision, 20).unwrap();
         assert_eq!(moved.sidecars.frontier, Some(20));
+    }
+
+    #[test]
+    fn unrecorded_custody_is_trusted_only_at_the_minimum() {
+        let dir = TempDir::new("legacy_custody").unwrap();
+        let blocks = chain(&[10, 20]);
+        let db = checkpoint_db(&dir, &blocks[1]);
+        db.confirm_anchor_sidecars(blocks[1].0).unwrap();
+        assert!(matches!(
+            db.align_sidecar_custody(&[1, 5], 40, false).unwrap(),
+            CustodyAlignment::Restarted(meta) if meta.sidecars.frontier == Some(40)
+        ));
+
+        let dir = TempDir::new("legacy_minimum_custody").unwrap();
+        let db = checkpoint_db(&dir, &blocks[1]);
+        db.confirm_anchor_sidecars(blocks[1].0).unwrap();
+        assert_eq!(
+            db.align_sidecar_custody(&[1, 5], 40, true).unwrap(),
+            CustodyAlignment::Recorded
+        );
+        assert_eq!(meta(&db).sidecars.frontier, Some(20));
+    }
+
+    #[test]
+    fn genesis_history_reports_missing_columns() {
+        let dir = TempDir::new("genesis_custody").unwrap();
+        let db = ReamDB::new(dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap();
+        let write = db.db.begin_write().unwrap();
+        {
+            let mut table = write.open_table(BOOTSTRAP).unwrap();
+            table.insert(MARKER, &[0u8][..]).unwrap();
+            table
+                .insert(GVR, B256::ZERO.as_ssz_bytes().as_slice())
+                .unwrap();
+        }
+        write.commit().unwrap();
+        assert_eq!(
+            db.align_sidecar_custody(&[1, 5], 40, false).unwrap(),
+            CustodyAlignment::Missing
+        );
+        assert_eq!(db.sidecar_custody().unwrap(), None);
+        assert_eq!(
+            db.align_sidecar_custody(&[1, 5], 40, true).unwrap(),
+            CustodyAlignment::Recorded
+        );
+        assert_eq!(
+            db.align_sidecar_custody(&[1, 9], 40, false).unwrap(),
+            CustodyAlignment::Missing
+        );
+        assert_eq!(db.sidecar_custody().unwrap(), Some(vec![1, 5]));
     }
 
     #[test]

@@ -14,7 +14,10 @@ use crate::{
     errors::StoreError,
     tables::{
         beacon::{
-            backfill::{BOOTSTRAP, BackfillMeta, BackfillMode, GVR, IN_PROGRESS, MARKER, META},
+            backfill::{
+                BOOTSTRAP, BackfillMeta, BackfillMode, GVR, IN_PROGRESS, MARKER, META,
+                SIDECAR_CUSTODY,
+            },
             beacon_state::STATE_FOLDER_NAME,
             blobs_and_proofs::BLOB_FOLDER_NAME,
             column_sidecars::COLUMN_FOLDER_NAME,
@@ -290,6 +293,8 @@ impl BeaconDB {
                 "Bootstrap was not started"
             );
             table.insert(GVR, genesis_validators_root.as_ssz_bytes().as_slice())?;
+            // No columns are held yet; the first startup records the custody.
+            table.insert(SIDECAR_CUSTODY, Vec::<u64>::new().as_ssz_bytes().as_slice())?;
             if let Some(meta) = meta {
                 table.insert(META, meta.as_ssz_bytes().as_slice())?;
                 table.insert(MARKER, &[1u8][..])?;
