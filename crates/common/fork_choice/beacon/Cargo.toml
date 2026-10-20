@@ -46,6 +46,7 @@ ream-storage.workspace = true
 ream-sync-committee-pool.workspace = true
 
 [dev-dependencies]
+snap.workspace = true
 tempdir.workspace = true
 
 [lints]
