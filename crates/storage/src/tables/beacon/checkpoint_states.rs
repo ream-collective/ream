@@ -163,7 +163,8 @@ impl CheckpointStatesTable {
         self.cache.is_some()
     }
 
-    fn in_memory(&self, checkpoint: Checkpoint) -> Option<Arc<BeaconState>> {
+    /// The checkpoint state if it is in memory, without building a missing one.
+    pub fn in_memory(&self, checkpoint: Checkpoint) -> Option<Arc<BeaconState>> {
         self.cache
             .as_ref()?
             .checkpoint_states

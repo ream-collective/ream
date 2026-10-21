@@ -3289,12 +3289,31 @@ impl BeaconState {
 
         self.process_slots_from_root(compute_start_slot_at_epoch(block_epoch), pre_state_root)?;
         let epoch_start_state = self.clone();
+        self.state_transition_from_epoch_start(signed_block, validate_result, execution_engine)
+            .await?;
+        Ok(Some(epoch_start_state))
+    }
+
+    /// ``state_transition`` for a pre-state already advanced to the first slot of the block's
+    /// epoch, such as a checkpoint state built before the block arrived. The epoch processing is
+    /// then already done.
+    pub async fn state_transition_from_epoch_start(
+        &mut self,
+        signed_block: &SignedBeaconBlock,
+        validate_result: bool,
+        execution_engine: &Option<impl ExecutionApi>,
+    ) -> anyhow::Result<()> {
+        let block_slot = signed_block.message.slot;
+        ensure!(
+            self.slot == compute_start_slot_at_epoch(compute_epoch_at_slot(block_slot)),
+            "pre-state slot {} is not the first slot of block slot {block_slot}'s epoch",
+            self.slot
+        );
         if self.slot < block_slot {
             self.process_slots(block_slot)?;
         }
         self.process_signed_block(signed_block, validate_result, execution_engine)
-            .await?;
-        Ok(Some(epoch_start_state))
+            .await
     }
 
     /// The part of ``state_transition`` after ``process_slots``.

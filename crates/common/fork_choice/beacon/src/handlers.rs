@@ -106,33 +106,65 @@ pub async fn on_block_with_root(
     )?;
     ensure!(store.db.finalized_checkpoint_provider().get()?.root == finalized_checkpoint_block);
     // Check the block is valid and compute the post-state
-    // Make a copy of the state to avoid mutability issues
-    let mut state = Arc::unwrap_or_clone(
-        store
-            .db
-            .state_provider()
-            .get_shared(parent_root)?
-            .ok_or_else(|| anyhow!("beacon state not found"))?,
-    );
     // The parent state is the parent block's post-state, and the parent block commits to its root,
     // which was checked when the parent was imported.
-    let parent_state_root = store
+    let parent_block = store
         .db
         .block_provider()
         .get(parent_root)?
         .ok_or_else(|| anyhow!("parent block not found"))?
-        .message
-        .state_root;
+        .message;
+    let block_epoch = compute_epoch_at_slot(block_slot);
+    let epoch_start_checkpoint = Checkpoint {
+        epoch: block_epoch,
+        root: parent_root,
+    };
+    // The parent state advanced to this epoch's first slot, when it was built before the block
+    // came: by the state advance at the end of the previous epoch, or for an attestation target.
+    // Starting from it skips the epoch processing, about 1 s on mainnet.
+    let advanced_parent_state = if compute_epoch_at_slot(parent_block.slot) < block_epoch {
+        store
+            .db
+            .checkpoint_states_provider()
+            .in_memory(epoch_start_checkpoint)
+    } else {
+        None
+    };
+    let advanced_pre_state = advanced_parent_state.is_some();
+    let (mut state, epoch_start_state) = match advanced_parent_state {
+        Some(epoch_start_state) => (
+            Arc::unwrap_or_clone(epoch_start_state.clone()),
+            Some(epoch_start_state),
+        ),
+        None => (
+            Arc::unwrap_or_clone(
+                store
+                    .db
+                    .state_provider()
+                    .get_shared(parent_root)?
+                    .ok_or_else(|| anyhow!("beacon state not found"))?,
+            ),
+            None,
+        ),
+    };
     let state_loaded = started.elapsed();
     let state_transition_timer = BEACON_BLOCK_STATE_TRANSITION_SECONDS.start_timer();
-    let epoch_start_state = state
-        .state_transition_keeping_epoch_start(
-            signed_block,
-            true,
-            execution_engine,
-            Some(parent_state_root),
-        )
-        .await?;
+    let epoch_start_state = if advanced_pre_state {
+        state
+            .state_transition_from_epoch_start(signed_block, true, execution_engine)
+            .await?;
+        epoch_start_state
+    } else {
+        state
+            .state_transition_keeping_epoch_start(
+                signed_block,
+                true,
+                execution_engine,
+                Some(parent_block.state_root),
+            )
+            .await?
+            .map(Arc::new)
+    };
     state_transition_timer.observe_duration();
     let transitioned = started.elapsed();
     tracing::debug!(
@@ -140,13 +172,13 @@ pub async fn on_block_with_root(
         slot = block_slot,
         checks_and_state_load_ms = state_loaded.as_millis() as u64,
         state_transition_ms = (transitioned - state_loaded).as_millis() as u64,
+        advanced_pre_state,
         "timing: on_block"
     );
     // The checkpoint state of the block's epoch is at hand in two cases: the block is at the
     // epoch's first slot, and then its post-state is that checkpoint state; or the first slot was
     // skipped, and then the epoch-start state is the parent's checkpoint state. Its fork choice
     // balances are cached for when the checkpoint becomes justified.
-    let block_epoch = compute_epoch_at_slot(block_slot);
     if block_slot == compute_start_slot_at_epoch(block_epoch) {
         store.cache_fork_choice_balances(
             Checkpoint {
@@ -156,22 +188,16 @@ pub async fn on_block_with_root(
             &state,
         );
     } else if let Some(epoch_start_state) = &epoch_start_state {
-        store.cache_fork_choice_balances(
-            Checkpoint {
-                epoch: block_epoch,
-                root: parent_root,
-            },
-            epoch_start_state,
-        );
+        store.cache_fork_choice_balances(epoch_start_checkpoint, epoch_start_state);
     }
-    if let Some(epoch_start_state) = epoch_start_state {
-        store.db.checkpoint_states_provider().insert_shared(
-            Checkpoint {
-                epoch: compute_epoch_at_slot(block_slot),
-                root: parent_root,
-            },
-            Arc::new(epoch_start_state),
-        );
+    // An advanced parent state is in memory already.
+    if let Some(epoch_start_state) = epoch_start_state
+        && !advanced_pre_state
+    {
+        store
+            .db
+            .checkpoint_states_provider()
+            .insert_shared(epoch_start_checkpoint, epoch_start_state);
     }
 
     let pending = PendingBlock {

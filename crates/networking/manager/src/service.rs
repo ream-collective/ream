@@ -560,6 +560,29 @@ fn start_unknown_parent_lookup(
     }
 }
 
+/// How far into a slot, in basis points of the slot, the head state is advanced through a coming
+/// epoch boundary. Lighthouse's state advance runs at three quarters of each slot: the slot's
+/// block has usually come by then, and the next block is still seconds away.
+const STATE_ADVANCE_SLOT_BPS: u64 = 7_500;
+
+/// The epoch the head state is advanced into during `slot`: the next one, when `slot` is the last
+/// slot of its epoch.
+fn epoch_to_advance_into(slot: u64) -> Option<u64> {
+    (slot + 1)
+        .is_multiple_of(SLOTS_PER_EPOCH)
+        .then(|| (slot + 1) / SLOTS_PER_EPOCH)
+}
+
+/// Advances the head state into the next epoch in the background when `slot` is the last slot
+/// of an epoch; see `BeaconChain::advance_head_to_next_epoch`.
+fn spawn_state_advance(beacon_chain: &Arc<BeaconChain>, slot: u64) {
+    let Some(next_epoch) = epoch_to_advance_into(slot) else {
+        return;
+    };
+    let beacon_chain = beacon_chain.clone();
+    tokio::spawn(async move { beacon_chain.advance_head_to_next_epoch(next_epoch).await });
+}
+
 async fn reconcile_block_lookup_state(
     beacon_chain: &BeaconChain,
     roots: Vec<alloy_primitives::B256>,
@@ -779,6 +802,14 @@ impl NetworkManagerService {
         // A tick delayed by a busy loop is skipped rather than replayed, so later ticks stay at
         // slot starts.
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut state_advance_interval = interval_at(
+            first_slot_tick + Duration::from_millis(seconds_per_slot * STATE_ADVANCE_SLOT_BPS / 10),
+            Duration::from_secs(seconds_per_slot),
+        );
+        state_advance_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // The slot whose state advance has run, so a head block that comes later in that slot is
+        // advanced too.
+        let mut state_advance_slot = None;
         let mut block_import_receiver = beacon_chain.subscribe_block_imports();
         let mut block_import_receiver_active = true;
         let mut block_lookup_coordinator =
@@ -966,6 +997,11 @@ impl NetworkManagerService {
                                 ream_chain_beacon::beacon_chain::BlockImportEvent::Imported { block_root } => {
                                     unknown_parent_lookups.block_imported(block_root);
                                     column_fetch_tracker.remove(&block_root);
+                                    if let Some(slot) = state_advance_slot
+                                        && beacon_chain.head().is_ok_and(|head| head.current_slot == slot)
+                                    {
+                                        spawn_state_advance(&beacon_chain, slot);
+                                    }
                                 }
                                 ream_chain_beacon::beacon_chain::BlockImportEvent::PendingAvailability { block_root } => {
                                     unknown_parent_lookups.block_pending_availability(block_root);
@@ -1121,6 +1157,12 @@ impl NetworkManagerService {
                         set_backfill_running(false);
                         syncer_handle = block_range_syncer.start();
                         syncer_active = true;
+                    }
+                }
+                _ = state_advance_interval.tick() => {
+                    if let Ok(head) = beacon_chain.head() {
+                        state_advance_slot = Some(head.current_slot);
+                        spawn_state_advance(&beacon_chain, head.current_slot);
                     }
                 }
                 // Advance the chain clock and prune stale lookup state.
@@ -1372,6 +1414,14 @@ impl NetworkManagerService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_head_state_is_advanced_in_the_last_slot_of_each_epoch() {
+        assert_eq!(epoch_to_advance_into(SLOTS_PER_EPOCH - 1), Some(1));
+        assert_eq!(epoch_to_advance_into(10 * SLOTS_PER_EPOCH - 1), Some(10));
+        assert_eq!(epoch_to_advance_into(10 * SLOTS_PER_EPOCH), None);
+        assert_eq!(epoch_to_advance_into(10 * SLOTS_PER_EPOCH - 2), None);
+    }
 
     #[test]
     fn the_slot_tick_runs_just_after_each_slot_start() {
