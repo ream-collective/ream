@@ -24,12 +24,19 @@ use ream_polynomial_commitments::handlers::verify_data_column_sidecar_kzg_proofs
 use ream_req_resp::beacon::messages::{
     BeaconResponseMessage, data_column_sidecars::DataColumnsByRootIdentifier,
 };
-use ream_storage::tables::table::{CustomTable, REDBTable};
+use ream_storage::tables::{
+    field::REDBField,
+    table::{CustomTable, REDBTable},
+};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 use tree_hash::TreeHash;
 
-use crate::{block_lookup::ensure_pending_item_is_importable_with_store, p2p_sender::P2PSender};
+use crate::{
+    block_lookup::ensure_pending_item_is_importable_with_store,
+    p2p_sender::P2PSender,
+    timing::{ColumnSource, log_columns_received},
+};
 
 /// If no untried peer is available for 30 seconds, the fetch is parked. This matches Lighthouse's
 /// stale no-peer timeout for custody requests; transiently failed peers may also be retried then.
@@ -323,6 +330,15 @@ pub async fn fetch_missing_columns(
         .collect::<Vec<_>>();
     let parent_root = expected_header.message.parent_root;
     let slot = expected_header.message.slot;
+    if let Ok(genesis_time) = beacon_chain.db().genesis_time_provider().get() {
+        log_columns_received(
+            genesis_time,
+            slot,
+            columns.iter().map(|column| column.index),
+            ColumnSource::ByRoot,
+            Some(&peer_id),
+        );
+    }
     if let Err(err) = beacon_chain
         .import_data_column_sidecars_if(columns, move |store| {
             if let Some(imported_block) = store.db.block_provider().get(block_root)? {
@@ -464,6 +480,15 @@ async fn fetch_anchor_columns(
             }
         };
         let complete = columns.len() == missing.len();
+        if let Ok(genesis_time) = chain.db().genesis_time_provider().get() {
+            log_columns_received(
+                genesis_time,
+                header.message.slot,
+                columns.iter().map(|column| column.index),
+                ColumnSource::ByRoot,
+                Some(&peer),
+            );
+        }
         let db = chain.db().clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             ensure!(

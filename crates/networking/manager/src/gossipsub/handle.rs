@@ -1,6 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::ensure;
+use libp2p::PeerId;
 pub use libp2p::gossipsub::{Message, MessageAcceptance};
 use ream_chain_beacon::beacon_chain::{BeaconChain, BlockProcessingOutcome};
 use ream_consensus_beacon::{
@@ -18,7 +19,10 @@ use ream_p2p::gossipsub::beacon::{
     message::GossipsubMessage,
     topics::{GossipTopic, GossipTopicKind},
 };
-use ream_storage::{cache::BeaconCacheDB, tables::table::CustomTable};
+use ream_storage::{
+    cache::BeaconCacheDB,
+    tables::{field::REDBField, table::CustomTable},
+};
 use ream_validator_beacon::{
     attestation::single_attestation_to_attestation, blob_sidecars::compute_subnet_for_blob_sidecar,
     constants::SYNC_COMMITTEE_SUBNET_COUNT,
@@ -44,6 +48,7 @@ use crate::{
         sync_committee_contribution_and_proof::validate_sync_committee_contribution_and_proof,
         voluntary_exit::validate_voluntary_exit,
     },
+    timing::{ColumnSource, log_block_proposer, log_columns_received},
 };
 
 pub struct UnknownParentGossipBlock {
@@ -219,6 +224,7 @@ pub async fn handle_gossipsub_message(
     cached_db: &BeaconCacheDB,
     pending_item: &mut Option<PendingGossipItem>,
     unknown_parent_block: &mut Option<UnknownParentGossipBlock>,
+    propagation_source: PeerId,
     on_valid_block: impl FnOnce(&SignedBeaconBlock),
 ) -> MessageAcceptance {
     match GossipsubMessage::decode(&message.topic, &message.data) {
@@ -258,6 +264,9 @@ pub async fn handle_gossipsub_message(
                 let acceptance = dependency_message_acceptance(&validation_result);
                 match validation_result {
                     DependencyValidationResult::Accept => {
+                        if let Ok(genesis_time) = beacon_chain.db().genesis_time_provider().get() {
+                            log_block_proposer(genesis_time, &signed_block);
+                        }
                         on_valid_block(&signed_block);
                         match beacon_chain.process_block(*signed_block).await {
                             Ok(BlockProcessingOutcome::Imported { .. }) => {}
@@ -616,6 +625,15 @@ pub async fn handle_gossipsub_message(
                 let acceptance = dependency_message_acceptance(&validation_result);
                 match validation_result {
                     DependencyValidationResult::Accept => {
+                        if let Ok(genesis_time) = beacon_chain.db().genesis_time_provider().get() {
+                            log_columns_received(
+                                genesis_time,
+                                data_column_sidecar.signed_block_header.message.slot,
+                                [data_column_sidecar.index],
+                                ColumnSource::Gossip,
+                                Some(&propagation_source),
+                            );
+                        }
                         if let Err(err) =
                             import_validated_data_column(beacon_chain, *data_column_sidecar).await
                         {
@@ -833,6 +851,7 @@ mod tests {
             &cached_db,
             &mut pending_item,
             &mut unknown_parent_block,
+            PeerId::random(),
             |_| {},
         )
         .await;
