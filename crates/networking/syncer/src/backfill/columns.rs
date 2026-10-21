@@ -1,7 +1,7 @@
 //! A bounded sidecar pass over the verified block hash chain. A few consecutive batches below
 //! the frontier download together and commit in order, so coverage stays contiguous.
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -172,6 +172,48 @@ type Groups = BTreeMap<PeerId, Vec<u64>>;
 /// Columns of one batch, grouped by the peer that sent them.
 type Responses = Vec<(PeerId, Vec<DataColumnSidecar>)>;
 
+/// Verifies and commits downloaded batches; returns the committed coverage and a faulty peer.
+type Worker = tokio::task::JoinHandle<anyhow::Result<(Option<BackfillMeta>, Option<PeerId>)>>;
+
+/// Verifies and commits complete batches in order. Any pause or resume since the step started
+/// cancels it, before verification and again before anything is published.
+fn process(
+    db: &BeaconDB,
+    downloaded: Vec<(Batch, Responses)>,
+    running: &watch::Receiver<bool>,
+) -> anyhow::Result<(Option<BackfillMeta>, Option<PeerId>)> {
+    let cancelled = || !*running.borrow() || running.has_changed().unwrap_or(true);
+    let mut committed = None;
+    for (batch, responses) in downloaded {
+        if cancelled() {
+            break;
+        }
+        let verify_timer = BEACON_BACKFILL_VERIFY_SECONDS.start_timer();
+        let invalid = invalid_supplier(&responses);
+        drop(verify_timer);
+        if invalid.is_some() {
+            return Ok((committed, invalid));
+        }
+        if cancelled() {
+            break;
+        }
+        let columns = responses
+            .into_iter()
+            .flat_map(|(_, columns)| columns)
+            .collect::<Vec<_>>();
+        let count = columns.len();
+        db.column_sidecars_provider().insert_batch(columns)?;
+        match commit_coverage(db, batch.from, batch.to)? {
+            Some(meta) => {
+                BEACON_BACKFILL_COLUMNS_COMMITTED_TOTAL.inc_by(count as u64);
+                committed = Some(meta);
+            }
+            None => break,
+        }
+    }
+    Ok((committed, None))
+}
+
 /// Returns the first peer whose columns fail the proofs. Headers and commitments were matched
 /// against stored blocks on receipt.
 fn invalid_supplier(responses: &Responses) -> Option<PeerId> {
@@ -196,6 +238,7 @@ impl ColumnBackfill {
         let mut banned = HashMap::new();
         let mut requests = HashMap::<PeerId, u64>::new();
         let mut last_log = Instant::now();
+        let mut worker = None;
         loop {
             if !*running.borrow_and_update() {
                 if running.changed().await.is_err() {
@@ -216,12 +259,16 @@ impl ColumnBackfill {
                 info!(frontier_slot = ?meta.sidecars.frontier, "Column backfill complete");
                 return;
             }
+            // A paused step's worker stops at its next check; its payloads go before new ones.
+            if let Some(handle) = worker.take() {
+                let _ = handle.await;
+            }
             // Dropping the batch future drops every callback and aborts its download tasks.
             let active = running.clone();
             let result = tokio::select! {
                 biased;
                 changed = running.changed() => { if changed.is_err() { return; } continue; },
-                result = self.step(&active, &mut banned, &mut requests) => result,
+                result = self.step(&active, &mut banned, &mut requests, &mut worker) => result,
             };
             match result {
                 Ok(Some(meta)) => {
@@ -246,6 +293,7 @@ impl ColumnBackfill {
         running: &watch::Receiver<bool>,
         banned: &mut HashMap<PeerId, Instant>,
         requests: &mut HashMap<PeerId, u64>,
+        worker: &mut Option<Worker>,
     ) -> anyhow::Result<Option<BackfillMeta>> {
         let meta = match self.db.cached_backfill_mode()? {
             BackfillMode::Checkpoint(meta) => meta,
@@ -320,35 +368,12 @@ impl ColumnBackfill {
         }
         let db = self.db.clone();
         let running = running.clone();
-        let (meta, invalid) = tokio::task::spawn_blocking(move || {
-            let mut committed = None;
-            for (batch, responses) in downloaded {
-                if !*running.borrow() || running.has_changed().is_err() {
-                    break;
-                }
-                let verify_timer = BEACON_BACKFILL_VERIFY_SECONDS.start_timer();
-                let invalid = invalid_supplier(&responses);
-                drop(verify_timer);
-                if invalid.is_some() {
-                    return Ok((committed, invalid));
-                }
-                let columns = responses
-                    .into_iter()
-                    .flat_map(|(_, columns)| columns)
-                    .collect::<Vec<_>>();
-                let count = columns.len();
-                db.column_sidecars_provider().insert_batch(columns)?;
-                match commit_coverage(&db, batch.from, batch.to)? {
-                    Some(meta) => {
-                        BEACON_BACKFILL_COLUMNS_COMMITTED_TOTAL.inc_by(count as u64);
-                        committed = Some(meta);
-                    }
-                    None => break,
-                }
-            }
-            anyhow::Ok((committed, None))
-        })
-        .await??;
+        // Kept by `run` when this step is dropped, so the next step waits for it.
+        let handle = worker.insert(tokio::task::spawn_blocking(move || {
+            process(&db, downloaded, &running)
+        }));
+        let (meta, invalid) = handle.await??;
+        *worker = None;
         if let Some(peer) = invalid {
             warn!(?peer, "Invalid historical column proof");
             banned.insert(peer, Instant::now());
@@ -432,51 +457,45 @@ impl ColumnBackfill {
         let mut tasks = JoinSet::new();
         let mut queue = groups
             .into_iter()
-            .map(|(peer, columns)| (peer, columns, None::<Vec<B256>>, 1))
+            .map(|(peer, columns)| (peer, columns, None::<BTreeMap<B256, Vec<u64>>>, 1))
             .collect::<VecDeque<_>>();
         loop {
             while let Some((peer, columns, roots, attempt)) = queue.pop_front() {
                 *tried.entry(peer).or_default() += 1;
                 let sender = self.sender.clone();
-                let (blocks, limit, by_root) = match &roots {
+                let (want, blocks, limit) = match &roots {
                     None => (
+                        Want::Range(columns.clone()),
                         batch.blocks.clone(),
                         // The sum of group budgets is the batch budget, independent of
                         // concurrency.
                         batch.max_bytes * columns.len() / self.custody.columns.len(),
-                        false,
                     ),
                     Some(roots) => {
-                        let blocks = roots
-                            .iter()
-                            .filter_map(|root| Some((*root, batch.blocks.get(root)?.clone())))
-                            .collect::<BTreeMap<_, _>>();
-                        let limit = blocks
-                            .values()
-                            .map(|block| {
-                                (block.message.body.blob_kzg_commitments.len() * (2048 + 48 + 48)
-                                    + 512)
-                                    * columns.len()
-                            })
-                            .sum();
-                        (blocks, limit, true)
+                        let mut blocks = BTreeMap::new();
+                        let mut limit = 0;
+                        for (root, missing) in roots {
+                            let Some(block) = batch.blocks.get(root) else {
+                                continue;
+                            };
+                            limit += (block.message.body.blob_kzg_commitments.len()
+                                * (2048 + 48 + 48)
+                                + 512)
+                                * missing.len();
+                            blocks.insert(*root, block.clone());
+                        }
+                        (Want::Roots(roots.clone()), blocks, limit)
                     }
                 };
+                let by_root = roots.is_some();
                 let range = batch.from..batch.to;
                 let permits = permits.clone();
                 tasks.spawn(async move {
                     let _permit = permits.acquire_owned().await;
                     let started = Instant::now();
-                    let response = receive_columns(
-                        sender,
-                        peer,
-                        range.clone(),
-                        columns.clone(),
-                        Arc::new(blocks),
-                        limit,
-                        by_root,
-                    )
-                    .await;
+                    let response =
+                        receive_columns(sender, peer, range.clone(), want, Arc::new(blocks), limit)
+                            .await;
                     debug!(
                         ?peer,
                         from = range.start,
@@ -512,15 +531,23 @@ impl ColumnBackfill {
                 }
                 ColumnResponse::Unavailable(_) => false,
             };
-            let scope = roots.unwrap_or_else(|| batch.blocks.keys().copied().collect());
+            let scope = roots.unwrap_or_else(|| {
+                batch
+                    .blocks
+                    .keys()
+                    .map(|root| (*root, columns.clone()))
+                    .collect()
+            });
             let missing_roots = scope
                 .into_iter()
-                .filter(|root| {
-                    columns
-                        .iter()
-                        .any(|index| !received.contains(&(*root, *index)))
+                .filter_map(|(root, wanted)| {
+                    let missing = wanted
+                        .into_iter()
+                        .filter(|index| !received.contains(&(root, *index)))
+                        .collect::<Vec<_>>();
+                    (!missing.is_empty()).then_some((root, missing))
                 })
-                .collect::<Vec<_>>();
+                .collect::<BTreeMap<_, _>>();
             if missing_roots.is_empty() {
                 continue;
             }
@@ -531,14 +558,12 @@ impl ColumnBackfill {
             if attempt >= MAX_COLUMN_ATTEMPTS {
                 continue;
             }
-            let missing = columns
-                .iter()
+            let missing = missing_roots
+                .values()
+                .flatten()
                 .copied()
-                .filter(|index| {
-                    missing_roots
-                        .iter()
-                        .any(|root| !received.contains(&(*root, *index)))
-                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
                 .collect::<Vec<_>>();
             let mut load = lock(load);
             let Some(replacement) = peers
@@ -637,20 +662,37 @@ impl ColumnResponse {
     }
 }
 
+/// The columns one request asks for: the same columns for a slot range, or exact columns per root.
+enum Want {
+    Range(Vec<u64>),
+    Roots(BTreeMap<B256, Vec<u64>>),
+}
+
+impl Want {
+    fn contains(&self, root: &B256, index: u64) -> bool {
+        match self {
+            Self::Range(columns) => columns.contains(&index),
+            Self::Roots(roots) => roots
+                .get(root)
+                .is_some_and(|columns| columns.contains(&index)),
+        }
+    }
+}
+
 async fn receive_columns(
     sender: mpsc::UnboundedSender<P2PMessage>,
     peer: PeerId,
     range: std::ops::Range<u64>,
-    columns: Vec<u64>,
+    want: Want,
     blocks: Arc<BTreeMap<B256, SignedBeaconBlock>>,
     limit: usize,
-    by_root: bool,
 ) -> ColumnResponse {
     let (callback, mut receiver) = mpsc::channel(1);
-    let request = if by_root {
-        let identifiers = blocks
-            .keys()
-            .map(|root| DataColumnsByRootIdentifier::new(*root, columns.clone()))
+    let by_root = matches!(want, Want::Roots(_));
+    let request = if let Want::Roots(roots) = &want {
+        let identifiers = roots
+            .iter()
+            .map(|(root, columns)| DataColumnsByRootIdentifier::new(*root, columns.clone()))
             .collect::<Result<Vec<_>, _>>();
         let Ok(identifiers) = identifiers else {
             return ColumnResponse::Unavailable("bad identifiers".into());
@@ -661,6 +703,9 @@ async fn receive_columns(
             callback,
         }
     } else {
+        let Want::Range(columns) = &want else {
+            unreachable!("by-root requests are built above");
+        };
         P2PRequest::DataColumnRange {
             peer_id: peer,
             start: range.start,
@@ -688,7 +733,7 @@ async fn receive_columns(
                     let Some(block) = blocks.get(&root) else {
                         return ColumnResponse::Fault("unrequested block root".into());
                     };
-                    if !columns.contains(&column.index) || !seen.insert((root, column.index)) {
+                    if !want.contains(&root, column.index) || !seen.insert((root, column.index)) {
                         return ColumnResponse::Fault("unrequested or duplicate column".into());
                     }
                     if !column.verify()
@@ -892,7 +937,12 @@ mod tests {
     async fn run_step(driver: &ColumnBackfill) -> Option<BackfillMeta> {
         let (_sender, running) = watch::channel(true);
         driver
-            .step(&running, &mut HashMap::new(), &mut HashMap::new())
+            .step(
+                &running,
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                &mut None,
+            )
             .await
             .unwrap()
     }
@@ -980,7 +1030,7 @@ mod tests {
         let mut banned = HashMap::new();
         assert!(
             driver
-                .step(&running, &mut banned, &mut HashMap::new())
+                .step(&running, &mut banned, &mut HashMap::new(), &mut None)
                 .await
                 .unwrap()
                 .is_none()
@@ -1307,6 +1357,148 @@ mod tests {
         assert!(a.unwrap().0.is_some() && b.unwrap().0.is_some());
         assert_eq!(peak.load(Ordering::SeqCst), 1);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn root_retries_ask_only_for_each_roots_missing_columns() {
+        let fixture = fixture();
+        let second = add_supernode(&fixture.network);
+        let base = fixture.meta.blocks.frontier.oldest_block_slot;
+        let batch = plan_batch(&fixture.db, &fixture.meta, base, 128 * 1024 * 1024, 2)
+            .unwrap()
+            .unwrap();
+        let roots = batch.blocks.keys().copied().collect::<Vec<_>>();
+        // The range answer lacks column 0 of the first block and column 1 of the second.
+        let dropped = [(roots[0], 0), (roots[1], 1)];
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = asked.clone();
+        let columns = fixture.columns.clone();
+        let server = tokio::spawn(async move {
+            while let Some(P2PMessage::Request(request)) = receiver.recv().await {
+                let (selected, callback, by_root) = match request {
+                    P2PRequest::DataColumnRange {
+                        columns: indices,
+                        callback,
+                        ..
+                    } => (
+                        columns
+                            .iter()
+                            .filter(|column| {
+                                indices.contains(&column.index)
+                                    && !dropped.contains(&(
+                                        column.signed_block_header.message.tree_hash_root(),
+                                        column.index,
+                                    ))
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                        callback,
+                        false,
+                    ),
+                    P2PRequest::DataColumnIdentifiers {
+                        column_identifiers,
+                        callback,
+                        ..
+                    } => {
+                        let wanted = column_identifiers
+                            .iter()
+                            .flat_map(|id| id.columns.iter().map(|index| (id.block_root, *index)))
+                            .collect::<Vec<_>>();
+                        record.lock().unwrap().extend(wanted.iter().copied());
+                        (
+                            columns
+                                .iter()
+                                .filter(|column| {
+                                    wanted.contains(&(
+                                        column.signed_block_header.message.tree_hash_root(),
+                                        column.index,
+                                    ))
+                                })
+                                .cloned()
+                                .collect(),
+                            callback,
+                            true,
+                        )
+                    }
+                    _ => panic!("unexpected request"),
+                };
+                for column in selected {
+                    let response = if by_root {
+                        BeaconResponseMessage::DataColumnSidecarsByRoot(column)
+                    } else {
+                        BeaconResponseMessage::DataColumnSidecarsByRange(column)
+                    };
+                    let _ = callback
+                        .send(Ok(P2PCallbackResponse::ResponseMessage(Arc::new(response))))
+                        .await;
+                }
+                let _ = callback.send(Ok(P2PCallbackResponse::EndOfStream)).await;
+            }
+        });
+        let driver = ColumnBackfill {
+            db: fixture.db.clone(),
+            sender,
+            network: fixture.network.clone(),
+            config: BackfillConfig::default(),
+            rate_limit: false,
+            custody: ColumnCustody {
+                group_count: 2,
+                columns: vec![0, 1],
+            },
+        };
+        let first = fixture
+            .network
+            .connected_peers()
+            .into_iter()
+            .find(|peer| peer.peer_id != second)
+            .unwrap()
+            .peer_id;
+        let (responses, faults) = driver
+            .fetch(
+                &batch,
+                &fixture.network.connected_peers(),
+                Groups::from([(first, vec![0, 1])]),
+                &HashMap::new(),
+                &Mutex::new(Load::default()),
+                &Arc::new(Semaphore::new(5)),
+            )
+            .await
+            .unwrap();
+        assert!(responses.is_some());
+        assert_eq!(faults.len(), 1);
+        let mut asked = asked.lock().unwrap().clone();
+        asked.sort();
+        let mut expected = dropped.to_vec();
+        expected.sort();
+        assert_eq!(asked, expected);
+        server.abort();
+    }
+
+    #[test]
+    fn a_pause_or_resume_cancels_processing_before_publication() {
+        let fixture = fixture();
+        let base = fixture.meta.blocks.frontier.oldest_block_slot;
+        let downloaded = || {
+            let batch = plan_batch(&fixture.db, &fixture.meta, base, 128 * 1024 * 1024, 128)
+                .unwrap()
+                .unwrap();
+            vec![(batch, vec![(PeerId::random(), fixture.columns.clone())])]
+        };
+        let (sender, running) = watch::channel(true);
+        let session = running.clone();
+        sender.send(false).unwrap();
+        sender.send(true).unwrap();
+        assert_eq!(
+            process(&fixture.db, downloaded(), &session).unwrap(),
+            (None, None)
+        );
+        assert_eq!(current(&fixture.db).sidecars, fixture.meta.sidecars);
+        let mut fresh = running.clone();
+        fresh.borrow_and_update();
+        let (committed, invalid) = process(&fixture.db, downloaded(), &fresh).unwrap();
+        assert!(invalid.is_none());
+        assert_eq!(committed.unwrap().sidecars.frontier, Some(base));
     }
 
     #[test]

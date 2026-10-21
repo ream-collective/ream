@@ -452,9 +452,10 @@ impl BeaconDB {
         let cutoff = current_slot
             .saturating_sub(min_retention_slots)
             .min(finalized_slot);
-        let mut blocks_to_retain = HashSet::new();
-        // slot_index omits abandoned forks. Inspect only roots with blob files, retaining recent
-        // fork blocks and roots not imported yet, rather than treating either as old history.
+        let mut expired = HashSet::new();
+        // slot_index omits abandoned forks. Inspect only roots with blob files and delete only
+        // those whose stored block is old, so recent forks, roots not imported yet and files
+        // published during the scan survive.
         for entry in std::fs::read_dir(
             self.data_dir
                 .join(crate::tables::beacon::blobs_and_proofs::BLOB_FOLDER_NAME),
@@ -471,16 +472,13 @@ impl BeaconDB {
             if self
                 .block_provider()
                 .get(root)?
-                .is_none_or(|block| block.message.slot >= cutoff)
+                .is_some_and(|block| block.message.slot < cutoff)
             {
-                blocks_to_retain.insert(root);
+                expired.insert(root);
             }
         }
 
-        // Prune blobs not in the retention set
-        let pruned_count = self
-            .blobs_and_proofs_provider()
-            .prune_old_blobs(&blocks_to_retain)?;
+        let pruned_count = self.blobs_and_proofs_provider().prune_old_blobs(&expired)?;
 
         Ok(pruned_count)
     }

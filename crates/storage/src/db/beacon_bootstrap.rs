@@ -424,6 +424,14 @@ mod tests {
             [1],
         )
         .unwrap();
+        // An abandoned checkpoint may already be indexed as canonical.
+        let write = beacon.db.begin_write().unwrap();
+        write
+            .open_table(crate::db::beacon_canonical::CANONICAL_ROOTS)
+            .unwrap()
+            .insert(7, B256::repeat_byte(7))
+            .unwrap();
+        write.commit().unwrap();
         assert!(beacon.recover_interrupted_bootstrap().unwrap());
         assert!(beacon.recover_interrupted_bootstrap().unwrap());
         assert!(beacon.bootstrap_in_progress().unwrap());
@@ -443,6 +451,7 @@ mod tests {
                 .count(),
             0
         );
+        assert_eq!(beacon.canonical_root_before(u64::MAX).unwrap(), None);
     }
 
     #[test]

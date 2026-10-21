@@ -5,9 +5,9 @@ use redb::{MultimapTableDefinition, TableDefinition};
 use crate::tables::ssz_encoder::SSZEncoding;
 
 pub(crate) const COLUMN_ROOTS_BY_SLOT: MultimapTableDefinition<u64, SSZEncoding<B256>> =
-    MultimapTableDefinition::new("column_roots_by_slot");
+    MultimapTableDefinition::new("beacon_column_roots_by_slot");
 pub(crate) const COLUMN_MAINTENANCE: TableDefinition<&str, u64> =
-    TableDefinition::new("column_maintenance");
+    TableDefinition::new("beacon_column_maintenance");
 pub(crate) const INDEX_VERSION: &str = "index_version";
 pub(crate) const PRUNED_BEFORE: &str = "pruned_before";
 

@@ -43,7 +43,7 @@ impl BlobsAndProofsTable {
     /// Prune blobs older than the specified slot by removing their associated block roots
     pub fn prune_old_blobs(
         &self,
-        blocks_to_retain: &std::collections::HashSet<B256>,
+        expired: &std::collections::HashSet<B256>,
     ) -> Result<usize, StoreError> {
         let blob_dir = self.data_dir.join(BLOB_FOLDER_NAME);
 
@@ -67,8 +67,7 @@ impl BlobsAndProofsTable {
             if let Some(filename) = path.file_name().and_then(|n| n.to_str())
                 && let Some(block_root_str) = filename.split('_').next()
                 && let Ok(block_root) = block_root_str.parse::<B256>()
-                // If the block root is not in the retention set, remove the file
-                && !blocks_to_retain.contains(&block_root)
+                && expired.contains(&block_root)
             {
                 match crate::tables::sidecar_file::remove_published(&path, || Ok(())) {
                     Ok(_) => {
@@ -214,13 +213,7 @@ mod tests {
         assert!(table.get(blob_2)?.is_some());
         assert!(table.get(blob_3)?.is_some());
 
-        // Create a retention set that only includes block_root_2 and block_root_3
-        let mut blocks_to_retain = HashSet::new();
-        blocks_to_retain.insert(block_root_2);
-        blocks_to_retain.insert(block_root_3);
-
-        // Prune old blobs
-        let pruned_count = table.prune_old_blobs(&blocks_to_retain)?;
+        let pruned_count = table.prune_old_blobs(&HashSet::from([block_root_1]))?;
 
         // Should have pruned 1 blob (blob_1)
         assert_eq!(pruned_count, 1);
@@ -234,8 +227,8 @@ mod tests {
     }
 
     #[test]
-    fn test_prune_with_empty_retention_set() -> Result<(), StoreError> {
-        let tmp_dir = TempDir::new("test_prune_with_empty_retention_set")?;
+    fn test_prune_with_empty_expired_set() -> Result<(), StoreError> {
+        let tmp_dir = TempDir::new("test_prune_with_empty_expired_set")?;
 
         let blob_dir = tmp_dir.path().to_path_buf().join(BLOB_FOLDER_NAME);
         fs::create_dir_all(&blob_dir)?;
@@ -253,15 +246,10 @@ mod tests {
         // Verify blob exists
         assert!(table.get(key)?.is_some());
 
-        // Prune with empty retention set (should remove all blobs)
-        let blocks_to_retain = HashSet::new();
-        let pruned_count = table.prune_old_blobs(&blocks_to_retain)?;
-
-        // Should have pruned 1 blob
-        assert_eq!(pruned_count, 1);
-
-        // Verify blob is gone
-        assert!(table.get(key)?.is_none());
+        // Blobs not known to be expired, such as ones published during a scan, stay.
+        let pruned_count = table.prune_old_blobs(&HashSet::new())?;
+        assert_eq!(pruned_count, 0);
+        assert!(table.get(key)?.is_some());
 
         Ok(())
     }

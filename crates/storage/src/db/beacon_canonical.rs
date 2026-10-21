@@ -11,7 +11,7 @@ use crate::{
 };
 
 pub(crate) const CANONICAL_ROOTS: TableDefinition<u64, SSZEncoding<B256>> =
-    TableDefinition::new("canonical_block_roots");
+    TableDefinition::new("beacon_canonical_block_roots");
 
 pub(crate) fn record_finalized(write: &WriteTransaction, mut root: B256) -> Result<(), StoreError> {
     let blocks = write.open_table(BeaconBlockTable::TABLE_DEFINITION)?;
@@ -54,6 +54,9 @@ impl BeaconDB {
     /// A consistent finalized snapshot plus the ancestry of the caller's head snapshot. Imported
     /// forks and skipped slots never appear in this range. Historical backfill fills the same
     /// canonical table by hash linkage to the checkpoint origin.
+    ///
+    /// The head ancestry is used only when it passes through the latest finalized block of this
+    /// snapshot, so a stale head on an abandoned branch never mixes with finalized roots.
     pub fn canonical_roots_in_range(
         &self,
         mut head: B256,
@@ -70,26 +73,28 @@ impl BeaconDB {
             let (slot, root) = entry?;
             result.insert(slot.value(), root.value());
         }
+        let tip = canonical
+            .last()?
+            .map(|(slot, root)| (slot.value(), root.value()));
         let blocks = read.open_table(BeaconBlockTable::TABLE_DEFINITION)?;
-        loop {
+        let mut ancestry = Vec::new();
+        let descends = loop {
+            // Without finality the oldest stored block ends the chain; with it, a chain must
+            // reach the finalized block.
             let Some(block) = blocks.get(head)?.map(|block| block.value()) else {
-                break;
+                break tip.is_none();
             };
             let slot = block.message.slot;
-            if canonical
-                .get(slot)?
-                .is_some_and(|root| root.value() == head)
+            if let Some((tip_slot, tip_root)) = tip
+                && slot <= tip_slot
             {
-                break;
+                break head == tip_root;
             }
-            if slot < start {
-                break;
-            }
-            if slot < end {
-                result.insert(slot, head);
+            if (start..end).contains(&slot) {
+                ancestry.push((slot, head));
             }
             if slot == 0 {
-                break;
+                break true;
             }
             let parent = block.message.parent_root;
             if let Some(block) = blocks.get(parent)?.map(|block| block.value())
@@ -98,6 +103,9 @@ impl BeaconDB {
                 return Err(std::io::Error::other("Non-descending head ancestry").into());
             }
             head = parent;
+        };
+        if descends {
+            result.extend(ancestry);
         }
         Ok(result.into_iter().collect())
     }
@@ -172,5 +180,43 @@ mod tests {
             canonical[1..3]
         );
         assert_eq!(db.canonical_root_before(5).unwrap(), Some(canonical[1].1));
+    }
+
+    #[test]
+    fn a_stale_head_off_the_finalized_chain_adds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ReamDB::new(dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap();
+        let block = |slot, parent_root, tag| SignedBeaconBlock {
+            message: BeaconBlock {
+                slot,
+                parent_root,
+                state_root: B256::repeat_byte(tag),
+                ..Default::default()
+            },
+            signature: Default::default(),
+        };
+        let insert = |block: SignedBeaconBlock| {
+            let root = block.message.tree_hash_root();
+            db.block_provider().insert(root, block).unwrap();
+            root
+        };
+        let genesis = insert(block(0, B256::ZERO, 0));
+        let finalized = insert(block(2, genesis, 0));
+        let child = insert(block(4, finalized, 0));
+        // A branch from genesis that skips the finalized block.
+        let fork = insert(block(3, genesis, 1));
+        let stale = insert(block(6, fork, 1));
+        db.record_finalized_canonical(finalized).unwrap();
+        assert_eq!(
+            db.canonical_roots_in_range(stale, 0, 8).unwrap(),
+            vec![(0, genesis), (2, finalized)]
+        );
+        assert_eq!(
+            db.canonical_roots_in_range(child, 0, 8).unwrap(),
+            vec![(0, genesis), (2, finalized), (4, child)]
+        );
     }
 }
