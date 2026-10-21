@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 use super::{engine_trait::ExecutionApi, new_payload_request::NewPayloadRequest};
 
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, Clone)]
 pub struct MockExecutionEngine {
     execution_valid: bool,
 }

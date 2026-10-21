@@ -3188,29 +3188,15 @@ impl BeaconState {
 
         // Verify the execution payload is valid
         if let Some(execution_engine) = execution_engine {
-            let versioned_hashes = body
-                .blob_kzg_commitments
-                .iter()
-                .map(|commitment| commitment.calculate_versioned_hash())
-                .collect();
-            let new_payload_timer =
-                BEACON_ENGINE_NEW_PAYLOAD_REQUEST_DURATION_SECONDS.start_timer();
-            let new_payload_result = execution_engine
-                .verify_and_notify_new_payload(NewPayloadRequest {
-                    execution_payload: payload.clone(),
-                    versioned_hashes,
-                    parent_beacon_block_root: self.latest_block_header.parent_root,
-                    execution_requests: body.execution_requests.clone(),
-                })
-                .await;
-            let new_payload_seconds = new_payload_timer.stop_and_record();
-            tracing::debug!(
-                target: "ream::timing",
-                slot = self.slot,
-                new_payload_ms = (new_payload_seconds * 1000.0) as u64,
-                "timing: newPayload"
+            ensure!(
+                notify_new_payload(
+                    execution_engine,
+                    body,
+                    self.latest_block_header.parent_root,
+                    self.slot
+                )
+                .await?
             );
-            ensure!(new_payload_result?);
         }
 
         // Cache execution payload header
@@ -3847,6 +3833,37 @@ pub fn fork_name_from_version(version: [u8; 4]) -> ForkName {
         _ if version == beacon_network_spec().altair_fork_version => ForkName::Altair,
         _ => ForkName::Base,
     }
+}
+
+/// ``verify_and_notify_new_payload`` for a block's payload, timed.
+pub async fn notify_new_payload(
+    execution_engine: &impl ExecutionApi,
+    body: &BeaconBlockBody,
+    parent_beacon_block_root: B256,
+    slot: u64,
+) -> anyhow::Result<bool> {
+    let versioned_hashes = body
+        .blob_kzg_commitments
+        .iter()
+        .map(|commitment| commitment.calculate_versioned_hash())
+        .collect();
+    let timer = BEACON_ENGINE_NEW_PAYLOAD_REQUEST_DURATION_SECONDS.start_timer();
+    let result = execution_engine
+        .verify_and_notify_new_payload(NewPayloadRequest {
+            execution_payload: body.execution_payload.clone(),
+            versioned_hashes,
+            parent_beacon_block_root,
+            execution_requests: body.execution_requests.clone(),
+        })
+        .await;
+    let seconds = timer.stop_and_record();
+    tracing::debug!(
+        target: "ream::timing",
+        slot,
+        new_payload_ms = (seconds * 1000.0) as u64,
+        "timing: newPayload"
+    );
+    result
 }
 
 #[cfg(test)]

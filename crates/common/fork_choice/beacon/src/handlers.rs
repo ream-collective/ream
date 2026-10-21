@@ -8,7 +8,10 @@ use anyhow::{anyhow, ensure};
 use ream_consensus_beacon::{
     attestation::Attestation,
     attester_slashing::AttesterSlashing,
-    electra::{beacon_block::SignedBeaconBlock, beacon_state::BeaconState},
+    electra::{
+        beacon_block::SignedBeaconBlock,
+        beacon_state::{BeaconState, notify_new_payload},
+    },
     predicates::is_slashable_attestation_data,
 };
 use ream_consensus_misc::{
@@ -45,10 +48,10 @@ pub enum OnBlockOutcome {
 }
 
 /// Run ``on_block`` upon receiving a new block.
-pub async fn on_block(
+pub async fn on_block<E: ExecutionApi + Clone + Send + Sync + 'static>(
     store: &mut Store,
     signed_block: &SignedBeaconBlock,
-    execution_engine: &Option<impl ExecutionApi>,
+    execution_engine: &Option<E>,
     verify_data_availability: bool,
 ) -> anyhow::Result<OnBlockOutcome> {
     let block_root = signed_block.message.tree_hash_root();
@@ -64,11 +67,11 @@ pub async fn on_block(
 
 /// ``on_block`` for a block whose root the caller already computed. Hashing a mainnet block
 /// hashes its whole execution payload, a few milliseconds each time.
-pub async fn on_block_with_root(
+pub async fn on_block_with_root<E: ExecutionApi + Clone + Send + Sync + 'static>(
     store: &mut Store,
     signed_block: &SignedBeaconBlock,
     block_root: B256,
-    execution_engine: &Option<impl ExecutionApi>,
+    execution_engine: &Option<E>,
     verify_data_availability: bool,
 ) -> anyhow::Result<OnBlockOutcome> {
     let block = &signed_block.message;
@@ -105,6 +108,15 @@ pub async fn on_block_with_root(
         store.db.finalized_checkpoint_provider().get()?.epoch,
     )?;
     ensure!(store.db.finalized_checkpoint_provider().get()?.root == finalized_checkpoint_block);
+    // The execution engine checks the payload while the consensus state transition runs, as
+    // Lighthouse and Prysm do; the block is only imported once both pass.
+    let payload_check = execution_engine.clone().map(|engine| {
+        let body = block.body.clone();
+        tokio::spawn(
+            async move { notify_new_payload(&engine, &body, parent_root, block_slot).await },
+        )
+    });
+
     // Check the block is valid and compute the post-state
     // The parent state is the parent block's post-state, and the parent block commits to its root,
     // which was checked when the parent was imported.
@@ -151,7 +163,7 @@ pub async fn on_block_with_root(
     let state_transition_timer = BEACON_BLOCK_STATE_TRANSITION_SECONDS.start_timer();
     let epoch_start_state = if advanced_pre_state {
         state
-            .state_transition_from_epoch_start(signed_block, true, execution_engine)
+            .state_transition_from_epoch_start(signed_block, true, &None::<E>)
             .await?;
         epoch_start_state
     } else {
@@ -159,7 +171,7 @@ pub async fn on_block_with_root(
             .state_transition_keeping_epoch_start(
                 signed_block,
                 true,
-                execution_engine,
+                &None::<E>,
                 Some(parent_block.state_root),
             )
             .await?
@@ -167,12 +179,17 @@ pub async fn on_block_with_root(
     };
     state_transition_timer.observe_duration();
     let transitioned = started.elapsed();
+    if let Some(payload_check) = payload_check {
+        ensure!(payload_check.await??, "Execution payload is not valid");
+    }
+    let payload_checked = started.elapsed();
     tracing::debug!(
         target: "ream::timing",
         slot = block_slot,
         checks_and_state_load_ms = state_loaded.as_millis() as u64,
         state_transition_ms = (transitioned - state_loaded).as_millis() as u64,
         advanced_pre_state,
+        payload_wait_ms = (payload_checked - transitioned).as_millis() as u64,
         "timing: on_block"
     );
     // The checkpoint state of the block's epoch is at hand in two cases: the block is at the
