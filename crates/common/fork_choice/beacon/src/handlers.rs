@@ -116,6 +116,11 @@ pub async fn on_block_with_root<E: ExecutionApi + Clone + Send + Sync + 'static>
             async move { notify_new_payload(&engine, &body, parent_root, block_slot).await },
         )
     });
+    // The new task waits in this worker's LIFO slot, which other workers do not steal, so let it
+    // send the request before the state transition holds the worker.
+    if payload_check.is_some() {
+        tokio::task::yield_now().await;
+    }
 
     // Check the block is valid and compute the post-state
     // The parent state is the parent block's post-state, and the parent block commits to its root,
