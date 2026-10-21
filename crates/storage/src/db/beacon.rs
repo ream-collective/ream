@@ -3,7 +3,7 @@ use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::anyhow;
 use ream_consensus_beacon::electra::{beacon_block::SignedBeaconBlock, beacon_state::BeaconState};
 use ream_consensus_misc::{checkpoint::Checkpoint, constants::beacon::SLOTS_PER_EPOCH};
-use redb::{Database, Durability, ReadableDatabase, WriteTransaction};
+use redb::{Database, Durability, WriteTransaction};
 
 use crate::{
     cache::BeaconCacheDB,
@@ -190,6 +190,9 @@ impl BeaconDB {
         if FAIL_NEXT_BLOCK_IMPORT_COMMIT.with(|fail| fail.replace(false)) {
             return Err(std::io::Error::other("injected block import commit failure").into());
         }
+        if let Some(finalized) = record.checkpoints.finalized {
+            super::beacon_canonical::record_finalized(&write_txn, finalized.root)?;
+        }
         write_txn.commit()?;
         Ok(())
     }
@@ -205,6 +208,9 @@ impl BeaconDB {
         let mut write_txn = self.db.begin_write()?;
         write_txn.set_durability(Durability::Immediate)?;
         checkpoints.write(&write_txn)?;
+        if let Some(finalized) = checkpoints.finalized {
+            super::beacon_canonical::record_finalized(&write_txn, finalized.root)?;
+        }
         write_txn.commit()?;
         Ok(())
     }
@@ -306,6 +312,7 @@ impl BeaconDB {
 
     pub fn column_sidecars_provider(&self) -> ColumnSidecarsTable {
         ColumnSidecarsTable {
+            db: self.db.clone(),
             data_dir: self.data_dir.clone(),
         }
     }
@@ -436,30 +443,42 @@ impl BeaconDB {
         current_slot: u64,
         min_retention_epochs: u64,
     ) -> anyhow::Result<usize> {
-        let min_retention_slots = min_retention_epochs * SLOTS_PER_EPOCH;
-        let min_slot_to_retain = current_slot.saturating_sub(min_retention_slots);
-
-        // Collect all block roots that should be retained
-        let mut blocks_to_retain = HashSet::new();
-
-        let read_txn = self.db.begin_read()?;
-        let slot_index_table = read_txn.open_table(
-            crate::tables::beacon::slot_index::BeaconSlotIndexTable::TABLE_DEFINITION,
-        )?;
-
-        // Iterate through all slots from min_slot_to_retain to current
-        for item in slot_index_table.range(min_slot_to_retain..)? {
-            let (_, block_root) = item?;
-            blocks_to_retain.insert(block_root.value());
+        let min_retention_slots = min_retention_epochs.saturating_mul(SLOTS_PER_EPOCH);
+        let finalized_slot = self
+            .finalized_checkpoint_provider()
+            .get()?
+            .epoch
+            .saturating_mul(SLOTS_PER_EPOCH);
+        let cutoff = current_slot
+            .saturating_sub(min_retention_slots)
+            .min(finalized_slot);
+        let mut expired = HashSet::new();
+        // slot_index omits abandoned forks. Inspect only roots with blob files and delete only
+        // those whose stored block is old, so recent forks, roots not imported yet and files
+        // published during the scan survive.
+        for entry in std::fs::read_dir(
+            self.data_dir
+                .join(crate::tables::beacon::blobs_and_proofs::BLOB_FOLDER_NAME),
+        )? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(root) = name
+                .to_str()
+                .and_then(|name| name.split('_').next())
+                .and_then(|root| root.parse::<alloy_primitives::B256>().ok())
+            else {
+                continue;
+            };
+            if self
+                .block_provider()
+                .get(root)?
+                .is_some_and(|block| block.message.slot < cutoff)
+            {
+                expired.insert(root);
+            }
         }
 
-        drop(slot_index_table);
-        drop(read_txn);
-
-        // Prune blobs not in the retention set
-        let pruned_count = self
-            .blobs_and_proofs_provider()
-            .prune_old_blobs(&blocks_to_retain)?;
+        let pruned_count = self.blobs_and_proofs_provider().prune_old_blobs(&expired)?;
 
         Ok(pruned_count)
     }

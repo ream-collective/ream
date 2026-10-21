@@ -9,6 +9,8 @@ pub(crate) const META: &str = "backfill_meta";
 pub(crate) const GVR: &str = "genesis_validators_root";
 pub(crate) const MARKER: &str = "mode";
 pub(crate) const IN_PROGRESS: &str = "in_progress";
+/// Sorted column indices held for every slot the sidecar coverage claims.
+pub(crate) const SIDECAR_CUSTODY: &str = "sidecar_custody";
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct BackfillMeta {
@@ -19,8 +21,8 @@ pub struct BackfillMeta {
 }
 
 impl BackfillMeta {
-    /// First slot from which every required sidecar at or below the origin is held. Above the
-    /// origin, forward import only accepts blocks whose sidecars are already durable.
+    /// First slot from which every required sidecar is held. Forward import only accepts blocks
+    /// whose sidecars are durable; a custody increase moves this above the origin.
     pub fn sidecars_available_from(&self) -> u64 {
         self.sidecars
             .frontier

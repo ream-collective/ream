@@ -16,3 +16,5 @@ pub mod prepare_beacon_proposer;
 pub mod state;
 pub mod syncing;
 pub mod validator;
+
+mod representation;

@@ -1,0 +1,31 @@
+participants:
+  - el_type: geth
+    cl_type: lighthouse
+    cl_image: sigp/lighthouse:v8.2.0
+    vc_image: sigp/lighthouse:v8.2.0
+    supernode: true
+    count: 2
+  - el_type: geth
+    cl_type: prysm
+    cl_image: offchainlabs/prysm-beacon-chain:v7.3.0
+    vc_image: offchainlabs/prysm-validator:v7.3.0
+    supernode: true
+    count: 1
+network_params:
+  network_id: "746232"
+  seconds_per_slot: 3
+  num_validator_keys_per_node: 64
+  genesis_delay: 30
+  deneb_fork_epoch: 0
+  electra_fork_epoch: 0
+  fulu_fork_epoch: 0
+  gloas_fork_epoch: 18446744073709551615
+additional_services:
+  - assertoor
+assertoor_params:
+  run_blob_transaction_test: true
+port_publisher:
+  el:
+    enabled: true
+  cl:
+    enabled: true

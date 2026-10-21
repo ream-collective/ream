@@ -24,6 +24,28 @@ use tokio::{
 
 use super::*;
 
+// Fulu changes a process-wide network spec; isolate tests that require columns.
+fn initialize_column_recovery_test(name: &str) -> bool {
+    const CHILD: &str = "REAM_COLUMN_RECOVERY_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("tests::checkpoint_bootstrap_tests::{name}"),
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return false;
+    }
+    let mut spec = (*beacon_e2e_dev_spec()).clone();
+    spec.fulu_fork_epoch = 0;
+    initialize_beacon_e2e_network_spec(Arc::new(spec));
+    true
+}
+
 fn full_custody() -> PeerCustodyGroups {
     PeerCustodyGroups::from_advertised(discv5::enr::NodeId::random(), NUM_CUSTODY_GROUPS)
         .expect("full custody is a valid count")
@@ -440,7 +462,11 @@ async fn pending_anchor_recovers_from_partial_peer_responses_after_restart() {
         BackfillMeta, BlockBackfillState, BlockCoverage, Frontier, Origin, SidecarCoverage,
     };
 
-    initialize_beacon_e2e_network_spec(beacon_e2e_dev_spec());
+    if !initialize_column_recovery_test(
+        "pending_anchor_recovers_from_partial_peer_responses_after_restart",
+    ) {
+        return;
+    }
     let (mut state, mut anchor) = build_dev_genesis(&beacon_e2e_public_keys());
     initialize_beacon_e2e_genesis_root(state.genesis_validators_root);
     state.slot = SLOTS_PER_EPOCH;
@@ -486,6 +512,8 @@ async fn pending_anchor_recovers_from_partial_peer_responses_after_restart() {
             }),
         )
         .unwrap();
+    // A fresh bootstrap holds no columns, so the first startup records its custody as is.
+    assert_eq!(beacon_db.sidecar_custody().unwrap(), Some(Vec::new()));
     let path = beacon_db.data_dir.clone();
     drop(beacon_db);
     drop(db);
@@ -596,7 +624,11 @@ async fn parked_anchor_expires_using_actual_genesis_without_peer_changes() {
         BackfillMeta, BlockBackfillState, BlockCoverage, Frontier, Origin, SidecarCoverage,
     };
 
-    initialize_beacon_e2e_network_spec(beacon_e2e_dev_spec());
+    if !initialize_column_recovery_test(
+        "parked_anchor_expires_using_actual_genesis_without_peer_changes",
+    ) {
+        return;
+    }
     let spec = ream_network_spec::networks::beacon_network_spec();
     let (mut state, mut anchor) = build_dev_genesis(&beacon_e2e_public_keys());
     state.genesis_time = spec.min_genesis_time + 2 * SLOTS_PER_EPOCH * spec.seconds_per_slot();

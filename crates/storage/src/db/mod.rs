@@ -1,6 +1,8 @@
 pub mod beacon;
 pub mod beacon_backfill;
 mod beacon_bootstrap;
+mod beacon_canonical;
+mod beacon_columns;
 pub mod lean;
 
 use std::{
@@ -112,7 +114,12 @@ impl ReamDB {
     pub fn init_beacon_db(&self) -> Result<BeaconDB, StoreError> {
         let write_txn = self.db.begin_write()?;
 
+        write_txn.open_table(crate::db::beacon_canonical::CANONICAL_ROOTS)?;
         write_txn.open_table(crate::tables::beacon::backfill::BOOTSTRAP)?;
+        write_txn.open_multimap_table(
+            crate::tables::beacon::column_roots_by_slot::COLUMN_ROOTS_BY_SLOT,
+        )?;
+        write_txn.open_table(crate::tables::beacon::column_roots_by_slot::COLUMN_MAINTENANCE)?;
         write_txn.open_table(BeaconBlockTable::TABLE_DEFINITION)?;
         write_txn.open_table(BeaconStateTable::TABLE_DEFINITION)?;
         write_txn.open_table(BlockTimelinessTable::TABLE_DEFINITION)?;
@@ -138,13 +145,18 @@ impl ReamDB {
         fs::File::open(&self.data_dir)?.sync_all()?;
         self.remove_unrecorded_state_files()?;
 
-        Ok(BeaconDB {
+        let beacon_db = BeaconDB {
             db: self.db.clone(),
             votes_db: self.votes_db()?,
             data_dir: self.data_dir.clone(),
             cache: None,
             bootstrap_cache: self.bootstrap_cache.clone(),
-        })
+        };
+        beacon_db.migrate_column_index()?;
+        if let Ok(finalized) = beacon_db.finalized_checkpoint_provider().get() {
+            beacon_db.record_finalized_canonical(finalized.root)?;
+        }
+        Ok(beacon_db)
     }
 
     /// Deletes the state files that a crash left behind: temporary files and files whose summary

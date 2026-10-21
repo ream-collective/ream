@@ -1,13 +1,12 @@
 use std::{collections::HashSet, sync::Arc};
 
 use actix_web::{
-    HttpResponse, Responder, get,
+    HttpRequest, HttpResponse, Responder, get,
     web::{Data, Path},
 };
 use hashbrown::HashMap;
 use ream_api_types_beacon::responses::{
-    BeaconHeadResponse, BeaconResponse, DataResponse, ForkChoiceNode, ForkChoiceResponse,
-    ForkChoiceValidity,
+    BeaconHeadResponse, DataResponse, ForkChoiceNode, ForkChoiceResponse, ForkChoiceValidity,
 };
 use ream_api_types_common::{error::ApiError, id::ID};
 use ream_fork_choice_beacon::store::{BlockWithEpochInfo, Store};
@@ -15,16 +14,16 @@ use ream_operation_pool::OperationPool;
 use ream_storage::{db::beacon::BeaconDB, tables::field::REDBField};
 use serde_json::json;
 
-use crate::handlers::state::get_state_from_id;
+use crate::handlers::{representation::checkpoint_response, state::get_state_from_id};
 
 #[get("/debug/beacon/states/{state_id}")]
 pub async fn get_debug_beacon_state(
+    request: HttpRequest,
     db: Data<BeaconDB>,
     state_id: Path<ID>,
 ) -> Result<impl Responder, ApiError> {
-    Ok(HttpResponse::Ok().json(BeaconResponse::new(
-        get_state_from_id(state_id.into_inner(), &db).await?,
-    )))
+    let state = get_state_from_id(state_id.into_inner(), &db).await?;
+    Ok(checkpoint_response(&request, state.slot, state))
 }
 
 #[get("/debug/beacon/heads")]

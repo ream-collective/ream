@@ -20,3 +20,5 @@ pub mod time;
 pub mod unrealized_finalized_checkpoint;
 pub mod unrealized_justifications;
 pub mod unrealized_justified_checkpoint;
+
+pub(crate) mod column_roots_by_slot;

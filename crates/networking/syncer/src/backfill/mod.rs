@@ -3,6 +3,7 @@
 //! Runs only while forward sync is idle. Blocks are downloaded backwards from the block
 //! frontier, verified without running the state transition and committed straight to the
 //! database; fork choice never sees them.
+mod columns;
 mod download;
 pub mod scheduler;
 
@@ -24,6 +25,10 @@ use ream_consensus_misc::{
 };
 use ream_executor::ReamExecutor;
 use ream_fork_choice_beacon::store::get_current_slot_from_db;
+use ream_metrics::{
+    BEACON_BACKFILL_BLOCK_FRONTIER_SLOT, BEACON_BACKFILL_BLOCKS_COMMITTED_TOTAL,
+    BEACON_BACKFILL_PEER_BANS_TOTAL, BEACON_BACKFILL_PENDING_BYTES, BEACON_BACKFILL_VERIFY_SECONDS,
+};
 use ream_network_spec::networks::beacon::beacon_network_spec;
 use ream_p2p::network::beacon::{channel::P2PMessage, network_state::NetworkState};
 use ream_storage::{
@@ -117,30 +122,84 @@ impl Peers {
     }
 }
 
+/// The columns this node keeps for every block in the DA window.
+#[derive(Debug, Clone)]
+pub struct ColumnCustody {
+    pub group_count: u64,
+    /// Sorted and deduplicated.
+    pub columns: Vec<u64>,
+}
+
+impl ColumnCustody {
+    pub fn all() -> Self {
+        Self {
+            group_count: ream_consensus_misc::constants::beacon::NUM_CUSTODY_GROUPS,
+            columns: (0..ream_consensus_beacon::data_column_sidecar::NUMBER_OF_COLUMNS).collect(),
+        }
+    }
+}
+
 pub struct BackfillSyncer {
     db: BeaconDB,
     p2p_sender: mpsc::UnboundedSender<P2PMessage>,
     network_state: Arc<NetworkState>,
     executor: ReamExecutor,
     config: BackfillConfig,
+    rate_limit: bool,
 }
 
 impl BackfillSyncer {
-    /// Spawns the backfill task, initially paused. Returns `None` when this database has no
-    /// block backfill to do: it was synced from genesis, predates backfill metadata, or
-    /// already reached a terminal state.
+    /// Spawns block and column backfill, initially paused. Returns `None` for databases without
+    /// checkpoint history, or when both required block and column history are already covered.
     pub fn spawn(
         db: BeaconDB,
         p2p_sender: mpsc::UnboundedSender<P2PMessage>,
         network_state: Arc<NetworkState>,
         executor: ReamExecutor,
     ) -> anyhow::Result<Option<BackfillHandle>> {
+        Self::spawn_with_config(
+            db,
+            p2p_sender,
+            network_state,
+            executor,
+            BackfillConfig::default(),
+            true,
+            ColumnCustody::all(),
+        )
+    }
+
+    pub fn spawn_with_config(
+        db: BeaconDB,
+        p2p_sender: mpsc::UnboundedSender<P2PMessage>,
+        network_state: Arc<NetworkState>,
+        executor: ReamExecutor,
+        config: BackfillConfig,
+        rate_limit: bool,
+        custody: ColumnCustody,
+    ) -> anyhow::Result<Option<BackfillHandle>> {
+        config.validate()?;
+        anyhow::ensure!(
+            !custody.columns.is_empty(),
+            "Column custody must not be empty"
+        );
         match db.cached_backfill_mode()? {
-            BackfillMode::Checkpoint(meta)
-                if meta.blocks.state == BlockBackfillState::InProgress => {}
             BackfillMode::Checkpoint(meta) => {
-                info!(state = ?meta.blocks.state, "Block backfill already ended");
-                return Ok(None);
+                BEACON_BACKFILL_BLOCK_FRONTIER_SLOT
+                    .set(meta.blocks.frontier.oldest_block_slot as i64);
+                ream_metrics::BEACON_BACKFILL_SIDECAR_FRONTIER_SLOT
+                    .set(meta.sidecars_available_from() as i64);
+                let current_slot = get_current_slot_from_db(&db)?;
+                let da_start = beacon_network_spec()
+                    .data_column_retention_start_slot(compute_epoch_at_slot(current_slot));
+                let columns_complete = meta.sidecars.frontier.is_some_and(|slot| slot <= da_start);
+                ream_metrics::BEACON_CUSTODY_GROUPS_BACKFILLED.set(if columns_complete {
+                    custody.group_count as i64
+                } else {
+                    0
+                });
+                if meta.blocks.state != BlockBackfillState::InProgress && columns_complete {
+                    return Ok(None);
+                }
             }
             BackfillMode::GenesisSynced => return Ok(None),
             BackfillMode::Legacy => {
@@ -153,18 +212,30 @@ impl BackfillSyncer {
         }
 
         let (running, running_receiver) = watch::channel(false);
+        let columns = columns::ColumnBackfill {
+            db: db.clone(),
+            sender: p2p_sender.clone(),
+            network: network_state.clone(),
+            config: config.clone(),
+            rate_limit,
+            custody,
+        };
+        let column_running = running_receiver.clone();
+        executor.spawn(async move { columns.run(column_running).await });
         let syncer = Self {
             db,
             p2p_sender,
             network_state,
             executor: executor.clone(),
-            config: BackfillConfig::default(),
+            config,
+            rate_limit,
         };
         executor.spawn(async move { syncer.run(running_receiver).await });
         Ok(Some(BackfillHandle { running }))
     }
 
     async fn run(self, mut running: watch::Receiver<bool>) {
+        let _pending_reset = PendingBytesReset("blocks");
         let mut scheduler = None;
         let mut proposer_keys = None;
         let mut peers = Peers::default();
@@ -296,22 +367,30 @@ impl BackfillSyncer {
                     break;
                 }
                 match scheduler.advance(target_slot) {
-                    Step::Commit(blocks) => match self.commit(blocks, target_slot).await? {
-                        Some(meta) => {
-                            scheduler.on_committed(meta.blocks.frontier.clone());
-                            if meta.blocks.state != BlockBackfillState::InProgress {
-                                info!(
-                                    frontier_slot = meta.blocks.frontier.oldest_block_slot,
-                                    "Block backfill complete"
-                                );
-                                return Ok(SessionEnd::Finished);
+                    Step::Commit(blocks) => {
+                        if self.rate_limit {
+                            wait_for_backfill_window(&self.db, running).await?;
+                        }
+                        if !*running.borrow() {
+                            break;
+                        }
+                        match self.commit(blocks, target_slot).await? {
+                            Some(meta) => {
+                                scheduler.on_committed(meta.blocks.frontier.clone());
+                                if meta.blocks.state != BlockBackfillState::InProgress {
+                                    info!(
+                                        frontier_slot = meta.blocks.frontier.oldest_block_slot,
+                                        "Block backfill complete"
+                                    );
+                                    return Ok(SessionEnd::Finished);
+                                }
+                            }
+                            None => {
+                                warn!("Historical blocks no longer connect to the frontier");
+                                scheduler.reset(self.meta()?.blocks.frontier);
                             }
                         }
-                        None => {
-                            warn!("Historical blocks no longer connect to the frontier");
-                            scheduler.reset(self.meta()?.blocks.frontier);
-                        }
-                    },
+                    }
                     Step::Complete => {
                         self.finish(BlockBackfillState::BlocksComplete).await?;
                         info!(
@@ -333,7 +412,14 @@ impl BackfillSyncer {
                     Step::Wait => break,
                 }
             }
+            BEACON_BACKFILL_BLOCK_FRONTIER_SLOT.set(scheduler.frontier().oldest_block_slot as i64);
+            BEACON_BACKFILL_PENDING_BYTES
+                .with_label_values(&["blocks"])
+                .set(scheduler.pending_bytes() as i64);
             for (peer_id, reason) in scheduler.take_bans() {
+                BEACON_BACKFILL_PEER_BANS_TOTAL
+                    .with_label_values(&["invalid_block"])
+                    .inc();
                 warn!(%peer_id, reason, "Not asking peer for history again for a while");
                 peers.banned.insert(peer_id, Instant::now());
             }
@@ -418,9 +504,13 @@ impl BackfillSyncer {
             Response::TooLarge => return Ok(Outcome::TooLarge),
         };
 
+        if self.rate_limit {
+            wait_for_backfill_window(&self.db, &running).await?;
+        }
         Ok(self
             .executor
             .spawn_blocking(move || {
+                let _verify_timer = BEACON_BACKFILL_VERIFY_SECONDS.start_timer();
                 let rooted = match kind {
                     RequestKind::Range { start_slot, count } => {
                         check_range_response(start_slot, count, blocks)
@@ -467,7 +557,12 @@ impl BackfillSyncer {
                         bail!("Backfill metadata disappeared");
                     };
                     match db.commit_historical_blocks(meta.revision, &blocks, target_slot) {
-                        Ok(meta) => return Ok(Some(meta)),
+                        Ok(meta) => {
+                            BEACON_BACKFILL_BLOCKS_COMMITTED_TOTAL.inc_by(blocks.len() as u64);
+                            BEACON_BACKFILL_BLOCK_FRONTIER_SLOT
+                                .set(meta.blocks.frontier.oldest_block_slot as i64);
+                            return Ok(Some(meta));
+                        }
                         Err(CommitError::Conflict { .. }) => continue,
                         Err(CommitError::NotConnected) => return Ok(None),
                         Err(err) => return Err(err.into()),
@@ -495,5 +590,40 @@ impl BackfillSyncer {
                 bail!("Backfill metadata kept changing during a commit")
             })
             .await?
+    }
+}
+
+/// The second half of each slot leaves the head's arrival period available for live work.
+async fn wait_for_backfill_window(
+    db: &BeaconDB,
+    running: &watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let genesis = db.genesis_time_provider().get()?;
+    let slot_ms = beacon_network_spec()
+        .seconds_per_slot()
+        .saturating_mul(1000);
+    anyhow::ensure!(slot_ms > 0, "Invalid slot duration");
+    loop {
+        if !*running.borrow() || running.has_changed().is_err() {
+            return Ok(());
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis();
+        let elapsed = now.saturating_sub(genesis as u128 * 1000);
+        let position = (elapsed % slot_ms as u128) as u64;
+        if position >= slot_ms / 2 {
+            return Ok(());
+        }
+        sleep(Duration::from_millis((slot_ms / 2 - position).min(100))).await;
+    }
+}
+
+struct PendingBytesReset(&'static str);
+impl Drop for PendingBytesReset {
+    fn drop(&mut self) {
+        BEACON_BACKFILL_PENDING_BYTES
+            .with_label_values(&[self.0])
+            .set(0);
     }
 }

@@ -11,6 +11,31 @@ use crate::common::{set_int_gauge, set_int_gauge_vec};
 
 // Provisioning each metrics
 lazy_static::lazy_static! {
+    pub static ref BEACON_BACKFILL_BLOCK_FRONTIER_SLOT: IntGauge = register_int_gauge_with_registry!(
+        "beacon_backfill_block_frontier_slot", "Oldest verified historical block slot", default_registry()
+    ).expect("backfill frontier metric");
+    pub static ref BEACON_BACKFILL_SIDECAR_FRONTIER_SLOT: IntGauge = register_int_gauge_with_registry!(
+        "beacon_backfill_sidecar_frontier_slot", "First slot covered by historical columns", default_registry()
+    ).expect("backfill frontier metric");
+    pub static ref BEACON_BACKFILL_BLOCKS_COMMITTED_TOTAL: IntCounter = register_int_counter_with_registry!(
+        "beacon_backfill_blocks_committed_total", "Historical blocks committed", default_registry()
+    ).expect("backfill counter metric");
+    pub static ref BEACON_BACKFILL_COLUMNS_COMMITTED_TOTAL: IntCounter = register_int_counter_with_registry!(
+        "beacon_backfill_columns_committed_total", "Historical columns committed", default_registry()
+    ).expect("backfill counter metric");
+    pub static ref BEACON_COLUMNS_PRUNED_TOTAL: IntCounter = register_int_counter_with_registry!(
+        "beacon_columns_pruned_total", "Data columns pruned", default_registry()
+    ).expect("backfill counter metric");
+    pub static ref BEACON_BACKFILL_PENDING_BYTES: IntGaugeVec = register_int_gauge_vec_with_registry!(
+        "beacon_backfill_pending_bytes", "Reserved SSZ bytes by backfill pass", &["kind"], default_registry()
+    ).expect("backfill pending metric");
+    pub static ref BEACON_BACKFILL_PEER_BANS_TOTAL: IntCounterVec = register_int_counter_vec_with_registry!(
+        "beacon_backfill_peer_bans_total", "Backfill peer bans", &["reason"], default_registry()
+    ).expect("backfill bans metric");
+    pub static ref BEACON_BACKFILL_VERIFY_SECONDS: Histogram = register_histogram_with_registry!(
+        "beacon_backfill_verify_seconds", "Historical signature and column verification seconds", default_registry()
+    ).expect("backfill verify metric");
+
     // Node Info Metrics
     pub static ref BEACON_NODE_INFO: IntGaugeVec = register_int_gauge_vec_with_registry!(
         "beacon_node_info", "Node information (always 1)", &["name", "version"], default_registry()

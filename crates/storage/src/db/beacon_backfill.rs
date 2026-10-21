@@ -3,7 +3,7 @@
 use alloy_primitives::B256;
 use anyhow::anyhow;
 use ream_consensus_beacon::electra::beacon_block::SignedBeaconBlock;
-use redb::{Durability, ReadableTable};
+use redb::{Durability, ReadableDatabase, ReadableTable};
 use ssz::{Decode, Encode};
 
 use super::beacon::BeaconDB;
@@ -13,6 +13,7 @@ use crate::{
         beacon::{
             backfill::{
                 BOOTSTRAP, BackfillMeta, BackfillMode, BlockBackfillState, Frontier, MARKER, META,
+                SIDECAR_CUSTODY,
             },
             beacon_block::BeaconBlockTable,
             slot_index::BeaconSlotIndexTable,
@@ -20,6 +21,17 @@ use crate::{
         table::REDBTable,
     },
 };
+
+/// How the stored history relates to the node custody.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustodyAlignment {
+    Unchanged,
+    Recorded,
+    /// Coverage restarted for columns the history lacks.
+    Restarted(BackfillMeta),
+    /// Genesis-synced history lacks columns and has no coverage to restart.
+    Missing,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum CommitError {
@@ -65,6 +77,12 @@ impl BeaconDB {
         }
 
         self.update_backfill_meta(expected_revision, |write, meta| {
+            if meta.blocks.state != BlockBackfillState::InProgress {
+                return Ok(Err(CommitError::Invalid(format!(
+                    "block backfill already ended as {:?}",
+                    meta.blocks.state
+                ))));
+            }
             let frontier = &meta.blocks.frontier;
             if *highest_root != frontier.oldest_block_parent {
                 return Ok(Err(CommitError::NotConnected));
@@ -86,6 +104,11 @@ impl BeaconDB {
                     .insert(*root, block.clone())
                     .map_err(StoreError::from)?;
                 slot_index
+                    .insert(block.message.slot, *root)
+                    .map_err(StoreError::from)?;
+                write
+                    .open_table(super::beacon_canonical::CANONICAL_ROOTS)
+                    .map_err(StoreError::from)?
                     .insert(block.message.slot, *root)
                     .map_err(StoreError::from)?;
             }
@@ -114,7 +137,131 @@ impl BeaconDB {
             ));
         }
         self.update_backfill_meta(expected_revision, |_, meta| {
+            if meta.blocks.state != BlockBackfillState::InProgress {
+                return Ok(Err(CommitError::Invalid(format!(
+                    "block backfill already ended as {:?}",
+                    meta.blocks.state
+                ))));
+            }
             meta.blocks.state = state;
+            Ok(Ok(()))
+        })
+    }
+
+    /// The caller has verified and durably published every required column in the newly covered
+    /// interval. This axis remains writable after block backfill has completed.
+    pub fn commit_sidecar_coverage(
+        &self,
+        expected_revision: u64,
+        new_frontier: u64,
+    ) -> Result<BackfillMeta, CommitError> {
+        self.update_backfill_meta(expected_revision, |_, meta| {
+            let Some(previous) = meta.sidecars.frontier else {
+                return Ok(Err(CommitError::Invalid(
+                    "anchor sidecars are pending".to_string(),
+                )));
+            };
+            if new_frontier >= previous || new_frontier < meta.blocks.frontier.oldest_block_slot {
+                return Ok(Err(CommitError::Invalid(
+                    "invalid sidecar frontier".to_string(),
+                )));
+            }
+            meta.sidecars.frontier = Some(new_frontier);
+            Ok(Ok(()))
+        })
+    }
+
+    /// Columns recorded for the sidecar coverage, or `None` before the first record.
+    pub fn sidecar_custody(&self) -> Result<Option<Vec<u64>>, StoreError> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(BOOTSTRAP)?;
+        let Some(raw) = table.get(SIDECAR_CUSTODY)? else {
+            return Ok(None);
+        };
+        Ok(Some(Vec::<u64>::from_ssz_bytes(raw.value())?))
+    }
+
+    /// Records `columns` as the custody of the stored history. A column not held before is
+    /// missing below `boundary`: checkpoint coverage restarts there so column backfill fetches
+    /// it, while genesis-synced history has no coverage to restart and reports `Missing`.
+    ///
+    /// Databases bootstrapped before the record existed are trusted only with `minimum` custody:
+    /// custody never drops below it nor decreases, so every earlier run held the same columns.
+    pub fn align_sidecar_custody(
+        &self,
+        columns: &[u64],
+        boundary: u64,
+        minimum: bool,
+    ) -> Result<CustodyAlignment, CommitError> {
+        let mut columns = columns.to_vec();
+        columns.sort_unstable();
+        columns.dedup();
+        let stored = self.sidecar_custody()?;
+        if stored.as_ref() == Some(&columns) {
+            return Ok(CustodyAlignment::Unchanged);
+        }
+        let grew = match &stored {
+            None => !minimum,
+            // A fresh bootstrap holds no history yet.
+            Some(stored) if stored.is_empty() => false,
+            Some(stored) => columns.iter().any(|index| !stored.contains(index)),
+        };
+        let mode = self.cached_backfill_mode()?;
+        // Legacy databases predate coverage metadata and are not backfilled.
+        if mode == BackfillMode::Legacy {
+            return Ok(CustodyAlignment::Unchanged);
+        }
+        if !matches!(mode, BackfillMode::Checkpoint(_)) {
+            if grew {
+                return Ok(CustodyAlignment::Missing);
+            }
+            let mut write = self.db.begin_write().map_err(StoreError::from)?;
+            write
+                .set_durability(Durability::Immediate)
+                .map_err(StoreError::from)?;
+            write
+                .open_table(BOOTSTRAP)
+                .map_err(StoreError::from)?
+                .insert(SIDECAR_CUSTODY, columns.as_ssz_bytes().as_slice())
+                .map_err(StoreError::from)?;
+            write.commit().map_err(StoreError::from)?;
+            return Ok(CustodyAlignment::Recorded);
+        }
+        for _ in 0..3 {
+            let BackfillMode::Checkpoint(meta) = self.cached_backfill_mode()? else {
+                break;
+            };
+            match self.update_backfill_meta(meta.revision, |write, meta| {
+                if grew {
+                    meta.sidecars.frontier = Some(boundary);
+                }
+                write
+                    .open_table(BOOTSTRAP)?
+                    .insert(SIDECAR_CUSTODY, columns.as_ssz_bytes().as_slice())?;
+                Ok(Ok(()))
+            }) {
+                Ok(meta) if grew => return Ok(CustodyAlignment::Restarted(meta)),
+                Ok(_) => return Ok(CustodyAlignment::Recorded),
+                Err(CommitError::Conflict { .. }) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Err(CommitError::Invalid(
+            "backfill metadata kept changing".to_string(),
+        ))
+    }
+
+    /// Forget coverage outside the moving retention window without changing advertised history.
+    /// Coverage below the origin is bounded by it; a pending anchor belongs to anchor recovery.
+    pub fn advance_sidecar_retention(
+        &self,
+        expected_revision: u64,
+        da_start: u64,
+    ) -> Result<BackfillMeta, CommitError> {
+        self.update_backfill_meta(expected_revision, |_, meta| {
+            if let Some(previous) = meta.sidecars.frontier {
+                meta.sidecars.frontier = Some(previous.max(da_start.min(meta.origin.slot)));
+            }
             Ok(Ok(()))
         })
     }
@@ -160,12 +307,6 @@ impl BeaconDB {
                 expected: expected_revision,
                 found: meta.revision,
             });
-        }
-        if meta.blocks.state != BlockBackfillState::InProgress {
-            return Err(CommitError::Invalid(format!(
-                "block backfill already ended as {:?}",
-                meta.blocks.state
-            )));
         }
 
         update(&write, &mut meta)??;
@@ -273,6 +414,130 @@ mod tests {
             BackfillMode::Checkpoint(meta) => meta,
             mode => panic!("unexpected mode {mode:?}"),
         }
+    }
+
+    fn set_custody_record(db: &BeaconDB, columns: &[u64]) {
+        let write = db.db.begin_write().unwrap();
+        write
+            .open_table(BOOTSTRAP)
+            .unwrap()
+            .insert(SIDECAR_CUSTODY, columns.to_vec().as_ssz_bytes().as_slice())
+            .unwrap();
+        write.commit().unwrap();
+    }
+
+    #[test]
+    fn custody_growth_restarts_sidecar_coverage_at_the_boundary() {
+        let dir = TempDir::new("sidecar_custody").unwrap();
+        let blocks = chain(&[10, 20]);
+        let db = checkpoint_db(&dir, &blocks[1]);
+        db.confirm_anchor_sidecars(blocks[1].0).unwrap();
+        set_custody_record(&db, &[]);
+        assert_eq!(
+            db.align_sidecar_custody(&[5, 1], 40, false).unwrap(),
+            CustodyAlignment::Recorded
+        );
+        assert_eq!(meta(&db).sidecars.frontier, Some(20));
+        assert_eq!(db.sidecar_custody().unwrap(), Some(vec![1, 5]));
+        assert_eq!(
+            db.align_sidecar_custody(&[1, 5], 40, false).unwrap(),
+            CustodyAlignment::Unchanged
+        );
+        assert_eq!(
+            db.align_sidecar_custody(&[1], 40, false).unwrap(),
+            CustodyAlignment::Recorded
+        );
+        assert_eq!(meta(&db).sidecars.frontier, Some(20));
+        let CustodyAlignment::Restarted(grown) =
+            db.align_sidecar_custody(&[1, 9], 40, false).unwrap()
+        else {
+            panic!("custody growth must restart coverage");
+        };
+        assert_eq!(grown.sidecars.frontier, Some(40));
+        assert_eq!(grown.earliest_available_slot(15), 40);
+        assert_eq!(db.sidecar_custody().unwrap(), Some(vec![1, 9]));
+        // Coverage above the origin survives a reload and moves down as columns are committed.
+        db.backfill_mode().unwrap();
+        let moved = db.commit_sidecar_coverage(grown.revision, 20).unwrap();
+        assert_eq!(moved.sidecars.frontier, Some(20));
+    }
+
+    #[test]
+    fn unrecorded_custody_is_trusted_only_at_the_minimum() {
+        let dir = TempDir::new("legacy_custody").unwrap();
+        let blocks = chain(&[10, 20]);
+        let db = checkpoint_db(&dir, &blocks[1]);
+        db.confirm_anchor_sidecars(blocks[1].0).unwrap();
+        assert!(matches!(
+            db.align_sidecar_custody(&[1, 5], 40, false).unwrap(),
+            CustodyAlignment::Restarted(meta) if meta.sidecars.frontier == Some(40)
+        ));
+
+        let dir = TempDir::new("legacy_minimum_custody").unwrap();
+        let db = checkpoint_db(&dir, &blocks[1]);
+        db.confirm_anchor_sidecars(blocks[1].0).unwrap();
+        assert_eq!(
+            db.align_sidecar_custody(&[1, 5], 40, true).unwrap(),
+            CustodyAlignment::Recorded
+        );
+        assert_eq!(meta(&db).sidecars.frontier, Some(20));
+    }
+
+    #[test]
+    fn genesis_history_reports_missing_columns() {
+        let dir = TempDir::new("genesis_custody").unwrap();
+        let db = ReamDB::new(dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap();
+        let write = db.db.begin_write().unwrap();
+        {
+            let mut table = write.open_table(BOOTSTRAP).unwrap();
+            table.insert(MARKER, &[0u8][..]).unwrap();
+            table
+                .insert(GVR, B256::ZERO.as_ssz_bytes().as_slice())
+                .unwrap();
+        }
+        write.commit().unwrap();
+        assert_eq!(
+            db.align_sidecar_custody(&[1, 5], 40, false).unwrap(),
+            CustodyAlignment::Missing
+        );
+        assert_eq!(db.sidecar_custody().unwrap(), None);
+        assert_eq!(
+            db.align_sidecar_custody(&[1, 5], 40, true).unwrap(),
+            CustodyAlignment::Recorded
+        );
+        assert_eq!(
+            db.align_sidecar_custody(&[1, 9], 40, false).unwrap(),
+            CustodyAlignment::Missing
+        );
+        assert_eq!(db.sidecar_custody().unwrap(), Some(vec![1, 5]));
+    }
+
+    #[test]
+    fn sidecar_progress_and_retention_remain_writable_after_block_completion() {
+        let dir = TempDir::new("sidecar_commit").unwrap();
+        let blocks = chain(&[10, 20]);
+        let db = checkpoint_db(&dir, &blocks[1]);
+        db.confirm_anchor_sidecars(blocks[1].0).unwrap();
+        let meta = meta(&db);
+        let done = db
+            .commit_historical_blocks(meta.revision, &blocks[..1], 10)
+            .unwrap();
+        assert_eq!(done.blocks.state, BlockBackfillState::BlocksComplete);
+        let covered = db.commit_sidecar_coverage(done.revision, 10).unwrap();
+        assert!(matches!(
+            db.commit_sidecar_coverage(done.revision, 10),
+            Err(CommitError::Conflict { .. })
+        ));
+        let advertised = covered.earliest_available_slot(15);
+        let pruned = db.advance_sidecar_retention(covered.revision, 15).unwrap();
+        assert_eq!(pruned.sidecars.frontier, Some(15));
+        assert_eq!(pruned.earliest_available_slot(15), advertised);
+        let expired = db.advance_sidecar_retention(pruned.revision, 99).unwrap();
+        assert_eq!(expired.sidecars.frontier, Some(20));
+        db.backfill_mode().unwrap();
     }
 
     #[test]

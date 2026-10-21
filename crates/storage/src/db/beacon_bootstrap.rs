@@ -14,7 +14,10 @@ use crate::{
     errors::StoreError,
     tables::{
         beacon::{
-            backfill::{BOOTSTRAP, BackfillMeta, BackfillMode, GVR, IN_PROGRESS, MARKER, META},
+            backfill::{
+                BOOTSTRAP, BackfillMeta, BackfillMode, GVR, IN_PROGRESS, MARKER, META,
+                SIDECAR_CUSTODY,
+            },
             beacon_state::STATE_FOLDER_NAME,
             blobs_and_proofs::BLOB_FOLDER_NAME,
             column_sidecars::COLUMN_FOLDER_NAME,
@@ -183,10 +186,8 @@ impl BeaconDB {
             "Block frontier is after origin"
         );
         if let Some(sidecar) = meta.sidecars.frontier {
-            ensure!(
-                f.oldest_block_slot <= sidecar && sidecar <= meta.origin.slot,
-                "Invalid backfill coverage"
-            );
+            // A custody increase restarts coverage above the origin.
+            ensure!(f.oldest_block_slot <= sidecar, "Invalid backfill coverage");
         }
         let origin = self
             .block_provider()
@@ -292,6 +293,8 @@ impl BeaconDB {
                 "Bootstrap was not started"
             );
             table.insert(GVR, genesis_validators_root.as_ssz_bytes().as_slice())?;
+            // No columns are held yet; the first startup records the custody.
+            table.insert(SIDECAR_CUSTODY, Vec::<u64>::new().as_ssz_bytes().as_slice())?;
             if let Some(meta) = meta {
                 table.insert(META, meta.as_ssz_bytes().as_slice())?;
                 table.insert(MARKER, &[1u8][..])?;
@@ -421,6 +424,14 @@ mod tests {
             [1],
         )
         .unwrap();
+        // An abandoned checkpoint may already be indexed as canonical.
+        let write = beacon.db.begin_write().unwrap();
+        write
+            .open_table(crate::db::beacon_canonical::CANONICAL_ROOTS)
+            .unwrap()
+            .insert(7, B256::repeat_byte(7))
+            .unwrap();
+        write.commit().unwrap();
         assert!(beacon.recover_interrupted_bootstrap().unwrap());
         assert!(beacon.recover_interrupted_bootstrap().unwrap());
         assert!(beacon.bootstrap_in_progress().unwrap());
@@ -440,6 +451,7 @@ mod tests {
                 .count(),
             0
         );
+        assert_eq!(beacon.canonical_root_before(u64::MAX).unwrap(), None);
     }
 
     #[test]
