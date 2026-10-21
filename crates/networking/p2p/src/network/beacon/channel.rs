@@ -6,7 +6,7 @@ use libp2p::{
     gossipsub::{MessageAcceptance, MessageId},
     swarm::ConnectionId,
 };
-use ream_consensus_beacon::blob_sidecar::BlobIdentifier;
+use ream_consensus_beacon::{blob_sidecar::BlobIdentifier, custody_group::CustodyAssignment};
 use ream_req_resp::{
     beacon::messages::{
         BeaconResponseMessage, data_column_sidecars::DataColumnsByRootIdentifier, status::Status,
@@ -37,6 +37,9 @@ pub enum P2PMessage {
     Request(P2PRequest),
     Response(P2PResponse),
     Gossip(GossipMessage),
+    /// Advertise a larger custody and subscribe to its sampled subnets. A custody that is not
+    /// larger than the advertised one is ignored, since the count never decreases.
+    RaiseCustody(CustodyAssignment),
     ReportGossipValidation {
         message_id: MessageId,
         propagation_source: PeerId,

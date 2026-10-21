@@ -4,6 +4,7 @@ use libp2p::{
     gossipsub::{MessageAcceptance, MessageId},
     swarm::ConnectionId,
 };
+use ream_consensus_beacon::custody_group::CustodyAssignment;
 use ream_p2p::network::beacon::channel::{GossipMessage, P2PMessage, P2PResponse};
 use ream_req_resp::{
     beacon::messages::BeaconResponseMessage, error::ReqRespError, handler::RespMessage,
@@ -16,6 +17,12 @@ use tracing::warn;
 pub struct P2PSender(pub mpsc::UnboundedSender<P2PMessage>);
 
 impl P2PSender {
+    pub fn raise_custody(&self, custody: CustodyAssignment) {
+        if let Err(err) = self.0.send(P2PMessage::RaiseCustody(custody)) {
+            warn!("Failed to send a custody raise: {err}");
+        }
+    }
+
     pub fn send_gossip(&self, message: GossipMessage) {
         if let Err(err) = self.0.send(P2PMessage::Gossip(message)) {
             warn!("Failed to send gossip message: {err}");

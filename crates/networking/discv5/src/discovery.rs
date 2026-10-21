@@ -32,9 +32,9 @@ use crate::{
     persisted_enr::{advertised_ip, continue_enr_seq, load_enr, save_enr},
     subnet::{
         ATTESTATION_BITFIELD_ENR_KEY, AttestationSubnets, CUSTODY_GROUP_COUNT_ENR_KEY,
-        NEXT_FORK_DIGEST_ENR_KEY, NextForkDigest, SYNC_COMMITTEE_BITFIELD_ENR_KEY,
-        attestation_subnet_predicate, compute_subscribed_subnets, next_fork_digest,
-        sync_committee_subnet_predicate,
+        CustodyGroupCount, NEXT_FORK_DIGEST_ENR_KEY, NextForkDigest,
+        SYNC_COMMITTEE_BITFIELD_ENR_KEY, attestation_subnet_predicate, compute_subscribed_subnets,
+        next_fork_digest, sync_committee_subnet_predicate,
     },
 };
 
@@ -239,6 +239,34 @@ impl Discovery {
             self.discv5.local_enr().node_id(),
             epoch,
         )
+    }
+
+    /// Advertises `custody_group_count` in the local ENR `cgc` entry. Returns whether the ENR
+    /// changed.
+    pub fn set_custody_group_count(
+        &mut self,
+        custody_group_count: CustodyGroupCount,
+    ) -> Result<bool> {
+        let advertised = self
+            .discv5
+            .local_enr()
+            .get_decodable::<CustodyGroupCount>(CUSTODY_GROUP_COUNT_ENR_KEY)
+            .and_then(std::result::Result::ok);
+        if advertised == Some(custody_group_count) {
+            return Ok(false);
+        }
+
+        self.update_local_enr(|enr, key| {
+            enr.insert(CUSTODY_GROUP_COUNT_ENR_KEY, &custody_group_count, key)
+                .map_err(|err| anyhow!("Failed to update local ENR cgc: {err:?}"))?;
+            Ok(())
+        })?;
+
+        info!(
+            custody_group_count = custody_group_count.0,
+            "Advertising custody group count in ENR"
+        );
+        Ok(true)
     }
 
     /// Advertises `subnets` in the local ENR. Returns whether the ENR changed.

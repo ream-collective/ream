@@ -177,6 +177,17 @@ impl BeaconChain {
             .ok_or_else(|| anyhow!("Head is not available yet: no anchor block in the database"))
     }
 
+    /// Makes blocks wait for these sampled columns from now on, after the custody grew.
+    pub async fn set_sampling_columns(&self, sampling_columns: impl IntoIterator<Item = u64>) {
+        let required_columns = sampling_columns.into_iter().collect();
+        let mut store = self.store.lock().await;
+        if store.data_availability_checker.required_columns() != &required_columns {
+            store
+                .data_availability_checker
+                .set_required_columns(required_columns);
+        }
+    }
+
     /// Database handle for lock-free reads. redb serves readers from consistent snapshots, so
     /// these never wait for the store lock.
     pub fn db(&self) -> &BeaconDB {
