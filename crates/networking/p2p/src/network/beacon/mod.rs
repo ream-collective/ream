@@ -1269,7 +1269,8 @@ impl Network {
         );
     }
 
-    /// Records how connected peers stand against the gossipsub score thresholds.
+    /// Records how connected peers stand against the gossipsub score thresholds. Gossipsub also
+    /// keeps the scores of disconnected peers for a while; those are left out.
     fn record_peer_scores(&self) {
         if self.peer_score_settings.is_none() {
             return;
@@ -1291,6 +1292,9 @@ impl Network {
             .map(|(peer_id, _)| *peer_id)
             .collect::<Vec<_>>()
         {
+            if !self.swarm.is_connected(&peer_id) {
+                continue;
+            }
             let Some(score) = gossipsub.peer_score(&peer_id) else {
                 continue;
             };
