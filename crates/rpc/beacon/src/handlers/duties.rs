@@ -226,25 +226,34 @@ pub async fn get_attester_duties(
 
 #[post("/validator/duties/sync/{epoch}")]
 pub async fn get_sync_committee_duties(
+    beacon_chain: Data<Arc<BeaconChain>>,
     db: Data<BeaconDB>,
     epoch: Path<u64>,
     validator_indices: Json<Vec<ValidatorIndexRequest>>,
 ) -> Result<impl Responder, ApiError> {
     let epoch = epoch.into_inner();
-    // The latest block's state already holds the current and next committees, so it never has to
-    // be advanced into a later sync committee period.
-    let block_root = get_block_root_at_or_before_slot(&db, compute_start_slot_at_epoch(epoch))?;
-    let state = db
-        .state_provider()
-        .get(block_root)
-        .map_err(|err| {
-            ApiError::InternalError(format!(
-                "Failed to get beacon state by block root, error: {err:?}"
-            ))
-        })?
-        .ok_or_else(|| {
-            ApiError::NotFound(format!("Failed to find beacon state for epoch {epoch}"))
-        })?;
+    let head = beacon_chain
+        .head()
+        .map_err(|err| ApiError::InternalError(format!("Failed to get head root: {err:?}")))?;
+    // A state holds the current and next committees, so it never has to be advanced into a later
+    // period, and the head state serves both without loading a stored state.
+    let state = if sync_committee_for_epoch(head.state.get_current_epoch(), epoch).is_some() {
+        head.state.clone()
+    } else {
+        let block_root = get_block_root_at_or_before_slot(&db, compute_start_slot_at_epoch(epoch))?;
+        Arc::new(
+            db.state_provider()
+                .get(block_root)
+                .map_err(|err| {
+                    ApiError::InternalError(format!(
+                        "Failed to get beacon state by block root, error: {err:?}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    ApiError::NotFound(format!("Failed to find beacon state for epoch {epoch}"))
+                })?,
+        )
+    };
     let sync_committee = match sync_committee_for_epoch(state.get_current_epoch(), epoch) {
         Some(SyncCommitteePeriod::Current) => &state.current_sync_committee,
         Some(SyncCommitteePeriod::Next) => &state.next_sync_committee,
