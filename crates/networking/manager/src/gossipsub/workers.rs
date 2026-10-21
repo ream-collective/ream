@@ -219,6 +219,7 @@ impl GossipWorkers {
                     &cached_db,
                     &mut pending_item,
                     &mut unknown_parent_block,
+                    work.propagation_source,
                     |block| on_valid_block(block),
                 )
                 .await;
