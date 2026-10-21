@@ -66,6 +66,9 @@ fn classify_req_resp_error(err: ReqRespError) -> DownloadFailure {
 /// Longest a range-sync request may run. The network layer times out only a silent stream, so a
 /// peer that trickles responses holds a request, and the segment waiting on it, for minutes.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
+/// Deadline for a data column range request. One asks for at most 32 columns over a few slots, a
+/// few megabytes, so a peer still sending after this is slow, and its columns go to another peer.
+const COLUMN_RANGE_DEADLINE: Duration = Duration::from_secs(15);
 
 async fn drain_responses<T>(
     rx: mpsc::Receiver<Result<P2PCallbackResponse, P2PCallbackError>>,
@@ -243,12 +246,16 @@ impl PeerDataColumnRangeDownloader {
                 }))
                 .expect("Failed to send data column range request");
 
-            drain_responses(rx, |message| match message {
-                BeaconResponseMessage::DataColumnSidecarsByRange(column) => Ok(column),
-                other => Err(DownloadFailure::InvalidData(format!(
-                    "unexpected response variant for a DataColumnRange request: {other:?}"
-                ))),
-            })
+            drain_responses_within(
+                rx,
+                |message| match message {
+                    BeaconResponseMessage::DataColumnSidecarsByRange(column) => Ok(column),
+                    other => Err(DownloadFailure::InvalidData(format!(
+                        "unexpected response variant for a DataColumnRange request: {other:?}"
+                    ))),
+                },
+                COLUMN_RANGE_DEADLINE,
+            )
             .await
         })
     }

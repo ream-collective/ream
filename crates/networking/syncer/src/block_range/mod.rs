@@ -84,6 +84,9 @@ fn range_sync_delay(delay: Duration) -> Duration {
 const RECOVERY_ATTEMPT_COOLDOWN: Duration = Duration::from_secs(30);
 
 const CANDIDATE_EXHAUSTION_TIMEOUT: Duration = Duration::from_secs(60);
+/// Column indices asked of one peer per column range. A range of 128 columns then goes to at least
+/// four peers, so a slow or rate-limiting peer holds up a quarter of it instead of all of it.
+const MAX_COLUMNS_PER_RANGE_REQUEST: usize = 32;
 
 fn should_abort_for_candidate_exhaustion(elapsed: Duration, tasks_in_flight: bool) -> bool {
     elapsed >= CANDIDATE_EXHAUSTION_TIMEOUT && !tasks_in_flight
@@ -1096,71 +1099,63 @@ impl BlockRangeSyncer {
                 DataToFetch::DataColumnRange(range) => {
                     let key = RequestKey::ColumnRange(range);
                     let excluded = block_cache.attempted_peers_for(key);
-                    let expected_identifiers =
-                        block_cache.expected_column_identifiers_in_range(range, &required_columns);
-                    let requested_columns_and_slots: Vec<(u64, u64)> = expected_identifiers
-                        .iter()
+                    // Most peers custody a few columns, so one peer covers a small share of the
+                    // range. Split it across idle peers by custody, the peer covering the most
+                    // first, and request every share at once (as Lighthouse and Prysm do). Columns
+                    // no idle peer covers are fetched by root once the range has returned.
+                    let columns = block_cache
+                        .unrequested_column_identifiers_in_range(range, &required_columns)
+                        .into_iter()
                         .filter_map(|identifier| {
                             block_cache
                                 .block_slot(identifier.block_root)
-                                .map(|slot| (identifier.index, slot))
+                                .map(|slot| (identifier, slot))
                         })
-                        .collect();
-                    let Some(peer) = self
-                        .peer_manager
-                        .fetch_idle_peer_for_columns_from_excluding(
+                        .collect::<Vec<_>>();
+                    // Every column of the range is cached or already requested.
+                    if columns.is_empty() {
+                        continue;
+                    }
+                    let (assignments, uncovered) =
+                        self.peer_manager.split_columns_across_idle_peers(
                             &candidate_peers,
-                            &requested_columns_and_slots,
                             &excluded,
-                        )
-                    else {
+                            columns,
+                            MAX_COLUMNS_PER_RANGE_REQUEST,
+                        );
+                    if assignments.is_empty() {
                         self.peer_manager.update_peer_set();
                         info!("No idle peers available for data column range sync.");
                         block_cache.push_column_range(range);
                         wait_for_download(task_handles, SLEEP_DURATION).await;
                         continue;
-                    };
-
-                    let peer_columns: HashSet<u64> = expected_identifiers
-                        .iter()
-                        .filter_map(|identifier| {
-                            let slot = block_cache.block_slot(identifier.block_root)?;
-                            (self
-                                .peer_manager
-                                .peer_custodies_column(&peer.peer_id, identifier.index)
-                                && self.peer_manager.peer_can_serve_slot(&peer.peer_id, slot))
-                            .then_some(identifier.index)
-                        })
-                        .collect();
-                    let expected_known_identifiers: Vec<ColumnIdentifier> = expected_identifiers
-                        .into_iter()
-                        .filter(|identifier| {
-                            peer_columns.contains(&identifier.index)
-                                && block_cache.block_slot(identifier.block_root).is_some_and(
-                                    |slot| {
-                                        self.peer_manager.peer_can_serve_slot(&peer.peer_id, slot)
-                                    },
-                                )
-                        })
-                        .collect();
-
-                    block_cache.mark_column_range_in_progress(range);
-                    // The range already asks for these columns, so requests by root skip them
-                    // until it finishes.
-                    block_cache
-                        .extend_data_column_identifiers_in_progress(&expected_known_identifiers);
-                    task_handles.push(DownloadTask::new_data_column_range(
-                        PeerDataColumnRangeDownloader::start(
-                            peer.peer_id,
-                            self.p2p_sender.clone(),
-                            self.executor.clone(),
+                    }
+                    debug!(
+                        ?range,
+                        requests = assignments.len(),
+                        uncovered = uncovered.len(),
+                        "Split data column range across peers"
+                    );
+                    for (peer, assigned) in assignments {
+                        let peer_columns: HashSet<u64> =
+                            assigned.iter().map(|identifier| identifier.index).collect();
+                        block_cache.mark_column_range_in_progress(range);
+                        // The range already asks for these columns, so requests by root skip them
+                        // until it finishes.
+                        block_cache.extend_data_column_identifiers_in_progress(&assigned);
+                        task_handles.push(DownloadTask::new_data_column_range(
+                            PeerDataColumnRangeDownloader::start(
+                                peer.peer_id,
+                                self.p2p_sender.clone(),
+                                self.executor.clone(),
+                                range,
+                                peer_columns.into_iter().collect(),
+                            ),
                             range,
-                            peer_columns.into_iter().collect(),
-                        ),
-                        range,
-                        peer.peer_id,
-                        expected_known_identifiers,
-                    ));
+                            peer.peer_id,
+                            assigned,
+                        ));
+                    }
                 }
                 DataToFetch::MissingBlockRoots(mut block_roots) => {
                     let mut reached_finalized_boundary = false;

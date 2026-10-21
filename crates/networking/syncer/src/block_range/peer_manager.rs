@@ -6,6 +6,7 @@ use std::{
 };
 
 use libp2p::PeerId;
+use ream_consensus_beacon::data_column_sidecar::ColumnIdentifier;
 use ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH;
 use ream_p2p::network::beacon::{network_state::NetworkState, peer::CachedPeer};
 use ream_req_resp::beacon::messages::status::Status;
@@ -211,6 +212,67 @@ impl PeerManager {
             })
             .map(|(peer_id, _)| *peer_id)?;
         self.reserve(&peer_id)
+    }
+
+    /// Splits `columns`, each with the slot of its block, across idle peers by custody: the peer
+    /// covering the most remaining columns takes up to `max_columns_per_peer` of the column
+    /// indices it custodies, then the next, until every column is assigned or no idle peer covers
+    /// what is left. The cap spreads a range over several peers even when one custodies every
+    /// column, so one slow peer holds up only its share. Each returned peer is reserved and must
+    /// be marked idle when its request ends. Returns the assignments and the columns no idle peer
+    /// covers.
+    pub fn split_columns_across_idle_peers(
+        &mut self,
+        eligible: &[PeerId],
+        excluded: &HashSet<PeerId>,
+        mut columns: Vec<(ColumnIdentifier, u64)>,
+        max_columns_per_peer: usize,
+    ) -> (
+        Vec<(CachedPeer, Vec<ColumnIdentifier>)>,
+        Vec<ColumnIdentifier>,
+    ) {
+        let mut assignments = Vec::new();
+        while !columns.is_empty() {
+            let requested = columns
+                .iter()
+                .map(|(identifier, slot)| (identifier.index, *slot))
+                .collect::<Vec<_>>();
+            let Some(peer) =
+                self.fetch_idle_peer_for_columns_from_excluding(eligible, &requested, excluded)
+            else {
+                break;
+            };
+            // A request names column indices over the whole range, so the cap counts indices.
+            let mut peer_columns = HashSet::new();
+            for (identifier, slot) in &columns {
+                if peer_columns.len() < max_columns_per_peer
+                    && self.peer_custodies_column(&peer.peer_id, identifier.index)
+                    && self.peer_can_serve_slot(&peer.peer_id, *slot)
+                {
+                    peer_columns.insert(identifier.index);
+                }
+            }
+            let (assigned, rest): (Vec<_>, Vec<_>) =
+                columns.into_iter().partition(|(identifier, slot)| {
+                    peer_columns.contains(&identifier.index)
+                        && self.peer_can_serve_slot(&peer.peer_id, *slot)
+                });
+            columns = rest;
+            assignments.push((
+                peer,
+                assigned
+                    .into_iter()
+                    .map(|(identifier, _)| identifier)
+                    .collect(),
+            ));
+        }
+        (
+            assignments,
+            columns
+                .into_iter()
+                .map(|(identifier, _)| identifier)
+                .collect(),
+        )
     }
 
     fn info_custodies_column(info: &PeerInfo, column: u64) -> bool {
@@ -752,6 +814,98 @@ mod tests {
             )
             .expect("the partial peer covers some requested columns");
         assert_eq!(selected.peer_id, partial_id);
+    }
+
+    #[test]
+    fn a_column_range_is_split_across_peers_by_custody() {
+        let mut peer_manager = PeerManager::new(test_network_state());
+        let peers = (0..40)
+            .map(|_| custody_peer(Status::default(), 8))
+            .collect::<Vec<_>>();
+        let eligible = peers.iter().map(|peer| peer.peer_id).collect::<Vec<_>>();
+        for peer in peers {
+            insert_idle(&mut peer_manager, peer);
+        }
+        let block_root = alloy_primitives::B256::repeat_byte(1);
+        let columns = (0..128)
+            .map(|index| (ColumnIdentifier::new(block_root, index), 10))
+            .collect::<Vec<_>>();
+
+        let (assignments, uncovered) =
+            peer_manager.split_columns_across_idle_peers(&eligible, &HashSet::new(), columns, 128);
+
+        // Each peer gets only columns it custodies, no column is given twice, and every column
+        // some idle peer custodies is assigned.
+        let mut assigned = HashSet::new();
+        for (peer, identifiers) in &assignments {
+            assert!(!identifiers.is_empty());
+            for identifier in identifiers {
+                assert!(peer_manager.peer_custodies_column(&peer.peer_id, identifier.index));
+                assert!(assigned.insert(*identifier));
+            }
+        }
+        assert!(
+            assignments.len() > 1,
+            "eight-column peers cannot cover a range alone"
+        );
+        for identifier in &uncovered {
+            assert!(
+                eligible
+                    .iter()
+                    .all(|peer_id| !peer_manager.peer_custodies_column(peer_id, identifier.index))
+            );
+        }
+        assert_eq!(assigned.len() + uncovered.len(), 128);
+        // Assigned peers are reserved for their requests.
+        let (peer, _) = &assignments[0];
+        assert!(peer_manager.fetch_idle_peer_from(&[peer.peer_id]).is_none());
+    }
+
+    #[test]
+    fn a_column_range_is_spread_even_when_one_peer_custodies_every_column() {
+        let mut peer_manager = PeerManager::new(test_network_state());
+        let supernodes = (0..6)
+            .map(|_| custody_peer(Status::default(), 128))
+            .collect::<Vec<_>>();
+        let eligible = supernodes
+            .iter()
+            .map(|peer| peer.peer_id)
+            .collect::<Vec<_>>();
+        for peer in supernodes {
+            insert_idle(&mut peer_manager, peer);
+        }
+        let block_root = alloy_primitives::B256::repeat_byte(3);
+        let columns = (0..128)
+            .map(|index| (ColumnIdentifier::new(block_root, index), 10))
+            .collect::<Vec<_>>();
+
+        let (assignments, uncovered) =
+            peer_manager.split_columns_across_idle_peers(&eligible, &HashSet::new(), columns, 32);
+        assert_eq!(assignments.len(), 4);
+        assert!(assignments.iter().all(|(_, assigned)| assigned.len() == 32));
+        assert!(uncovered.is_empty());
+    }
+
+    #[test]
+    fn a_supernode_takes_a_whole_column_range() {
+        let mut peer_manager = PeerManager::new(test_network_state());
+        let partial = custody_peer(Status::default(), 8);
+        let full = custody_peer(Status::default(), 128);
+        let eligible = [partial.peer_id, full.peer_id];
+        let full_id = full.peer_id;
+        insert_idle(&mut peer_manager, partial);
+        insert_idle(&mut peer_manager, full);
+        let block_root = alloy_primitives::B256::repeat_byte(2);
+        let columns = (0..128)
+            .map(|index| (ColumnIdentifier::new(block_root, index), 10))
+            .collect::<Vec<_>>();
+
+        let (assignments, uncovered) =
+            peer_manager.split_columns_across_idle_peers(&eligible, &HashSet::new(), columns, 128);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].0.peer_id, full_id);
+        assert_eq!(assignments[0].1.len(), 128);
+        assert!(uncovered.is_empty());
     }
 
     #[test]

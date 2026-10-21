@@ -16,7 +16,7 @@ use ream_consensus_beacon::{
 use ream_consensus_misc::misc::compute_epoch_at_slot;
 use ream_network_spec::networks::beacon_network_spec;
 use ream_polynomial_commitments::handlers::{
-    verify_blob_kzg_proof_batch, verify_data_column_sidecar_kzg_proofs,
+    verify_blob_kzg_proof_batch, verify_data_column_sidecars_kzg_proofs,
 };
 use ssz::Encode;
 use tracing::warn;
@@ -128,7 +128,9 @@ pub struct BlockCache {
     block_roots_in_progress: HashSet<B256>,
     blob_identifiers_in_progress: HashSet<BlobIdentifier>,
     column_ranges_to_fetch: Vec<Range>,
-    column_ranges_in_progress: HashSet<Range>,
+    /// Column range requests in flight per range. A range is split across peers by custody, so
+    /// it stays in progress until every request for it has returned.
+    column_ranges_in_progress: HashMap<Range, usize>,
     data_column_identifiers_in_progress: HashSet<ColumnIdentifier>,
     attempts: HashMap<RequestKey, AttemptState>,
     coverage_anchor: Option<CoverageAnchor>,
@@ -148,7 +150,7 @@ impl BlockCache {
             block_roots_in_progress: HashSet::new(),
             blob_identifiers_in_progress: HashSet::new(),
             column_ranges_to_fetch: vec![],
-            column_ranges_in_progress: HashSet::new(),
+            column_ranges_in_progress: HashMap::new(),
             data_column_identifiers_in_progress: HashSet::new(),
             attempts: HashMap::new(),
             coverage_anchor: None,
@@ -490,14 +492,20 @@ impl BlockCache {
                 "Invalid inclusion proof for column {} of block {block_root}",
                 column.index
             );
-            ensure!(
-                verify_data_column_sidecar_kzg_proofs(&column)?,
-                "Invalid KZG proof for column {} of block {block_root}",
-                column.index
-            );
 
             validated.push((block_root, column));
         }
+        // One batch for the whole response: a check per column costs ~12 ms, for each of a
+        // block's 128 columns on a supernode.
+        ensure!(
+            verify_data_column_sidecars_kzg_proofs(
+                &validated
+                    .iter()
+                    .map(|(_, column)| column)
+                    .collect::<Vec<_>>()
+            )?,
+            "Invalid KZG proof in a data column response"
+        );
 
         let affected_roots: HashSet<B256> = validated.iter().map(|(root, _)| *root).collect();
         for (block_root, column) in validated {
@@ -511,6 +519,15 @@ impl BlockCache {
         }
 
         for block_root in affected_roots {
+            // Rebuilding costs ~1.5 s a block, so it is the fallback for columns no peer serves,
+            // not done while the block's other columns are still on their way.
+            let requested = required_columns.iter().any(|index| {
+                self.data_column_identifiers_in_progress
+                    .contains(&ColumnIdentifier::new(block_root, *index))
+            });
+            if requested {
+                continue;
+            }
             let bundle = self
                 .blocks_and_blobs
                 .get_mut(&block_root)
@@ -548,11 +565,16 @@ impl BlockCache {
     }
 
     pub fn mark_column_range_in_progress(&mut self, range: Range) {
-        self.column_ranges_in_progress.insert(range);
+        *self.column_ranges_in_progress.entry(range).or_default() += 1;
     }
 
     pub fn remove_column_range_in_progress(&mut self, range: &Range) {
-        self.column_ranges_in_progress.remove(range);
+        if let Some(in_flight) = self.column_ranges_in_progress.get_mut(range) {
+            *in_flight -= 1;
+            if *in_flight == 0 {
+                self.column_ranges_in_progress.remove(range);
+            }
+        }
     }
 
     pub fn extend_data_column_identifiers_in_progress(&mut self, identifiers: &[ColumnIdentifier]) {
@@ -870,6 +892,22 @@ impl BlockCache {
             }
         }
         expected
+    }
+
+    /// The required columns of the blocks in `range` that are neither cached nor requested yet.
+    pub fn unrequested_column_identifiers_in_range(
+        &self,
+        range: Range,
+        required_columns: &HashSet<u64>,
+    ) -> Vec<ColumnIdentifier> {
+        self.expected_column_identifiers_in_range(range, required_columns)
+            .into_iter()
+            .filter(|identifier| {
+                !self
+                    .data_column_identifiers_in_progress
+                    .contains(identifier)
+            })
+            .collect()
     }
 
     pub fn block_slot(&self, block_root: B256) -> Option<u64> {
@@ -1271,6 +1309,67 @@ mod tests {
                 .len(),
             NUMBER_OF_COLUMNS as usize
         );
+    }
+
+    #[test]
+    fn columns_still_requested_are_awaited_instead_of_rebuilt() {
+        initialize_test_network_spec();
+        use ream_consensus_beacon::data_column_sidecar::get_data_column_sidecars_from_block;
+
+        let blob = Blob::default();
+        let commitment = KZGCommitment(
+            das_context()
+                .blob_to_kzg_commitment(&blob.to_fixed_bytes())
+                .expect("test blob should produce a commitment"),
+        );
+        let mut block = SignedBeaconBlock {
+            message: Default::default(),
+            signature: Default::default(),
+        };
+        block
+            .message
+            .body
+            .blob_kzg_commitments
+            .push(commitment)
+            .expect("one commitment should fit");
+        let block_root = block.message.tree_hash_root();
+        let columns = get_data_column_sidecars_from_block(
+            &block,
+            vec![compute_cells_and_kzg_proofs(&blob, das_context()).expect("cells and proofs")],
+        )
+        .expect("test block should produce data columns");
+        let all_columns: HashSet<u64> = (0..NUMBER_OF_COLUMNS).collect();
+        let half = (NUMBER_OF_COLUMNS / 2) as usize;
+        let cached_columns = |cache: &BlockCache| {
+            cache
+                .blocks_and_blobs
+                .get(&block_root)
+                .expect("block should be cached")
+                .columns
+                .len()
+        };
+
+        let mut cache = BlockCache::new(B256::ZERO, 0);
+        cache
+            .add_blocks(vec![block], false, PeerId::random())
+            .expect("block should enter cache");
+        let still_requested = (half as u64..NUMBER_OF_COLUMNS)
+            .map(|index| ColumnIdentifier::new(block_root, index))
+            .collect::<Vec<_>>();
+        cache.extend_data_column_identifiers_in_progress(&still_requested);
+
+        // Half of the columns arrive while a request for the rest is in flight: no rebuild.
+        cache
+            .add_data_columns(columns[..half].to_vec(), &all_columns)
+            .expect("valid columns are accepted");
+        assert_eq!(cached_columns(&cache), half);
+
+        // Once nothing is in flight, the missing half is rebuilt from the cached half.
+        cache.remove_data_column_identifiers_in_progress(&still_requested);
+        cache
+            .add_data_columns(columns[..1].to_vec(), &all_columns)
+            .expect("a repeated column is accepted");
+        assert_eq!(cached_columns(&cache), NUMBER_OF_COLUMNS as usize);
     }
 
     #[test]

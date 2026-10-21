@@ -1,3 +1,5 @@
+use std::borrow::Borrow;
+
 use anyhow::{anyhow, bail};
 use kzg::{DAS, Fr, G1, eip_4844::verify_blob_kzg_proof_batch_raw};
 use ream_consensus_beacon::data_column_sidecar::{
@@ -141,17 +143,24 @@ pub fn verify_data_column_sidecar_kzg_proofs(sidecar: &DataColumnSidecar) -> any
     )
 }
 
-/// Verify multiple columns with at most 4096 cells per KZG batch. Keeping the bound explicit
-/// avoids materializing an epoch of cells on the blocking worker.
-pub fn verify_data_column_sidecars_kzg_proofs(
-    sidecars: &[DataColumnSidecar],
+/// Most cells in one call of `verify_cell_kzg_proof_batch`, the limit of its lists.
+const MAX_CELLS_PER_KZG_BATCH: usize = 4096;
+
+/// Verifies the KZG proofs of every cell of `sidecars`, in batches of at most
+/// `MAX_CELLS_PER_KZG_BATCH` cells. One batch check of many cells costs far less than a check per
+/// column, which range sync and column backfill would otherwise pay for each of a block's 128
+/// columns. Takes sidecars or references to them, so callers need not copy their columns.
+pub fn verify_data_column_sidecars_kzg_proofs<S: Borrow<DataColumnSidecar>>(
+    sidecars: &[S],
 ) -> anyhow::Result<bool> {
     let mut offset = 0;
     while offset < sidecars.len() {
         let mut end = offset;
         let mut cell_count = 0;
-        while end < sidecars.len() && cell_count + sidecars[end].column.len() <= 4096 {
-            cell_count += sidecars[end].column.len();
+        while end < sidecars.len()
+            && cell_count + sidecars[end].borrow().column.len() <= MAX_CELLS_PER_KZG_BATCH
+        {
+            cell_count += sidecars[end].borrow().column.len();
             end += 1;
         }
         if end == offset {
@@ -162,6 +171,14 @@ pub fn verify_data_column_sidecars_kzg_proofs(
         let mut cells = Vec::with_capacity(cell_count);
         let mut proofs = Vec::with_capacity(cell_count);
         for column in &sidecars[offset..end] {
+            let column = column.borrow();
+            // A column with more cells than commitments would shift every later cell onto the
+            // wrong commitment.
+            if column.column.len() != column.kzg_commitments.len()
+                || column.column.len() != column.kzg_proofs.len()
+            {
+                bail!("Length mismatch in data column sidecar {}", column.index);
+            }
             commitments.extend(column.kzg_commitments.iter().cloned());
             indices.extend(std::iter::repeat_n(column.index, column.column.len()));
             cells.extend(column.column.iter().cloned());
@@ -179,4 +196,54 @@ pub fn verify_data_column_sidecars_kzg_proofs(
         offset = end;
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use ream_consensus_beacon::{
+        data_column_sidecar::get_data_column_sidecars_from_block,
+        electra::beacon_block::SignedBeaconBlock,
+        matrix_entry::{compute_cells_and_kzg_proofs, das_context},
+    };
+    use ream_consensus_misc::polynomial_commitments::kzg_commitment::KZGCommitment;
+    use ream_execution_rpc_types::get_blobs::Blob;
+
+    use super::*;
+
+    #[test]
+    fn a_batch_of_columns_verifies_together_and_fails_on_one_bad_proof() {
+        let blob = Blob::default();
+        let mut block = SignedBeaconBlock {
+            message: Default::default(),
+            signature: Default::default(),
+        };
+        for _ in 0..2 {
+            block
+                .message
+                .body
+                .blob_kzg_commitments
+                .push(KZGCommitment(
+                    das_context()
+                        .blob_to_kzg_commitment(&blob.to_fixed_bytes())
+                        .unwrap(),
+                ))
+                .unwrap();
+        }
+        let cells_and_proofs = compute_cells_and_kzg_proofs(&blob, das_context()).unwrap();
+        let mut columns = get_data_column_sidecars_from_block(
+            &block,
+            vec![cells_and_proofs.clone(), cells_and_proofs],
+        )
+        .unwrap();
+        assert!(
+            verify_data_column_sidecars_kzg_proofs(&columns.iter().collect::<Vec<_>>()).unwrap()
+        );
+        assert!(verify_data_column_sidecars_kzg_proofs::<DataColumnSidecar>(&[]).unwrap());
+
+        columns[77].kzg_proofs[1][0] ^= 1;
+        assert!(
+            !verify_data_column_sidecars_kzg_proofs(&columns.iter().collect::<Vec<_>>())
+                .unwrap_or(false)
+        );
+    }
 }
