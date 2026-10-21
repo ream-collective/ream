@@ -238,6 +238,7 @@ pub async fn handle_gossipsub_message(
         cached_db,
         pending_item,
         unknown_parent_block,
+        propagation_source,
         on_valid_block,
     )
     .await;
@@ -256,6 +257,7 @@ async fn dispatch_gossipsub_message(
     cached_db: &BeaconCacheDB,
     pending_item: &mut Option<PendingGossipItem>,
     unknown_parent_block: &mut Option<UnknownParentGossipBlock>,
+    propagation_source: PeerId,
     on_valid_block: impl FnOnce(&SignedBeaconBlock),
 ) -> MessageAcceptance {
     match GossipsubMessage::decode(&message.topic, &message.data) {
