@@ -10,15 +10,14 @@ use ream_api_types_beacon::{
     responses::DutiesResponse,
 };
 use ream_api_types_common::error::ApiError;
-use ream_chain_beacon::beacon_chain::BeaconChain;
+use ream_chain_beacon::beacon_chain::{BeaconChain, CachedHead};
 use ream_consensus_beacon::electra::beacon_state::BeaconState;
 use ream_consensus_misc::{
-    constants::beacon::{MIN_SEED_LOOKAHEAD, SLOTS_PER_EPOCH},
+    constants::beacon::{MIN_SEED_LOOKAHEAD, SLOTS_PER_EPOCH, SLOTS_PER_HISTORICAL_ROOT},
     misc::{compute_epoch_at_slot, compute_start_slot_at_epoch},
 };
-use ream_fork_choice_beacon::store::Store;
+use ream_fork_choice_beacon::store::get_ancestor_from_db;
 use ream_network_spec::networks::beacon_network_spec;
-use ream_operation_pool::OperationPool;
 use ream_storage::{db::beacon::BeaconDB, tables::table::REDBTable};
 use serde::Deserialize;
 
@@ -38,6 +37,12 @@ fn proposer_shuffling_decision_slot(epoch: u64, fulu_fork_epoch: u64) -> u64 {
     } else {
         compute_start_slot_at_epoch(epoch).saturating_sub(1)
     }
+}
+
+/// Returns the slot whose block root fixes the attester shuffling for `epoch`: the last slot of
+/// `epoch - 2`, or genesis for the first two epochs.
+fn attester_shuffling_decision_slot(epoch: u64) -> u64 {
+    compute_start_slot_at_epoch(epoch.saturating_sub(1)).saturating_sub(1)
 }
 
 fn validate_proposer_duties_epoch(epoch: u64, current_epoch: u64) -> Result<(), ApiError> {
@@ -64,11 +69,6 @@ async fn proposer_duties(
     let head = beacon_chain
         .head()
         .map_err(|err| ApiError::InternalError(format!("Failed to get head root: {err:?}")))?;
-    let store = Store::new(
-        beacon_chain.db().clone(),
-        Arc::new(OperationPool::default()),
-        None,
-    );
     validate_proposer_duties_epoch(epoch, compute_epoch_at_slot(head.current_slot))?;
 
     // Convert only after the guard because epoch-to-slot multiplication is unchecked.
@@ -79,9 +79,13 @@ async fn proposer_duties(
         }
     };
     let start_slot = compute_start_slot_at_epoch(epoch);
-    let (state, state_block_root) =
-        get_canonical_state_and_block_root_at_or_before_slot(&store, head.head_root, start_slot)
-            .await?;
+    let (state, state_block_root) = duties_state(
+        beacon_chain.db(),
+        &head,
+        start_slot,
+        head.state.determines_proposers_of(epoch),
+    )
+    .await?;
     let dependent_root = if state.slot <= decision_slot {
         state_block_root
     } else {
@@ -131,18 +135,23 @@ pub async fn get_proposer_duties_v2(
 
 #[post("/validator/duties/attester/{epoch}")]
 pub async fn get_attester_duties(
-    db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<BeaconChain>>,
     epoch: Path<u64>,
     validator_indices: Json<Vec<ValidatorIndexRequest>>,
 ) -> Result<impl Responder, ApiError> {
     let epoch = epoch.into_inner();
-    let start_slot = compute_start_slot_at_epoch(epoch);
-    let state = get_state_at_or_before_slot(&db, start_slot).await?;
-    let dependent_root = if epoch == 0 {
-        get_block_root_at_or_before_slot(&db, 0)?
-    } else {
-        get_block_root_at_or_before_slot(&db, start_slot - 1)?
-    };
+    let head = beacon_chain
+        .head()
+        .map_err(|err| ApiError::InternalError(format!("Failed to get head root: {err:?}")))?;
+    let (state, _) = duties_state(
+        beacon_chain.db(),
+        &head,
+        compute_start_slot_at_epoch(epoch),
+        head.state.determines_committees_of(epoch),
+    )
+    .await?;
+    let dependent_root =
+        attester_dependent_root(beacon_chain.db(), head.head_root, &head.state, epoch)?;
     let validator_indices = parse_validator_indices(validator_indices.into_inner())?;
     let committees_at_slot = state.get_committee_count_per_slot(epoch);
     let mut duties = vec![];
@@ -173,6 +182,7 @@ pub async fn get_attester_duties(
                 public_key: validator.public_key.clone(),
                 validator_index,
                 committee_index,
+                committee_length: committee.len() as u64,
                 committees_at_slot,
                 validator_committee_index: validator_committee_index as u64,
                 slot,
@@ -241,23 +251,66 @@ fn parse_validator_indices(
         .collect()
 }
 
-/// Resolves from fork-choice head so an overwritten slot index cannot select a side fork.
-async fn get_canonical_state_and_block_root_at_or_before_slot(
-    store: &Store,
-    head_root: B256,
-    slot: u64,
-) -> Result<(BeaconState, B256), ApiError> {
-    let block_root = get_block_root_at_or_before_slot_from_head(store, head_root, slot)?;
-
-    get_state_and_block_root(&store.db, block_root, slot).await
+/// The head state when it fixes the duties (its current and next epoch); loading another state
+/// clones the whole registry, about 0.5 s on Hoodi.
+async fn duties_state(
+    db: &BeaconDB,
+    head: &CachedHead,
+    start_slot: u64,
+    head_state_fixes_duties: bool,
+) -> Result<(Arc<BeaconState>, B256), ApiError> {
+    if head_state_fixes_duties {
+        return Ok((head.state.clone(), head.head_root));
+    }
+    // Resolved on the head chain: the slot index can hold a block a reorg left out.
+    let block_root = head_chain_block_root(db, head.head_root, &head.state, start_slot)?;
+    let (state, block_root) = get_state_and_block_root(db, block_root, start_slot).await?;
+    Ok((Arc::new(state), block_root))
 }
 
-fn get_block_root_at_or_before_slot_from_head(
-    store: &Store,
+/// The head chain's block at the attester shuffling decision slot. The slot index keeps a
+/// reorged-out block when the slot is empty on the head chain, so it is not used here.
+fn attester_dependent_root(
+    db: &BeaconDB,
     head_root: B256,
+    head_state: &BeaconState,
+    epoch: u64,
+) -> Result<B256, ApiError> {
+    head_chain_block_root(
+        db,
+        head_root,
+        head_state,
+        attester_shuffling_decision_slot(epoch),
+    )
+}
+
+/// The block at or before `slot` on the chain of `head_root`, whose post-state is `head_state`.
+/// The state's `block_roots` cover the last 8192 slots, also those before a checkpoint sync
+/// anchor whose blocks are not stored yet. Older slots are walked back from the oldest of them,
+/// but not past the finalized slot: the states before it are pruned, so no duties can be computed
+/// there, and the walk would read every block back to genesis.
+pub(crate) fn head_chain_block_root(
+    db: &BeaconDB,
+    head_root: B256,
+    head_state: &BeaconState,
     slot: u64,
 ) -> Result<B256, ApiError> {
-    store.get_ancestor(head_root, slot).map_err(|err| {
+    if slot >= head_state.slot {
+        return Ok(head_root);
+    }
+    if let Ok(root) = head_state.get_block_root_at_slot(slot) {
+        return Ok(root);
+    }
+    let finalized_slot = compute_start_slot_at_epoch(head_state.finalized_checkpoint.epoch);
+    if slot < finalized_slot {
+        return Err(ApiError::NotFound(format!(
+            "Slot {slot} is before the finalized slot {finalized_slot} and the head state's block roots"
+        )));
+    }
+    let oldest_root = head_state
+        .get_block_root_at_slot(head_state.slot - SLOTS_PER_HISTORICAL_ROOT)
+        .map_err(|err| ApiError::InternalError(format!("Failed to read block roots: {err}")))?;
+    get_ancestor_from_db(db, oldest_root, slot).map_err(|err| {
         ApiError::InternalError(format!(
             "Failed to find canonical block root at or before slot {slot}: {err:?}"
         ))
@@ -328,10 +381,22 @@ mod tests {
     use ream_bls::BLSSignature;
     use ream_consensus_beacon::electra::beacon_block::{BeaconBlock, SignedBeaconBlock};
     use ream_storage::db::ReamDB;
+    use ssz::Decode;
     use tempdir::TempDir;
     use tree_hash::TreeHash;
 
     use super::*;
+
+    #[test]
+    fn attester_dependent_root_is_last_slot_of_epoch_minus_two() {
+        assert_eq!(attester_shuffling_decision_slot(0), 0);
+        assert_eq!(attester_shuffling_decision_slot(1), 0);
+        assert_eq!(attester_shuffling_decision_slot(2), SLOTS_PER_EPOCH - 1);
+        assert_eq!(
+            attester_shuffling_decision_slot(130_615),
+            130_614 * SLOTS_PER_EPOCH - 1
+        );
+    }
 
     fn test_db() -> (BeaconDB, TempDir) {
         let temp_dir = TempDir::new("ream_rpc_beacon_duties").expect("creates temp directory");
@@ -393,6 +458,26 @@ mod tests {
         ));
     }
 
+    /// A head state at `slot`, from a real state: only its slot, finalized checkpoint and
+    /// block roots matter here.
+    fn head_state(slot: u64, finalized_epoch: u64) -> BeaconState {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../../testing/gossip-validation/tests/assets/sepolia/states/\
+             grandparent_state_9552074.ssz_snappy",
+        );
+        let bytes = snap::raw::Decoder::new()
+            .decompress_vec(&std::fs::read(path).expect("reads fixture state"))
+            .expect("decompresses fixture state");
+        let mut state = BeaconState::from_ssz_bytes(&bytes).expect("decodes fixture state");
+        state.slot = slot;
+        state.finalized_checkpoint.epoch = finalized_epoch;
+        state
+    }
+
+    fn set_block_root(state: &mut BeaconState, slot: u64, root: B256) {
+        state.block_roots[(slot % SLOTS_PER_HISTORICAL_ROOT) as usize] = root;
+    }
+
     #[test]
     fn canonical_lookup_ignores_a_later_side_fork_at_the_same_slot() {
         let (db, _temp_dir) = test_db();
@@ -418,11 +503,69 @@ mod tests {
             Some(side_fork_root)
         );
 
-        let store = Store::new(db, Arc::new(OperationPool::default()), None);
+        // Slot 100 is older than the head state's block roots, so it is found by walking back
+        // from the oldest of them, at slot 150, where the head chain still had block 100.
+        let mut state = head_state(150 + SLOTS_PER_HISTORICAL_ROOT, 0);
+        set_block_root(&mut state, 150, canonical_root);
         assert_eq!(
-            get_block_root_at_or_before_slot_from_head(&store, canonical_root, 100)
+            head_chain_block_root(&db, B256::repeat_byte(9), &state, 100)
                 .expect("resolves canonical ancestor"),
             canonical_root
         );
+    }
+
+    #[test]
+    fn attester_dependent_root_skips_a_reorged_block_at_an_empty_slot() {
+        let (db, _temp_dir) = test_db();
+        let anchor = block(0, B256::ZERO, B256::repeat_byte(1));
+        let anchor_root = anchor.message.tree_hash_root();
+        // The block at the decision slot of epoch 2 lost a reorg; the head chain skips the slot.
+        let reorged = block(SLOTS_PER_EPOCH - 1, anchor_root, B256::repeat_byte(2));
+        let reorged_root = reorged.message.tree_hash_root();
+        let head = block(SLOTS_PER_EPOCH, anchor_root, B256::repeat_byte(3));
+        let head_root = head.message.tree_hash_root();
+        for (root, block) in [
+            (anchor_root, anchor),
+            (reorged_root, reorged),
+            (head_root, head),
+        ] {
+            db.block_provider()
+                .insert(root, block)
+                .expect("stores block");
+        }
+        assert_eq!(
+            get_block_root_at_or_before_slot(&db, SLOTS_PER_EPOCH - 1).expect("reads slot index"),
+            reorged_root
+        );
+
+        let mut state = head_state(SLOTS_PER_EPOCH, 0);
+        set_block_root(&mut state, SLOTS_PER_EPOCH - 1, anchor_root);
+        assert_eq!(
+            attester_dependent_root(&db, head_root, &state, 2).expect("resolves dependent root"),
+            anchor_root
+        );
+    }
+
+    #[test]
+    fn head_chain_lookup_uses_block_roots_and_stops_at_the_finalized_slot() {
+        // No blocks are stored, as right after a checkpoint sync.
+        let (db, _temp_dir) = test_db();
+        let mut state = head_state(20_000, 400);
+        set_block_root(&mut state, 19_000, B256::repeat_byte(7));
+        assert_eq!(
+            head_chain_block_root(&db, B256::repeat_byte(9), &state, 19_000)
+                .expect("reads the head state's block roots"),
+            B256::repeat_byte(7)
+        );
+        assert_eq!(
+            head_chain_block_root(&db, B256::repeat_byte(9), &state, 20_000)
+                .expect("the head itself"),
+            B256::repeat_byte(9)
+        );
+        // Before the finalized slot and the block roots: refused without reading any block.
+        assert!(matches!(
+            head_chain_block_root(&db, B256::repeat_byte(9), &state, 0),
+            Err(ApiError::NotFound(_))
+        ));
     }
 }

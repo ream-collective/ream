@@ -95,7 +95,7 @@ use ssz_types::{
 use tokio::sync::{Mutex, broadcast};
 use tree_hash::TreeHash;
 
-use super::state::get_state_from_id;
+use super::{duties::head_chain_block_root, state::get_state_from_id};
 
 ///  For slots in Electra and later, this AttestationData must have a committee_index of 0.
 const ELECTRA_COMMITTEE_INDEX: u64 = 0;
@@ -454,63 +454,61 @@ impl ValidatorLivenessData {
 
 #[post("/validator/liveness/{epoch}")]
 pub async fn post_validator_liveness(
-    db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<BeaconChain>>,
     epoch: Path<u64>,
     validator_indices: Json<Vec<String>>,
 ) -> Result<impl Responder, ApiError> {
     let epoch = epoch.into_inner();
-    let validator_indices = validator_indices.into_inner();
-
-    let slot = epoch * SLOTS_PER_EPOCH;
-    let state = get_state_from_id(ID::Slot(slot), &db).await?;
+    let head = beacon_chain
+        .head()
+        .map_err(|err| ApiError::InternalError(format!("Failed to get head: {err:?}")))?;
+    validate_liveness_epoch(epoch, compute_epoch_at_slot(head.current_slot))?;
 
     let mut liveness_data = Vec::new();
-
-    for validator_index_str in validator_indices {
-        let validator_index: u64 = validator_index_str
+    for validator_index in validator_indices.into_inner() {
+        let validator_index: u64 = validator_index
             .parse()
             .map_err(|err| ApiError::BadRequest(format!("Invalid validator index: {err:?}")))?;
-        let index = validator_index as usize;
-
-        match state.validators.get(index) {
-            Some(_validator) => {
-                let is_live = check_validator_participation(&state, index, epoch)?;
-                liveness_data.push(ValidatorLivenessData::new(validator_index, is_live));
-            }
-            None => continue,
+        if (validator_index as usize) < head.state.validators.len() {
+            liveness_data.push(ValidatorLivenessData::new(
+                validator_index,
+                is_live(&head.state, validator_index as usize, epoch),
+            ));
         }
     }
 
     Ok(HttpResponse::Ok().json(BeaconResponse::new(liveness_data)))
 }
 
-fn check_validator_participation(
-    state: &BeaconState,
-    validator_index: usize,
-    epoch: u64,
-) -> Result<bool, ApiError> {
-    let validator = &state.validators[validator_index];
-    if !validator.is_active_validator(epoch) {
-        return Ok(false);
+/// Liveness is answered for the previous, current and next epoch, as Lighthouse does; the next
+/// epoch keeps a validator client whose clock is slightly ahead from failing at the boundary.
+fn validate_liveness_epoch(epoch: u64, current_epoch: u64) -> Result<(), ApiError> {
+    let (first, last) = (
+        current_epoch.saturating_sub(1),
+        current_epoch.saturating_add(1),
+    );
+    if epoch < first || epoch > last {
+        return Err(ApiError::BadRequest(format!(
+            "Liveness is only known for epochs {first} to {last}"
+        )));
     }
+    Ok(())
+}
 
-    let current_epoch = state.get_current_epoch();
-
-    if epoch == current_epoch {
-        if let Some(participation) = state.current_epoch_participation.get(validator_index) {
-            Ok(*participation > 0)
-        } else {
-            Ok(false)
-        }
-    } else if epoch == current_epoch - 1 {
-        if let Some(participation) = state.previous_epoch_participation.get(validator_index) {
-            Ok(*participation > 0)
-        } else {
-            Ok(false)
-        }
+/// Whether the head state records an attestation by the validator for `epoch`. The state at the
+/// start of an epoch has not seen any of its attestations yet, so the head state is used.
+fn is_live(head_state: &BeaconState, validator_index: usize, epoch: u64) -> bool {
+    let state_epoch = head_state.get_current_epoch();
+    let participation = if epoch == state_epoch {
+        &head_state.current_epoch_participation
+    } else if epoch + 1 == state_epoch {
+        &head_state.previous_epoch_participation
     } else {
-        Ok(validator.is_active_validator(epoch))
-    }
+        return false;
+    };
+    participation
+        .get(validator_index)
+        .is_some_and(|flags| *flags > 0)
 }
 
 fn validator_api_is_syncing(current_slot: u64, head_slot: u64) -> bool {
@@ -519,19 +517,31 @@ fn validator_api_is_syncing(current_slot: u64, head_slot: u64) -> bool {
     current_slot.saturating_sub(head_slot) > SYNC_TOLERANCE_EPOCHS * SLOTS_PER_EPOCH
 }
 
+/// Source checkpoint for an attestation in `target_epoch`, built on a head state in
+/// `state_epoch`. A head state from an earlier epoch has not run the epoch transition yet, so its
+/// justification is the head block's pulled-up (unrealized) one.
+fn attestation_source(
+    state_epoch: u64,
+    previous_justified: Checkpoint,
+    current_justified: Checkpoint,
+    target_epoch: u64,
+    unrealized_justification: Option<Checkpoint>,
+) -> Checkpoint {
+    if target_epoch + 1 == state_epoch {
+        previous_justified
+    } else if target_epoch > state_epoch {
+        unrealized_justification.unwrap_or(current_justified)
+    } else {
+        current_justified
+    }
+}
+
 #[get("/validator/attestation_data")]
 pub async fn get_attestation_data(
     db: Data<BeaconDB>,
-    opertation_pool: Data<Arc<OperationPool>>,
     beacon_chain: Data<Arc<BeaconChain>>,
     query: Query<AttestationQuery>,
 ) -> Result<impl Responder, ApiError> {
-    let store = Store::new(
-        db.get_ref().clone(),
-        opertation_pool.get_ref().clone(),
-        None,
-    );
-
     let head = beacon_chain
         .head()
         .map_err(|err| ApiError::InternalError(format!("Failed to get head root: {err:?}")))?;
@@ -554,34 +564,33 @@ pub async fn get_attestation_data(
     let beacon_block_root = if slot >= state.slot {
         head_root
     } else {
-        state
-            .get_block_root_at_slot(slot)
-            .or_else(|_| store.get_ancestor(head_root, slot))
-            .map_err(|err| {
-                ApiError::InternalError(format!(
-                    "Failed to get attestation beacon block root, error: {err:?}"
-                ))
-            })?
+        head_chain_block_root(&db, head_root, state, slot)?
     };
 
     let target_epoch = compute_epoch_at_slot(slot);
-    let source_checkpoint = if target_epoch == state.get_previous_epoch() {
-        state.previous_justified_checkpoint
+    let unrealized_justification = if target_epoch > state.get_current_epoch() {
+        db.unrealized_justifications_provider()
+            .get(head_root)
+            .map_err(|err| {
+                ApiError::InternalError(format!(
+                    "Failed to get unrealized justification, error: {err:?}"
+                ))
+            })?
     } else {
-        state.current_justified_checkpoint
+        None
     };
+    let source_checkpoint = attestation_source(
+        state.get_current_epoch(),
+        state.previous_justified_checkpoint,
+        state.current_justified_checkpoint,
+        target_epoch,
+        unrealized_justification,
+    );
     let target_slot = compute_start_slot_at_epoch(target_epoch);
     let target_root = if state.slot <= target_slot {
         beacon_block_root
     } else {
-        state
-            .get_block_root(target_epoch)
-            .or_else(|_| store.get_checkpoint_block(beacon_block_root, target_epoch))
-            .map_err(|err| {
-                ApiError::InternalError(format!(
-                    "Failed to get target checkpoint block, error: {err:?}"
-                ))
-            })?
+        head_chain_block_root(&db, head_root, state, target_slot)?
     };
     let target_checkpoint = Checkpoint {
         epoch: target_epoch,
@@ -1765,7 +1774,94 @@ pub async fn get_aggregate_attestation(
 
 #[cfg(test)]
 mod tests {
-    use super::validator_api_is_syncing;
+    use std::path::PathBuf;
+
+    use alloy_primitives::B256;
+    use ream_consensus_misc::checkpoint::Checkpoint;
+    use ssz::Decode;
+
+    use super::*;
+
+    fn checkpoint(epoch: u64) -> Checkpoint {
+        Checkpoint {
+            epoch,
+            root: B256::repeat_byte(epoch as u8),
+        }
+    }
+
+    #[test]
+    fn attestation_source_uses_pulled_up_justification_in_a_new_epoch() {
+        // Head state in epoch 10 justified 8; its pulled-up justification is 9.
+        let (previous, current, unrealized) = (checkpoint(7), checkpoint(8), Some(checkpoint(9)));
+
+        assert_eq!(
+            attestation_source(10, previous, current, 11, unrealized),
+            checkpoint(9)
+        );
+        assert_eq!(
+            attestation_source(10, previous, current, 11, None),
+            checkpoint(8)
+        );
+        assert_eq!(
+            attestation_source(10, previous, current, 10, unrealized),
+            checkpoint(8)
+        );
+        assert_eq!(
+            attestation_source(10, previous, current, 9, unrealized),
+            checkpoint(7)
+        );
+    }
+
+    fn sepolia_state() -> BeaconState {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../../testing/gossip-validation/tests/assets/sepolia/states/\
+             grandparent_state_9552074.ssz_snappy",
+        );
+        let bytes = snap::raw::Decoder::new()
+            .decompress_vec(&std::fs::read(path).unwrap())
+            .unwrap();
+        BeaconState::from_ssz_bytes(&bytes).unwrap()
+    }
+
+    #[test]
+    fn liveness_accepts_the_previous_current_and_next_epoch() {
+        for epoch in [9, 10, 11] {
+            assert!(validate_liveness_epoch(epoch, 10).is_ok());
+        }
+        for epoch in [0, 8, 12, u64::MAX] {
+            assert!(matches!(
+                validate_liveness_epoch(epoch, 10),
+                Err(ApiError::BadRequest(_))
+            ));
+        }
+        assert!(validate_liveness_epoch(0, 0).is_ok());
+    }
+
+    #[test]
+    fn liveness_reads_the_head_state_participation() {
+        let state = sepolia_state();
+        let epoch = state.get_current_epoch();
+        let live = state
+            .previous_epoch_participation
+            .iter()
+            .position(|flags| *flags > 0)
+            .unwrap();
+        let idle = state
+            .previous_epoch_participation
+            .iter()
+            .position(|flags| *flags == 0)
+            .unwrap();
+
+        assert!(is_live(&state, live, epoch - 1));
+        assert!(!is_live(&state, idle, epoch - 1));
+        assert_eq!(
+            is_live(&state, live, epoch),
+            state.current_epoch_participation[live] > 0
+        );
+        assert!(!is_live(&state, live, epoch + 1));
+        assert!(!is_live(&state, live, epoch - 2));
+        assert!(!is_live(&state, state.validators.len(), epoch - 1));
+    }
 
     #[test]
     fn cached_head_sync_check_preserves_the_two_epoch_tolerance() {
