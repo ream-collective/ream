@@ -1495,7 +1495,32 @@ impl Network {
         }
         let until = self.duty_topics.entry(topic).or_insert(until_slot);
         *until = (*until).max(until_slot);
+        if matches!(topic.kind, GossipTopicKind::SyncCommittee(_))
+            && let Err(err) = self.advertise_sync_committee_subnets()
+        {
+            warn!("Failed to advertise sync committee subnets: {err:?}");
+        }
         true
+    }
+
+    /// Advertises the joined sync committee subnets in the ENR and `MetaData`.
+    fn advertise_sync_committee_subnets(&mut self) -> anyhow::Result<()> {
+        let mut subnets = SyncCommitteeSubnets::new();
+        for topic in self.subscribed_topics.lock().iter() {
+            if let GossipTopicKind::SyncCommittee(subnet_id) = topic.kind {
+                subnets.enable_sync_committee_subnet(subnet_id)?;
+            }
+        }
+        let discovery = &mut self.swarm.behaviour_mut().discovery;
+        discovery.set_sync_committee_subnets(subnets)?;
+        let local_enr = discovery.local_enr();
+        let (attnets, syncnets) = enr_subnet_bitfields(&local_enr)?;
+        *self.network_state.local_enr.write() = local_enr;
+        self.network_state.update_meta_data(|meta_data| {
+            meta_data.attnets = attnets;
+            meta_data.syncnets = syncnets;
+        })?;
+        Ok(())
     }
 
     /// Leaves duty topics whose last slot has passed, unless they are backbone subnets.
@@ -1507,6 +1532,7 @@ impl Network {
             .filter(|(_, until_slot)| **until_slot < current_slot)
             .map(|(topic, _)| *topic)
             .collect();
+        let mut left_sync_subnet = false;
         for topic in expired {
             self.duty_topics.remove(&topic);
             if !self
@@ -1515,7 +1541,11 @@ impl Network {
                 .any(|backbone| *backbone == topic)
             {
                 self.unsubscribe_from_topic(topic);
+                left_sync_subnet |= matches!(topic.kind, GossipTopicKind::SyncCommittee(_));
             }
+        }
+        if left_sync_subnet && let Err(err) = self.advertise_sync_committee_subnets() {
+            warn!("Failed to advertise sync committee subnets: {err:?}");
         }
     }
 
@@ -2766,6 +2796,37 @@ mod tests {
         assert!(network.duty_topics.is_empty());
         assert_eq!(network.backbone_topics.get(&subnet_id), Some(&topic));
         assert_eq!(advertised(&network), after);
+        assert_subnets_consistent(&network, data_dir.path());
+    }
+
+    #[test]
+    fn sync_duty_subnets_are_advertised_while_joined() {
+        initialize_test_network_spec();
+
+        let runtime = Runtime::new().unwrap();
+        let data_dir = TestDataDir::new();
+        let mut network = create_local_network(&runtime, data_dir.path()).unwrap();
+        let seq = meta_data_seq(&network);
+        let topic = GossipTopic {
+            fork: beacon_network_spec().fork_digest(0, genesis_validators_root()),
+            kind: GossipTopicKind::SyncCommittee(2),
+        };
+        let syncnets = |network: &Network| enr_subnet_bitfields(&network.enr()).unwrap().1;
+
+        assert!(network.subscribe_for_duty(topic, 10));
+        assert_eq!(syncnets(&network).num_set_bits(), 1);
+        assert!(syncnets(&network).get(2).unwrap());
+        assert_eq!(meta_data_seq(&network), seq + 1);
+        assert_subnets_consistent(&network, data_dir.path());
+
+        let slot_start = |slot: u64| {
+            epoch_start(0) + Duration::from_secs(slot * beacon_network_spec().seconds_per_slot())
+        };
+        network.expire_duty_topics(slot_start(10));
+        assert!(syncnets(&network).get(2).unwrap());
+        network.expire_duty_topics(slot_start(11));
+        assert_eq!(syncnets(&network).num_set_bits(), 0);
+        assert_eq!(meta_data_seq(&network), seq + 2);
         assert_subnets_consistent(&network, data_dir.path());
     }
 

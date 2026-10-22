@@ -34,8 +34,8 @@ use crate::{
     subnet::{
         ATTESTATION_BITFIELD_ENR_KEY, AttestationSubnets, CUSTODY_GROUP_COUNT_ENR_KEY,
         CustodyGroupCount, NEXT_FORK_DIGEST_ENR_KEY, NextForkDigest,
-        SYNC_COMMITTEE_BITFIELD_ENR_KEY, attestation_subnet_predicate, compute_subscribed_subnets,
-        next_fork_digest, sync_committee_subnet_predicate,
+        SYNC_COMMITTEE_BITFIELD_ENR_KEY, SyncCommitteeSubnets, attestation_subnet_predicate,
+        compute_subscribed_subnets, next_fork_digest, sync_committee_subnet_predicate,
     },
 };
 
@@ -288,6 +288,29 @@ impl Discovery {
 
         info!("Advertising attestation subnets {subnets:?}");
         self.current_attestation_subnets = subnets;
+        Ok(true)
+    }
+
+    /// Advertises `subnets` as the sync committee subnets in the local ENR. Returns whether the
+    /// ENR changed.
+    pub fn set_sync_committee_subnets(&mut self, subnets: SyncCommitteeSubnets) -> Result<bool> {
+        if self
+            .discv5
+            .local_enr()
+            .get_decodable::<SyncCommitteeSubnets>(SYNC_COMMITTEE_BITFIELD_ENR_KEY)
+            .and_then(Result::ok)
+            == Some(subnets.clone())
+        {
+            return Ok(false);
+        }
+
+        self.update_local_enr(|enr, key| {
+            enr.insert(SYNC_COMMITTEE_BITFIELD_ENR_KEY, &subnets, key)
+                .map_err(|err| anyhow!("Failed to update local ENR syncnets: {err:?}"))?;
+            Ok(())
+        })?;
+
+        info!("Advertising sync committee subnets {subnets:?}");
         Ok(true)
     }
 
