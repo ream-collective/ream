@@ -909,7 +909,7 @@ impl BeaconChain {
 
         let mut checked = vec![];
         let mut aggregates = vec![];
-        {
+        let latest = {
             let mut store = self.store.lock().await;
             let mut states: HashMap<Checkpoint, Option<Arc<BeaconState>>> = HashMap::new();
             for vote in votes {
@@ -952,22 +952,22 @@ impl BeaconChain {
                 .iter()
                 .flat_map(|(indexed, _, _)| indexed.attesting_indices.iter().copied())
                 .collect();
-            let latest = store.db.latest_messages_provider().get_many(indices)?;
-            aggregates = votes_with_new_messages(aggregates, |index, epoch| {
-                latest
-                    .get(&index)
-                    .is_none_or(|message| epoch > message.epoch)
-            });
-        }
+            store.db.latest_messages_provider().get_many(indices)?
+        };
 
         let verified = tokio::task::spawn_blocking(move || {
-            aggregates
-                .into_iter()
-                .filter(|(indexed, _, state)| {
-                    state.is_valid_indexed_attestation(indexed).unwrap_or(false)
-                })
-                .map(|(indexed, attestation, _)| (indexed.attesting_indices.to_vec(), attestation))
-                .collect::<Vec<_>>()
+            votes_with_new_messages(
+                aggregates,
+                |index, epoch| {
+                    latest
+                        .get(&index)
+                        .is_none_or(|message| epoch > message.epoch)
+                },
+                |indexed, state| state.is_valid_indexed_attestation(indexed).unwrap_or(false),
+            )
+            .into_iter()
+            .map(|(indexed, attestation, _)| (indexed.attesting_indices.to_vec(), attestation))
+            .collect::<Vec<_>>()
         })
         .await?;
         checked.extend(verified);
@@ -1236,26 +1236,32 @@ fn take_ready_votes(queue: &mut VecDeque<QueuedVote>, current_slot: u64) -> Vec<
     ready.into()
 }
 
-/// The aggregates that add a latest message, largest first, without those whose new votes an
-/// earlier one covers. `is_newer(index, epoch)` tells whether a vote of `index` for target
-/// `epoch` replaces its stored latest message.
+/// The valid aggregates that add a latest message, largest first, skipping those whose new votes
+/// an earlier valid one covers. `is_newer(index, epoch)` tells whether a vote of `index` for
+/// target `epoch` replaces its stored latest message; `is_valid` is only called on aggregates
+/// that would add one, and only valid ones cover votes.
 fn votes_with_new_messages<T>(
     mut aggregates: Vec<(IndexedAttestation, Attestation, T)>,
     is_newer: impl Fn(u64, u64) -> bool,
+    mut is_valid: impl FnMut(&IndexedAttestation, &T) -> bool,
 ) -> Vec<(IndexedAttestation, Attestation, T)> {
     aggregates.sort_by_key(|(indexed, _, _)| std::cmp::Reverse(indexed.attesting_indices.len()));
     let mut covered: HashSet<(u64, u64)> = HashSet::new();
     aggregates
         .into_iter()
-        .filter(|(indexed, attestation, _)| {
+        .filter(|(indexed, attestation, extra)| {
             let epoch = attestation.data.target.epoch;
-            let mut adds = false;
-            for index in indexed.attesting_indices.iter() {
-                if is_newer(*index, epoch) && covered.insert((*index, epoch)) {
-                    adds = true;
-                }
+            let new_votes: Vec<(u64, u64)> = indexed
+                .attesting_indices
+                .iter()
+                .map(|index| (*index, epoch))
+                .filter(|vote| is_newer(vote.0, epoch) && !covered.contains(vote))
+                .collect();
+            if new_votes.is_empty() || !is_valid(indexed, extra) {
+                return false;
             }
-            adds
+            covered.extend(new_votes);
+            true
         })
         .collect()
 }
@@ -2016,8 +2022,26 @@ mod tests {
             (indexed(&[1, 2]), vote(128, 4), "next epoch"),
         ];
 
-        let kept = votes_with_new_messages(aggregates, |index, epoch| index != 1 || epoch > 3);
+        let mut checked = vec![];
+        let kept = votes_with_new_messages(
+            aggregates.clone(),
+            |index, epoch| index != 1 || epoch > 3,
+            |_, name| {
+                checked.push(*name);
+                true
+            },
+        );
         let names: Vec<&str> = kept.iter().map(|(_, _, name)| *name).collect();
         assert_eq!(names, vec!["large", "next epoch"]);
+        assert_eq!(checked, vec!["large", "next epoch"]);
+
+        // An aggregate that fails the target state's check leaves its votes to the next one.
+        let kept = votes_with_new_messages(
+            aggregates,
+            |index, epoch| index != 1 || epoch > 3,
+            |_, name| *name != "large",
+        );
+        let names: Vec<&str> = kept.iter().map(|(_, _, name)| *name).collect();
+        assert_eq!(names, vec!["small", "next epoch"]);
     }
 }
