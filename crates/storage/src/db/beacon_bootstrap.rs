@@ -328,10 +328,18 @@ impl BeaconDB {
                 "Conflicting bootstrap markers; refusing recovery"
             );
         }
-        for folder in [BLOB_FOLDER_NAME, COLUMN_FOLDER_NAME, STATE_FOLDER_NAME] {
-            let dir = self.data_dir.join(folder);
+        let column_dir = self.data_dir.join(COLUMN_FOLDER_NAME);
+        for dir in [
+            self.data_dir.join(BLOB_FOLDER_NAME),
+            column_dir.clone(),
+            self.data_dir.join(STATE_FOLDER_NAME),
+        ] {
             for entry in fs::read_dir(&dir)? {
                 let entry = entry?;
+                if entry.file_type()?.is_dir() && dir == column_dir {
+                    fs::remove_dir_all(entry.path())?;
+                    continue;
+                }
                 ensure!(
                     entry.file_type()?.is_file(),
                     "Unexpected directory in bootstrap sidecars"
@@ -424,6 +432,7 @@ mod tests {
             [1],
         )
         .unwrap();
+
         // An abandoned checkpoint may already be indexed as canonical.
         let write = beacon.db.begin_write().unwrap();
         write

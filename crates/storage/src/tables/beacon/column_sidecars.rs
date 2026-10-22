@@ -1,5 +1,11 @@
-use std::{io::Read, path::PathBuf, sync::Arc};
+use std::{
+    fs::{self, File},
+    io::Read,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
+use alloy_primitives::B256;
 use ream_consensus_beacon::data_column_sidecar::{ColumnIdentifier, DataColumnSidecar};
 use redb::{Database, Durability, ReadableTable};
 use snap::raw::{Decoder, Encoder};
@@ -13,6 +19,84 @@ use crate::{errors::StoreError, tables::table::CustomTable};
 
 pub(crate) const COLUMN_FOLDER_NAME: &str = "beacon_columns";
 
+const LAYOUT_MIGRATION_LOG_EVERY: usize = 500_000;
+
+/// `beacon_columns/<block root>/<index>.ssz_snappy`: one flat directory overflows ext4's
+/// directory index on a supernode.
+pub(crate) fn column_file_path(data_dir: &Path, column_identifier: &ColumnIdentifier) -> PathBuf {
+    column_block_dir(data_dir, &column_identifier.block_root)
+        .join(format!("{}.ssz_snappy", column_identifier.index))
+}
+
+pub(crate) fn column_block_dir(data_dir: &Path, block_root: &B256) -> PathBuf {
+    data_dir
+        .join(COLUMN_FOLDER_NAME)
+        .join(block_root.to_string())
+}
+
+/// Creates a block's column directory if it is missing, durably.
+fn ensure_dir(dir: &Path) -> Result<(), StoreError> {
+    match fs::create_dir(dir) {
+        Ok(()) => {
+            if let Some(parent) = dir.parent() {
+                File::open(parent)?.sync_all()?;
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Moves files of the old flat layout, `<root>_<index>.ssz_snappy`, into their block
+/// directories. Startup only; an interrupted move resumes at the next start.
+pub(crate) fn prepare_column_layout(column_dir: &Path) -> Result<(), StoreError> {
+    fs::create_dir_all(column_dir)?;
+    let started = std::time::Instant::now();
+    let mut moved = 0;
+    let mut touched = std::collections::HashSet::new();
+    for entry in fs::read_dir(column_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some((root, index)) = name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".ssz_snappy"))
+            .and_then(|name| name.rsplit_once('_'))
+            .and_then(|(root, index)| Some((root.parse::<B256>().ok()?, index.to_string())))
+        else {
+            continue;
+        };
+        let block_dir = column_dir.join(root.to_string());
+        if touched.insert(block_dir.clone()) && !block_dir.exists() {
+            fs::create_dir(&block_dir)?;
+        }
+        fs::rename(entry.path(), block_dir.join(format!("{index}.ssz_snappy")))?;
+        moved += 1;
+        if moved % LAYOUT_MIGRATION_LOG_EVERY == 0 {
+            tracing::info!(
+                moved,
+                elapsed_s = started.elapsed().as_secs(),
+                "Moving column files into block directories"
+            );
+        }
+    }
+    if moved > 0 {
+        for block_dir in touched {
+            File::open(block_dir)?.sync_all()?;
+        }
+        File::open(column_dir)?.sync_all()?;
+        tracing::info!(
+            moved,
+            elapsed_s = started.elapsed().as_secs(),
+            "Moved column files into block directories"
+        );
+    }
+    Ok(())
+}
+
 pub struct ColumnSidecarsTable {
     pub data_dir: PathBuf,
     pub db: Arc<Database>,
@@ -25,6 +109,7 @@ impl ColumnSidecarsTable {
         value: DataColumnSidecar,
     ) -> Result<crate::tables::sidecar_file::PreparedSidecarFile, StoreError> {
         let bytes = Encoder::new().compress_vec(&value.as_ssz_bytes())?;
+        ensure_dir(&column_block_dir(&self.data_dir, &key.block_root))?;
         crate::tables::sidecar_file::PreparedSidecarFile::new(self.column_file_path(&key), &bytes)
     }
 
@@ -77,10 +162,7 @@ impl ColumnSidecarsTable {
     }
 
     fn column_file_path(&self, column_identifier: &ColumnIdentifier) -> PathBuf {
-        self.data_dir.join(COLUMN_FOLDER_NAME).join(format!(
-            "{}_{}.ssz_snappy",
-            column_identifier.block_root, column_identifier.index
-        ))
+        column_file_path(&self.data_dir, column_identifier)
     }
 }
 
