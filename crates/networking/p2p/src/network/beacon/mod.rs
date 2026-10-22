@@ -1552,15 +1552,20 @@ impl Network {
         }
         let mut failed = vec![];
         for subnet_id in 0..ATTESTATION_SUBNET_COUNT as u64 {
-            if !desired.is_attestation_subnet_enabled(subnet_id)?
-                || joined.is_attestation_subnet_enabled(subnet_id)?
-            {
+            if !desired.is_attestation_subnet_enabled(subnet_id)? {
                 continue;
             }
             let topic = GossipTopic {
                 fork: fork_digest,
                 kind: GossipTopicKind::BeaconAttestation(subnet_id),
             };
+            if joined.is_attestation_subnet_enabled(subnet_id)? {
+                // Joined for a duty, it must outlive that duty.
+                if self.subscribed_topics.lock().contains(&topic) {
+                    self.backbone_topics.insert(subnet_id, topic);
+                }
+                continue;
+            }
             if self.subscribe_to_topic(topic) {
                 joined.enable_attestation_subnet(subnet_id)?;
                 self.backbone_topics.insert(subnet_id, topic);
@@ -2722,6 +2727,46 @@ mod tests {
         assert!(!joined(&network, duty_subnet));
         assert!(joined(&network, backbone_subnet));
         assert!(network.duty_topics.is_empty());
+    }
+
+    #[test]
+    fn a_duty_subnet_that_becomes_backbone_stays_joined() {
+        initialize_test_network_spec();
+
+        let runtime = Runtime::new().unwrap();
+        let data_dir = TestDataDir::new();
+        let mut network = create_local_network(&runtime, data_dir.path()).unwrap();
+        let boundary = next_assignment_change(&network, 0);
+        let discovery = &network.swarm.behaviour().discovery;
+        let before = discovery.attestation_subnets_at(boundary - 1).unwrap();
+        let after = discovery.attestation_subnets_at(boundary).unwrap();
+        let subnet_id = (0..ATTESTATION_SUBNET_COUNT as u64)
+            .find(|subnet_id| {
+                after.is_attestation_subnet_enabled(*subnet_id).unwrap()
+                    && !before.is_attestation_subnet_enabled(*subnet_id).unwrap()
+            })
+            .unwrap();
+        let topic = GossipTopic {
+            fork: beacon_network_spec().fork_digest(
+                beacon_network_spec().current_epoch(),
+                genesis_validators_root(),
+            ),
+            kind: GossipTopicKind::BeaconAttestation(subnet_id),
+        };
+
+        network
+            .sync_attestation_subnets(epoch_start(boundary - 1))
+            .unwrap();
+        assert!(network.subscribe_for_duty(topic, boundary * SLOTS_PER_EPOCH));
+        network
+            .sync_attestation_subnets(epoch_start(boundary))
+            .unwrap();
+        network.expire_duty_topics(epoch_start(boundary + 1));
+
+        assert!(network.duty_topics.is_empty());
+        assert_eq!(network.backbone_topics.get(&subnet_id), Some(&topic));
+        assert_eq!(advertised(&network), after);
+        assert_subnets_consistent(&network, data_dir.path());
     }
 
     #[test]
