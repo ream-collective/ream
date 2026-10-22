@@ -275,17 +275,17 @@ impl BeaconDB {
                         drop(database);
                         break DatabaseClose::Closed(name);
                     }
-                    Err(shared) if std::time::Instant::now() >= deadline => {
-                        let mut write_txn = shared.begin_write()?;
+                    Err(err) if std::time::Instant::now() >= deadline => {
+                        let mut write_txn = err.begin_write()?;
                         write_txn.set_quick_repair(true);
                         write_txn.commit()?;
                         break DatabaseClose::AllocatorStateSaved {
                             name,
-                            other_handles: Arc::strong_count(&shared) - 1,
+                            other_handles: Arc::strong_count(&err) - 1,
                         };
                     }
-                    Err(shared) => {
-                        database = shared;
+                    Err(err) => {
+                        database = err;
                         std::thread::sleep(Duration::from_millis(50));
                     }
                 }
