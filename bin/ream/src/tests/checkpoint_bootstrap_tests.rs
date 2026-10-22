@@ -521,13 +521,9 @@ async fn pending_anchor_recovers_from_partial_peer_responses_after_restart() {
     let beacon_db = db.init_beacon_db().unwrap();
     let other_handle = db.init_beacon_db().unwrap();
     assert_eq!(other_handle.pending_anchor_root().unwrap(), Some(root));
-    fs::write(
-        beacon_db
-            .data_dir
-            .join(format!("beacon_columns/{root}_0.ssz_snappy")),
-        b"truncated old file",
-    )
-    .unwrap();
+    let block_dir = beacon_db.data_dir.join(format!("beacon_columns/{root}"));
+    fs::create_dir_all(&block_dir).unwrap();
+    fs::write(block_dir.join("0.ssz_snappy"), b"truncated old file").unwrap();
     let chain = Arc::new(BeaconChain::new(
         beacon_db.clone(),
         Default::default(),

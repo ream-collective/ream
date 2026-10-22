@@ -2,7 +2,7 @@
 use std::{collections::HashSet, fs, path::PathBuf};
 
 use alloy_primitives::B256;
-use ream_consensus_beacon::data_column_sidecar::NUMBER_OF_COLUMNS;
+use ream_consensus_beacon::data_column_sidecar::{ColumnIdentifier, NUMBER_OF_COLUMNS};
 use redb::{Durability, ReadableDatabase, ReadableTable};
 
 use super::beacon::BeaconDB;
@@ -14,7 +14,7 @@ use crate::{
                 COLUMN_MAINTENANCE, COLUMN_ROOTS_BY_SLOT, COLUMN_WRITER, INDEX_VERSION,
                 PRUNED_BEFORE,
             },
-            column_sidecars::COLUMN_FOLDER_NAME,
+            column_sidecars::{COLUMN_FOLDER_NAME, column_block_dir, column_file_path},
         },
         table::REDBTable,
     },
@@ -37,23 +37,14 @@ impl BeaconDB {
         let mut roots = HashSet::new();
         for entry in fs::read_dir(self.data_dir.join(COLUMN_FOLDER_NAME))? {
             let entry = entry?;
-            let name = entry.file_name();
-            let Some((root, index)) = name
-                .to_str()
-                .and_then(|name| name.strip_suffix(".ssz_snappy"))
-                .and_then(|name| name.rsplit_once('_'))
-            else {
+            if !entry.file_type()?.is_dir() {
                 continue;
-            };
-            let root = root
-                .parse::<B256>()
-                .map_err(|err| std::io::Error::other(format!("Invalid column file root: {err}")))?;
-            let index = index.parse::<u64>().map_err(|err| {
-                std::io::Error::other(format!("Invalid column file index: {err}"))
-            })?;
-            if index >= NUMBER_OF_COLUMNS {
-                return Err(std::io::Error::other("Column file index out of bounds").into());
             }
+            let root = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<B256>().ok())
+                .ok_or_else(|| std::io::Error::other("Invalid column directory name"))?;
             roots.insert(root);
         }
         for root in roots {
@@ -67,7 +58,7 @@ impl BeaconDB {
                     write.commit()?;
                 }
                 None => {
-                    crate::tables::sidecar_file::remove_published_batch(&self.column_paths(root))?;
+                    self.remove_column_files(root)?;
                 }
             }
         }
@@ -80,13 +71,21 @@ impl BeaconDB {
         Ok(())
     }
 
+    /// Removes a block's column files, then its directory with any leftover temporary file.
+    fn remove_column_files(&self, root: B256) -> Result<usize, StoreError> {
+        let removed =
+            crate::tables::sidecar_file::remove_published_batch(&self.column_paths(root))?;
+        match fs::remove_dir_all(column_block_dir(&self.data_dir, &root)) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+        Ok(removed)
+    }
+
     fn column_paths(&self, root: B256) -> Vec<PathBuf> {
         (0..NUMBER_OF_COLUMNS)
-            .map(|index| {
-                self.data_dir
-                    .join(COLUMN_FOLDER_NAME)
-                    .join(format!("{root}_{index}.ssz_snappy"))
-            })
+            .map(|index| column_file_path(&self.data_dir, &ColumnIdentifier::new(root, index)))
             .collect()
     }
 
@@ -132,8 +131,7 @@ impl BeaconDB {
         let mut removed = 0;
         for (slot, root) in roots {
             let _writer = COLUMN_WRITER.lock().unwrap_or_else(|err| err.into_inner());
-            removed +=
-                crate::tables::sidecar_file::remove_published_batch(&self.column_paths(root))?;
+            removed += self.remove_column_files(root)?;
             let mut write = self.db.begin_write()?;
             write.set_durability(Durability::Immediate)?;
             write
@@ -174,6 +172,42 @@ mod tests {
             kzg_commitments_inclusion_proof: Default::default(),
         };
         (root, block, column)
+    }
+
+    #[test]
+    fn columns_of_the_flat_layout_move_into_subdirectories_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let column_dir = dir.path().join(COLUMN_FOLDER_NAME);
+        let (root, block, sidecar) = column(9);
+        {
+            let db = ReamDB::new(dir.path().to_path_buf())
+                .unwrap()
+                .init_beacon_db()
+                .unwrap();
+            db.block_provider().insert(root, block).unwrap();
+            db.column_sidecars_provider()
+                .insert_batch(vec![sidecar.clone()])
+                .unwrap();
+        }
+        let name = format!("{root}_0.ssz_snappy");
+        let sharded = column_dir.join(root.to_string()).join("0.ssz_snappy");
+        fs::rename(&sharded, column_dir.join(&name)).unwrap();
+        fs::remove_dir(column_dir.join(root.to_string())).unwrap();
+        fs::write(column_dir.join(".ream-sidecar-leftover"), b"partial").unwrap();
+
+        let db = ReamDB::new(dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap();
+        assert!(!column_dir.join(&name).exists());
+        assert!(!column_dir.join(".ream-sidecar-leftover").exists());
+        assert!(sharded.is_file());
+        assert_eq!(
+            db.column_sidecars_provider()
+                .get(ColumnIdentifier::new(root, 0))
+                .unwrap(),
+            Some(sidecar)
+        );
     }
 
     #[test]

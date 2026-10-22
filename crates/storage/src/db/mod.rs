@@ -147,12 +147,15 @@ impl ReamDB {
     pub fn new(data_dir: PathBuf) -> Result<Self, StoreError> {
         let db = open_database(&data_dir.join(REDB_FILE), REDB_CACHE_SIZE)?;
 
-        for folder in [BLOB_FOLDER_NAME, COLUMN_FOLDER_NAME] {
-            let directory = data_dir.join(folder);
-            if directory.exists() {
-                crate::tables::sidecar_file::cleanup_temporary_sidecars(&directory)?;
-            }
+        let blob_dir = data_dir.join(BLOB_FOLDER_NAME);
+        if blob_dir.exists() {
+            crate::tables::sidecar_file::cleanup_temporary_sidecars(&blob_dir)?;
         }
+        let column_dir = data_dir.join(COLUMN_FOLDER_NAME);
+        if column_dir.exists() {
+            crate::tables::sidecar_file::cleanup_temporary_sidecars(&column_dir)?;
+        }
+        crate::tables::beacon::column_sidecars::prepare_column_layout(&column_dir)?;
 
         Ok(ReamDB {
             db: Arc::new(db),
