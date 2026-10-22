@@ -940,7 +940,7 @@ impl BeaconChain {
                 match vote.verified_attester {
                     // Under another shuffling the verified bit would name someone else.
                     Some(attester) => {
-                        if indexed.attesting_indices[..] == [attester] {
+                        if is_only_attester(&indexed.attesting_indices, attester) {
                             checked.push((vec![attester], attestation));
                         }
                     }
@@ -1221,20 +1221,19 @@ impl BeaconChain {
     }
 }
 
+/// Whether the committee bit of a gossip attestation names `verified_attester`, the only
+/// validator whose signature gossip validation checked.
+fn is_only_attester(attesting_indices: &[u64], verified_attester: u64) -> bool {
+    attesting_indices == [verified_attester]
+}
+
 /// Removes and returns the queued votes from before `current_slot`.
 fn take_ready_votes(queue: &mut VecDeque<QueuedVote>, current_slot: u64) -> Vec<QueuedVote> {
-    let mut ready = vec![];
-    queue.retain_mut(|vote| {
-        if vote.attestation.data.slot >= current_slot {
-            return true;
-        }
-        ready.push(QueuedVote {
-            attestation: vote.attestation.clone(),
-            verified_attester: vote.verified_attester,
-        });
-        false
-    });
-    ready
+    let (ready, waiting): (VecDeque<_>, VecDeque<_>) = std::mem::take(queue)
+        .into_iter()
+        .partition(|vote| vote.attestation.data.slot < current_slot);
+    *queue = waiting;
+    ready.into()
 }
 
 /// The aggregates that add a latest message, largest first, without those whose new votes an
@@ -1949,6 +1948,14 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_gossip_vote_counts_only_for_the_verified_attester() {
+        assert!(is_only_attester(&[7], 7));
+        assert!(!is_only_attester(&[8], 7));
+        assert!(!is_only_attester(&[7, 8], 7));
+        assert!(!is_only_attester(&[], 7));
     }
 
     fn vote(slot: u64, epoch: u64) -> Attestation {
