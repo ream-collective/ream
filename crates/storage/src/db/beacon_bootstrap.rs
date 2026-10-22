@@ -20,7 +20,9 @@ use crate::{
             },
             beacon_state::STATE_FOLDER_NAME,
             blobs_and_proofs::BLOB_FOLDER_NAME,
-            column_sidecars::COLUMN_FOLDER_NAME,
+            column_sidecars::{
+                COLUMN_FOLDER_NAME, check_block_dir, is_block_dir_name, remove_block_dir,
+            },
             latest_messages::LatestMessagesTable,
         },
         table::REDBTable,
@@ -219,12 +221,17 @@ impl BeaconDB {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         *cache = None;
-        ensure!(
-            self.slot_index_provider().get_highest_slot()?.is_none(),
-            "Refusing to bootstrap over existing blocks"
-        );
         let mut write = self.db.begin_write()?;
         write.set_durability(Durability::Immediate)?;
+        ensure!(
+            write
+                .open_table(
+                    crate::tables::beacon::slot_index::BeaconSlotIndexTable::TABLE_DEFINITION
+                )?
+                .last()?
+                .is_none(),
+            "Refusing to bootstrap over existing blocks"
+        );
         {
             let mut table = write.open_table(BOOTSTRAP)?;
             ensure!(
@@ -328,31 +335,43 @@ impl BeaconDB {
                 "Conflicting bootstrap markers; refusing recovery"
             );
         }
+        // Check everything before deleting anything: only files, and block directories of the
+        // column layout, are removed.
         let column_dir = self.data_dir.join(COLUMN_FOLDER_NAME);
-        for dir in [
+        let dirs = [
             self.data_dir.join(BLOB_FOLDER_NAME),
             column_dir.clone(),
             self.data_dir.join(STATE_FOLDER_NAME),
-        ] {
-            for entry in fs::read_dir(&dir)? {
+        ];
+        let mut files = Vec::new();
+        let mut block_dirs = Vec::new();
+        for dir in &dirs {
+            for entry in fs::read_dir(dir)? {
                 let entry = entry?;
-                // Only block directories of the column layout are removed whole.
-                if entry.file_type()?.is_dir()
-                    && dir == column_dir
-                    && entry
-                        .file_name()
-                        .to_str()
-                        .is_some_and(|name| name.parse::<B256>().is_ok())
+                let file_type = entry.file_type()?;
+                if file_type.is_file() {
+                    files.push(entry.path());
+                } else if file_type.is_dir()
+                    && *dir == column_dir
+                    && entry.file_name().to_str().is_some_and(is_block_dir_name)
                 {
-                    fs::remove_dir_all(entry.path())?;
-                    continue;
+                    check_block_dir(&entry.path())?;
+                    block_dirs.push(entry.path());
+                } else {
+                    bail!(
+                        "Unexpected entry {} in bootstrap sidecars",
+                        entry.path().display()
+                    );
                 }
-                ensure!(
-                    entry.file_type()?.is_file(),
-                    "Unexpected directory in bootstrap sidecars"
-                );
-                fs::remove_file(entry.path())?;
             }
+        }
+        for file in files {
+            fs::remove_file(file)?;
+        }
+        for block_dir in block_dirs {
+            remove_block_dir(&block_dir)?;
+        }
+        for dir in dirs {
             File::open(dir)?.sync_all()?;
         }
         let mut write = self.db.begin_write()?;

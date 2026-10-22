@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::errors::StoreError;
-const TEMP_PREFIX: &str = ".ream-sidecar-";
+pub(crate) const TEMP_PREFIX: &str = ".ream-sidecar-";
 // Only writers serialize. No filesystem I/O runs under the reader visibility lock.
 // true denotes a rollback failure: readers report an error until a writer repairs it.
 static WRITER: Mutex<()> = Mutex::new(());

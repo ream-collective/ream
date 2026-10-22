@@ -6,7 +6,9 @@ use std::{
 };
 
 use alloy_primitives::B256;
-use ream_consensus_beacon::data_column_sidecar::{ColumnIdentifier, DataColumnSidecar};
+use ream_consensus_beacon::data_column_sidecar::{
+    ColumnIdentifier, DataColumnSidecar, NUMBER_OF_COLUMNS,
+};
 use redb::{Database, Durability, ReadableTable};
 use snap::raw::{Decoder, Encoder};
 use ssz::{Decode, Encode};
@@ -49,7 +51,8 @@ fn ensure_dir(dir: &Path) -> Result<(), StoreError> {
 }
 
 /// Moves files of the old flat layout, `<root>_<index>.ssz_snappy`, into their block
-/// directories. Startup only; an interrupted move resumes at the next start.
+/// directories. Startup only; an interrupted move resumes at the next start. A file whose
+/// destination already exists is moved only if both are identical, and kept otherwise.
 pub(crate) fn prepare_column_layout(column_dir: &Path) -> Result<(), StoreError> {
     fs::create_dir_all(column_dir)?;
     let started = std::time::Instant::now();
@@ -65,7 +68,11 @@ pub(crate) fn prepare_column_layout(column_dir: &Path) -> Result<(), StoreError>
             .to_str()
             .and_then(|name| name.strip_suffix(".ssz_snappy"))
             .and_then(|name| name.rsplit_once('_'))
-            .and_then(|(root, index)| Some((root.parse::<B256>().ok()?, index.to_string())))
+            .and_then(|(root, index)| {
+                let parsed = root.parse::<B256>().ok()?;
+                let index = index.parse::<u64>().ok()?;
+                (parsed.to_string() == root && index < NUMBER_OF_COLUMNS).then_some((parsed, index))
+            })
         else {
             continue;
         };
@@ -73,7 +80,19 @@ pub(crate) fn prepare_column_layout(column_dir: &Path) -> Result<(), StoreError>
         if touched.insert(block_dir.clone()) && !block_dir.exists() {
             fs::create_dir(&block_dir)?;
         }
-        fs::rename(entry.path(), block_dir.join(format!("{index}.ssz_snappy")))?;
+        let destination = block_dir.join(format!("{index}.ssz_snappy"));
+        if destination.exists() {
+            if fs::read(&destination)? == fs::read(entry.path())? {
+                fs::remove_file(entry.path())?;
+            } else {
+                tracing::warn!(
+                    ?destination,
+                    "Kept an old column file that differs from its new copy"
+                );
+            }
+            continue;
+        }
+        fs::rename(entry.path(), destination)?;
         moved += 1;
         if moved % LAYOUT_MIGRATION_LOG_EVERY == 0 {
             tracing::info!(
@@ -83,7 +102,7 @@ pub(crate) fn prepare_column_layout(column_dir: &Path) -> Result<(), StoreError>
             );
         }
     }
-    if moved > 0 {
+    if !touched.is_empty() {
         for block_dir in touched {
             File::open(block_dir)?.sync_all()?;
         }
@@ -94,6 +113,46 @@ pub(crate) fn prepare_column_layout(column_dir: &Path) -> Result<(), StoreError>
             "Moved column files into block directories"
         );
     }
+    Ok(())
+}
+
+/// Whether `name` is a block directory of the column layout.
+pub(crate) fn is_block_dir_name(name: &str) -> bool {
+    name.parse::<B256>()
+        .is_ok_and(|root| root.to_string() == name)
+}
+
+/// Checks that a block directory holds only column files and temporary files of a write.
+pub(crate) fn check_block_dir(dir: &Path) -> Result<(), StoreError> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let known = entry.file_type()?.is_file()
+            && name.to_str().is_some_and(|name| {
+                name.starts_with(crate::tables::sidecar_file::TEMP_PREFIX)
+                    || name
+                        .strip_suffix(".ssz_snappy")
+                        .and_then(|index| index.parse::<u64>().ok())
+                        .is_some_and(|index| index < NUMBER_OF_COLUMNS)
+            });
+        if !known {
+            return Err(std::io::Error::other(format!(
+                "Unexpected entry {} in column directory {}",
+                name.to_string_lossy(),
+                dir.display()
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Removes a block directory after `check_block_dir` accepted it.
+pub(crate) fn remove_block_dir(dir: &Path) -> Result<(), StoreError> {
+    for entry in fs::read_dir(dir)? {
+        fs::remove_file(entry?.path())?;
+    }
+    fs::remove_dir(dir)?;
     Ok(())
 }
 

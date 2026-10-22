@@ -14,7 +14,10 @@ use crate::{
                 COLUMN_MAINTENANCE, COLUMN_ROOTS_BY_SLOT, COLUMN_WRITER, INDEX_VERSION,
                 PRUNED_BEFORE,
             },
-            column_sidecars::{COLUMN_FOLDER_NAME, column_block_dir, column_file_path},
+            column_sidecars::{
+                COLUMN_FOLDER_NAME, check_block_dir, column_block_dir, column_file_path,
+                remove_block_dir,
+            },
         },
         table::REDBTable,
     },
@@ -71,14 +74,17 @@ impl BeaconDB {
         Ok(())
     }
 
-    /// Removes a block's column files, then its directory with any leftover temporary file.
+    /// Removes a block's column files, then its directory. A directory holding anything else is
+    /// kept.
     fn remove_column_files(&self, root: B256) -> Result<usize, StoreError> {
         let removed =
             crate::tables::sidecar_file::remove_published_batch(&self.column_paths(root))?;
-        match fs::remove_dir_all(column_block_dir(&self.data_dir, &root)) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
+        let dir = column_block_dir(&self.data_dir, &root);
+        if dir.exists() {
+            match check_block_dir(&dir) {
+                Ok(()) => remove_block_dir(&dir)?,
+                Err(err) => tracing::warn!("Kept column directory: {err}"),
+            }
         }
         Ok(removed)
     }
@@ -208,6 +214,21 @@ mod tests {
                 .unwrap(),
             Some(sidecar)
         );
+    }
+
+    #[test]
+    fn migration_never_overwrites_a_different_column_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let column_dir = dir.path().join(COLUMN_FOLDER_NAME);
+        let root = B256::repeat_byte(3);
+        let block_dir = column_dir.join(root.to_string());
+        fs::create_dir_all(&block_dir).unwrap();
+        fs::write(block_dir.join("0.ssz_snappy"), b"new").unwrap();
+        fs::write(column_dir.join(format!("{root}_0.ssz_snappy")), b"old").unwrap();
+
+        ReamDB::new(dir.path().to_path_buf()).unwrap();
+        assert_eq!(fs::read(block_dir.join("0.ssz_snappy")).unwrap(), b"new");
+        assert!(column_dir.join(format!("{root}_0.ssz_snappy")).exists());
     }
 
     #[test]
