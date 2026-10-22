@@ -10,7 +10,10 @@ use ream_consensus_misc::{
 };
 use serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
-use ssz_types::{FixedVector, typenum::U6};
+use ssz_types::{
+    FixedVector,
+    typenum::{U6, U7},
+};
 use tree_hash::TreeHash;
 use tree_hash_derive::TreeHash;
 
@@ -27,7 +30,7 @@ pub struct LightClientUpdate {
     pub next_sync_committee_branch: FixedVector<B256, U6>,
     /// Finalized header corresponding to `attested_header.beacon.state_root`
     pub finalized_header: LightClientHeader,
-    pub finality_branch: FixedVector<B256, U6>,
+    pub finality_branch: FixedVector<B256, U7>,
     /// Sync committee aggregate signature
     pub sync_aggregate: SyncAggregate,
     /// Slot at which the aggregate signature was created (untrusted)

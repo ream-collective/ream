@@ -36,10 +36,20 @@ use ream_consensus_misc::{
 use ream_execution_rpc_types::electra::{
     execution_payload::ExecutionPayload, execution_payload_header::ExecutionPayloadHeader,
 };
+use ream_light_client::{
+    bootstrap::LightClientBootstrap, finality_update::LightClientFinalityUpdate,
+    header::LightClientHeader, optimistic_update::LightClientOptimisticUpdate,
+    update::LightClientUpdate,
+};
 use ream_merkle::is_valid_normalized_merkle_branch;
 
 // General consensus types
 test_consensus_type!(Attestation);
+test_consensus_type!(LightClientBootstrap);
+test_consensus_type!(LightClientFinalityUpdate);
+test_consensus_type!(LightClientHeader);
+test_consensus_type!(LightClientOptimisticUpdate);
+test_consensus_type!(LightClientUpdate);
 test_consensus_type!(AttestationData);
 test_consensus_type!(AttesterSlashing);
 test_consensus_type!(BeaconBlock);

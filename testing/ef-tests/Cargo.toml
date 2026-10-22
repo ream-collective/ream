@@ -26,14 +26,6 @@ const-hex.workspace = true
 ethereum_ssz.workspace = true
 ethereum_ssz_derive.workspace = true
 paste = "1.0.15"
-rstest.workspace = true
-rust_eth_kzg.workspace = true
-serde.workspace = true
-serde_yaml.workspace = true
-snap.workspace = true
-ssz_types.workspace = true
-tokio.workspace = true
-tree_hash.workspace = true
 
 # ream dependencies
 ream-bls.workspace = true
@@ -43,10 +35,19 @@ ream-consensus-misc.workspace = true
 ream-execution-engine.workspace = true
 ream-execution-rpc-types.workspace = true
 ream-fork-choice-beacon.workspace = true
+ream-light-client.workspace = true
 ream-merkle.workspace = true
 ream-network-spec.workspace = true
 ream-polynomial-commitments.workspace = true
 ream-storage.workspace = true
+rstest.workspace = true
+rust_eth_kzg.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+snap.workspace = true
+ssz_types.workspace = true
+tokio.workspace = true
+tree_hash.workspace = true
 
 [lints]
 workspace = true

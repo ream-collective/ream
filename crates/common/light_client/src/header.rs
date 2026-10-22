@@ -5,7 +5,7 @@ use ream_consensus_misc::beacon_block_header::BeaconBlockHeader;
 use ream_execution_rpc_types::electra::execution_payload_header::ExecutionPayloadHeader;
 use serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
-use ssz_types::{FixedVector, typenum::U3};
+use ssz_types::{FixedVector, typenum::U4};
 use tree_hash::TreeHash;
 use tree_hash_derive::TreeHash;
 
@@ -15,7 +15,7 @@ use tree_hash_derive::TreeHash;
 pub struct LightClientHeader {
     pub beacon: BeaconBlockHeader,
     pub execution: ExecutionPayloadHeader,
-    pub execution_branch: FixedVector<B256, U3>,
+    pub execution_branch: FixedVector<B256, U4>,
 }
 
 impl LightClientHeader {
