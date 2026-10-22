@@ -34,14 +34,18 @@ use crate::{
 
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, TreeHash)]
 pub struct SyncAggregatorSelectionData {
+    #[serde(with = "serde_utils::quoted_u64")]
     pub slot: u64,
+    #[serde(with = "serde_utils::quoted_u64")]
     pub subcommittee_index: u64,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, Encode, Decode, TreeHash)]
 pub struct SyncCommitteeMessage {
+    #[serde(with = "serde_utils::quoted_u64")]
     pub slot: u64,
     pub beacon_block_root: B256,
+    #[serde(with = "serde_utils::quoted_u64")]
     pub validator_index: u64,
     pub signature: BLSSignature,
 }

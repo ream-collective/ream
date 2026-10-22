@@ -1,15 +1,17 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::ensure;
+use anyhow::{anyhow, ensure};
 use libp2p::PeerId;
 pub use libp2p::gossipsub::{Message, MessageAcceptance};
 use ream_chain_beacon::beacon_chain::{BeaconChain, BlockProcessingOutcome};
 use ream_consensus_beacon::{
-    blob_sidecar::BlobIdentifier, electra::beacon_block::SignedBeaconBlock,
+    blob_sidecar::BlobIdentifier,
+    electra::{beacon_block::SignedBeaconBlock, beacon_state::BeaconState},
     single_attestation::SingleAttestation,
+    sync_committee::SyncCommittee,
 };
 use ream_consensus_misc::{
-    constants::beacon::{MIN_ATTESTATION_INCLUSION_DELAY, genesis_validators_root},
+    constants::beacon::{SYNC_COMMITTEE_SIZE, genesis_validators_root},
     misc::compute_epoch_at_slot,
 };
 use ream_execution_rpc_types::get_blobs::BlobAndProofV1;
@@ -25,8 +27,10 @@ use ream_storage::{
     tables::{field::REDBField, table::CustomTable},
 };
 use ream_validator_beacon::{
-    attestation::single_attestation_to_attestation, blob_sidecars::compute_subnet_for_blob_sidecar,
+    attestation::single_attestation_to_attestation,
+    blob_sidecars::compute_subnet_for_blob_sidecar,
     constants::SYNC_COMMITTEE_SUBNET_COUNT,
+    sync_committee::{SyncCommitteeMessage, compute_sync_committee_period},
 };
 use tracing::{debug, error, info, trace, warn};
 use tree_hash::TreeHash;
@@ -51,6 +55,54 @@ use crate::{
     },
     timing::{ColumnSource, log_block_proposer, log_columns_received},
 };
+
+/// The committee that signs at `slot`: the one the block at `slot + 1` checks, so the next
+/// committee on a period's last slot.
+fn message_sync_committee(state: &BeaconState, slot: u64) -> &SyncCommittee {
+    if compute_sync_committee_period(compute_epoch_at_slot(slot + 1))
+        == compute_sync_committee_period(state.get_current_epoch())
+    {
+        &state.current_sync_committee
+    } else {
+        &state.next_sync_committee
+    }
+}
+
+/// Adds an accepted sync committee message to the pool that sync committee contributions are
+/// built from.
+fn import_sync_committee_message(
+    beacon_chain: &BeaconChain,
+    message: &SyncCommitteeMessage,
+    subnet_id: u64,
+) -> anyhow::Result<()> {
+    let head = beacon_chain.head()?;
+    let state = head.state.as_ref();
+    let public_key = &state
+        .validators
+        .get(message.validator_index as usize)
+        .ok_or_else(|| anyhow!("Validator {} not found", message.validator_index))?
+        .public_key;
+    let sync_committee = message_sync_committee(state, message.slot);
+    let subcommittee_size = (SYNC_COMMITTEE_SIZE / SYNC_COMMITTEE_SUBNET_COUNT) as usize;
+    let positions = sync_committee
+        .public_keys
+        .iter()
+        .enumerate()
+        .filter(|(position, key)| {
+            *key == public_key && (position / subcommittee_size) as u64 == subnet_id
+        })
+        .map(|(position, _)| (message.clone(), position % subcommittee_size));
+
+    let pool = beacon_chain.sync_committee_pool();
+    pool.aggregate_messages(
+        message.slot,
+        message.beacon_block_root,
+        subnet_id,
+        positions,
+    );
+    pool.insert_sync_committee_message(message.clone(), subnet_id);
+    Ok(())
+}
 
 pub struct UnknownParentGossipBlock {
     pub parent_root: alloy_primitives::B256,
@@ -111,20 +163,9 @@ pub fn init_gossipsub_config_with_topics(
         },
     ];
 
-    // Subnets
-    for subnet_id in 0..beacon_network_spec().attestation_subnet_count {
-        topics.push(GossipTopic {
-            fork: fork_digest,
-            kind: GossipTopicKind::BeaconAttestation(subnet_id),
-        });
-    }
-
-    for subnet_id in 0..SYNC_COMMITTEE_SUBNET_COUNT {
-        topics.push(GossipTopic {
-            fork: fork_digest,
-            kind: GossipTopicKind::SyncCommittee(subnet_id),
-        });
-    }
+    // Attestation and sync committee subnets are joined per node (backbone) and per validator
+    // duty, not all at once: every attestation subnet together carries one attestation per
+    // active validator per epoch.
 
     if subscribes_to_blob_sidecars(beacon_network_spec().current_epoch()) {
         for subnet_id in 0..beacon_network_spec().blob_sidecar_subnet_count_electra {
@@ -173,14 +214,7 @@ async fn import_gossip_attestation(
         .operation_pool()
         .insert_attestation(attestation.clone(), single_attestation.committee_index);
 
-    let should_process_attestation =
-        head.current_slot >= single_attestation.data.slot + MIN_ATTESTATION_INCLUSION_DELAY;
-
-    if should_process_attestation {
-        beacon_chain
-            .process_gossip_attestation(attestation, single_attestation.attester_index)
-            .await?;
-    }
+    beacon_chain.queue_vote(attestation, Some(single_attestation.attester_index));
 
     Ok(())
 }
@@ -413,7 +447,14 @@ async fn dispatch_gossipsub_message(
                     Ok(validation_result) => {
                         let acceptance = accepted_message_acceptance(&validation_result);
                         match validation_result {
-                            ValidationResult::Accept => {}
+                            ValidationResult::Accept => {
+                                if let Err(err) = beacon_chain
+                                    .import_aggregate(aggregate_and_proof.message.aggregate)
+                                    .await
+                                {
+                                    warn!("Failed to import gossip aggregate: {err}");
+                                }
+                            }
                             ValidationResult::Reject(reason) => {
                                 info!("Aggregate and proof rejected: {reason}");
                             }
@@ -441,7 +482,15 @@ async fn dispatch_gossipsub_message(
                     Ok(validation_result) => {
                         let acceptance = accepted_message_acceptance(&validation_result);
                         match validation_result {
-                            ValidationResult::Accept => {}
+                            ValidationResult::Accept => {
+                                if let Err(err) = import_sync_committee_message(
+                                    beacon_chain,
+                                    &sync_committee,
+                                    subnet_id,
+                                ) {
+                                    warn!("Failed to import gossip sync committee message: {err}");
+                                }
+                            }
                             ValidationResult::Reject(reason) => {
                                 info!("Sync committee message rejected: {reason}");
                             }
@@ -473,8 +522,17 @@ async fn dispatch_gossipsub_message(
                     Ok(validation_result) => {
                         let acceptance = accepted_message_acceptance(&validation_result);
                         match validation_result {
-                            ValidationResult::Accept => {}
-
+                            ValidationResult::Accept => {
+                                let contribution =
+                                    signed_contribution_and_proof.message.contribution;
+                                beacon_chain.operation_pool().insert_sync_contribution(
+                                    contribution.slot,
+                                    contribution.beacon_block_root,
+                                    contribution.subcommittee_index,
+                                    contribution.aggregation_bits,
+                                    contribution.signature,
+                                );
+                            }
                             ValidationResult::Reject(reason) => {
                                 info!("Sync committee contribution and proof rejected: {reason}");
                             }
@@ -809,6 +867,38 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn a_period_s_last_slot_is_signed_by_the_next_sync_committee() {
+        use ream_consensus_misc::constants::beacon::{
+            EPOCHS_PER_SYNC_COMMITTEE_PERIOD, SLOTS_PER_EPOCH,
+        };
+        use ssz::Decode;
+
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../../testing/gossip-validation/tests/assets/sepolia/states/\
+             grandparent_state_9552074.ssz_snappy",
+        );
+        let bytes = snap::raw::Decoder::new()
+            .decompress_vec(&std::fs::read(path).expect("reads fixture state"))
+            .expect("decompresses fixture state");
+        let mut state = BeaconState::from_ssz_bytes(&bytes).expect("decodes fixture state");
+        let last_slot = 1000 * EPOCHS_PER_SYNC_COMMITTEE_PERIOD * SLOTS_PER_EPOCH - 1;
+        let is_next = |state: &BeaconState, slot| {
+            std::ptr::eq(
+                message_sync_committee(state, slot),
+                state.next_sync_committee.as_ref(),
+            )
+        };
+
+        state.slot = last_slot;
+        assert!(!is_next(&state, last_slot - 1));
+        assert!(is_next(&state, last_slot));
+        // Once the head is in the new period, its current committee signed that slot.
+        state.slot = last_slot + 1;
+        assert!(!is_next(&state, last_slot));
+        assert!(!is_next(&state, last_slot + 1));
+    }
 
     #[test]
     fn data_column_topics_are_the_sampled_subnets() {

@@ -12,6 +12,7 @@ version.workspace = true
 [dependencies]
 alloy-primitives.workspace = true
 parking_lot.workspace = true
+ssz_types.workspace = true
 tree_hash.workspace = true
 
 # ream dependencies
@@ -20,7 +21,6 @@ ream-consensus-beacon.workspace = true
 ream-consensus-misc.workspace = true
 
 [dev-dependencies]
-ssz_types.workspace = true
 
 [lints]
 workspace = true

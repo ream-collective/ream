@@ -10,14 +10,25 @@ use ream_consensus_beacon::{
     voluntary_exit::SignedVoluntaryExit,
 };
 use ream_consensus_misc::{
-    constants::beacon::MIN_ATTESTATION_INCLUSION_DELAY,
+    constants::beacon::{MIN_ATTESTATION_INCLUSION_DELAY, SYNC_COMMITTEE_SIZE},
     deposit::Deposit,
     misc::{compute_epoch_at_slot, get_committee_indices},
 };
+use ssz_types::{BitVector, typenum::U128};
 use tree_hash::TreeHash;
 
 /// Electra's `MAX_ATTESTATIONS_ELECTRA`: the most attestations a block body can carry.
 const MAX_ATTESTATIONS_ELECTRA: usize = 8;
+
+const SYNC_COMMITTEE_SUBNET_COUNT: usize = 4;
+const SYNC_SUBCOMMITTEE_SIZE: usize = SYNC_COMMITTEE_SIZE as usize / SYNC_COMMITTEE_SUBNET_COUNT;
+
+/// The best contribution seen for one sync subcommittee.
+#[derive(Debug, Clone)]
+struct SyncContribution {
+    aggregation_bits: BitVector<U128>,
+    signature: BLSSignature,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProposerPreparation {
@@ -32,7 +43,7 @@ pub struct AttestationKey {
     committee_index: u64,
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct SyncAggregateKey {
     slot: u64,
     beacon_block_root: B256,
@@ -47,7 +58,8 @@ pub struct OperationPool {
     proposer_slashings: RwLock<HashSet<ProposerSlashing>>,
     attestations: RwLock<HashMap<AttestationKey, Vec<Attestation>>>,
     included_attestation_bits: RwLock<HashMap<AttestationKey, HashSet<usize>>>,
-    sync_aggregates: RwLock<HashMap<SyncAggregateKey, SyncAggregate>>,
+    sync_contributions:
+        RwLock<HashMap<SyncAggregateKey, [Option<SyncContribution>; SYNC_COMMITTEE_SUBNET_COUNT]>>,
     deposits: RwLock<HashSet<Deposit>>,
 }
 
@@ -184,6 +196,26 @@ impl OperationPool {
             .collect()
     }
 
+    /// The aggregate an aggregator publishes for one committee: the largest attestations first,
+    /// then every vote that does not overlap them.
+    pub fn get_aggregate_attestation(
+        &self,
+        slot: u64,
+        committee_index: u64,
+        attestation_data_root: B256,
+    ) -> Option<Attestation> {
+        let key = AttestationKey {
+            slot,
+            attestation_data_root,
+            committee_index,
+        };
+        let mut group = self.attestations.read().get(&key)?.clone();
+        group.sort_by_key(|attestation| {
+            std::cmp::Reverse(attestation.aggregation_bits.num_set_bits())
+        });
+        aggregate_attestation_group(&group, &HashSet::default())
+    }
+
     pub fn get_all_attestations(&self) -> Vec<Attestation> {
         self.attestations
             .read()
@@ -277,31 +309,80 @@ impl OperationPool {
             .retain(|key, _| is_live(key));
     }
 
+    /// Builds the block's sync aggregate from the best contribution of each subcommittee for
+    /// ``beacon_block_root`` at ``slot``.
     pub fn get_sync_aggregate(&self, slot: u64, beacon_block_root: B256) -> Option<SyncAggregate> {
         let key = SyncAggregateKey {
             slot,
             beacon_block_root,
         };
-        self.sync_aggregates.read().get(&key).cloned()
+        let contributions = self.sync_contributions.read();
+        let contributions = contributions.get(&key)?;
+
+        let mut sync_committee_bits = BitVector::default();
+        let mut signatures = vec![];
+        for (subcommittee_index, contribution) in contributions.iter().enumerate() {
+            let Some(contribution) = contribution else {
+                continue;
+            };
+            for (position, bit) in contribution.aggregation_bits.iter().enumerate() {
+                if bit {
+                    sync_committee_bits
+                        .set(subcommittee_index * SYNC_SUBCOMMITTEE_SIZE + position, true)
+                        .ok()?;
+                }
+            }
+            signatures.push(&contribution.signature);
+        }
+        if signatures.is_empty() {
+            return None;
+        }
+
+        Some(SyncAggregate {
+            sync_committee_bits,
+            sync_committee_signature: BLSSignature::aggregate(&signatures).ok()?,
+        })
     }
 
-    pub fn get_all_sync_aggregates(&self) -> Vec<SyncAggregate> {
-        self.sync_aggregates.read().values().cloned().collect()
-    }
-
-    pub fn insert_sync_aggregate(
+    /// Keeps a validated sync committee contribution if it has more participants than the one
+    /// held for its subcommittee.
+    pub fn insert_sync_contribution(
         &self,
-        sync_aggregate: SyncAggregate,
         slot: u64,
         beacon_block_root: B256,
+        subcommittee_index: u64,
+        aggregation_bits: BitVector<U128>,
+        signature: BLSSignature,
     ) {
+        let Some(index) = usize::try_from(subcommittee_index)
+            .ok()
+            .filter(|index| *index < SYNC_COMMITTEE_SUBNET_COUNT)
+        else {
+            return;
+        };
         let key = SyncAggregateKey {
             slot,
             beacon_block_root,
         };
+        let mut contributions = self.sync_contributions.write();
+        let best = &mut contributions.entry(key).or_default()[index];
+        let participants = aggregation_bits.num_set_bits();
+        if best
+            .as_ref()
+            .is_none_or(|best| best.aggregation_bits.num_set_bits() < participants)
+        {
+            *best = Some(SyncContribution {
+                aggregation_bits,
+                signature,
+            });
+        }
+    }
 
-        let mut map = self.sync_aggregates.write();
-        map.insert(key, sync_aggregate);
+    /// Keeps contributions a block at ``current_slot`` or later can still include.
+    pub fn clean_sync_contributions(&self, current_slot: u64) {
+        self.sync_contributions
+            .write()
+            .retain(|key, _| key.slot + 2 >= current_slot);
     }
 
     pub fn get_all_deposits(&self) -> Vec<Deposit> {
@@ -455,6 +536,26 @@ mod tests {
 
         assert!(aggregate.aggregation_bits.get(0).unwrap());
         assert!(aggregate.aggregation_bits.get(2).unwrap());
+    }
+
+    #[test]
+    fn aggregate_attestation_takes_the_largest_votes_first() {
+        let pool = OperationPool::default();
+        let small = make_attestation(10, 3, 1, 8, &[0]);
+        let large = make_attestation(10, 3, 1, 8, &[0, 1, 2]);
+        let other = make_attestation(10, 3, 1, 8, &[5]);
+        let root = small.data.tree_hash_root();
+        for attestation in [small, large, other] {
+            pool.insert_attestation(attestation, 3);
+        }
+
+        let aggregate = pool.get_aggregate_attestation(10, 3, root).unwrap();
+        let set_bits: Vec<usize> = (0..aggregate.aggregation_bits.len())
+            .filter(|&index| aggregate.aggregation_bits.get(index).unwrap())
+            .collect();
+        assert_eq!(set_bits, vec![0, 1, 2, 5]);
+        assert_eq!(aggregate.aggregation_bits.len(), 8);
+        assert!(pool.get_aggregate_attestation(10, 4, root).is_none());
     }
 
     #[test]
@@ -624,5 +725,38 @@ mod tests {
         // Should be expired at epoch 103
         operation_pool.clean_proposer_preparations(103);
         assert_eq!(operation_pool.get_proposer_preparation(1), None);
+    }
+
+    #[test]
+    fn sync_aggregate_combines_the_best_contribution_per_subcommittee() {
+        let pool = OperationPool::default();
+        let root = B256::repeat_byte(7);
+        let bits = |positions: &[usize]| {
+            let mut bits = BitVector::<U128>::default();
+            for &position in positions {
+                bits.set(position, true).unwrap();
+            }
+            bits
+        };
+
+        assert!(pool.get_sync_aggregate(10, root).is_none());
+
+        pool.insert_sync_contribution(10, root, 0, bits(&[1, 2]), BLSSignature::infinity());
+        pool.insert_sync_contribution(10, root, 0, bits(&[5]), BLSSignature::infinity());
+        pool.insert_sync_contribution(10, root, 2, bits(&[0, 127]), BLSSignature::infinity());
+        pool.insert_sync_contribution(10, root, 4, bits(&[3]), BLSSignature::infinity());
+
+        let aggregate = pool.get_sync_aggregate(10, root).unwrap();
+        let set: Vec<usize> = aggregate
+            .sync_committee_bits
+            .iter()
+            .enumerate()
+            .filter_map(|(index, bit)| bit.then_some(index))
+            .collect();
+        assert_eq!(set, vec![1, 2, 256, 383]);
+        assert!(pool.get_sync_aggregate(10, B256::ZERO).is_none());
+
+        pool.clean_sync_contributions(13);
+        assert!(pool.get_sync_aggregate(10, root).is_none());
     }
 }

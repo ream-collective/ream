@@ -1143,6 +1143,7 @@ impl Store {
                 .clean_sync_committee_messages(current_slot);
             self.sync_committee_pool
                 .clean_sync_committee_contributions(current_slot);
+            self.operation_pool.clean_sync_contributions(current_slot);
 
             // A finalized checkpoint only finalizes the checkpoint slot, not every block in its
             // epoch. Keep pending blocks from later slots in that epoch while pruning entries at

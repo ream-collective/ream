@@ -1,10 +1,10 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 
 use alloy_primitives::B256;
-use anyhow::anyhow;
+use anyhow::{anyhow, bail};
 use parking_lot::RwLock;
 use ream_consensus_beacon::{
     attestation::Attestation,
@@ -14,8 +14,11 @@ use ream_consensus_beacon::{
     matrix_entry::{data_column_sidecars_from_execution_blobs, reconstruct_data_column_sidecars},
 };
 use ream_consensus_misc::{
-    beacon_block_header::SignedBeaconBlockHeader, checkpoint::Checkpoint,
-    constants::beacon::genesis_validators_root, misc::compute_epoch_at_slot,
+    beacon_block_header::SignedBeaconBlockHeader,
+    checkpoint::Checkpoint,
+    constants::beacon::genesis_validators_root,
+    indexed_attestation::IndexedAttestation,
+    misc::{compute_epoch_at_slot, get_committee_indices},
 };
 use ream_events_beacon::{BeaconEvent, BeaconEventSender, event::chain::BlockEvent};
 use ream_execution_engine::{ExecutionEngine, engine_trait::ExecutionApi};
@@ -24,8 +27,7 @@ use ream_fork_choice_beacon::{
     data_availability::{DataAvailabilityChecker, PendingBlock},
     handlers::{
         OnBlockOutcome, on_attestation, on_attester_slashing, on_block_attestations,
-        on_block_with_root, on_gossip_attestation_with_shuffling, on_tick, process_available_block,
-        shares_target_shuffling,
+        on_block_with_root, on_tick, process_available_block, shares_target_shuffling,
     },
     store::Store,
 };
@@ -48,7 +50,7 @@ use ream_storage::{
     },
 };
 use ream_sync_committee_pool::SyncCommitteePool;
-use tokio::sync::{Mutex, Semaphore, broadcast};
+use tokio::sync::{Mutex, Notify, Semaphore, broadcast};
 use tracing::{debug, warn};
 use tree_hash::TreeHash;
 
@@ -109,6 +111,7 @@ pub struct BeaconChain {
     cached_head: RwLock<Option<CachedHead>>,
     db: BeaconDB,
     operation_pool: Arc<OperationPool>,
+    sync_committee_pool: Arc<SyncCommitteePool>,
     pub execution_engine: Option<ExecutionEngine>,
     pub event_sender: Option<broadcast::Sender<BeaconEvent>>,
     block_import_sender: broadcast::Sender<BlockImportEvent>,
@@ -123,7 +126,21 @@ pub struct BeaconChain {
     /// Checkpoint state builds that may run at once. Each copies a state and may run epoch
     /// processing; Prysm also allows one (`attPreStateRegenSem`).
     checkpoint_state_regen: Semaphore,
+    /// Gossip votes waiting for fork choice, which counts a vote from the slot after its own.
+    queued_votes: parking_lot::Mutex<VecDeque<QueuedVote>>,
+    /// Wakes `run_vote_application` when queued votes may be ready.
+    votes_ready: Notify,
 }
+
+/// A validated gossip attestation or aggregate for fork choice. Gossip validation checked its
+/// signature; for an unaggregated attestation, only `verified_attester`'s.
+struct QueuedVote {
+    attestation: Attestation,
+    verified_attester: Option<u64>,
+}
+
+/// More votes than several slots of gossip on mainnet; the oldest are dropped beyond this.
+const MAX_QUEUED_VOTES: usize = 1 << 17;
 
 impl BeaconChain {
     /// Creates a new instance of `BeaconChain`.
@@ -138,6 +155,7 @@ impl BeaconChain {
 
         let read_db = db.clone();
         let read_operation_pool = operation_pool.clone();
+        let read_sync_committee_pool = sync_committee_pool.clone();
         let mut store = Store::new(db, operation_pool, Some(sync_committee_pool));
         if let Err(err) = store.enable_fork_choice_tree() {
             warn!(
@@ -158,6 +176,7 @@ impl BeaconChain {
             cached_head: RwLock::new(cached_head),
             db: read_db,
             operation_pool: read_operation_pool,
+            sync_committee_pool: read_sync_committee_pool,
             execution_engine,
             event_sender,
             block_import_sender,
@@ -165,6 +184,8 @@ impl BeaconChain {
             reconstructions: parking_lot::Mutex::new(HashSet::new()),
             checkpoint_state_locks: parking_lot::Mutex::new(HashMap::new()),
             checkpoint_state_regen: Semaphore::new(CHECKPOINT_STATE_REGEN_PERMITS),
+            queued_votes: parking_lot::Mutex::new(VecDeque::new()),
+            votes_ready: Notify::new(),
             force_data_availability_checks: false,
         }
     }
@@ -192,6 +213,10 @@ impl BeaconChain {
     /// these never wait for the store lock.
     pub fn db(&self) -> &BeaconDB {
         &self.db
+    }
+
+    pub fn sync_committee_pool(&self) -> &Arc<SyncCommitteePool> {
+        &self.sync_committee_pool
     }
 
     pub fn operation_pool(&self) -> &Arc<OperationPool> {
@@ -795,41 +820,163 @@ impl BeaconChain {
         Ok(())
     }
 
-    /// ``process_attestation`` for a gossip attestation whose signature gossip validation verified
-    /// for `attester_index`; see ``on_gossip_attestation``.
-    pub async fn process_gossip_attestation(
-        &self,
-        attestation: Attestation,
-        attester_index: u64,
-    ) -> anyhow::Result<()> {
-        let target = attestation.data.target;
-        let head = self.head().ok();
-        let mut store = self.store.lock().await;
-        // When the target checkpoint state is not in memory, read the committee from the head
-        // state if it has the same shuffling, as Prysm does; otherwise build the checkpoint state
-        // outside the lock. Without a cached head (no anchor block stored yet) there is no
-        // shortcut, and the checkpoint state is used as before.
-        let shuffling_head = head.filter(|head| {
-            !self.db.checkpoint_states_provider().is_in_memory(target)
-                && shares_target_shuffling(
-                    &store,
-                    head.state.get_current_epoch(),
-                    head.head_root,
-                    target,
-                )
-                .unwrap_or(false)
-        });
-        if shuffling_head.is_none() && !self.db.checkpoint_states_provider().is_in_memory(target) {
-            drop(store);
-            self.prepare_checkpoint_state(target).await;
-            store = self.store.lock().await;
+    /// Adds a validated aggregate to the operation pool and queues it for fork choice.
+    pub async fn import_aggregate(&self, aggregate: Attestation) -> anyhow::Result<()> {
+        let [committee_index] = get_committee_indices(&aggregate.committee_bits)[..] else {
+            bail!("Aggregate must have exactly one committee bit set");
+        };
+        self.operation_pool
+            .insert_attestation(aggregate.clone(), committee_index);
+        self.queue_vote(aggregate, None);
+        Ok(())
+    }
+
+    /// Queues a validated gossip vote for fork choice. `verified_attester` is the attester of an
+    /// unaggregated attestation, whose signature gossip validation checked.
+    pub fn queue_vote(&self, attestation: Attestation, verified_attester: Option<u64>) {
+        let late = self
+            .head()
+            .is_ok_and(|head| head.current_slot > attestation.data.slot);
+        {
+            let mut queue = self.queued_votes.lock();
+            if queue.len() >= MAX_QUEUED_VOTES {
+                queue.pop_front();
+            }
+            queue.push_back(QueuedVote {
+                attestation,
+                verified_attester,
+            });
         }
-        on_gossip_attestation_with_shuffling(
-            &mut store,
-            attestation,
-            attester_index,
-            shuffling_head.as_ref().map(|head| head.state.as_ref()),
-        )?;
+        if late {
+            self.votes_ready.notify_one();
+        }
+    }
+
+    /// Applies queued votes to fork choice whenever a slot starts or a late vote arrives.
+    pub async fn run_vote_application(self: Arc<Self>) {
+        loop {
+            self.votes_ready.notified().await;
+            loop {
+                let Ok(head) = self.head() else {
+                    break;
+                };
+                let votes = take_ready_votes(&mut self.queued_votes.lock(), head.current_slot);
+                if votes.is_empty() {
+                    break;
+                }
+                let count = votes.len();
+                let started = std::time::Instant::now();
+                if let Err(err) = self.apply_votes(&head, votes).await {
+                    warn!("Failed to apply {count} gossip votes to fork choice: {err:#}");
+                }
+                debug!(
+                    count,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "Applied gossip votes to fork choice"
+                );
+            }
+        }
+    }
+
+    /// ``on_attestation`` for a batch of gossip votes, writing the latest messages once.
+    /// Committees come from the head state when it has the target's shuffling, otherwise from the
+    /// target checkpoint state, built outside the lock. Aggregate signatures are checked again
+    /// only for aggregates that add a vote, and outside the lock.
+    async fn apply_votes(&self, head: &CachedHead, votes: Vec<QueuedVote>) -> anyhow::Result<()> {
+        let targets: HashSet<Checkpoint> = votes
+            .iter()
+            .map(|vote| vote.attestation.data.target)
+            .collect();
+        let shared_shuffling: HashSet<Checkpoint> = {
+            let store = self.store.lock().await;
+            targets
+                .iter()
+                .filter(|target| {
+                    shares_target_shuffling(
+                        &store,
+                        head.state.get_current_epoch(),
+                        head.head_root,
+                        **target,
+                    )
+                    .unwrap_or(false)
+                })
+                .copied()
+                .collect()
+        };
+        for target in targets.difference(&shared_shuffling) {
+            self.prepare_checkpoint_state(*target).await;
+        }
+
+        let mut checked = vec![];
+        let mut aggregates = vec![];
+        let latest = {
+            let mut store = self.store.lock().await;
+            let mut states: HashMap<Checkpoint, Option<Arc<BeaconState>>> = HashMap::new();
+            for vote in votes {
+                let attestation = vote.attestation;
+                if let Err(err) = store.validate_on_attestation(&attestation, false) {
+                    debug!("Gossip vote not applied: {err}");
+                    continue;
+                }
+                let target = attestation.data.target;
+                let state = states.entry(target).or_insert_with(|| {
+                    if shared_shuffling.contains(&target) {
+                        Some(head.state.clone())
+                    } else {
+                        store
+                            .db
+                            .checkpoint_states_provider()
+                            .get_shared(target)
+                            .ok()
+                            .flatten()
+                    }
+                });
+                let Some(state) = state else {
+                    continue;
+                };
+                let Ok(indexed) = state.get_indexed_attestation(&attestation) else {
+                    continue;
+                };
+                match vote.verified_attester {
+                    // Under another shuffling the verified bit would name someone else.
+                    Some(attester) => {
+                        if is_only_attester(&indexed.attesting_indices, attester) {
+                            checked.push((vec![attester], attestation));
+                        }
+                    }
+                    None => aggregates.push((indexed, attestation, state.clone())),
+                }
+            }
+
+            let indices: HashSet<u64> = aggregates
+                .iter()
+                .flat_map(|(indexed, _, _)| indexed.attesting_indices.iter().copied())
+                .collect();
+            store.db.latest_messages_provider().get_many(indices)?
+        };
+
+        let verified = tokio::task::spawn_blocking(move || {
+            votes_with_new_messages(
+                aggregates,
+                |index, epoch| {
+                    latest
+                        .get(&index)
+                        .is_none_or(|message| epoch > message.epoch)
+                },
+                |indexed, state| state.is_valid_indexed_attestation(indexed).unwrap_or(false),
+            )
+            .into_iter()
+            .map(|(indexed, attestation, _)| (indexed.attesting_indices.to_vec(), attestation))
+            .collect::<Vec<_>>()
+        })
+        .await?;
+        checked.extend(verified);
+        if checked.is_empty() {
+            return Ok(());
+        }
+
+        let mut store = self.store.lock().await;
+        store.update_latest_messages_batch(checked)?;
         self.publish_cached_head(&store);
         drop(store);
         self.update_execution_forkchoice(false).await;
@@ -984,6 +1131,8 @@ impl BeaconChain {
         self.publish_cached_head(&store);
         drop(store);
         self.update_execution_forkchoice(false).await;
+        // Votes from the slot that just ended now count.
+        self.votes_ready.notify_one();
         Ok(())
     }
 
@@ -1070,6 +1219,51 @@ impl BeaconChain {
             finalized_checkpoint: store.db.finalized_checkpoint_provider().get()?,
         })
     }
+}
+
+/// Whether the committee bit of a gossip attestation names `verified_attester`, the only
+/// validator whose signature gossip validation checked.
+fn is_only_attester(attesting_indices: &[u64], verified_attester: u64) -> bool {
+    attesting_indices == [verified_attester]
+}
+
+/// Removes and returns the queued votes from before `current_slot`.
+fn take_ready_votes(queue: &mut VecDeque<QueuedVote>, current_slot: u64) -> Vec<QueuedVote> {
+    let (ready, waiting): (VecDeque<_>, VecDeque<_>) = std::mem::take(queue)
+        .into_iter()
+        .partition(|vote| vote.attestation.data.slot < current_slot);
+    *queue = waiting;
+    ready.into()
+}
+
+/// The valid aggregates that add a latest message, largest first, skipping those whose new votes
+/// an earlier valid one covers. `is_newer(index, epoch)` tells whether a vote of `index` for
+/// target `epoch` replaces its stored latest message; `is_valid` is only called on aggregates
+/// that would add one, and only valid ones cover votes.
+fn votes_with_new_messages<T>(
+    mut aggregates: Vec<(IndexedAttestation, Attestation, T)>,
+    is_newer: impl Fn(u64, u64) -> bool,
+    mut is_valid: impl FnMut(&IndexedAttestation, &T) -> bool,
+) -> Vec<(IndexedAttestation, Attestation, T)> {
+    aggregates.sort_by_key(|(indexed, _, _)| std::cmp::Reverse(indexed.attesting_indices.len()));
+    let mut covered: HashSet<(u64, u64)> = HashSet::new();
+    aggregates
+        .into_iter()
+        .filter(|(indexed, attestation, extra)| {
+            let epoch = attestation.data.target.epoch;
+            let new_votes: Vec<(u64, u64)> = indexed
+                .attesting_indices
+                .iter()
+                .map(|index| (*index, epoch))
+                .filter(|vote| is_newer(vote.0, epoch) && !covered.contains(vote))
+                .collect();
+            if new_votes.is_empty() || !is_valid(indexed, extra) {
+                return false;
+            }
+            covered.extend(new_votes);
+            true
+        })
+        .collect()
 }
 
 /// Check data availability only for blocks within the sidecar retention window.
@@ -1760,5 +1954,94 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_gossip_vote_counts_only_for_the_verified_attester() {
+        assert!(is_only_attester(&[7], 7));
+        assert!(!is_only_attester(&[8], 7));
+        assert!(!is_only_attester(&[7, 8], 7));
+        assert!(!is_only_attester(&[], 7));
+    }
+
+    fn vote(slot: u64, epoch: u64) -> Attestation {
+        let checkpoint = Checkpoint {
+            epoch,
+            root: B256::ZERO,
+        };
+        Attestation {
+            aggregation_bits: ssz_types::BitList::with_capacity(0).unwrap(),
+            data: ream_consensus_misc::attestation_data::AttestationData {
+                slot,
+                index: 0,
+                beacon_block_root: B256::ZERO,
+                source: checkpoint,
+                target: checkpoint,
+            },
+            signature: ream_bls::BLSSignature::infinity(),
+            committee_bits: Default::default(),
+        }
+    }
+
+    fn indexed(indices: &[u64]) -> IndexedAttestation {
+        IndexedAttestation {
+            attesting_indices: ssz_types::VariableList::new(indices.to_vec()).unwrap(),
+            data: vote(0, 0).data,
+            signature: ream_bls::BLSSignature::infinity(),
+        }
+    }
+
+    #[test]
+    fn votes_wait_for_the_slot_after_their_own() {
+        let mut queue: VecDeque<QueuedVote> = [5, 6, 4, 6]
+            .into_iter()
+            .map(|slot| QueuedVote {
+                attestation: vote(slot, 0),
+                verified_attester: None,
+            })
+            .collect();
+
+        let ready = take_ready_votes(&mut queue, 6);
+        let slots = |votes: &[QueuedVote]| -> Vec<u64> {
+            votes
+                .iter()
+                .map(|vote| vote.attestation.data.slot)
+                .collect()
+        };
+        assert_eq!(slots(&ready), vec![5, 4]);
+        assert_eq!(slots(queue.make_contiguous()), vec![6, 6]);
+    }
+
+    #[test]
+    fn only_aggregates_with_new_votes_are_verified() {
+        // Validator 1 already voted in epoch 3; aggregates are checked largest first.
+        let aggregates = vec![
+            (indexed(&[1, 2]), vote(96, 3), "small"),
+            (indexed(&[1]), vote(96, 3), "stale"),
+            (indexed(&[1, 2, 3]), vote(96, 3), "large"),
+            (indexed(&[1, 2]), vote(128, 4), "next epoch"),
+        ];
+
+        let mut checked = vec![];
+        let kept = votes_with_new_messages(
+            aggregates.clone(),
+            |index, epoch| index != 1 || epoch > 3,
+            |_, name| {
+                checked.push(*name);
+                true
+            },
+        );
+        let names: Vec<&str> = kept.iter().map(|(_, _, name)| *name).collect();
+        assert_eq!(names, vec!["large", "next epoch"]);
+        assert_eq!(checked, vec!["large", "next epoch"]);
+
+        // An aggregate that fails the target state's check leaves its votes to the next one.
+        let kept = votes_with_new_messages(
+            aggregates,
+            |index, epoch| index != 1 || epoch > 3,
+            |_, name| *name != "large",
+        );
+        let names: Vec<&str> = kept.iter().map(|(_, _, name)| *name).collect();
+        assert_eq!(names, vec!["small", "next epoch"]);
     }
 }

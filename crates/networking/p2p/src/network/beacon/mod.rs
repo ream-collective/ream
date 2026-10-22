@@ -26,7 +26,7 @@ use libp2p::{
     futures::StreamExt,
     gossipsub::{
         Event as GossipsubEvent, IdentTopic as Topic, Message, MessageAuthenticity, MessageId,
-        PublishError,
+        PublishError, TopicHash,
     },
     identify,
     multiaddr::Protocol,
@@ -86,7 +86,10 @@ use utils::read_meta_data_from_disk;
 
 use crate::{
     config::{NetworkConfig, PeerLimits},
-    constants::{CUSTODY_DISCOVERY_TARGET_PEERS, PING_INTERVAL_DURATION},
+    constants::{
+        CUSTODY_DISCOVERY_TARGET_PEERS, PING_INTERVAL_DURATION, SLOW_PEER_DROPPED_MESSAGES,
+        SLOW_PEER_STRIKES, SLOW_PEER_WINDOW, SUBNET_DISCOVERY_TARGET_PEERS, TARGET_SUBNET_PEERS,
+    },
     gossipsub::{
         GossipsubBehaviour,
         beacon::{
@@ -140,16 +143,54 @@ fn enr_subnet_bitfields(enr: &Enr) -> anyhow::Result<(BitVector<U64>, BitVector<
     Ok((attestation_subnets.0, sync_committee_subnets.0))
 }
 
+/// Counts a heartbeat in which `dropped` messages to `peer_id` were dropped because its send queue
+/// was full. Returns true once the peer has been slow for `SLOW_PEER_STRIKES` heartbeats in a row,
+/// each within `SLOW_PEER_WINDOW` of the last, and forgets it.
+fn record_slow_heartbeat(
+    slow_peers: &mut HashMap<PeerId, (u32, Instant)>,
+    peer_id: PeerId,
+    dropped: usize,
+    now: Instant,
+) -> bool {
+    slow_peers.retain(|_, (_, last)| now.duration_since(*last) < SLOW_PEER_WINDOW);
+    if dropped <= SLOW_PEER_DROPPED_MESSAGES {
+        return false;
+    }
+    let (strikes, last) = slow_peers.entry(peer_id).or_insert((0, now));
+    *strikes += 1;
+    *last = now;
+    if *strikes < SLOW_PEER_STRIKES {
+        return false;
+    }
+    slow_peers.remove(&peer_id);
+    true
+}
+
+/// Duty subnets with fewer than `TARGET_SUBNET_PEERS` peers, in order.
+fn subnets_needing_peers(duty_subnets: &HashMap<u64, u64>, peer_counts: &[usize]) -> Vec<u64> {
+    let mut subnets: Vec<u64> = duty_subnets
+        .keys()
+        .copied()
+        .filter(|subnet_id| {
+            peer_counts
+                .get(*subnet_id as usize)
+                .is_some_and(|count| *count < TARGET_SUBNET_PEERS)
+        })
+        .collect();
+    subnets.sort_unstable();
+    subnets
+}
+
 /// Epoch at `now` for a chain that started at `genesis_time`, counted like the fork choice store.
 /// Before genesis this is epoch 0, so the mesh for the first backbone subnets forms early.
+fn epoch_at(genesis_time: u64, now: SystemTime) -> u64 {
+    compute_epoch_at_slot(slot_at(genesis_time, now))
+}
+
 /// The slot at `now` for a chain that started at `genesis_time`, 0 before genesis.
 fn slot_at(genesis_time: u64, now: SystemTime) -> u64 {
     let now = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     now.saturating_sub(genesis_time) / beacon_network_spec().seconds_per_slot()
-}
-
-fn epoch_at(genesis_time: u64, now: SystemTime) -> u64 {
-    compute_epoch_at_slot(slot_at(genesis_time, now))
 }
 
 /// Time from `now` until `epoch` starts on the clock of [`epoch_at`], so once it has elapsed
@@ -256,6 +297,12 @@ pub struct Network {
     target_peers: usize,
     /// Gossipsub peer scoring settings, `None` when scoring is off.
     peer_score_settings: Option<PeerScoreSettings>,
+    /// Subnet topics joined for validator duties, with the last slot each is needed for.
+    duty_topics: HashMap<GossipTopic, u64>,
+    /// Attestation subnets validators publish to, with the last slot each is needed for.
+    duty_subnets: HashMap<u64, u64>,
+    /// Slow heartbeats per peer whose gossipsub send queue overflows, with the last one's time.
+    slow_peers: HashMap<PeerId, (u32, Instant)>,
 }
 
 impl Network {
@@ -398,6 +445,9 @@ impl Network {
             genesis_time: config.genesis_time,
             backbone_topics: HashMap::new(),
             target_peers: config.target_peers,
+            duty_topics: HashMap::new(),
+            duty_subnets: HashMap::new(),
+            slow_peers: HashMap::new(),
             sampling_columns,
             meta_data_requests: HashMap::new(),
             peer_score_settings,
@@ -587,6 +637,18 @@ impl Network {
                                 trace!("Gossipsub message was not in validation cache: {message_id}");
                             }
                         }
+                        P2PMessage::SubscribeForDuty { topic, until_slot } => {
+                            if !self.subscribe_for_duty(topic, until_slot) {
+                                warn!("Failed to subscribe to {topic:?} for a validator duty");
+                            }
+                        }
+                        P2PMessage::AttestationDutySubnets(subnets) => {
+                            for (subnet_id, until_slot) in subnets {
+                                let until = self.duty_subnets.entry(subnet_id).or_insert(until_slot);
+                                *until = (*until).max(until_slot);
+                            }
+                            self.discover_duty_subnet_peers(SystemTime::now());
+                        }
                     }
                 }
                 Some(Ok(peer_id)) = self.peers_to_ping.next() => {
@@ -646,6 +708,8 @@ impl Network {
                     if let Err(err) = self.sync_attestation_subnets(SystemTime::now()) {
                         warn!("Failed to sync attestation subnets: {err:?}");
                     }
+                    self.expire_duty_topics(SystemTime::now());
+                    self.discover_duty_subnet_peers(SystemTime::now());
                     // Retries a failed fork update and catches a boundary the timer slept past.
                     next_fork_update.set(self.update_fork_enr(SystemTime::now()).map(sleep).into());
 
@@ -1159,6 +1223,62 @@ impl Network {
     /// Starts a bounded discv5 query for peers custodying the groups of sampling columns that no
     /// connected peer covers. Runs from the periodic maintenance tick, and `Discovery` keeps at
     /// most one custody query in flight.
+    /// Starts a discovery query for duty subnets with fewer than `TARGET_SUBNET_PEERS` peers,
+    /// after dropping subnets whose last slot has passed.
+    fn discover_duty_subnet_peers(&mut self, now: SystemTime) {
+        let current_slot = slot_at(self.genesis_time, now);
+        self.duty_subnets
+            .retain(|_, until_slot| *until_slot >= current_slot);
+        if self.duty_subnets.is_empty() {
+            return;
+        }
+        let peer_counts = self.attestation_subnet_peer_counts();
+        let subnets = subnets_needing_peers(&self.duty_subnets, &peer_counts);
+        if subnets.is_empty() {
+            return;
+        }
+        let counts: Vec<usize> = subnets
+            .iter()
+            .map(|subnet_id| peer_counts[*subnet_id as usize])
+            .collect();
+        if self
+            .swarm
+            .behaviour_mut()
+            .discovery
+            .discover_attestation_subnet_peers(subnets.clone(), SUBNET_DISCOVERY_TARGET_PEERS)
+        {
+            info!(
+                "Duty attestation subnets {subnets:?} have {counts:?} peers, discovering peers for them"
+            );
+        }
+    }
+
+    /// Connected peers subscribed to each attestation subnet of the current fork.
+    fn attestation_subnet_peer_counts(&self) -> [usize; ATTESTATION_SUBNET_COUNT] {
+        let fork = beacon_network_spec().fork_digest(
+            beacon_network_spec().current_epoch(),
+            genesis_validators_root(),
+        );
+        let subnet_of: HashMap<TopicHash, usize> = (0..ATTESTATION_SUBNET_COUNT)
+            .map(|subnet_id| {
+                let topic = GossipTopic {
+                    fork,
+                    kind: GossipTopicKind::BeaconAttestation(subnet_id as u64),
+                };
+                (topic.into(), subnet_id)
+            })
+            .collect();
+        let mut counts = [0; ATTESTATION_SUBNET_COUNT];
+        for (_, topics) in self.swarm.behaviour().gossipsub.all_peers() {
+            for topic in topics {
+                if let Some(subnet_id) = subnet_of.get(topic) {
+                    counts[*subnet_id] += 1;
+                }
+            }
+        }
+        counts
+    }
+
     fn discover_custody_peers_if_uncovered(&mut self) {
         if self.sampling_columns.is_empty()
             || self.swarm.behaviour().discovery.custody_query_active()
@@ -1222,6 +1342,21 @@ impl Network {
             }
             GossipsubEvent::Unsubscribed { peer_id, topic } => {
                 trace!("Peer {peer_id} unsubscribed from topic: {topic:?}");
+                None
+            }
+            GossipsubEvent::SlowPeer {
+                peer_id,
+                failed_messages,
+            } => {
+                if record_slow_heartbeat(
+                    &mut self.slow_peers,
+                    peer_id,
+                    failed_messages.total_queue_full(),
+                    Instant::now(),
+                ) {
+                    info!("Disconnecting peer {peer_id}: its gossipsub send queue stays full");
+                    let _ = self.swarm.disconnect_peer_id(peer_id);
+                }
                 None
             }
             _ => None,
@@ -1353,6 +1488,67 @@ impl Network {
         }
     }
 
+    /// Joins `topic` for a validator duty and stays subscribed until `until_slot` has passed.
+    pub fn subscribe_for_duty(&mut self, topic: GossipTopic, until_slot: u64) -> bool {
+        if !self.subscribe_to_topic(topic) {
+            return false;
+        }
+        let until = self.duty_topics.entry(topic).or_insert(until_slot);
+        *until = (*until).max(until_slot);
+        if matches!(topic.kind, GossipTopicKind::SyncCommittee(_))
+            && let Err(err) = self.advertise_sync_committee_subnets()
+        {
+            warn!("Failed to advertise sync committee subnets: {err:?}");
+        }
+        true
+    }
+
+    /// Advertises the joined sync committee subnets in the ENR and `MetaData`.
+    fn advertise_sync_committee_subnets(&mut self) -> anyhow::Result<()> {
+        let mut subnets = SyncCommitteeSubnets::new();
+        for topic in self.subscribed_topics.lock().iter() {
+            if let GossipTopicKind::SyncCommittee(subnet_id) = topic.kind {
+                subnets.enable_sync_committee_subnet(subnet_id)?;
+            }
+        }
+        let discovery = &mut self.swarm.behaviour_mut().discovery;
+        discovery.set_sync_committee_subnets(subnets)?;
+        let local_enr = discovery.local_enr();
+        let (attnets, syncnets) = enr_subnet_bitfields(&local_enr)?;
+        *self.network_state.local_enr.write() = local_enr;
+        self.network_state.update_meta_data(|meta_data| {
+            meta_data.attnets = attnets;
+            meta_data.syncnets = syncnets;
+        })?;
+        Ok(())
+    }
+
+    /// Leaves duty topics whose last slot has passed, unless they are backbone subnets.
+    fn expire_duty_topics(&mut self, now: SystemTime) {
+        let current_slot = slot_at(self.genesis_time, now);
+        let expired: Vec<GossipTopic> = self
+            .duty_topics
+            .iter()
+            .filter(|(_, until_slot)| **until_slot < current_slot)
+            .map(|(topic, _)| *topic)
+            .collect();
+        let mut left_sync_subnet = false;
+        for topic in expired {
+            self.duty_topics.remove(&topic);
+            if !self
+                .backbone_topics
+                .values()
+                .any(|backbone| *backbone == topic)
+            {
+                self.unsubscribe_from_topic(topic);
+                left_sync_subnet |= matches!(topic.kind, GossipTopicKind::SyncCommittee(_));
+            }
+        }
+        if left_sync_subnet && let Err(err) = self.advertise_sync_committee_subnets() {
+            warn!("Failed to advertise sync committee subnets: {err:?}");
+        }
+    }
+
     pub fn unsubscribe_from_topic(&mut self, topic: GossipTopic) -> bool {
         self.subscribed_topics.lock().remove(&topic);
 
@@ -1386,15 +1582,20 @@ impl Network {
         }
         let mut failed = vec![];
         for subnet_id in 0..ATTESTATION_SUBNET_COUNT as u64 {
-            if !desired.is_attestation_subnet_enabled(subnet_id)?
-                || joined.is_attestation_subnet_enabled(subnet_id)?
-            {
+            if !desired.is_attestation_subnet_enabled(subnet_id)? {
                 continue;
             }
             let topic = GossipTopic {
                 fork: fork_digest,
                 kind: GossipTopicKind::BeaconAttestation(subnet_id),
             };
+            if joined.is_attestation_subnet_enabled(subnet_id)? {
+                // Joined for a duty, it must outlive that duty.
+                if self.subscribed_topics.lock().contains(&topic) {
+                    self.backbone_topics.insert(subnet_id, topic);
+                }
+                continue;
+            }
             if self.subscribe_to_topic(topic) {
                 joined.enable_attestation_subnet(subnet_id)?;
                 self.backbone_topics.insert(subnet_id, topic);
@@ -1421,7 +1622,9 @@ impl Network {
             .filter(|subnet_id| !desired.0.get(*subnet_id as usize).unwrap_or(false))
             .collect();
         for subnet_id in dropped {
-            if let Some(topic) = self.backbone_topics.remove(&subnet_id) {
+            if let Some(topic) = self.backbone_topics.remove(&subnet_id)
+                && !self.duty_topics.contains_key(&topic)
+            {
                 self.unsubscribe_from_topic(topic);
             }
         }
@@ -2340,7 +2543,7 @@ mod tests {
         ))
     }
 
-    /// All subnet topics, as the manager configures them.
+    /// All subnet topics, as a node joined to every subnet has them.
     fn all_subnet_topics() -> Vec<GossipTopic> {
         let fork = beacon_network_spec().fork_digest(
             beacon_network_spec().current_epoch(),
@@ -2453,6 +2656,177 @@ mod tests {
                 .unwrap();
         assert_eq!(network.enr(), enr);
         assert_eq!(meta_data_seq(&network), seq);
+        assert_subnets_consistent(&network, data_dir.path());
+    }
+
+    #[test]
+    fn peers_with_a_full_send_queue_for_ten_heartbeats_are_dropped() {
+        let mut slow_peers = HashMap::new();
+        let peer = PeerId::random();
+        let start = Instant::now();
+        let heartbeat = |n: u64| start + Duration::from_millis(700 * n);
+
+        // Small drops do not count.
+        assert!(!record_slow_heartbeat(
+            &mut slow_peers,
+            peer,
+            SLOW_PEER_DROPPED_MESSAGES,
+            start
+        ));
+        for n in 0..SLOW_PEER_STRIKES as u64 - 1 {
+            assert!(!record_slow_heartbeat(
+                &mut slow_peers,
+                peer,
+                50,
+                heartbeat(n)
+            ));
+        }
+        // A quiet minute resets the count.
+        let later = heartbeat(SLOW_PEER_STRIKES as u64) + SLOW_PEER_WINDOW;
+        assert!(!record_slow_heartbeat(&mut slow_peers, peer, 50, later));
+        assert_eq!(slow_peers[&peer].0, 1);
+
+        for n in 1..SLOW_PEER_STRIKES as u64 - 1 {
+            assert!(!record_slow_heartbeat(
+                &mut slow_peers,
+                peer,
+                50,
+                later + Duration::from_millis(700 * n)
+            ));
+        }
+        assert!(record_slow_heartbeat(
+            &mut slow_peers,
+            peer,
+            50,
+            later + Duration::from_secs(10)
+        ));
+        assert!(slow_peers.is_empty());
+    }
+
+    #[test]
+    fn duty_subnets_with_few_peers_need_discovery() {
+        let mut peer_counts = [TARGET_SUBNET_PEERS; ATTESTATION_SUBNET_COUNT];
+        peer_counts[5] = 0;
+        peer_counts[9] = TARGET_SUBNET_PEERS - 1;
+        let duty_subnets = HashMap::from([(9, 100), (5, 100), (7, 100)]);
+
+        assert_eq!(
+            subnets_needing_peers(&duty_subnets, &peer_counts),
+            vec![5, 9]
+        );
+        assert!(subnets_needing_peers(&HashMap::new(), &peer_counts).is_empty());
+    }
+
+    #[test]
+    fn duty_subnets_are_left_after_their_last_slot() {
+        initialize_test_network_spec();
+
+        let runtime = Runtime::new().unwrap();
+        let data_dir = TestDataDir::new();
+        let mut network = create_local_network(&runtime, data_dir.path()).unwrap();
+        let backbone = advertised(&network);
+        let duty_subnet = (0..ATTESTATION_SUBNET_COUNT as u64)
+            .find(|subnet_id| !backbone.is_attestation_subnet_enabled(*subnet_id).unwrap())
+            .unwrap();
+        let backbone_subnet = (0..ATTESTATION_SUBNET_COUNT as u64)
+            .find(|subnet_id| backbone.is_attestation_subnet_enabled(*subnet_id).unwrap())
+            .unwrap();
+        let fork = beacon_network_spec().fork_digest(0, genesis_validators_root());
+        let topic = |subnet_id| GossipTopic {
+            fork,
+            kind: GossipTopicKind::BeaconAttestation(subnet_id),
+        };
+        let slot_start = |slot: u64| {
+            epoch_start(0) + Duration::from_secs(slot * beacon_network_spec().seconds_per_slot())
+        };
+        let joined = |network: &Network, subnet_id: u64| {
+            subscribed_subnets(network)
+                .0
+                .get(subnet_id as usize)
+                .unwrap()
+        };
+
+        assert!(!joined(&network, duty_subnet));
+        assert!(network.subscribe_for_duty(topic(duty_subnet), 10));
+        assert!(network.subscribe_for_duty(topic(duty_subnet), 8));
+        assert!(network.subscribe_for_duty(topic(backbone_subnet), 10));
+
+        network.expire_duty_topics(slot_start(10));
+        assert!(joined(&network, duty_subnet));
+        network.expire_duty_topics(slot_start(11));
+        assert!(!joined(&network, duty_subnet));
+        assert!(joined(&network, backbone_subnet));
+        assert!(network.duty_topics.is_empty());
+    }
+
+    #[test]
+    fn a_duty_subnet_that_becomes_backbone_stays_joined() {
+        initialize_test_network_spec();
+
+        let runtime = Runtime::new().unwrap();
+        let data_dir = TestDataDir::new();
+        let mut network = create_local_network(&runtime, data_dir.path()).unwrap();
+        let boundary = next_assignment_change(&network, 0);
+        let discovery = &network.swarm.behaviour().discovery;
+        let before = discovery.attestation_subnets_at(boundary - 1).unwrap();
+        let after = discovery.attestation_subnets_at(boundary).unwrap();
+        let subnet_id = (0..ATTESTATION_SUBNET_COUNT as u64)
+            .find(|subnet_id| {
+                after.is_attestation_subnet_enabled(*subnet_id).unwrap()
+                    && !before.is_attestation_subnet_enabled(*subnet_id).unwrap()
+            })
+            .unwrap();
+        let topic = GossipTopic {
+            fork: beacon_network_spec().fork_digest(
+                beacon_network_spec().current_epoch(),
+                genesis_validators_root(),
+            ),
+            kind: GossipTopicKind::BeaconAttestation(subnet_id),
+        };
+
+        network
+            .sync_attestation_subnets(epoch_start(boundary - 1))
+            .unwrap();
+        assert!(network.subscribe_for_duty(topic, boundary * SLOTS_PER_EPOCH));
+        network
+            .sync_attestation_subnets(epoch_start(boundary))
+            .unwrap();
+        network.expire_duty_topics(epoch_start(boundary + 1));
+
+        assert!(network.duty_topics.is_empty());
+        assert_eq!(network.backbone_topics.get(&subnet_id), Some(&topic));
+        assert_eq!(advertised(&network), after);
+        assert_subnets_consistent(&network, data_dir.path());
+    }
+
+    #[test]
+    fn sync_duty_subnets_are_advertised_while_joined() {
+        initialize_test_network_spec();
+
+        let runtime = Runtime::new().unwrap();
+        let data_dir = TestDataDir::new();
+        let mut network = create_local_network(&runtime, data_dir.path()).unwrap();
+        let seq = meta_data_seq(&network);
+        let topic = GossipTopic {
+            fork: beacon_network_spec().fork_digest(0, genesis_validators_root()),
+            kind: GossipTopicKind::SyncCommittee(2),
+        };
+        let syncnets = |network: &Network| enr_subnet_bitfields(&network.enr()).unwrap().1;
+
+        assert!(network.subscribe_for_duty(topic, 10));
+        assert_eq!(syncnets(&network).num_set_bits(), 1);
+        assert!(syncnets(&network).get(2).unwrap());
+        assert_eq!(meta_data_seq(&network), seq + 1);
+        assert_subnets_consistent(&network, data_dir.path());
+
+        let slot_start = |slot: u64| {
+            epoch_start(0) + Duration::from_secs(slot * beacon_network_spec().seconds_per_slot())
+        };
+        network.expire_duty_topics(slot_start(10));
+        assert!(syncnets(&network).get(2).unwrap());
+        network.expire_duty_topics(slot_start(11));
+        assert_eq!(syncnets(&network).num_set_bits(), 0);
+        assert_eq!(meta_data_seq(&network), seq + 2);
         assert_subnets_consistent(&network, data_dir.path());
     }
 

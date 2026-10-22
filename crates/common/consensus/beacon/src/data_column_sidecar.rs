@@ -29,6 +29,7 @@ pub type MaxBlobCommitmentsPerBlock = typenum::U4096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Encode, Decode, TreeHash)]
 pub struct DataColumnSidecar {
+    #[serde(with = "serde_utils::quoted_u64")]
     pub index: u64,
     pub column: VariableList<Cell, MaxBlobCommitmentsPerBlock>,
     pub kzg_commitments: VariableList<KZGCommitment, MaxBlobCommitmentsPerBlock>,

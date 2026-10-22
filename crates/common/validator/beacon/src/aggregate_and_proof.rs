@@ -13,6 +13,7 @@ use crate::attestation::get_slot_signature;
 
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, Encode, Decode, TreeHash)]
 pub struct AggregateAndProof {
+    #[serde(with = "serde_utils::quoted_u64")]
     pub aggregator_index: u64,
     pub aggregate: Attestation,
     pub selection_proof: BLSSignature,
@@ -64,4 +65,42 @@ pub fn sign_aggregate_and_proof(
     );
     let signing_root = compute_signing_root(aggregate_and_proof, domain);
     Ok(private_key.sign(signing_root.as_ref())?)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// Lighthouse's validator client sends the aggregator index as a quoted string.
+    #[test]
+    fn signed_aggregate_and_proof_reads_quoted_aggregator_index() {
+        let signature = format!("0xc0{}", "00".repeat(95));
+        let root = format!("0x{}", "11".repeat(32));
+        let checkpoint = json!({"epoch": "130701", "root": root});
+        let request = json!({
+            "message": {
+                "aggregator_index": "1449083",
+                "aggregate": {
+                    "aggregation_bits": "0x03",
+                    "data": {
+                        "slot": "4182505",
+                        "index": "0",
+                        "beacon_block_root": root,
+                        "source": checkpoint,
+                        "target": checkpoint
+                    },
+                    "signature": signature,
+                    "committee_bits": "0x0100000000000000"
+                },
+                "selection_proof": signature
+            },
+            "signature": signature
+        });
+
+        let decoded: SignedAggregateAndProof = serde_json::from_value(request.clone()).unwrap();
+        assert_eq!(decoded.message.aggregator_index, 1449083);
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), request);
+    }
 }

@@ -584,48 +584,6 @@ pub fn on_attestation(
     Ok(())
 }
 
-/// ``on_attestation`` for a gossip attestation whose single attester's signature gossip validation
-/// already verified, so it is not verified again here. That check only covers
-/// ``verified_attester``, so the target state's committee must name exactly that validator: under
-/// a different shuffling the attestation's bit would belong to someone else.
-pub fn on_gossip_attestation(
-    store: &mut Store,
-    attestation: Attestation,
-    verified_attester: u64,
-) -> anyhow::Result<()> {
-    on_gossip_attestation_with_shuffling(store, attestation, verified_attester, None)
-}
-
-/// ``on_gossip_attestation`` that reads the target committee from `shuffling_state` when one is
-/// given, instead of the target checkpoint state. Pass a state only when
-/// ``shares_target_shuffling`` holds for it.
-pub fn on_gossip_attestation_with_shuffling(
-    store: &mut Store,
-    attestation: Attestation,
-    verified_attester: u64,
-    shuffling_state: Option<&BeaconState>,
-) -> anyhow::Result<()> {
-    store.validate_on_attestation(&attestation, false)?;
-
-    let target_state;
-    let shuffling_state = match shuffling_state {
-        Some(state) => state,
-        None => {
-            target_state = store
-                .db
-                .checkpoint_states_provider()
-                .get_shared(attestation.data.target)?
-                .ok_or_else(|| anyhow!("checkpoint_states not found"))?;
-            &target_state
-        }
-    };
-    let indexed_attestation = shuffling_state.get_indexed_attestation(&attestation)?;
-    ensure_only_attester(&indexed_attestation.attesting_indices, verified_attester)?;
-    store.update_latest_messages(vec![verified_attester], attestation)?;
-
-    Ok(())
-}
-
 /// Whether the post-state of block `state_block_root`, at `state_epoch`, has the same shuffling
 /// for `target.epoch` as the target checkpoint state, so committees can be read from it without
 /// building that checkpoint state.
@@ -651,14 +609,6 @@ pub fn shares_target_shuffling(
         == store.get_ancestor(target.root, decision_slot)?)
 }
 
-fn ensure_only_attester(attesting_indices: &[u64], verified_attester: u64) -> anyhow::Result<()> {
-    ensure!(
-        attesting_indices == [verified_attester],
-        "target committee names {attesting_indices:?}, not the verified attester {verified_attester}"
-    );
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -675,17 +625,9 @@ mod tests {
     use tempdir::TempDir;
 
     use super::{
-        Store, ensure_only_attester, get_proposer_boost_root, get_time_at_slot, is_on_chain_of,
-        is_same_dependent_root, shares_target_shuffling,
+        Store, get_proposer_boost_root, get_time_at_slot, is_on_chain_of, is_same_dependent_root,
+        shares_target_shuffling,
     };
-
-    #[test]
-    fn a_gossip_vote_counts_only_for_the_verified_attester() {
-        assert!(ensure_only_attester(&[7], 7).is_ok());
-        assert!(ensure_only_attester(&[8], 7).is_err());
-        assert!(ensure_only_attester(&[7, 8], 7).is_err());
-        assert!(ensure_only_attester(&[], 7).is_err());
-    }
 
     fn block(slot: u64, parent_root: B256) -> SignedBeaconBlock {
         SignedBeaconBlock {
