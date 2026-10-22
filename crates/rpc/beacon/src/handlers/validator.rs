@@ -95,7 +95,7 @@ use ssz_types::{
 use tokio::sync::{Mutex, broadcast};
 use tree_hash::TreeHash;
 
-use super::state::get_state_from_id;
+use super::{duties::head_chain_block_root, state::get_state_from_id};
 
 ///  For slots in Electra and later, this AttestationData must have a committee_index of 0.
 const ELECTRA_COMMITTEE_INDEX: u64 = 0;
@@ -531,16 +531,9 @@ fn attestation_source(
 #[get("/validator/attestation_data")]
 pub async fn get_attestation_data(
     db: Data<BeaconDB>,
-    opertation_pool: Data<Arc<OperationPool>>,
     beacon_chain: Data<Arc<BeaconChain>>,
     query: Query<AttestationQuery>,
 ) -> Result<impl Responder, ApiError> {
-    let store = Store::new(
-        db.get_ref().clone(),
-        opertation_pool.get_ref().clone(),
-        None,
-    );
-
     let head = beacon_chain
         .head()
         .map_err(|err| ApiError::InternalError(format!("Failed to get head root: {err:?}")))?;
@@ -563,14 +556,7 @@ pub async fn get_attestation_data(
     let beacon_block_root = if slot >= state.slot {
         head_root
     } else {
-        state
-            .get_block_root_at_slot(slot)
-            .or_else(|_| store.get_ancestor(head_root, slot))
-            .map_err(|err| {
-                ApiError::InternalError(format!(
-                    "Failed to get attestation beacon block root, error: {err:?}"
-                ))
-            })?
+        head_chain_block_root(&db, head_root, state, slot)?
     };
 
     let target_epoch = compute_epoch_at_slot(slot);
@@ -596,14 +582,7 @@ pub async fn get_attestation_data(
     let target_root = if state.slot <= target_slot {
         beacon_block_root
     } else {
-        state
-            .get_block_root(target_epoch)
-            .or_else(|_| store.get_checkpoint_block(beacon_block_root, target_epoch))
-            .map_err(|err| {
-                ApiError::InternalError(format!(
-                    "Failed to get target checkpoint block, error: {err:?}"
-                ))
-            })?
+        head_chain_block_root(&db, head_root, state, target_slot)?
     };
     let target_checkpoint = Checkpoint {
         epoch: target_epoch,
