@@ -2306,6 +2306,7 @@ dependencies = [
  "ream-execution-engine",
  "ream-execution-rpc-types",
  "ream-fork-choice-beacon",
+ "ream-light-client",
  "ream-merkle",
  "ream-network-spec",
  "ream-polynomial-commitments",

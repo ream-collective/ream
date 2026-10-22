@@ -4,17 +4,19 @@ use ream_consensus_beacon::{
     electra::{beacon_block::SignedBeaconBlock, beacon_state::BeaconState},
     sync_committee::SyncCommittee,
 };
-use serde::Serialize;
-use ssz_types::{FixedVector, typenum::U5};
+use serde::{Deserialize, Serialize};
+use ssz_derive::{Decode, Encode};
+use ssz_types::{FixedVector, typenum::U6};
 use tree_hash::TreeHash;
+use tree_hash_derive::TreeHash;
 
 use crate::header::LightClientHeader;
 
-#[derive(Serialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, Encode, Decode, TreeHash)]
 pub struct LightClientBootstrap {
     pub header: LightClientHeader,
     pub current_sync_committee: SyncCommittee,
-    pub current_sync_committee_branch: FixedVector<B256, U5>,
+    pub current_sync_committee_branch: FixedVector<B256, U6>,
 }
 
 impl LightClientBootstrap {
