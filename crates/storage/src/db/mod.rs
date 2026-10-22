@@ -8,14 +8,18 @@ pub mod lean;
 use std::{
     fs, io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicI64, Ordering},
+    },
+    time::Instant,
 };
 
 use anyhow::Result;
 use beacon::BeaconDB;
 use lean::LeanDB;
 use redb::{Builder, Database, ReadableDatabase, ReadableTable};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     errors::StoreError,
@@ -77,6 +81,56 @@ pub const VOTES_REDB_CACHE_SIZE: usize = 256 * 1_024 * 1_024;
 /// 1 GiB
 pub const REDB_CACHE_SIZE: usize = 1_024 * 1_024 * 1_024;
 
+/// Opens or creates the redb database at `path`.
+///
+/// A database that was not closed cleanly is repaired before it opens: redb reads the whole file
+/// to rebuild its allocator state. On a mainnet database that takes minutes, so the repair's
+/// progress is logged.
+fn open_database(path: &Path, cache_size: usize) -> Result<Database, StoreError> {
+    open_database_reporting_repair(path, cache_size).map(|(database, _)| database)
+}
+
+/// `open_database` that also says whether the database had to be repaired.
+fn open_database_reporting_repair(
+    path: &Path,
+    cache_size: usize,
+) -> Result<(Database, bool), StoreError> {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let started = Instant::now();
+    let repaired = Arc::new(AtomicBool::new(false));
+    let logged_decile = Arc::new(AtomicI64::new(-1));
+    let database = {
+        let name = name.clone();
+        let repaired = repaired.clone();
+        Builder::new()
+            .set_cache_size(cache_size)
+            .set_repair_callback(move |session| {
+                repaired.store(true, Ordering::Relaxed);
+                let decile = (session.progress() * 10.0) as i64;
+                if logged_decile.fetch_max(decile, Ordering::Relaxed) < decile {
+                    warn!(
+                        database = %name,
+                        progress = format!("{}%", decile * 10),
+                        elapsed_s = started.elapsed().as_secs(),
+                        "Repairing a database that was not closed cleanly"
+                    );
+                }
+            })
+            .create(path)?
+    };
+    if repaired.load(Ordering::Relaxed) {
+        warn!(
+            database = %name,
+            elapsed_s = started.elapsed().as_secs(),
+            "Repaired a database that was not closed cleanly"
+        );
+    }
+    Ok((database, repaired.load(Ordering::Relaxed)))
+}
+
 #[derive(Clone, Debug)]
 pub struct ReamDB {
     db: Arc<Database>,
@@ -91,9 +145,7 @@ pub struct ReamDB {
 
 impl ReamDB {
     pub fn new(data_dir: PathBuf) -> Result<Self, StoreError> {
-        let db = Builder::new()
-            .set_cache_size(REDB_CACHE_SIZE)
-            .create(data_dir.join(REDB_FILE))?;
+        let db = open_database(&data_dir.join(REDB_FILE), REDB_CACHE_SIZE)?;
 
         for folder in [BLOB_FOLDER_NAME, COLUMN_FOLDER_NAME] {
             let directory = data_dir.join(folder);
@@ -198,11 +250,10 @@ impl ReamDB {
         if let Some(votes_db) = votes_db.as_ref() {
             return Ok(votes_db.clone());
         }
-        let opened = Arc::new(
-            Builder::new()
-                .set_cache_size(VOTES_REDB_CACHE_SIZE)
-                .create(self.data_dir.join(VOTES_REDB_FILE))?,
-        );
+        let opened = Arc::new(open_database(
+            &self.data_dir.join(VOTES_REDB_FILE),
+            VOTES_REDB_CACHE_SIZE,
+        )?);
         let write_txn = opened.begin_write()?;
         write_txn.open_table(LatestMessagesTable::TABLE_DEFINITION)?;
         write_txn.commit()?;
@@ -316,7 +367,119 @@ mod tests {
     use tempdir::TempDir;
 
     use super::*;
-    use crate::test_utils::sepolia_state;
+    use crate::{db::beacon::DatabaseClose, test_utils::sepolia_state};
+
+    /// Writes a block root into a fresh database, so it has a committed write transaction.
+    fn write_something(beacon_db: &BeaconDB) {
+        let write_txn = beacon_db.db.begin_write().unwrap();
+        write_txn
+            .open_table(BeaconBlockTable::TABLE_DEFINITION)
+            .unwrap();
+        write_txn.commit().unwrap();
+    }
+
+    /// Set in the child processes of `a_database_left_open_is_repaired_unless_closed`: the
+    /// directory to open a database in, then exit with a handle still held.
+    const CHILD_DIR: &str = "REAM_TEST_DATABASE_CHILD_DIR";
+    /// With `CHILD_DIR`: "forget" exits without closing, "close" closes first.
+    const CHILD_MODE: &str = "REAM_TEST_DATABASE_CHILD_MODE";
+
+    /// Runs this test binary as a child that opens a database in `dir`, writes to it, keeps a
+    /// second handle, optionally closes it, and exits the way `main` does.
+    fn run_child(dir: &Path, mode: &str) {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "db::tests::a_database_left_open_is_repaired_unless_closed",
+            ])
+            .env(CHILD_DIR, dir)
+            .env(CHILD_MODE, mode)
+            .status()
+            .unwrap();
+        assert!(status.success(), "child {mode} failed");
+    }
+
+    fn repaired_on_open(dir: &Path) -> bool {
+        let (_database, repaired) =
+            open_database_reporting_repair(&dir.join(REDB_FILE), REDB_CACHE_SIZE).unwrap();
+        repaired
+    }
+
+    #[test]
+    fn a_database_left_open_is_repaired_unless_closed() {
+        if let Ok(dir) = std::env::var(CHILD_DIR) {
+            let beacon_db = ReamDB::new(PathBuf::from(dir))
+                .unwrap()
+                .init_beacon_db()
+                .unwrap();
+            write_something(&beacon_db);
+            // A task that still holds the database when the node stops.
+            let held = beacon_db.clone();
+            if std::env::var(CHILD_MODE).as_deref() == Ok("close") {
+                let closes = beacon_db
+                    .close(std::time::Duration::from_millis(100))
+                    .unwrap();
+                assert!(matches!(
+                    closes[0],
+                    DatabaseClose::AllocatorStateSaved {
+                        name: "ream.redb",
+                        other_handles: 1
+                    }
+                ));
+            }
+            // `process::exit` drops nothing.
+            std::mem::forget(held);
+            std::process::exit(0);
+        }
+
+        let dir = TempDir::new("ream_db_left_open").unwrap();
+        run_child(dir.path(), "forget");
+        assert!(
+            repaired_on_open(dir.path()),
+            "a database left open is repaired"
+        );
+
+        let dir = TempDir::new("ream_db_closed_while_held").unwrap();
+        run_child(dir.path(), "close");
+        assert!(
+            !repaired_on_open(dir.path()),
+            "a database closed while still held opens without a repair"
+        );
+
+        // With no other handle, closing drops it.
+        let dir = TempDir::new("ream_db_closed").unwrap();
+        let ream_db = ReamDB::new(dir.path().to_path_buf()).unwrap();
+        let beacon_db = ream_db.init_beacon_db().unwrap();
+        write_something(&beacon_db);
+        drop(ream_db);
+        assert_eq!(
+            beacon_db.close(std::time::Duration::from_secs(1)).unwrap(),
+            vec![
+                DatabaseClose::Closed("ream.redb"),
+                DatabaseClose::Closed("fork_choice_votes.redb")
+            ]
+        );
+        assert!(
+            !repaired_on_open(dir.path()),
+            "a closed database opens without a repair"
+        );
+    }
+
+    #[test]
+    fn closing_waits_for_a_handle_that_is_being_dropped() {
+        let dir = TempDir::new("ream_db_close_wait").unwrap();
+        let ream_db = ReamDB::new(dir.path().to_path_buf()).unwrap();
+        let beacon_db = ream_db.init_beacon_db().unwrap();
+        drop(ream_db);
+        let held = beacon_db.clone();
+        let dropper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(held);
+        });
+        let closes = beacon_db.close(std::time::Duration::from_secs(5)).unwrap();
+        dropper.join().unwrap();
+        assert_eq!(closes[0], DatabaseClose::Closed("ream.redb"));
+    }
 
     /// Stores one recorded state file, then adds `leftover`, a file a crash left in the state
     /// directory, and reopens the database. Checks that only the recorded file is left.

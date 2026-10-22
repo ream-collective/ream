@@ -105,7 +105,7 @@ use tokio::{
     task::JoinError,
     time::{self, Instant},
 };
-use tracing::{Instrument, error, info};
+use tracing::{Instrument, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[cfg(all(feature = "jemalloc", feature = "shadow-integration"))]
@@ -176,6 +176,9 @@ async fn shutdown_requested() -> &'static str {
         "Ctrl-C"
     }
 }
+
+/// How long shutdown waits for stopping tasks to drop their database handles.
+const DATABASE_CLOSE_WAIT: Duration = Duration::from_secs(10);
 
 /// Entry point for the Ream client. Initializes logging, parses CLI arguments, and runs the
 /// appropriate node type (beacon node, validator node, or account manager) based on the command
@@ -270,11 +273,17 @@ fn main() {
 
     executor_clone.shutdown_runtime();
 
-    if let Ok(db) = storage_receiver.try_recv()
-        && let Err(err) = db.shutdown_storage()
-    {
-        error!("Failed to drain beacon storage before shutdown: {err:?}");
-        process::exit(1);
+    if let Ok(db) = storage_receiver.try_recv() {
+        if let Err(err) = db.shutdown_storage() {
+            error!("Failed to drain beacon storage before shutdown: {err:?}");
+            process::exit(1);
+        }
+        // `process::exit` runs no destructors, so the databases are closed here; one left open
+        // is repaired at the next start.
+        match db.close(DATABASE_CLOSE_WAIT) {
+            Ok(closes) => info!(?closes, "Closed the beacon databases"),
+            Err(err) => warn!("The next start will repair the database: {err}"),
+        }
     }
 
     if let Err(err) = service_result {
