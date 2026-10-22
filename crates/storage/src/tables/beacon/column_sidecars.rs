@@ -17,7 +17,13 @@ use tree_hash::TreeHash;
 use super::column_roots_by_slot::{
     COLUMN_MAINTENANCE, COLUMN_ROOTS_BY_SLOT, COLUMN_WRITER, PRUNED_BEFORE,
 };
-use crate::{errors::StoreError, tables::table::CustomTable};
+use crate::{
+    errors::StoreError,
+    tables::{
+        sidecar_file::{index_from_name, is_root_index_file_name, is_root_name, is_temporary_name},
+        table::CustomTable,
+    },
+};
 
 pub(crate) const COLUMN_FOLDER_NAME: &str = "beacon_columns";
 
@@ -66,13 +72,10 @@ pub(crate) fn prepare_column_layout(column_dir: &Path) -> Result<(), StoreError>
         let name = entry.file_name();
         let Some((root, index)) = name
             .to_str()
+            .filter(|name| is_root_index_file_name(name, NUMBER_OF_COLUMNS))
             .and_then(|name| name.strip_suffix(".ssz_snappy"))
             .and_then(|name| name.rsplit_once('_'))
-            .and_then(|(root, index)| {
-                let parsed = root.parse::<B256>().ok()?;
-                let index = index.parse::<u64>().ok()?;
-                (parsed.to_string() == root && index < NUMBER_OF_COLUMNS).then_some((parsed, index))
-            })
+            .and_then(|(root, index)| Some((root.parse::<B256>().ok()?, index.to_string())))
         else {
             continue;
         };
@@ -118,8 +121,7 @@ pub(crate) fn prepare_column_layout(column_dir: &Path) -> Result<(), StoreError>
 
 /// Whether `name` is a block directory of the column layout.
 pub(crate) fn is_block_dir_name(name: &str) -> bool {
-    name.parse::<B256>()
-        .is_ok_and(|root| root.to_string() == name)
+    is_root_name(name)
 }
 
 /// Checks that a block directory holds only column files and temporary files of a write.
@@ -129,11 +131,11 @@ pub(crate) fn check_block_dir(dir: &Path) -> Result<(), StoreError> {
         let name = entry.file_name();
         let known = entry.file_type()?.is_file()
             && name.to_str().is_some_and(|name| {
-                name.starts_with(crate::tables::sidecar_file::TEMP_PREFIX)
+                is_temporary_name(name)
                     || name
                         .strip_suffix(".ssz_snappy")
-                        .and_then(|index| index.parse::<u64>().ok())
-                        .is_some_and(|index| index < NUMBER_OF_COLUMNS)
+                        .and_then(|index| index_from_name(index, NUMBER_OF_COLUMNS))
+                        .is_some()
             });
         if !known {
             return Err(std::io::Error::other(format!(

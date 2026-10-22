@@ -5,6 +5,7 @@ use std::{
 
 use alloy_primitives::B256;
 use anyhow::{bail, ensure};
+use ream_consensus_beacon::data_column_sidecar::NUMBER_OF_COLUMNS;
 use redb::{Durability, MultimapTableHandle, ReadableDatabase, ReadableTable, TableHandle};
 use ssz::{Decode, Encode};
 use tree_hash::TreeHash;
@@ -25,6 +26,7 @@ use crate::{
             },
             latest_messages::LatestMessagesTable,
         },
+        sidecar_file::{is_root_index_file_name, is_root_name, is_temporary_name},
         table::REDBTable,
     },
 };
@@ -335,26 +337,31 @@ impl BeaconDB {
                 "Conflicting bootstrap markers; refusing recovery"
             );
         }
-        // Check everything before deleting anything: only files, and block directories of the
-        // column layout, are removed.
+        // Check everything before deleting anything: only files and block directories Ream
+        // writes are removed.
+        let blob_dir = self.data_dir.join(BLOB_FOLDER_NAME);
         let column_dir = self.data_dir.join(COLUMN_FOLDER_NAME);
-        let dirs = [
-            self.data_dir.join(BLOB_FOLDER_NAME),
-            column_dir.clone(),
-            self.data_dir.join(STATE_FOLDER_NAME),
-        ];
+        let state_dir = self.data_dir.join(STATE_FOLDER_NAME);
+        let dirs = [blob_dir.clone(), column_dir.clone(), state_dir];
         let mut files = Vec::new();
         let mut block_dirs = Vec::new();
         for dir in &dirs {
             for entry in fs::read_dir(dir)? {
                 let entry = entry?;
                 let file_type = entry.file_type()?;
-                if file_type.is_file() {
+                let name = entry.file_name();
+                let name = name.to_str().unwrap_or_default();
+                let ream_file = is_temporary_name(name)
+                    || if *dir == blob_dir {
+                        is_root_index_file_name(name, u64::MAX)
+                    } else if *dir == column_dir {
+                        is_root_index_file_name(name, NUMBER_OF_COLUMNS)
+                    } else {
+                        name.strip_suffix(".ssz_snappy").is_some_and(is_root_name)
+                    };
+                if file_type.is_file() && ream_file {
                     files.push(entry.path());
-                } else if file_type.is_dir()
-                    && *dir == column_dir
-                    && entry.file_name().to_str().is_some_and(is_block_dir_name)
-                {
+                } else if file_type.is_dir() && *dir == column_dir && is_block_dir_name(name) {
                     check_block_dir(&entry.path())?;
                     block_dirs.push(entry.path());
                 } else {
@@ -460,8 +467,14 @@ mod tests {
 
         assert!(beacon.recover_interrupted_bootstrap().is_err());
         assert!(unknown.is_dir());
-
         fs::remove_dir(&unknown).unwrap();
+
+        let readme = beacon.data_dir.join(STATE_FOLDER_NAME).join("README");
+        fs::write(&readme, b"notes").unwrap();
+        assert!(beacon.recover_interrupted_bootstrap().is_err());
+        assert!(readme.is_file());
+        fs::remove_file(&readme).unwrap();
+
         assert!(beacon.recover_interrupted_bootstrap().unwrap());
         assert!(!block_dir.exists());
     }
@@ -477,7 +490,10 @@ mod tests {
         write.commit().unwrap();
         beacon.begin_bootstrap().unwrap();
         fs::write(
-            beacon.data_dir.join(COLUMN_FOLDER_NAME).join("partial"),
+            beacon
+                .data_dir
+                .join(COLUMN_FOLDER_NAME)
+                .join(".ream-sidecar-partial"),
             [1],
         )
         .unwrap();

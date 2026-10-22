@@ -16,7 +16,7 @@ use crate::{
             },
             column_sidecars::{
                 COLUMN_FOLDER_NAME, check_block_dir, column_block_dir, column_file_path,
-                remove_block_dir,
+                is_block_dir_name, remove_block_dir,
             },
         },
         table::REDBTable,
@@ -46,6 +46,7 @@ impl BeaconDB {
             let root = entry
                 .file_name()
                 .to_str()
+                .filter(|name| is_block_dir_name(name))
                 .and_then(|name| name.parse::<B256>().ok())
                 .ok_or_else(|| std::io::Error::other("Invalid column directory name"))?;
             roots.insert(root);
@@ -77,14 +78,25 @@ impl BeaconDB {
     /// Removes a block's column files, then its directory. A directory holding anything else is
     /// kept.
     fn remove_column_files(&self, root: B256) -> Result<usize, StoreError> {
+        let dir = column_block_dir(&self.data_dir, &root);
+        match fs::symlink_metadata(&dir) {
+            Ok(metadata) if !metadata.is_dir() => {
+                tracing::warn!("Kept {}: not a directory", dir.display());
+                return Ok(0);
+            }
+            Ok(_) => {
+                if let Err(err) = check_block_dir(&dir) {
+                    tracing::warn!("Kept column directory: {err}");
+                    return Ok(0);
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
         let removed =
             crate::tables::sidecar_file::remove_published_batch(&self.column_paths(root))?;
-        let dir = column_block_dir(&self.data_dir, &root);
         if dir.exists() {
-            match check_block_dir(&dir) {
-                Ok(()) => remove_block_dir(&dir)?,
-                Err(err) => tracing::warn!("Kept column directory: {err}"),
-            }
+            remove_block_dir(&dir)?;
         }
         Ok(removed)
     }
