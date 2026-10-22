@@ -83,6 +83,8 @@ pub struct AggregateAndProofKey {
 pub struct ValidatedDataColumnHeader {
     pub signature: BLSSignature,
     pub finalized_checkpoint: Checkpoint,
+    /// The parent was pending availability, so the ancestry is still unchecked.
+    pub parent_pending: bool,
 }
 
 /// Latest messages not yet written to the database, whether a write is running, when the last
@@ -259,6 +261,8 @@ pub struct BeaconCacheDB {
     pub seen_blob_sidecars: RwLock<LruCache<(u64, u64, u64), ()>>,
     pub seen_data_column_sidecars: RwLock<LruCache<(u64, u64, u64), ()>>,
     pub validated_data_column_headers: RwLock<LruCache<B256, ValidatedDataColumnHeader>>,
+    /// Per-header locks so a block's columns run the header checks once.
+    pub data_column_header_locks: Mutex<HashMap<B256, Arc<tokio::sync::Mutex<()>>>>,
     pub seen_attestations: RwLock<LruCache<AtestationKey, ()>>,
     pub seen_bls_to_execution_change: RwLock<LruCache<AddressValidaterIndexIdentifier, ()>>,
     pub seen_sync_messages: RwLock<LruCache<SyncCommitteeKey, ()>>,
@@ -346,6 +350,7 @@ impl BeaconCacheDB {
                 NonZeroUsize::new(LRU_CACHE_SIZE).expect("Invalid cache size"),
             )
             .into(),
+            data_column_header_locks: Mutex::new(HashMap::new()),
             seen_attestations: LruCache::new(
                 NonZeroUsize::new(LRU_CACHE_SIZE).expect("Invalid cache size"),
             )

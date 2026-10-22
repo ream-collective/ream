@@ -1,17 +1,20 @@
 use std::sync::Arc;
 
+use alloy_primitives::B256;
 use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::{
-    data_column_sidecar::DataColumnSidecar, electra::beacon_state::BeaconState,
+    data_column_sidecar::{ColumnIdentifier, DataColumnSidecar},
+    electra::beacon_state::BeaconState,
 };
 use ream_consensus_misc::{
+    checkpoint::Checkpoint,
     constants::beacon::GENESIS_SLOT,
     misc::{compute_epoch_at_slot, compute_start_slot_at_epoch},
 };
 #[cfg(not(feature = "disable_ancestor_validation"))]
 use ream_fork_choice_beacon::store::get_checkpoint_block_from_db;
 use ream_metrics::{
-    BEACON_DATA_COLUMN_SIDECAR_GOSSIP_VERIFICATION_SECONDS,
+    BEACON_DATA_COLUMN_HEADER_CHECKS_TOTAL, BEACON_DATA_COLUMN_SIDECAR_GOSSIP_VERIFICATION_SECONDS,
     BEACON_DATA_COLUMN_SIDECAR_PROCESSING_REQUESTS_TOTAL,
     BEACON_DATA_COLUMN_SIDECAR_PROCESSING_SUCCESSES_TOTAL,
 };
@@ -19,7 +22,7 @@ use ream_network_spec::networks::beacon_network_spec;
 use ream_polynomial_commitments::handlers::verify_data_column_sidecar_kzg_proofs;
 use ream_storage::{
     cache::{BeaconCacheDB, ValidatedDataColumnHeader},
-    tables::field::REDBField,
+    tables::{field::REDBField, table::REDBTable},
 };
 use tree_hash::TreeHash;
 
@@ -138,22 +141,68 @@ async fn validate_data_column_sidecar_full_inner(
         ));
     }
 
-    // All columns of a block share one signed header, so the header checks below only need to
-    // pass once per block (and again if finality moves), not once per column.
     let header_root = header.tree_hash_root();
-    let header_already_validated = cached_db
-        .validated_data_column_headers
-        .read()
-        .await
-        .peek(&header_root)
-        .is_some_and(|validated| {
-            validated.signature == data_column_sidecar.signed_block_header.signature
-                && validated.finalized_checkpoint == finalized_checkpoint
-        });
+    // A stored column is not the first for its tuple; ignore it before loading any parent.
+    if db
+        .column_sidecars_provider()
+        .contains(&ColumnIdentifier::new(
+            header_root,
+            data_column_sidecar.index,
+        ))?
+    {
+        return Ok(ValidationResult::Ignore(
+            "Data column sidecar is already stored".to_string(),
+        ));
+    }
+
+    // One column per block runs the header checks; the others wait and reuse the result.
+    let mut header_guard = None;
+    let mut header_check = remembered_header_check(
+        cached_db,
+        header_root,
+        data_column_sidecar,
+        finalized_checkpoint,
+    )
+    .await;
+    if header_check.is_none() {
+        let guard = HeaderLockGuard::lock(cached_db, header_root).await;
+        header_check = remembered_header_check(
+            cached_db,
+            header_root,
+            data_column_sidecar,
+            finalized_checkpoint,
+        )
+        .await;
+        header_guard = Some(guard);
+    }
+    let header_already_validated = header_check.is_some();
+    // A remembered header skips the parent-state checks, not the ancestry check.
+    let remembered_parent_pending = match header_check {
+        Some(RememberedHeader::Current) => false,
+        Some(RememberedHeader::FinalityMoved | RememberedHeader::ParentWasPending) => {
+            if !db.block_provider().contains_key(header.parent_root)? {
+                // Still pending: the release re-walks the ancestry once the parent imports.
+                true
+            } else {
+                #[cfg(not(feature = "disable_ancestor_validation"))]
+                if get_checkpoint_block_from_db(db, header.parent_root, finalized_checkpoint.epoch)?
+                    != finalized_checkpoint.root
+                {
+                    return Ok(ValidationResult::Reject(
+                        "Finalized checkpoint is not an ancestor of the sidecar's block"
+                            .to_string(),
+                    ));
+                }
+                false
+            }
+        }
+        None => false,
+    };
 
     let proposer_check = if header_already_validated {
         None
     } else {
+        BEACON_DATA_COLUMN_HEADER_CHECKS_TOTAL.inc();
         let parent = match find_parent(beacon_chain, header.parent_root).await? {
             Some(ParentBlock::Imported { block, state }) => {
                 let Some(parent_state) = state else {
@@ -284,7 +333,7 @@ async fn validate_data_column_sidecar_full_inner(
             }
             pending_availability
         }
-        None => false,
+        None => remembered_parent_pending,
     };
 
     // Re-check under the write lock in case another validation inserted the tuple.
@@ -298,25 +347,93 @@ async fn validate_data_column_sidecar_full_inner(
         seen.put(tuple, ());
     }
 
+    if !matches!(header_check, Some(RememberedHeader::Current)) {
+        cached_db.validated_data_column_headers.write().await.put(
+            header_root,
+            ValidatedDataColumnHeader {
+                signature: data_column_sidecar.signed_block_header.signature.clone(),
+                finalized_checkpoint,
+                parent_pending: pending_availability,
+            },
+        );
+    }
+    drop(header_guard);
+
     if pending_availability {
         return Ok(ValidationResult::ParentPendingAvailability {
             parent_root: header.parent_root,
             validated: GossipValidatedDataColumn::new(data_column_sidecar.clone()),
         });
     }
-
-    // Only a header whose parent is imported is remembered: a pending parent must be revalidated
-    // against the block DB once it imports.
-    if !header_already_validated {
-        cached_db.validated_data_column_headers.write().await.put(
-            header_root,
-            ValidatedDataColumnHeader {
-                signature: data_column_sidecar.signed_block_header.signature.clone(),
-                finalized_checkpoint,
-            },
-        );
-    }
     Ok(ValidationResult::Accept)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RememberedHeader {
+    Current,
+    FinalityMoved,
+    ParentWasPending,
+}
+
+async fn remembered_header_check(
+    cached_db: &BeaconCacheDB,
+    header_root: B256,
+    data_column_sidecar: &DataColumnSidecar,
+    finalized_checkpoint: Checkpoint,
+) -> Option<RememberedHeader> {
+    let headers = cached_db.validated_data_column_headers.read().await;
+    let validated = headers.peek(&header_root)?;
+    if validated.signature != data_column_sidecar.signed_block_header.signature {
+        return None;
+    }
+    Some(if validated.parent_pending {
+        RememberedHeader::ParentWasPending
+    } else if validated.finalized_checkpoint != finalized_checkpoint {
+        RememberedHeader::FinalityMoved
+    } else {
+        RememberedHeader::Current
+    })
+}
+
+/// A block's header lock, removed from the map once no column waits for it.
+struct HeaderLockGuard<'a> {
+    cached_db: &'a BeaconCacheDB,
+    header_root: B256,
+    lock: Arc<tokio::sync::Mutex<()>>,
+    _guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl<'a> HeaderLockGuard<'a> {
+    async fn lock(cached_db: &'a BeaconCacheDB, header_root: B256) -> Self {
+        let lock = cached_db
+            .data_column_header_locks
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .entry(header_root)
+            .or_default()
+            .clone();
+        let guard = lock.clone().lock_owned().await;
+        Self {
+            cached_db,
+            header_root,
+            lock,
+            _guard: Some(guard),
+        }
+    }
+}
+
+impl Drop for HeaderLockGuard<'_> {
+    fn drop(&mut self) {
+        self._guard = None;
+        let mut locks = self
+            .cached_db
+            .data_column_header_locks
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if Arc::strong_count(&self.lock) <= 2 {
+            locks.remove(&self.header_root);
+        }
+    }
 }
 
 fn is_not_from_future_slot(genesis_time: u64, slot: u64, current_time_ms: u64) -> bool {

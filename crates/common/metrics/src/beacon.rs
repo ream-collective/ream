@@ -169,6 +169,12 @@ lazy_static::lazy_static! {
         default_registry()
     ).expect("failed to create BEACON_GOSSIPSUB_LOWEST_PEER_SCORE int gauge");
 
+    pub static ref BEACON_DATA_COLUMN_HEADER_CHECKS_TOTAL: IntCounter = register_int_counter_with_registry!(
+        "beacon_data_column_header_checks_total",
+        "Data column headers checked against their parent state; the other columns of a block reuse the result",
+        default_registry()
+    ).expect("failed to create BEACON_DATA_COLUMN_HEADER_CHECKS_TOTAL int counter");
+
     // Block lookup recovery metrics
     pub static ref BEACON_BLOCK_LOOKUP_ENTRIES: IntGaugeVec = register_int_gauge_vec_with_registry!(
         "beacon_block_lookup_entries",

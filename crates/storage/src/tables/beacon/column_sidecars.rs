@@ -222,6 +222,14 @@ impl ColumnSidecarsTable {
         Ok(())
     }
 
+    /// Whether the column is stored, without reading it.
+    pub fn contains(&self, column_identifier: &ColumnIdentifier) -> Result<bool, StoreError> {
+        Ok(
+            crate::tables::sidecar_file::open_published(&self.column_file_path(column_identifier))?
+                .is_some(),
+        )
+    }
+
     fn column_file_path(&self, column_identifier: &ColumnIdentifier) -> PathBuf {
         column_file_path(&self.data_dir, column_identifier)
     }

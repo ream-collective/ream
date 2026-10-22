@@ -711,6 +711,88 @@ async fn test_data_column_header_checks_are_cached_per_signed_header() {
 
 #[tokio::test]
 #[serial]
+async fn test_concurrent_columns_of_a_block_check_the_header_once() {
+    let (harness, genesis_state, genesis_block) =
+        GossipLookupHarness::new("data_column_header_once").await;
+    harness.wait_for_slot(4).await;
+
+    let fixture = build_blob_block(&genesis_state, &genesis_block, 1, None, 1).await;
+    let (blob, _) = sample_blob_and_commitment(1).expect("sample blob should be reproducible");
+    let cells_and_proofs =
+        compute_cells_and_kzg_proofs(&blob, das_context()).expect("blob should encode to cells");
+    let columns =
+        get_data_column_sidecars_from_block(&fixture.signed_block, vec![cells_and_proofs])
+            .expect("fixture sidecars should build");
+
+    let checks_before = ream_metrics::BEACON_DATA_COLUMN_HEADER_CHECKS_TOTAL.get();
+    let (r0, r1, r2, r3, r4, r5, r6, r7) = tokio::join!(
+        validate_gossip_column(&harness, &columns[0]),
+        validate_gossip_column(&harness, &columns[1]),
+        validate_gossip_column(&harness, &columns[2]),
+        validate_gossip_column(&harness, &columns[3]),
+        validate_gossip_column(&harness, &columns[4]),
+        validate_gossip_column(&harness, &columns[5]),
+        validate_gossip_column(&harness, &columns[6]),
+        validate_gossip_column(&harness, &columns[7]),
+    );
+    let results = [r0, r1, r2, r3, r4, r5, r6, r7];
+    assert!(
+        results
+            .iter()
+            .all(|result| matches!(result, DependencyValidationResult::Accept)),
+        "every column of the block is valid"
+    );
+    assert_eq!(
+        ream_metrics::BEACON_DATA_COLUMN_HEADER_CHECKS_TOTAL.get() - checks_before,
+        1,
+        "eight columns arriving together check their shared header once"
+    );
+    assert!(
+        harness
+            .cached_db
+            .data_column_header_locks
+            .lock()
+            .unwrap()
+            .is_empty(),
+        "header locks are dropped once no column waits for them"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_stored_data_column_is_ignored_before_the_parent_checks() {
+    let (harness, genesis_state, genesis_block) =
+        GossipLookupHarness::new("data_column_already_stored").await;
+    harness.wait_for_slot(4).await;
+
+    let fixture = build_blob_block(&genesis_state, &genesis_block, 1, None, 1).await;
+    let (blob, _) = sample_blob_and_commitment(1).expect("sample blob should be reproducible");
+    let cells_and_proofs =
+        compute_cells_and_kzg_proofs(&blob, das_context()).expect("blob should encode to cells");
+    let columns =
+        get_data_column_sidecars_from_block(&fixture.signed_block, vec![cells_and_proofs])
+            .expect("fixture sidecars should build");
+    harness
+        .beacon_chain
+        .db()
+        .column_sidecars_provider()
+        .insert_batch(vec![columns[6].clone()])
+        .expect("column should store");
+
+    let checks_before = ream_metrics::BEACON_DATA_COLUMN_HEADER_CHECKS_TOTAL.get();
+    assert!(matches!(
+        validate_gossip_column(&harness, &columns[6]).await,
+        DependencyValidationResult::Ignore(_)
+    ));
+    assert_eq!(
+        ream_metrics::BEACON_DATA_COLUMN_HEADER_CHECKS_TOTAL.get(),
+        checks_before,
+        "a stored column is ignored without loading its parent"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn test_pending_parent_block_imports_after_parent_becomes_available() {
     let (mut harness, genesis_state, genesis_block) =
         GossipLookupHarness::new("pending_parent_lookup").await;
