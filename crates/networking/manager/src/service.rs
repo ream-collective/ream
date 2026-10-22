@@ -801,6 +801,14 @@ impl NetworkManagerService {
             ..
         } = self;
 
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("correct time")
+            .as_secs();
+        if let Err(err) = beacon_chain.process_tick(now).await {
+            error!("Failed to process startup tick: {err}");
+        }
+
         let mut resync_check_interval = interval(Duration::from_secs(
             SLOTS_PER_EPOCH * beacon_network_spec().seconds_per_slot(),
         ));

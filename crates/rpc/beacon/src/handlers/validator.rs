@@ -974,7 +974,11 @@ fn verify_validator_registration_signature(
 ) -> Result<bool, ApiError> {
     use ream_validator_beacon::builder::DOMAIN_APPLICATION_BUILDER;
 
-    let domain = compute_domain(DOMAIN_APPLICATION_BUILDER, None, None);
+    let domain = compute_domain(
+        DOMAIN_APPLICATION_BUILDER,
+        Some(beacon_network_spec().genesis_fork_version),
+        None,
+    );
     let signing_root = compute_signing_root(signed_registration.message.clone(), domain);
 
     signed_registration

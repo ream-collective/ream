@@ -198,12 +198,21 @@ pub async fn get_beacon_block_from_id(
 
 /// Called by `/genesis` to get the Genesis Config of Beacon Chain.
 #[get("/beacon/genesis")]
-pub async fn get_genesis() -> Result<impl Responder, ApiError> {
-    Ok(HttpResponse::Ok().json(DataResponse::new(Genesis {
-        genesis_time: beacon_network_spec().min_genesis_time,
-        genesis_validators_root: genesis_validators_root(),
+pub async fn get_genesis(beacon_chain: Data<Arc<BeaconChain>>) -> Result<impl Responder, ApiError> {
+    let head = beacon_chain
+        .head()
+        .map_err(|err| ApiError::InternalError(format!("Failed to get head: {err:?}")))?;
+    Ok(HttpResponse::Ok().json(DataResponse::new(genesis_from_state(&head.state))))
+}
+
+/// Validator clients build their slot clock from `genesis_time`, so it must be the chain's
+/// genesis time. `MIN_GENESIS_TIME` is only the earliest time genesis could have happened.
+fn genesis_from_state(state: &BeaconState) -> Genesis {
+    Genesis {
+        genesis_time: state.genesis_time,
+        genesis_validators_root: state.genesis_validators_root,
         genesis_fork_version: beacon_network_spec().genesis_fork_version,
-    })))
+    }
 }
 
 /// Called by `/eth/v2/beacon/blocks/{block_id}/attestations` to get block attestations
@@ -843,4 +852,37 @@ pub async fn post_blinded_beacon_block(
     info!("Publishing assembled block from blinded block: slot={slot}, block_root={block_root:?}",);
 
     publish_and_process_block(signed_block, beacon_chain, p2p_sender).await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use ream_network_spec::networks::initialize_test_network_spec;
+    use ssz::Decode;
+
+    use super::*;
+
+    #[test]
+    fn genesis_time_is_the_chain_genesis_not_min_genesis_time() {
+        initialize_test_network_spec();
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../../testing/gossip-validation/tests/assets/sepolia/states/\
+             grandparent_state_9552074.ssz_snappy",
+        );
+        let compressed = std::fs::read(path).expect("reads fixture state");
+        let bytes = snap::raw::Decoder::new()
+            .decompress_vec(&compressed)
+            .expect("decompresses fixture state");
+        let state = BeaconState::from_ssz_bytes(&bytes).expect("decodes fixture state");
+
+        let genesis = genesis_from_state(&state);
+
+        // Sepolia: MIN_GENESIS_TIME 1655647200, genesis 1655733600.
+        assert_eq!(genesis.genesis_time, 1_655_733_600);
+        assert_eq!(
+            genesis.genesis_validators_root,
+            state.genesis_validators_root
+        );
+    }
 }

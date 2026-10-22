@@ -4,11 +4,11 @@ use anyhow::{anyhow, bail};
 use ream_api_types_beacon::{error::ValidatorError, id::ValidatorID, validator::ValidatorStatus};
 use ream_api_types_common::id::ID;
 use ream_bls::{PrivateKey, traits::Signable};
-use ream_consensus_beacon::voluntary_exit::{SignedVoluntaryExit, VoluntaryExit};
-use ream_consensus_misc::{
-    constants::beacon::DOMAIN_VOLUNTARY_EXIT,
-    misc::{compute_domain, compute_signing_root},
+use ream_consensus_beacon::{
+    electra::beacon_state::voluntary_exit_domain,
+    voluntary_exit::{SignedVoluntaryExit, VoluntaryExit},
 };
+use ream_consensus_misc::{constants::beacon::genesis_validators_root, misc::compute_signing_root};
 use ream_network_spec::networks::beacon_network_spec;
 use tokio::time::sleep;
 use tracing::info;
@@ -30,11 +30,7 @@ pub fn sign_voluntary_exit(
             .sign(
                 compute_signing_root(
                     &voluntary_exit,
-                    compute_domain(
-                        DOMAIN_VOLUNTARY_EXIT,
-                        Some(beacon_network_spec().current_fork_version(epoch)),
-                        None,
-                    ),
+                    voluntary_exit_domain(genesis_validators_root()),
                 )
                 .as_ref(),
             )

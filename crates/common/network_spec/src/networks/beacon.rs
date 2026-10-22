@@ -86,6 +86,13 @@ pub fn set_beacon_network_spec(network_spec: Arc<BeaconNetworkSpec>) {
         .expect("BeaconNetworkSpec should be set only once at the start of the application");
 }
 
+static GENESIS_TIME: OnceLock<u64> = OnceLock::new();
+
+/// Sets the chain's genesis time once the anchor state is loaded. Later calls are ignored.
+pub fn set_genesis_time(genesis_time: u64) {
+    let _ = GENESIS_TIME.set(genesis_time);
+}
+
 /// Returns the static [BeaconNetworkSpec] initialized by [set_beacon_network_spec].
 ///
 /// # Panics
@@ -319,7 +326,7 @@ impl BeaconNetworkSpec {
     ///
     /// if n_days_ago is larger then the current slot, it returns 0.
     pub fn slot_n_days_ago(&self, n_days_ago: u64) -> u64 {
-        let genesis_instant = UNIX_EPOCH + Duration::from_secs(self.min_genesis_time);
+        let genesis_instant = UNIX_EPOCH + Duration::from_secs(self.genesis_time());
         // A node started before genesis — routine on a devnet with a genesis delay — is at
         // slot 0, not a crash. `current_epoch` funnels through here, so panicking would take
         // down gossip topic construction and message validation, not just this call.
@@ -328,6 +335,12 @@ impl BeaconNetworkSpec {
             .map(|elapsed| elapsed.as_millis() as u64 / self.slot_duration_ms)
             .unwrap_or(0);
         current_slot.saturating_sub(n_days_ago * 24 * 60 * 60 * 1000 / self.slot_duration_ms)
+    }
+
+    /// The chain's genesis time, set by [set_genesis_time]. Until then it is `min_genesis_time`,
+    /// which is only the earliest time genesis could happen (600 s early on Hoodi).
+    pub fn genesis_time(&self) -> u64 {
+        GENESIS_TIME.get().copied().unwrap_or(self.min_genesis_time)
     }
 
     /// Returns the current wall-clock epoch.

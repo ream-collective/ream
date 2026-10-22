@@ -131,8 +131,7 @@ pub async fn initialize_db_from_checkpoint(
         .insert_batch(anchor_data.columns)?;
     let mut store = get_forkchoice_store(state.clone(), block, db.clone())?;
 
-    let time = beacon_network_spec().min_genesis_time
-        + beacon_network_spec().seconds_per_slot() * (slot + 1);
+    let time = state.genesis_time + beacon_network_spec().seconds_per_slot() * (slot + 1);
     on_tick(&mut store, time)?;
     db.finish_bootstrap(state.genesis_validators_root, Some(&meta))?;
     info!("Initial sync complete");

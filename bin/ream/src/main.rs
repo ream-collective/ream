@@ -43,7 +43,7 @@ use ream_consensus_lean::attestation::MultiMessageAggregate;
 use ream_consensus_lean::{block::SignedBlock, validator::Validator};
 use ream_consensus_misc::{
     constants::{
-        beacon::set_genesis_validator_root,
+        beacon::{ensure_genesis_validator_root, set_genesis_validator_root},
         lean::{attestation_committee_count, set_attestation_committee_count},
     },
     misc::compute_epoch_at_slot,
@@ -64,7 +64,8 @@ use ream_network_manager::{
     config::ManagerConfig, custody::local_custody_assignment, service::NetworkManagerService,
 };
 use ream_network_spec::networks::{
-    beacon_network_spec, lean_network_spec, set_beacon_network_spec, set_lean_network_spec,
+    beacon_network_spec, lean_network_spec, set_beacon_network_spec, set_genesis_time,
+    set_lean_network_spec,
 };
 use ream_network_state_lean::AggregatorState;
 use ream_node::version::REAM_VERSION;
@@ -87,6 +88,7 @@ use ream_storage::{
     cache::{BeaconCacheDB, LeanCacheDB},
     db::{ReamDB, beacon::BeaconDB, reset_db},
     dir::setup_data_dir,
+    tables::field::REDBField,
 };
 use ream_sync::rwlock::Writer;
 use ream_sync_committee_pool::SyncCommitteePool;
@@ -684,6 +686,12 @@ async fn run_beacon_node_inner(
             .expect("Unable to load genesis validators root");
     if initialize_globals {
         set_genesis_validator_root(genesis_validators_root);
+        set_genesis_time(
+            beacon_db
+                .genesis_time_provider()
+                .get()
+                .expect("Unable to load genesis time"),
+        );
     }
 
     let operation_pool = Arc::new(OperationPool::default());
@@ -1033,6 +1041,10 @@ pub async fn run_voluntary_exit(config: VoluntaryExitConfig) {
         .get_genesis()
         .await
         .expect("Failed to get genesis information");
+    // The exit is signed with the chain's genesis validators root.
+    ensure_genesis_validator_root(genesis.data.genesis_validators_root)
+        .expect("Failed to set the genesis validators root");
+    set_genesis_time(genesis.data.genesis_time);
 
     match process_voluntary_exit(
         &beacon_api_client,
