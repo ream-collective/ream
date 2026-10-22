@@ -24,7 +24,7 @@ use ream_consensus_misc::{
     attestation_data::AttestationData,
     constants::beacon::{
         DOMAIN_SYNC_COMMITTEE, INTERVALS_PER_SLOT, SLOTS_PER_EPOCH, SYNC_COMMITTEE_SIZE,
-        genesis_validators_root,
+        ensure_genesis_validator_root, genesis_validators_root,
     },
     misc::{compute_domain, compute_epoch_at_slot, compute_signing_root},
 };
@@ -33,7 +33,7 @@ use ream_events_beacon::contribution_and_proof::{
 };
 use ream_executor::ReamExecutor;
 use ream_keystore::keystore::Keystore;
-use ream_network_spec::networks::beacon_network_spec;
+use ream_network_spec::networks::{beacon_network_spec, set_genesis_time};
 use reqwest::Url;
 use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep};
 use tracing::{error, info, warn};
@@ -120,14 +120,22 @@ impl ValidatorService {
         let seconds_per_slot = beacon_network_spec().seconds_per_slot();
         let seconds_per_interval = seconds_per_slot / INTERVALS_PER_SLOT;
 
-        let genesis_time = match self.beacon_api_client.get_genesis().await {
-            Ok(genesis) => genesis.data.genesis_time,
-            Err(err) => {
-                warn!("Failed to get genesis from the beacon node, using the network spec: {err}");
-                beacon_network_spec().genesis_time()
+        // Signing needs the chain's genesis validators root, and duties its genesis time.
+        let genesis = loop {
+            match self.beacon_api_client.get_genesis().await {
+                Ok(genesis) => break genesis.data,
+                Err(err) => {
+                    warn!("Waiting for the beacon node's genesis: {err}");
+                    sleep(Duration::from_secs(seconds_per_slot)).await;
+                }
             }
         };
-        let genesis_instant = UNIX_EPOCH + Duration::from_secs(genesis_time);
+        if let Err(err) = ensure_genesis_validator_root(genesis.genesis_validators_root) {
+            error!("Wrong chain: {err}");
+            return;
+        }
+        set_genesis_time(genesis.genesis_time);
+        let genesis_instant = UNIX_EPOCH + Duration::from_secs(genesis.genesis_time);
         let elapsed = elapsed_since_genesis(SystemTime::now(), genesis_instant);
 
         let mut intervals = elapsed.as_secs() / seconds_per_interval;

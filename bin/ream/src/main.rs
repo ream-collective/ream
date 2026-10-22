@@ -43,7 +43,7 @@ use ream_consensus_lean::attestation::MultiMessageAggregate;
 use ream_consensus_lean::{block::SignedBlock, validator::Validator};
 use ream_consensus_misc::{
     constants::{
-        beacon::set_genesis_validator_root,
+        beacon::{ensure_genesis_validator_root, set_genesis_validator_root},
         lean::{attestation_committee_count, set_attestation_committee_count},
     },
     misc::compute_epoch_at_slot,
@@ -1041,6 +1041,10 @@ pub async fn run_voluntary_exit(config: VoluntaryExitConfig) {
         .get_genesis()
         .await
         .expect("Failed to get genesis information");
+    // The exit is signed with the chain's genesis validators root.
+    ensure_genesis_validator_root(genesis.data.genesis_validators_root)
+        .expect("Failed to set the genesis validators root");
+    set_genesis_time(genesis.data.genesis_time);
 
     match process_voluntary_exit(
         &beacon_api_client,

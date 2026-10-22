@@ -160,6 +160,17 @@ pub fn set_genesis_validator_root(genesis_validators_root: B256) {
         .expect("GENESIS_VALIDATORS_ROOT should be set only once at the start of the application");
 }
 
+/// Sets the genesis validators root, or checks it equals the one already set: a validator
+/// client can run in the beacon node's process, which sets it first.
+pub fn ensure_genesis_validator_root(genesis_validators_root: B256) -> anyhow::Result<()> {
+    let set = *GENESIS_VALIDATORS_ROOT.get_or_init(|| genesis_validators_root);
+    anyhow::ensure!(
+        set == genesis_validators_root,
+        "Genesis validators root {genesis_validators_root} differs from {set}, set earlier"
+    );
+    Ok(())
+}
+
 /// Returns the static [B256] initialized by [set_genesis_validator_root].
 ///
 /// # Panics
@@ -169,4 +180,18 @@ pub fn genesis_validators_root() -> B256 {
     *GENESIS_VALIDATORS_ROOT
         .get()
         .expect("GENESIS_VALIDATORS_ROOT wasn't set")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_genesis_validator_root_sets_once_and_rejects_another_chain() {
+        let root = B256::repeat_byte(1);
+        ensure_genesis_validator_root(root).unwrap();
+        ensure_genesis_validator_root(root).unwrap();
+        assert_eq!(genesis_validators_root(), root);
+        assert!(ensure_genesis_validator_root(B256::repeat_byte(2)).is_err());
+    }
 }
