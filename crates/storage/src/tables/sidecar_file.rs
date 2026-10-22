@@ -278,6 +278,32 @@ impl Drop for Publication {
     }
 }
 
+/// Whether `name` is a temporary file of a sidecar or state write.
+pub(crate) fn is_temporary_name(name: &str) -> bool {
+    name.starts_with(TEMP_PREFIX) || name.starts_with(".tmp")
+}
+
+/// Whether `name` is a block root as Ream writes it.
+pub(crate) fn is_root_name(name: &str) -> bool {
+    name.parse::<alloy_primitives::B256>()
+        .is_ok_and(|root| root.to_string() == name)
+}
+
+/// The index of `name` as Ream writes it, if it is below `limit`.
+pub(crate) fn index_from_name(name: &str, limit: u64) -> Option<u64> {
+    name.parse::<u64>()
+        .ok()
+        .filter(|index| *index < limit && index.to_string() == name)
+}
+
+/// Whether `name` is `<root>_<index>.ssz_snappy`, a blob file or a column file of the flat
+/// layout, with the index below `limit`.
+pub(crate) fn is_root_index_file_name(name: &str, limit: u64) -> bool {
+    name.strip_suffix(".ssz_snappy")
+        .and_then(|name| name.rsplit_once('_'))
+        .is_some_and(|(root, index)| is_root_name(root) && index_from_name(index, limit).is_some())
+}
+
 /// Startup only, before any writers start. Never run this during live pruning: a tempfile
 /// could still belong to an active write. `.tmp` covers files from the previous implementation.
 pub(crate) fn cleanup_temporary_sidecars(directory: &Path) -> Result<(), StoreError> {

@@ -5,6 +5,7 @@ use std::{
 
 use alloy_primitives::B256;
 use anyhow::{bail, ensure};
+use ream_consensus_beacon::data_column_sidecar::NUMBER_OF_COLUMNS;
 use redb::{Durability, MultimapTableHandle, ReadableDatabase, ReadableTable, TableHandle};
 use ssz::{Decode, Encode};
 use tree_hash::TreeHash;
@@ -20,9 +21,12 @@ use crate::{
             },
             beacon_state::STATE_FOLDER_NAME,
             blobs_and_proofs::BLOB_FOLDER_NAME,
-            column_sidecars::COLUMN_FOLDER_NAME,
+            column_sidecars::{
+                COLUMN_FOLDER_NAME, check_block_dir, is_block_dir_name, remove_block_dir,
+            },
             latest_messages::LatestMessagesTable,
         },
+        sidecar_file::{is_root_index_file_name, is_root_name, is_temporary_name},
         table::REDBTable,
     },
 };
@@ -219,12 +223,17 @@ impl BeaconDB {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         *cache = None;
-        ensure!(
-            self.slot_index_provider().get_highest_slot()?.is_none(),
-            "Refusing to bootstrap over existing blocks"
-        );
         let mut write = self.db.begin_write()?;
         write.set_durability(Durability::Immediate)?;
+        ensure!(
+            write
+                .open_table(
+                    crate::tables::beacon::slot_index::BeaconSlotIndexTable::TABLE_DEFINITION
+                )?
+                .last()?
+                .is_none(),
+            "Refusing to bootstrap over existing blocks"
+        );
         {
             let mut table = write.open_table(BOOTSTRAP)?;
             ensure!(
@@ -328,24 +337,48 @@ impl BeaconDB {
                 "Conflicting bootstrap markers; refusing recovery"
             );
         }
+        // Check everything before deleting anything: only files and block directories Ream
+        // writes are removed.
+        let blob_dir = self.data_dir.join(BLOB_FOLDER_NAME);
         let column_dir = self.data_dir.join(COLUMN_FOLDER_NAME);
-        for dir in [
-            self.data_dir.join(BLOB_FOLDER_NAME),
-            column_dir.clone(),
-            self.data_dir.join(STATE_FOLDER_NAME),
-        ] {
-            for entry in fs::read_dir(&dir)? {
+        let state_dir = self.data_dir.join(STATE_FOLDER_NAME);
+        let dirs = [blob_dir.clone(), column_dir.clone(), state_dir];
+        let mut files = Vec::new();
+        let mut block_dirs = Vec::new();
+        for dir in &dirs {
+            for entry in fs::read_dir(dir)? {
                 let entry = entry?;
-                if entry.file_type()?.is_dir() && dir == column_dir {
-                    fs::remove_dir_all(entry.path())?;
-                    continue;
+                let file_type = entry.file_type()?;
+                let name = entry.file_name();
+                let name = name.to_str().unwrap_or_default();
+                let ream_file = is_temporary_name(name)
+                    || if *dir == blob_dir {
+                        is_root_index_file_name(name, u64::MAX)
+                    } else if *dir == column_dir {
+                        is_root_index_file_name(name, NUMBER_OF_COLUMNS)
+                    } else {
+                        name.strip_suffix(".ssz_snappy").is_some_and(is_root_name)
+                    };
+                if file_type.is_file() && ream_file {
+                    files.push(entry.path());
+                } else if file_type.is_dir() && *dir == column_dir && is_block_dir_name(name) {
+                    check_block_dir(&entry.path())?;
+                    block_dirs.push(entry.path());
+                } else {
+                    bail!(
+                        "Unexpected entry {} in bootstrap sidecars",
+                        entry.path().display()
+                    );
                 }
-                ensure!(
-                    entry.file_type()?.is_file(),
-                    "Unexpected directory in bootstrap sidecars"
-                );
-                fs::remove_file(entry.path())?;
             }
+        }
+        for file in files {
+            fs::remove_file(file)?;
+        }
+        for block_dir in block_dirs {
+            remove_block_dir(&block_dir)?;
+        }
+        for dir in dirs {
             File::open(dir)?.sync_all()?;
         }
         let mut write = self.db.begin_write()?;
@@ -418,6 +451,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recovery_removes_block_directories_but_refuses_unknown_ones() {
+        let dir = TempDir::new("bootstrap_recovery_dirs").unwrap();
+        let beacon = ReamDB::new(dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap();
+        beacon.begin_bootstrap().unwrap();
+        let column_dir = beacon.data_dir.join(COLUMN_FOLDER_NAME);
+        let block_dir = column_dir.join(B256::repeat_byte(7).to_string());
+        fs::create_dir(&block_dir).unwrap();
+        fs::write(block_dir.join("0.ssz_snappy"), [1]).unwrap();
+        let unknown = column_dir.join("not-a-block");
+        fs::create_dir(&unknown).unwrap();
+
+        assert!(beacon.recover_interrupted_bootstrap().is_err());
+        assert!(unknown.is_dir());
+        fs::remove_dir(&unknown).unwrap();
+
+        let readme = beacon.data_dir.join(STATE_FOLDER_NAME).join("README");
+        fs::write(&readme, b"notes").unwrap();
+        assert!(beacon.recover_interrupted_bootstrap().is_err());
+        assert!(readme.is_file());
+        fs::remove_file(&readme).unwrap();
+
+        assert!(beacon.recover_interrupted_bootstrap().unwrap());
+        assert!(!block_dir.exists());
+    }
+
+    #[test]
     fn recovery_is_restartable_and_preserves_non_beacon_tables() {
         let dir = TempDir::new("bootstrap_recovery").unwrap();
         let db = ReamDB::new(dir.path().to_path_buf()).unwrap();
@@ -428,7 +490,10 @@ mod tests {
         write.commit().unwrap();
         beacon.begin_bootstrap().unwrap();
         fs::write(
-            beacon.data_dir.join(COLUMN_FOLDER_NAME).join("partial"),
+            beacon
+                .data_dir
+                .join(COLUMN_FOLDER_NAME)
+                .join(".ream-sidecar-partial"),
             [1],
         )
         .unwrap();

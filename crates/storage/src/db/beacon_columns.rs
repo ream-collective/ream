@@ -4,6 +4,7 @@ use std::{collections::HashSet, fs, path::PathBuf};
 use alloy_primitives::B256;
 use ream_consensus_beacon::data_column_sidecar::{ColumnIdentifier, NUMBER_OF_COLUMNS};
 use redb::{Durability, ReadableDatabase, ReadableTable};
+use tree_hash::TreeHash;
 
 use super::beacon::BeaconDB;
 use crate::{
@@ -14,9 +15,12 @@ use crate::{
                 COLUMN_MAINTENANCE, COLUMN_ROOTS_BY_SLOT, COLUMN_WRITER, INDEX_VERSION,
                 PRUNED_BEFORE,
             },
-            column_sidecars::{COLUMN_FOLDER_NAME, column_block_dir, column_file_path},
+            column_sidecars::{
+                COLUMN_FOLDER_NAME, check_block_dir, column_block_dir, column_file_path,
+                is_block_dir_name, remove_block_dir,
+            },
         },
-        table::REDBTable,
+        table::{CustomTable, REDBTable},
     },
 };
 
@@ -43,23 +47,31 @@ impl BeaconDB {
             let root = entry
                 .file_name()
                 .to_str()
+                .filter(|name| is_block_dir_name(name))
                 .and_then(|name| name.parse::<B256>().ok())
                 .ok_or_else(|| std::io::Error::other("Invalid column directory name"))?;
             roots.insert(root);
         }
         for root in roots {
-            match self.block_provider().get(root)? {
-                Some(block) => {
+            // Columns can be stored before their block, so a missing block takes the slot from a
+            // sidecar's own header. A directory with no readable sidecar of that root is kept.
+            let slot = match self.block_provider().get(root)? {
+                Some(block) => Some(block.message.slot),
+                None => self.stored_column_slot(root)?,
+            };
+            match slot {
+                Some(slot) => {
                     let mut write = self.db.begin_write()?;
                     write.set_durability(Durability::Immediate)?;
                     write
                         .open_multimap_table(COLUMN_ROOTS_BY_SLOT)?
-                        .insert(block.message.slot, root)?;
+                        .insert(slot, root)?;
                     write.commit()?;
                 }
-                None => {
-                    self.remove_column_files(root)?;
-                }
+                None => tracing::warn!(
+                    "Kept unindexed column directory {}: no readable sidecar of its root",
+                    column_block_dir(&self.data_dir, &root).display()
+                ),
             }
         }
         let mut write = self.db.begin_write()?;
@@ -71,14 +83,43 @@ impl BeaconDB {
         Ok(())
     }
 
-    /// Removes a block's column files, then its directory with any leftover temporary file.
+    /// The slot in the header of a stored column of `root`, if one is readable and signed for it.
+    fn stored_column_slot(&self, root: B256) -> Result<Option<u64>, StoreError> {
+        for index in 0..NUMBER_OF_COLUMNS {
+            if let Ok(Some(column)) = self
+                .column_sidecars_provider()
+                .get(ColumnIdentifier::new(root, index))
+                && column.signed_block_header.message.tree_hash_root() == root
+            {
+                return Ok(Some(column.signed_block_header.message.slot));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Removes a block's column files, then its directory. A directory holding anything else is
+    /// kept.
     fn remove_column_files(&self, root: B256) -> Result<usize, StoreError> {
+        let dir = column_block_dir(&self.data_dir, &root);
+        match fs::symlink_metadata(&dir) {
+            Ok(metadata) if !metadata.is_dir() => {
+                tracing::warn!("Kept {}: not a directory", dir.display());
+                return Ok(0);
+            }
+            Ok(_) => {
+                if let Err(err) = check_block_dir(&dir) {
+                    tracing::warn!("Kept column directory: {err}");
+                    return Ok(0);
+                }
+            }
+            // Removed already, before a crash kept its index entry.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(err) => return Err(err.into()),
+        }
         let removed =
             crate::tables::sidecar_file::remove_published_batch(&self.column_paths(root))?;
-        match fs::remove_dir_all(column_block_dir(&self.data_dir, &root)) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
+        if dir.exists() {
+            remove_block_dir(&dir)?;
         }
         Ok(removed)
     }
@@ -149,10 +190,9 @@ mod tests {
         data_column_sidecar::{ColumnIdentifier, DataColumnSidecar},
         electra::beacon_block::{BeaconBlock, SignedBeaconBlock},
     };
-    use tree_hash::TreeHash;
 
     use super::*;
-    use crate::{db::ReamDB, tables::table::CustomTable};
+    use crate::db::ReamDB;
 
     fn column(slot: u64) -> (B256, SignedBeaconBlock, DataColumnSidecar) {
         let block = SignedBeaconBlock {
@@ -211,6 +251,21 @@ mod tests {
     }
 
     #[test]
+    fn migration_never_overwrites_a_different_column_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let column_dir = dir.path().join(COLUMN_FOLDER_NAME);
+        let root = B256::repeat_byte(3);
+        let block_dir = column_dir.join(root.to_string());
+        fs::create_dir_all(&block_dir).unwrap();
+        fs::write(block_dir.join("0.ssz_snappy"), b"new").unwrap();
+        fs::write(column_dir.join(format!("{root}_0.ssz_snappy")), b"old").unwrap();
+
+        ReamDB::new(dir.path().to_path_buf()).unwrap();
+        assert_eq!(fs::read(block_dir.join("0.ssz_snappy")).unwrap(), b"new");
+        assert!(column_dir.join(format!("{root}_0.ssz_snappy")).exists());
+    }
+
+    #[test]
     fn pruning_respects_retention_finality_and_rejects_late_republication() {
         let dir = tempfile::tempdir().unwrap();
         let db = ReamDB::new(dir.path().to_path_buf())
@@ -266,7 +321,11 @@ mod tests {
         db.column_sidecars_provider()
             .insert_batch(vec![fork_sidecar])
             .unwrap();
-        // Simulate an old database without an index, including an orphan from a failed import.
+        // A directory without a readable sidecar of its root.
+        let orphan = column_block_dir(dir.path(), &B256::repeat_byte(9));
+        fs::create_dir(&orphan).unwrap();
+        fs::write(orphan.join("0.ssz_snappy"), b"not a sidecar").unwrap();
+        // Simulate an old database without an index.
         let write = db.db.begin_write().unwrap();
         write
             .open_multimap_table(COLUMN_ROOTS_BY_SLOT)
@@ -289,20 +348,22 @@ mod tests {
             .unwrap()
             .init_beacon_db()
             .unwrap();
+        // Columns stored before their block are kept and indexed by their header's slot.
         assert!(
             db.column_sidecars_provider()
                 .get(ColumnIdentifier::new(column(10).0, 0))
                 .unwrap()
-                .is_none()
+                .is_some()
         );
+        assert!(orphan.join("0.ssz_snappy").is_file());
         assert!(
             db.column_sidecars_provider()
                 .get(ColumnIdentifier::new(root, 0))
                 .unwrap()
                 .is_some()
         );
-        // Simulate a crash after unlink but before the index transaction commits.
-        fs::remove_file(db.column_paths(root)[0].clone()).unwrap();
+        // Simulate a crash after the files are removed but before the index transaction commits.
+        fs::remove_dir_all(column_block_dir(&db.data_dir, &root)).unwrap();
         assert_eq!(db.prune_columns(10, 10, 256).unwrap(), 1);
         assert!(
             db.db
