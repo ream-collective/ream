@@ -149,6 +149,26 @@ lazy_static::lazy_static! {
         ).expect("failed to create BEACON_DATA_COLUMN_SIDECAR_GOSSIP_VERIFICATION_SECONDS")
     };
 
+    pub static ref BEACON_GOSSIP_VALIDATION_TOTAL: IntCounterVec = register_int_counter_vec_with_registry!(
+        "beacon_gossip_validation_total",
+        "Gossip messages by topic kind and the validation result reported to gossipsub",
+        &["topic", "result"],
+        default_registry()
+    ).expect("failed to create BEACON_GOSSIP_VALIDATION_TOTAL int counter vec");
+
+    pub static ref BEACON_GOSSIPSUB_PEERS_BY_SCORE: IntGaugeVec = register_int_gauge_vec_with_registry!(
+        "beacon_gossipsub_peers_by_score",
+        "Gossipsub peers by score band: graylisted, below_publish, below_gossip, negative or non_negative",
+        &["band"],
+        default_registry()
+    ).expect("failed to create BEACON_GOSSIPSUB_PEERS_BY_SCORE int gauge vec");
+
+    pub static ref BEACON_GOSSIPSUB_LOWEST_PEER_SCORE: IntGauge = register_int_gauge_with_registry!(
+        "beacon_gossipsub_lowest_peer_score",
+        "Lowest gossipsub score among connected peers, rounded",
+        default_registry()
+    ).expect("failed to create BEACON_GOSSIPSUB_LOWEST_PEER_SCORE int gauge");
+
     // Block lookup recovery metrics
     pub static ref BEACON_BLOCK_LOOKUP_ENTRIES: IntGaugeVec = register_int_gauge_vec_with_registry!(
         "beacon_block_lookup_entries",

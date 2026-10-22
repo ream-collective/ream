@@ -17,6 +17,10 @@ pub struct NetworkConfig {
 
     /// Peers the node keeps connected; the connection limits are derived from it.
     pub target_peers: usize,
+
+    /// Active validators at startup, which set the expected message rates of the scored gossip
+    /// topics. `None` leaves gossipsub peer scoring off.
+    pub active_validators: Option<usize>,
 }
 
 /// Established connection limits derived from the target peer count, with Lighthouse v8's

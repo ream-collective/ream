@@ -583,6 +583,22 @@ fn spawn_state_advance(beacon_chain: &Arc<BeaconChain>, slot: u64) {
     tokio::spawn(async move { beacon_chain.advance_head_to_next_epoch(next_epoch).await });
 }
 
+/// Validators active in the head state's epoch, which gossipsub peer scoring derives its expected
+/// message rates from. `None`, leaving scoring off, before there is a head.
+fn active_validator_count(beacon_chain: &BeaconChain) -> Option<usize> {
+    match beacon_chain.head() {
+        Ok(head) => Some(
+            head.state
+                .get_active_validator_indices(head.state.get_current_epoch())
+                .len(),
+        ),
+        Err(err) => {
+            warn!("Gossipsub peer scoring is off: no head state yet: {err:#}");
+            None
+        }
+    }
+}
+
 async fn reconcile_block_lookup_state(
     beacon_chain: &BeaconChain,
     roots: Vec<alloy_primitives::B256>,
@@ -710,6 +726,11 @@ impl NetworkManagerService {
             data_dir: ream_directory,
             genesis_time: ream_db.genesis_time_provider().get()?,
             target_peers: config.target_peers,
+            active_validators: if config.disable_peer_scoring {
+                None
+            } else {
+                active_validator_count(&beacon_chain)
+            },
         };
 
         let (manager_sender, manager_receiver) = mpsc::unbounded_channel();
