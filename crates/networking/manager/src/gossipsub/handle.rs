@@ -5,8 +5,10 @@ use libp2p::PeerId;
 pub use libp2p::gossipsub::{Message, MessageAcceptance};
 use ream_chain_beacon::beacon_chain::{BeaconChain, BlockProcessingOutcome};
 use ream_consensus_beacon::{
-    blob_sidecar::BlobIdentifier, electra::beacon_block::SignedBeaconBlock,
+    blob_sidecar::BlobIdentifier,
+    electra::{beacon_block::SignedBeaconBlock, beacon_state::BeaconState},
     single_attestation::SingleAttestation,
+    sync_committee::SyncCommittee,
 };
 use ream_consensus_misc::{
     constants::beacon::{SYNC_COMMITTEE_SIZE, genesis_validators_root},
@@ -54,6 +56,18 @@ use crate::{
     timing::{ColumnSource, log_block_proposer, log_columns_received},
 };
 
+/// The committee that signs at `slot`: the one the block at `slot + 1` checks, so the next
+/// committee on a period's last slot.
+fn message_sync_committee(state: &BeaconState, slot: u64) -> &SyncCommittee {
+    if compute_sync_committee_period(compute_epoch_at_slot(slot + 1))
+        == compute_sync_committee_period(state.get_current_epoch())
+    {
+        &state.current_sync_committee
+    } else {
+        &state.next_sync_committee
+    }
+}
+
 /// Adds an accepted sync committee message to the pool that sync committee contributions are
 /// built from.
 fn import_sync_committee_message(
@@ -68,13 +82,7 @@ fn import_sync_committee_message(
         .get(message.validator_index as usize)
         .ok_or_else(|| anyhow!("Validator {} not found", message.validator_index))?
         .public_key;
-    let sync_committee = if compute_sync_committee_period(compute_epoch_at_slot(message.slot))
-        == compute_sync_committee_period(state.get_current_epoch())
-    {
-        &state.current_sync_committee
-    } else {
-        &state.next_sync_committee
-    };
+    let sync_committee = message_sync_committee(state, message.slot);
     let subcommittee_size = (SYNC_COMMITTEE_SIZE / SYNC_COMMITTEE_SUBNET_COUNT) as usize;
     let positions = sync_committee
         .public_keys
@@ -859,6 +867,38 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn a_period_s_last_slot_is_signed_by_the_next_sync_committee() {
+        use ream_consensus_misc::constants::beacon::{
+            EPOCHS_PER_SYNC_COMMITTEE_PERIOD, SLOTS_PER_EPOCH,
+        };
+        use ssz::Decode;
+
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../../testing/gossip-validation/tests/assets/sepolia/states/\
+             grandparent_state_9552074.ssz_snappy",
+        );
+        let bytes = snap::raw::Decoder::new()
+            .decompress_vec(&std::fs::read(path).expect("reads fixture state"))
+            .expect("decompresses fixture state");
+        let mut state = BeaconState::from_ssz_bytes(&bytes).expect("decodes fixture state");
+        let last_slot = 1000 * EPOCHS_PER_SYNC_COMMITTEE_PERIOD * SLOTS_PER_EPOCH - 1;
+        let is_next = |state: &BeaconState, slot| {
+            std::ptr::eq(
+                message_sync_committee(state, slot),
+                state.next_sync_committee.as_ref(),
+            )
+        };
+
+        state.slot = last_slot;
+        assert!(!is_next(&state, last_slot - 1));
+        assert!(is_next(&state, last_slot));
+        // Once the head is in the new period, its current committee signed that slot.
+        state.slot = last_slot + 1;
+        assert!(!is_next(&state, last_slot));
+        assert!(!is_next(&state, last_slot + 1));
+    }
 
     #[test]
     fn data_column_topics_are_the_sampled_subnets() {
