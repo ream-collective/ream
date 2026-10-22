@@ -336,7 +336,14 @@ impl BeaconDB {
         ] {
             for entry in fs::read_dir(&dir)? {
                 let entry = entry?;
-                if entry.file_type()?.is_dir() && dir == column_dir {
+                // Only block directories of the column layout are removed whole.
+                if entry.file_type()?.is_dir()
+                    && dir == column_dir
+                    && entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.parse::<B256>().is_ok())
+                {
                     fs::remove_dir_all(entry.path())?;
                     continue;
                 }
@@ -416,6 +423,29 @@ mod tests {
     use tempdir::TempDir;
 
     use super::*;
+
+    #[test]
+    fn recovery_removes_block_directories_but_refuses_unknown_ones() {
+        let dir = TempDir::new("bootstrap_recovery_dirs").unwrap();
+        let beacon = ReamDB::new(dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap();
+        beacon.begin_bootstrap().unwrap();
+        let column_dir = beacon.data_dir.join(COLUMN_FOLDER_NAME);
+        let block_dir = column_dir.join(B256::repeat_byte(7).to_string());
+        fs::create_dir(&block_dir).unwrap();
+        fs::write(block_dir.join("0.ssz_snappy"), [1]).unwrap();
+        let unknown = column_dir.join("not-a-block");
+        fs::create_dir(&unknown).unwrap();
+
+        assert!(beacon.recover_interrupted_bootstrap().is_err());
+        assert!(unknown.is_dir());
+
+        fs::remove_dir(&unknown).unwrap();
+        assert!(beacon.recover_interrupted_bootstrap().unwrap());
+        assert!(!block_dir.exists());
+    }
 
     #[test]
     fn recovery_is_restartable_and_preserves_non_beacon_tables() {
