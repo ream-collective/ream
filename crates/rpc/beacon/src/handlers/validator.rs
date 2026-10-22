@@ -462,14 +462,7 @@ pub async fn post_validator_liveness(
     let head = beacon_chain
         .head()
         .map_err(|err| ApiError::InternalError(format!("Failed to get head: {err:?}")))?;
-    let current_epoch = compute_epoch_at_slot(head.current_slot);
-    if epoch + 1 < current_epoch || epoch > current_epoch + 1 {
-        return Err(ApiError::BadRequest(format!(
-            "Liveness is only known for epochs {} to {}",
-            current_epoch.saturating_sub(1),
-            current_epoch + 1
-        )));
-    }
+    validate_liveness_epoch(epoch, compute_epoch_at_slot(head.current_slot))?;
 
     let mut liveness_data = Vec::new();
     for validator_index in validator_indices.into_inner() {
@@ -485,6 +478,21 @@ pub async fn post_validator_liveness(
     }
 
     Ok(HttpResponse::Ok().json(BeaconResponse::new(liveness_data)))
+}
+
+/// Liveness is answered for the previous, current and next epoch, as Lighthouse does; the next
+/// epoch keeps a validator client whose clock is slightly ahead from failing at the boundary.
+fn validate_liveness_epoch(epoch: u64, current_epoch: u64) -> Result<(), ApiError> {
+    let (first, last) = (
+        current_epoch.saturating_sub(1),
+        current_epoch.saturating_add(1),
+    );
+    if epoch < first || epoch > last {
+        return Err(ApiError::BadRequest(format!(
+            "Liveness is only known for epochs {first} to {last}"
+        )));
+    }
+    Ok(())
 }
 
 /// Whether the head state records an attestation by the validator for `epoch`. The state at the
@@ -1813,6 +1821,20 @@ mod tests {
             .decompress_vec(&std::fs::read(path).unwrap())
             .unwrap();
         BeaconState::from_ssz_bytes(&bytes).unwrap()
+    }
+
+    #[test]
+    fn liveness_accepts_the_previous_current_and_next_epoch() {
+        for epoch in [9, 10, 11] {
+            assert!(validate_liveness_epoch(epoch, 10).is_ok());
+        }
+        for epoch in [0, 8, 12, u64::MAX] {
+            assert!(matches!(
+                validate_liveness_epoch(epoch, 10),
+                Err(ApiError::BadRequest(_))
+            ));
+        }
+        assert!(validate_liveness_epoch(0, 0).is_ok());
     }
 
     #[test]
