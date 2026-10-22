@@ -1,7 +1,6 @@
 use alloy_primitives::B256;
 use ream_consensus_misc::{
     beacon_block_header::SignedBeaconBlockHeader,
-    blob_parameters::get_blob_parameters,
     constants::beacon::{BLOB_KZG_COMMITMENTS_INDEX, DATA_COLUMN_SIDECAR_KZG_PROOF_DEPTH},
     misc::compute_epoch_at_slot,
     polynomial_commitments::{kzg_commitment::KZGCommitment, kzg_proof::KZGProof},
@@ -96,11 +95,9 @@ impl DataColumnSidecar {
         }
 
         // Check that the sidecar respects the blob limit
-        let limit = get_blob_parameters(
-            &beacon_network_spec().blob_schedule,
-            compute_epoch_at_slot(self.signed_block_header.message.slot),
-        )
-        .max_blobs_per_block;
+        let limit = beacon_network_spec()
+            .blob_parameters(compute_epoch_at_slot(self.signed_block_header.message.slot))
+            .max_blobs_per_block;
         if self.kzg_commitments.len() > limit as usize {
             return false;
         }

@@ -19,7 +19,7 @@ use ream_consensus_beacon::{
     single_attestation::SingleAttestation, voluntary_exit::SignedVoluntaryExit,
 };
 use ream_consensus_misc::{
-    constants::beacon::{DOMAIN_SYNC_COMMITTEE, FULU_FORK_EPOCH, SYNC_COMMITTEE_SIZE},
+    constants::beacon::{DOMAIN_SYNC_COMMITTEE, SYNC_COMMITTEE_SIZE},
     misc::{compute_epoch_at_slot, compute_signing_root},
 };
 use ream_network_manager::{
@@ -50,7 +50,7 @@ use tracing::warn;
 use crate::handlers::state::get_state_from_id;
 
 fn gossip_fork_digest(state: &BeaconState) -> B32 {
-    beacon_network_spec().fork_digest(FULU_FORK_EPOCH, state.genesis_validators_root)
+    beacon_network_spec().current_fork_digest(state.genesis_validators_root)
 }
 
 /// GET /eth/v1/beacon/pool/bls_to_execution_changes

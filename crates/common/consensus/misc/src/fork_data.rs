@@ -28,6 +28,7 @@ impl ForkData {
 pub fn compute_fork_digest(
     fork_data: ForkData,
     blob_schedule: &[BlobParameters],
+    electra: BlobParameters,
     fulu_fork_epoch: u64,
     epoch: u64,
 ) -> B32 {
@@ -37,7 +38,7 @@ pub fn compute_fork_digest(
         return B32::from_slice(&base_digest[..4]);
     }
 
-    let blob_parameters = get_blob_parameters(blob_schedule, epoch);
+    let blob_parameters = get_blob_parameters(blob_schedule, electra, epoch);
 
     // EIP-7892: SHA256 over the raw little-endian uint64 bytes, not the SSZ hash_tree_root.
     let mut hasher = Sha256::new();
@@ -58,6 +59,13 @@ mod tests {
     use alloy_primitives::fixed_bytes;
 
     use super::*;
+
+    fn electra() -> BlobParameters {
+        BlobParameters {
+            epoch: 5,
+            max_blobs_per_block: 9,
+        }
+    }
 
     fn schedule() -> Vec<BlobParameters> {
         vec![
@@ -90,7 +98,7 @@ mod tests {
     #[test]
     fn test_compute_fork_digest_matches_other_clients() {
         assert_eq!(
-            compute_fork_digest(fork_data(), &schedule(), 100, 100),
+            compute_fork_digest(fork_data(), &schedule(), electra(), 100, 100),
             fixed_bytes!("0xdf67557b"),
         );
     }
@@ -100,12 +108,12 @@ mod tests {
     #[test]
     fn test_compute_fork_digest_is_stable_between_bpo_entries() {
         assert_eq!(
-            compute_fork_digest(fork_data(), &schedule(), 100, 149),
-            compute_fork_digest(fork_data(), &schedule(), 100, 100),
+            compute_fork_digest(fork_data(), &schedule(), electra(), 100, 149),
+            compute_fork_digest(fork_data(), &schedule(), electra(), 100, 100),
         );
         assert_ne!(
-            compute_fork_digest(fork_data(), &schedule(), 100, 150),
-            compute_fork_digest(fork_data(), &schedule(), 100, 149),
+            compute_fork_digest(fork_data(), &schedule(), electra(), 100, 150),
+            compute_fork_digest(fork_data(), &schedule(), electra(), 100, 149),
         );
     }
 
@@ -114,7 +122,7 @@ mod tests {
     #[test]
     fn test_compute_fork_digest_is_unmasked_before_fulu() {
         assert_eq!(
-            compute_fork_digest(fork_data(), &schedule(), 100, 99),
+            compute_fork_digest(fork_data(), &schedule(), electra(), 100, 99),
             B32::from_slice(&fork_data().compute_fork_data_root()[..4]),
         );
     }

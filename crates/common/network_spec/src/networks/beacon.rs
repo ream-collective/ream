@@ -6,7 +6,7 @@ use std::{
 
 use alloy_primitives::{Address, B256, U256, address, aliases::B32, b256, fixed_bytes};
 use ream_consensus_misc::{
-    blob_parameters::BlobParameters,
+    blob_parameters::{BlobParameters, get_blob_parameters},
     constants::beacon::{FAR_FUTURE_EPOCH, GENESIS_VALIDATORS_ROOT},
     fork::Fork,
     fork_data::{ForkData, compute_fork_digest},
@@ -251,7 +251,31 @@ impl BeaconNetworkSpec {
             current_version: self.current_fork_version(epoch),
             genesis_validators_root,
         };
-        compute_fork_digest(fork_data, &self.blob_schedule, self.fulu_fork_epoch, epoch)
+        compute_fork_digest(
+            fork_data,
+            &self.blob_schedule,
+            self.electra_blob_parameters(),
+            self.fulu_fork_epoch,
+            epoch,
+        )
+    }
+
+    /// The fork digest of the wall-clock epoch: the one gossip topics are subscribed with.
+    pub fn current_fork_digest(&self, genesis_validators_root: B256) -> B32 {
+        self.fork_digest(self.current_epoch(), genesis_validators_root)
+    }
+
+    /// The blob parameters in effect at `epoch` (EIP-7892 `get_blob_parameters`).
+    pub fn blob_parameters(&self, epoch: u64) -> BlobParameters {
+        get_blob_parameters(&self.blob_schedule, self.electra_blob_parameters(), epoch)
+    }
+
+    /// Electra's blob parameters, in effect until the first blob schedule entry.
+    fn electra_blob_parameters(&self) -> BlobParameters {
+        BlobParameters {
+            epoch: self.electra_fork_epoch,
+            max_blobs_per_block: self.max_blobs_per_block_electra,
+        }
     }
 
     pub fn current_fork_version(&self, epoch: u64) -> B32 {
@@ -729,6 +753,32 @@ mod backfill_tests {
         assert_eq!(
             spec.epoch_duration(),
             Duration::from_secs(6 * SLOTS_PER_EPOCH)
+        );
+    }
+
+    #[test]
+    fn blob_parameters_before_the_first_bpo_use_the_networks_electra_epoch() {
+        // Hoodi: Electra at 2048, Fulu at 50688, BPO1 at 52480.
+        for epoch in [HOODI.fulu_fork_epoch, 52479] {
+            assert_eq!(
+                HOODI.blob_parameters(epoch),
+                BlobParameters {
+                    epoch: 2048,
+                    max_blobs_per_block: 9,
+                }
+            );
+        }
+        assert_eq!(HOODI.blob_parameters(52480).max_blobs_per_block, 15);
+        assert_eq!(
+            MAINNET.blob_parameters(MAINNET.fulu_fork_epoch).epoch,
+            364032
+        );
+        // The Fulu digest before BPO1 depends on it, so it differs from one using mainnet's.
+        let mut with_mainnet_electra = (**HOODI).clone();
+        with_mainnet_electra.electra_fork_epoch = MAINNET.electra_fork_epoch;
+        assert_ne!(
+            HOODI.fork_digest(HOODI.fulu_fork_epoch, B256::ZERO),
+            with_mainnet_electra.fork_digest(HOODI.fulu_fork_epoch, B256::ZERO)
         );
     }
 

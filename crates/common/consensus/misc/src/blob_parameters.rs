@@ -2,8 +2,6 @@ use serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
 use tree_hash_derive::TreeHash;
 
-use crate::constants::beacon::{ELECTRA_FORK_EPOCH, MAX_BLOBS_PER_BLOCK_ELECTRA};
-
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, Encode, Decode, TreeHash)]
 #[serde(rename_all = "UPPERCASE")]
 pub struct BlobParameters {
@@ -12,14 +10,16 @@ pub struct BlobParameters {
 }
 
 /// Returns the blob parameters in effect at `epoch` per the network's BPO (EIP-7892) schedule.
-pub fn get_blob_parameters(blob_schedule: &[BlobParameters], epoch: u64) -> BlobParameters {
+/// Before its first entry they are `electra`: the network's Electra fork epoch and blob limit.
+pub fn get_blob_parameters(
+    blob_schedule: &[BlobParameters],
+    electra: BlobParameters,
+    epoch: u64,
+) -> BlobParameters {
     blob_schedule
         .iter()
         .rev()
         .find(|entry| epoch >= entry.epoch)
         .cloned()
-        .unwrap_or(BlobParameters {
-            epoch: ELECTRA_FORK_EPOCH,
-            max_blobs_per_block: MAX_BLOBS_PER_BLOCK_ELECTRA,
-        })
+        .unwrap_or(electra)
 }
