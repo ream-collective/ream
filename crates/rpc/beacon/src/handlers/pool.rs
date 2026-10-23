@@ -24,7 +24,9 @@ use ream_consensus_misc::{
 };
 use ream_network_manager::{
     gossipsub::validate::{
-        beacon_attestation::validate_beacon_attestation, result::ValidationResult,
+        beacon_attestation::validate_beacon_attestation,
+        result::ValidationResult,
+        sync_committee::{is_current_slot, now_ms},
     },
     p2p_sender::P2PSender,
     service::NetworkManagerService,
@@ -40,9 +42,7 @@ use ream_sync_committee_pool::SyncCommitteePool;
 use ream_validator_beacon::{
     attestation::{compute_subnet_for_attestation, single_attestation_to_attestation},
     constants::SYNC_COMMITTEE_SUBNET_COUNT,
-    sync_committee::{
-        SyncCommitteeMessage, compute_sync_committee_period, is_assigned_to_sync_committee,
-    },
+    sync_committee::{SyncCommitteeMessage, sync_committee_at_slot},
 };
 use ssz::Encode;
 use tracing::warn;
@@ -381,7 +381,7 @@ async fn get_head_state(beacon_chain: &BeaconChain) -> Result<Arc<BeaconState>, 
 #[post("/beacon/pool/sync_committees")]
 pub async fn post_sync_committees(
     messages: Json<Vec<SyncCommitteeRequestItem>>,
-    db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<BeaconChain>>,
     sync_committee_pool: Data<Arc<SyncCommitteePool>>,
     p2p_sender: Data<Arc<P2PSender>>,
 ) -> Result<impl Responder, ApiError> {
@@ -398,7 +398,17 @@ pub async fn post_sync_committees(
             continue;
         }
 
-        let state = get_state_from_id(ID::Slot(slot), &db).await?;
+        // Messages are for the current slot, which may have no block yet, so the state at the
+        // message slot may not exist. The head state knows the committee and the fork.
+        let state = get_head_state(beacon_chain.get_ref().as_ref()).await?;
+
+        // The signature does not cover the slot, so a message must be for the current slot, as on
+        // gossip, or it could be replayed for later ones.
+        if !is_current_slot(state.genesis_time, slot, now_ms()) {
+            return Err(ApiError::BadRequest(format!(
+                "Sync committee message slot {slot} is not the current slot"
+            )));
+        }
 
         let validator_index = message.validator_index;
 
@@ -409,20 +419,20 @@ pub async fn post_sync_committees(
 
         let epoch = compute_epoch_at_slot(slot);
 
-        let is_validator_assigned = is_assigned_to_sync_committee(&state, epoch, validator_index);
-        match is_validator_assigned {
-            Ok(res) => {
-                if !res {
-                    return Err(ApiError::BadRequest(
-                        "Validator not assigned to sync committee".into(),
-                    ));
-                }
-            }
-            Err(err) => {
-                return Err(ApiError::InternalError(format!(
-                    "Failed due to internal error: {err}"
-                )));
-            }
+        let sync_committee = sync_committee_at_slot(&state, slot)
+            .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+        let positions: Vec<usize> = sync_committee
+            .public_keys
+            .iter()
+            .enumerate()
+            .filter_map(|(position, public_key)| {
+                (public_key == &validator.public_key).then_some(position)
+            })
+            .collect();
+        if positions.is_empty() {
+            return Err(ApiError::BadRequest(
+                "Validator not assigned to sync committee".into(),
+            ));
         }
 
         let validator_domain = state.get_domain(DOMAIN_SYNC_COMMITTEE, Some(epoch));
@@ -442,13 +452,6 @@ pub async fn post_sync_committees(
             ));
         }
 
-        let sync_committee = if compute_sync_committee_period(epoch)
-            == compute_sync_committee_period(state.get_current_epoch())
-        {
-            &state.current_sync_committee
-        } else {
-            &state.next_sync_committee
-        };
         let sync_subcommittee_size = (SYNC_COMMITTEE_SIZE / SYNC_COMMITTEE_SUBNET_COUNT) as usize;
         let sync_message = SyncCommitteeMessage {
             slot,
@@ -458,15 +461,7 @@ pub async fn post_sync_committees(
         };
         let mut subcommittee_indices = HashSet::new();
 
-        for position in
-            sync_committee
-                .public_keys
-                .iter()
-                .enumerate()
-                .filter_map(|(position, public_key)| {
-                    (public_key == &validator.public_key).then_some(position)
-                })
-        {
+        for position in positions {
             let subcommittee_index = (position / sync_subcommittee_size) as u64;
             let index_in_subcommittee = position % sync_subcommittee_size;
 

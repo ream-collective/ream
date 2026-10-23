@@ -36,6 +36,7 @@ pub struct SyncCommitteeDuty {
     pub public_key: PublicKey,
     #[serde(with = "serde_utils::quoted_u64")]
     pub validator_index: u64,
+    #[serde(with = "serde_utils::quoted_u64_vec")]
     pub validator_sync_committee_indices: Vec<u64>,
 }
 
@@ -58,5 +59,21 @@ mod tests {
         let duty: AttesterDuty = serde_json::from_value(json.clone()).expect("deserializes");
         assert_eq!(duty.committee_length, 555);
         assert_eq!(serde_json::to_value(&duty).expect("serializes"), json);
+    }
+
+    #[test]
+    fn sync_committee_indices_are_quoted() {
+        let duty = SyncCommitteeDuty {
+            public_key: PublicKey::default(),
+            validator_index: 865059,
+            validator_sync_committee_indices: vec![473, 9],
+        };
+        let json = serde_json::to_value(&duty).expect("serializes");
+        assert_eq!(
+            json["validator_sync_committee_indices"],
+            serde_json::json!(["473", "9"])
+        );
+        let parsed: SyncCommitteeDuty = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(parsed.validator_sync_committee_indices, vec![473, 9]);
     }
 }

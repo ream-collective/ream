@@ -4,7 +4,7 @@ use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::electra::beacon_state::BeaconState;
 use ream_consensus_misc::{
     constants::beacon::{DOMAIN_SYNC_COMMITTEE, SYNC_COMMITTEE_SIZE},
-    misc::{compute_epoch_at_slot, compute_signing_root, compute_sync_committee_period},
+    misc::{compute_epoch_at_slot, compute_signing_root},
 };
 use ream_events_beacon::contribution_and_proof::SignedContributionAndProof;
 use ream_storage::cache::{
@@ -16,21 +16,34 @@ use ream_validator_beacon::{
         DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
         SYNC_COMMITTEE_SUBNET_COUNT,
     },
-    sync_committee::{SyncAggregatorSelectionData, is_sync_committee_aggregator},
+    sync_committee::{
+        SyncAggregatorSelectionData, is_sync_committee_aggregator, sync_committee_at_slot,
+    },
 };
 use ssz_types::{BitVector, typenum::U128};
 
-use super::result::ValidationResult;
+use super::{
+    result::ValidationResult,
+    sync_committee::{is_current_slot, now_ms},
+};
 
 pub async fn validate_sync_committee_contribution_and_proof(
     beacon_chain: &BeaconChain,
     cached_db: &BeaconCacheDB,
     signed_contribution_and_proof: &SignedContributionAndProof,
 ) -> anyhow::Result<ValidationResult> {
+    // [IGNORE] The contribution's slot is for the current slot (with a
+    // MAXIMUM_GOSSIP_CLOCK_DISPARITY allowance)
+    let slot = signed_contribution_and_proof.message.contribution.slot;
     let head = beacon_chain.head()?;
+    if !is_current_slot(head.state.genesis_time, slot, now_ms()) {
+        return Ok(ValidationResult::Ignore(
+            "Contribution is not from the current slot".to_string(),
+        ));
+    }
+
     validate_against_state(
         head.state.as_ref(),
-        head.current_slot,
         cached_db,
         signed_contribution_and_proof,
     )
@@ -39,20 +52,11 @@ pub async fn validate_sync_committee_contribution_and_proof(
 
 async fn validate_against_state(
     state: &BeaconState,
-    current_slot: u64,
     cached_db: &BeaconCacheDB,
     signed_contribution_and_proof: &SignedContributionAndProof,
 ) -> anyhow::Result<ValidationResult> {
     let contribution_and_proof = &signed_contribution_and_proof.message;
     let contribution = &contribution_and_proof.contribution;
-
-    // [IGNORE] if contribution.slot is equal to or earlier than the current_slot (with a
-    // MAXIMUM_GOSSIP_CLOCK_DISPARITY allowance)
-    if contribution.slot != current_slot {
-        return Ok(ValidationResult::Ignore(
-            "Contribution is from a future slot".to_string(),
-        ));
-    }
 
     // [REJECT] if contribution.subcommittee_index is out of SYNC_COMMITTEE_SUBNET_COUNT range.
     if contribution.subcommittee_index >= SYNC_COMMITTEE_SUBNET_COUNT {
@@ -83,8 +87,13 @@ async fn validate_against_state(
         .ok_or_else(|| anyhow!("invalid aggregator_index"))?
         .public_key;
 
-    let subcommittee_pubkeys =
-        get_sync_subcommittee_pubkeys(state, contribution.subcommittee_index);
+    let Ok(subcommittee_pubkeys) =
+        get_sync_subcommittee_pubkeys(state, contribution.slot, contribution.subcommittee_index)
+    else {
+        return Ok(ValidationResult::Ignore(
+            "The head state has no committee for the contribution slot".to_string(),
+        ));
+    };
     let is_valid_committee_member = subcommittee_pubkeys.contains(validator_pubkey);
 
     if !is_valid_committee_member {
@@ -232,26 +241,21 @@ fn already_seen(
     None
 }
 
+/// The public keys of a subcommittee of the committee that signs at `slot`.
 pub fn get_sync_subcommittee_pubkeys(
     state: &BeaconState,
+    slot: u64,
     subcommittee_index: u64,
-) -> Vec<PublicKey> {
-    let current_epoch = state.get_current_epoch();
-
-    let next_slot_epoch = compute_epoch_at_slot(state.slot + 1);
-    let sync_committee = if compute_sync_committee_period(current_epoch)
-        == compute_sync_committee_period(next_slot_epoch)
-    {
-        state.current_sync_committee.as_ref()
-    } else {
-        state.next_sync_committee.as_ref()
-    };
-
+) -> anyhow::Result<Vec<PublicKey>> {
+    let sync_committee = sync_committee_at_slot(state, slot)?;
     let sync_subcommittee_size = SYNC_COMMITTEE_SIZE / SYNC_COMMITTEE_SUBNET_COUNT;
     let start = (subcommittee_index * sync_subcommittee_size) as usize;
-
     let end = start + sync_subcommittee_size as usize;
-    sync_committee.public_keys[start..end].to_vec()
+    sync_committee
+        .public_keys
+        .get(start..end)
+        .map(<[PublicKey]>::to_vec)
+        .ok_or_else(|| anyhow!("Subcommittee index {subcommittee_index} is out of range"))
 }
 
 #[cfg(test)]
@@ -383,7 +387,7 @@ mod tests {
             cached_db: &BeaconCacheDB,
             contribution: &SignedContributionAndProof,
         ) -> ValidationResult {
-            validate_against_state(&self.state, self.state.slot, cached_db, contribution)
+            validate_against_state(&self.state, cached_db, contribution)
                 .await
                 .expect("validation runs")
         }
