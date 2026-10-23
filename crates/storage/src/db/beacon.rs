@@ -637,10 +637,23 @@ mod tests {
         block.message.slot = 7;
         block.message.parent_root = alloy_primitives::B256::repeat_byte(0x30);
         {
+            let cache = Arc::new(BeaconCacheDB::new());
             let db = ReamDB::new(dir.path().to_path_buf())
                 .unwrap()
                 .init_beacon_db()
-                .unwrap();
+                .unwrap()
+                .with_cache(cache.clone());
+            // Only in the cache, so a hit cannot come from disk.
+            let cached_root = alloy_primitives::B256::repeat_byte(0x33);
+            cache.blocks.lock().unwrap().put(cached_root, block.clone());
+            assert!(db.block_provider().contains_key(cached_root).unwrap());
+            assert_eq!(
+                db.block_provider()
+                    .slot_and_parent_root(cached_root)
+                    .unwrap(),
+                Some((7, block.message.parent_root))
+            );
+
             commit_block_rows(&db, root, &block).unwrap();
             assert!(db.block_provider().contains_key(root).unwrap());
             assert_eq!(
