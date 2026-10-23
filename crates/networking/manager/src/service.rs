@@ -609,13 +609,13 @@ async fn reconcile_block_lookup_state(
         let has_block = store
             .db
             .block_provider()
-            .get(*block_root)
-            .is_ok_and(|block| block.is_some());
+            .contains_key(*block_root)
+            .unwrap_or(false);
         let has_state = store
             .db
             .state_provider()
-            .get(*block_root)
-            .is_ok_and(|state| state.is_some());
+            .contains_key(*block_root)
+            .unwrap_or(false);
         has_block && has_state
     });
     let pending_availability_roots = roots
