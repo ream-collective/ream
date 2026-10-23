@@ -26,7 +26,7 @@ use ream_execution_engine::{ExecutionEngine, engine_trait::ExecutionApi};
 use ream_execution_rpc_types::{
     execution_payload::WithdrawalV1,
     forkchoice_update::{ForkchoiceStateV1, PayloadAttributesV3},
-    get_blobs::BlobAndProofV2,
+    get_blobs::{Blob, BlobAndProofV2},
 };
 use ream_fork_choice_beacon::{
     data_availability::{DataAvailabilityChecker, PendingBlock},
@@ -63,6 +63,9 @@ pub const BLOCK_IMPORT_EVENT_CHANNEL_CAPACITY: usize = 1024;
 
 /// How long before its slot a proposal's payload is started, as Lighthouse does.
 const PAYLOAD_PREPARATION_LEAD_MS: u64 = 4000;
+
+/// Produced blocks whose blobs are kept for their publication.
+const PRODUCED_BLOBS_KEPT: usize = 4;
 
 /// A payload the execution client is building for one of our proposals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,6 +200,8 @@ pub struct BeaconChain {
     /// Wakes `run_vote_application` when queued votes may be ready.
     votes_ready: Notify,
     prepared_payload: parking_lot::Mutex<Option<PreparedPayload>>,
+    /// Blobs of blocks produced here, by block root, until the validator client publishes them.
+    produced_blobs: parking_lot::Mutex<VecDeque<(B256, Vec<Blob>)>>,
 }
 
 /// A validated gossip attestation or aggregate for fork choice. Gossip validation checked its
@@ -254,6 +259,7 @@ impl BeaconChain {
             queued_votes: parking_lot::Mutex::new(VecDeque::new()),
             votes_ready: Notify::new(),
             prepared_payload: parking_lot::Mutex::new(None),
+            produced_blobs: parking_lot::Mutex::new(VecDeque::new()),
             force_data_availability_checks: false,
         }
     }
@@ -666,6 +672,29 @@ impl BeaconChain {
         self.prepared_payload
             .lock()
             .and_then(|prepared| prepared.id_for(slot, head_root, fee_recipient))
+    }
+
+    /// Keeps the blobs of a produced block, so its columns can be built when it is published
+    /// without its blobs.
+    pub fn cache_produced_blobs(&self, block_root: B256, blobs: Vec<Blob>) {
+        if blobs.is_empty() {
+            return;
+        }
+        let mut produced = self.produced_blobs.lock();
+        produced.retain(|(root, _)| *root != block_root);
+        if produced.len() >= PRODUCED_BLOBS_KEPT {
+            produced.pop_front();
+        }
+        produced.push_back((block_root, blobs));
+    }
+
+    /// The blobs of a block produced here, if they are still kept.
+    pub fn produced_blobs(&self, block_root: B256) -> Option<Vec<Blob>> {
+        self.produced_blobs
+            .lock()
+            .iter()
+            .find(|(root, _)| *root == block_root)
+            .map(|(_, blobs)| blobs.clone())
     }
 
     /// Engine API block hashes for a head snapshot.
@@ -2274,6 +2303,29 @@ mod tests {
             next_payload_preparation(genesis_ms, 12_000, genesis_ms + 12_000 * 6 - 1000),
             (6, genesis_ms + 12_000 * 6 - 4000, genesis_ms + 12_000 * 6)
         );
+    }
+
+    #[test]
+    fn produced_blobs_are_kept_for_the_latest_blocks() {
+        let (_data_dir, chain) = test_chain();
+        let blobs = |byte: u8| {
+            let mut blob = Blob::default();
+            blob.inner[0] = byte;
+            vec![blob]
+        };
+        chain.cache_produced_blobs(B256::repeat_byte(0xff), vec![]);
+        assert!(chain.produced_blobs(B256::repeat_byte(0xff)).is_none());
+
+        for byte in 0..=PRODUCED_BLOBS_KEPT as u8 {
+            chain.cache_produced_blobs(B256::repeat_byte(byte), blobs(byte));
+        }
+        assert!(chain.produced_blobs(B256::repeat_byte(0)).is_none());
+        for byte in 1..=PRODUCED_BLOBS_KEPT as u8 {
+            assert_eq!(
+                chain.produced_blobs(B256::repeat_byte(byte)),
+                Some(blobs(byte))
+            );
+        }
     }
 
     #[test]

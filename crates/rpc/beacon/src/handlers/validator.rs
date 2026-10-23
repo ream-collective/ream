@@ -1548,35 +1548,38 @@ pub async fn get_blocks_v3(
         })?;
     block.state_root = post_state.state_root();
 
-    // Cache the blobs for the publish path, which builds data columns from them. A Fulu bundle
-    // has cell proofs only, so the blob proof is left empty.
+    // Kept for the publish path, which builds data columns from them when the block comes back
+    // without its blobs. Before Fulu the bundle also has the blob proofs, so the blobs are stored
+    // to be served as sidecars; a Fulu bundle has cell proofs only.
     let block_root = block.tree_hash_root();
-    let blobs_and_proofs_provider = db.blobs_and_proofs_provider();
-    let cached_blobs = blobs
-        .iter()
-        .enumerate()
-        .map(|(index, blob)| {
-            let proof = if blobs_bundle.is_fulu() {
-                KZGProof::default()
-            } else {
-                kzg_proofs[index]
-            };
-            (
-                BlobIdentifier::new(block_root, index as u64),
-                BlobAndProofV1 {
-                    blob: blob.clone(),
-                    proof,
-                },
-            )
+    beacon_chain.cache_produced_blobs(block_root, blobs.clone());
+    if !blobs_bundle.is_fulu() && !blobs.is_empty() {
+        let blobs_and_proofs_provider = db.blobs_and_proofs_provider();
+        let cached_blobs = blobs
+            .iter()
+            .zip(&kzg_proofs)
+            .enumerate()
+            .map(|(index, (blob, proof))| {
+                (
+                    BlobIdentifier::new(block_root, index as u64),
+                    BlobAndProofV1 {
+                        blob: blob.clone(),
+                        proof: *proof,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        match tokio::task::spawn_blocking(move || {
+            blobs_and_proofs_provider.insert_batch(cached_blobs)
         })
-        .collect::<Vec<_>>();
-
-    match tokio::task::spawn_blocking(move || blobs_and_proofs_provider.insert_batch(cached_blobs))
         .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => tracing::error!("Failed to cache blobs for block {block_root:?}: {err}"),
-        Err(err) => tracing::error!("Blob cache task failed for block {block_root:?}: {err}"),
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::error!("Failed to store blobs for block {block_root:?}: {err}")
+            }
+            Err(err) => tracing::error!("Blob store task failed for block {block_root:?}: {err}"),
+        }
     }
 
     let response = ProduceBlockResponse {

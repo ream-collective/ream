@@ -7051,6 +7051,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "libp2p",
  "parking_lot",
+ "rayon",
  "ream-api-types-beacon",
  "ream-api-types-common",
  "ream-bls",

@@ -8,8 +8,9 @@ use actix_web::{
     web::{Data, Json, Path, Payload, Query},
 };
 use alloy_primitives::B256;
-use anyhow::anyhow;
+use anyhow::{anyhow, ensure};
 use futures::StreamExt;
+use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use ream_api_types_beacon::{
     block::{BroadcastValidation, SignedBlockContents},
     id::ValidatorID,
@@ -21,7 +22,6 @@ use ream_api_types_beacon::{
 use ream_api_types_common::{error::ApiError, id::ID};
 use ream_chain_beacon::beacon_chain::{BeaconChain, BlockProcessingOutcome};
 use ream_consensus_beacon::{
-    blob_sidecar::BlobIdentifier,
     data_column_sidecar::{DataColumnSidecar, get_data_column_sidecars_from_block},
     electra::{
         beacon_block::{BeaconBlock, SignedBeaconBlock},
@@ -32,8 +32,9 @@ use ream_consensus_beacon::{
     genesis::Genesis,
     matrix_entry::{compute_cells_and_kzg_proofs, das_context},
 };
-use ream_consensus_misc::constants::beacon::{
-    GENESIS_SLOT, WHISTLEBLOWER_REWARD_QUOTIENT, genesis_validators_root,
+use ream_consensus_misc::{
+    constants::beacon::{GENESIS_SLOT, WHISTLEBLOWER_REWARD_QUOTIENT, genesis_validators_root},
+    polynomial_commitments::kzg_commitment::KZGCommitment,
 };
 use ream_execution_rpc_types::get_blobs::Blob;
 use ream_network_manager::p2p_sender::P2PSender;
@@ -45,11 +46,7 @@ use ream_p2p::{
 use ream_storage::{
     cache::{AddressSlotIdentifier, BeaconCacheDB},
     db::beacon::BeaconDB,
-    tables::{
-        beacon::{blobs_and_proofs::BlobsAndProofsTable, column_sidecars::ColumnSidecarsTable},
-        field::REDBField,
-        table::{CustomTable, REDBTable},
-    },
+    tables::{beacon::column_sidecars::ColumnSidecarsTable, field::REDBField, table::REDBTable},
 };
 use ream_validator_beacon::builder::builder_client::BuilderClient;
 use serde::{Deserialize, Serialize};
@@ -630,35 +627,24 @@ async fn publish_and_process_block(
 fn build_and_store_data_column_sidecars(
     signed_block: &SignedBeaconBlock,
     block_root: B256,
-    commitment_count: usize,
-    published_blobs: Vec<Blob>,
-    blobs_and_proofs_provider: &BlobsAndProofsTable,
+    blobs: Vec<Blob>,
     column_sidecars_provider: &ColumnSidecarsTable,
 ) -> anyhow::Result<Vec<DataColumnSidecar>> {
-    // Blobs sent with the block are used as they are; otherwise those cached at production.
-    let use_published = published_blobs.len() == commitment_count;
-    let mut published_blobs = published_blobs.into_iter();
-    let mut cells_and_kzg_proofs = Vec::with_capacity(commitment_count);
-    for index in 0..commitment_count as u64 {
-        let blob = match published_blobs.next().filter(|_| use_published) {
-            Some(blob) => blob,
-            None => {
-                blobs_and_proofs_provider
-                    .get(BlobIdentifier::new(block_root, index))
-                    .map_err(|err| {
-                        anyhow!(
-                            "Failed to read cached blob {index} for block {block_root:?}: {err}"
-                        )
-                    })?
-                    .ok_or_else(|| anyhow!("No cached blob {index} for block {block_root:?}"))?
-                    .blob
-            }
-        };
-
-        cells_and_kzg_proofs.push(compute_cells_and_kzg_proofs(&blob, das_context()).map_err(
-            |err| anyhow!("Failed to compute cells/KZG proofs for blob {index}: {err}"),
-        )?);
-    }
+    let commitment_count = signed_block.message.body.blob_kzg_commitments.len();
+    ensure!(
+        blobs.len() == commitment_count,
+        "{} blobs for {commitment_count} commitments",
+        blobs.len()
+    );
+    let cells_and_kzg_proofs = blobs
+        .iter()
+        .enumerate()
+        .map(|(index, blob)| {
+            compute_cells_and_kzg_proofs(blob, das_context()).map_err(|err| {
+                anyhow!("Failed to compute cells/KZG proofs for blob {index}: {err}")
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     let sidecars = get_data_column_sidecars_from_block(signed_block, cells_and_kzg_proofs)
         .map_err(|err| {
@@ -687,21 +673,26 @@ async fn broadcast_data_column_sidecars(
     }
 
     let block_root = signed_block.message.tree_hash_root();
-    let (blobs_and_proofs_provider, column_sidecars_provider) = {
-        let store = beacon_chain.store.lock().await;
-        (
-            store.db.blobs_and_proofs_provider(),
-            store.db.column_sidecars_provider(),
-        )
+    // Blobs sent with the block were checked against its commitments; without them, those kept
+    // when this node produced the block are used.
+    let blobs = if published_blobs.is_empty() {
+        match beacon_chain.produced_blobs(block_root) {
+            Some(blobs) => blobs,
+            None => {
+                warn!("Skipping data column sidecar broadcast for block {block_root:?}: no blobs");
+                return;
+            }
+        }
+    } else {
+        published_blobs
     };
+    let column_sidecars_provider = beacon_chain.db().column_sidecars_provider();
 
     let sidecars = match tokio::task::spawn_blocking(move || {
         build_and_store_data_column_sidecars(
             &signed_block,
             block_root,
-            commitment_count,
-            published_blobs,
-            &blobs_and_proofs_provider,
+            blobs,
             &column_sidecars_provider,
         )
     })
@@ -769,6 +760,12 @@ pub async fn post_beacon_block(
         .is_some_and(|value| value.starts_with("application/json"));
     let body = read_ssz_payload(payload).await?;
     let (signed_block, blobs) = decode_published_block(&body, is_json)?;
+    let commitments = signed_block.message.body.blob_kzg_commitments.to_vec();
+    let blobs = tokio::task::spawn_blocking(move || {
+        check_published_blobs(&blobs, &commitments).map(|()| blobs)
+    })
+    .await
+    .map_err(|err| ApiError::InternalError(format!("Blob check task failed: {err}")))??;
 
     // Validate based on broadcast_validation level
     validate_block_for_broadcast(
@@ -817,6 +814,36 @@ fn decode_published_block(
     }
     .map_err(|err| ApiError::BadRequest(format!("Failed to decode block: {err}")))?;
     Ok((contents.signed_block, contents.blobs))
+}
+
+/// Checks that blobs published with a block are those of its commitments, so the columns built
+/// from them are valid. A block published without blobs passes.
+fn check_published_blobs(blobs: &[Blob], commitments: &[KZGCommitment]) -> Result<(), ApiError> {
+    if blobs.is_empty() {
+        return Ok(());
+    }
+    if blobs.len() != commitments.len() {
+        return Err(ApiError::BadRequest(format!(
+            "{} blobs for {} commitments",
+            blobs.len(),
+            commitments.len()
+        )));
+    }
+    blobs
+        .par_iter()
+        .zip(commitments)
+        .enumerate()
+        .try_for_each(|(index, (blob, commitment))| {
+            let computed = das_context()
+                .blob_to_kzg_commitment(&blob.to_fixed_bytes())
+                .map_err(|err| ApiError::BadRequest(format!("Invalid blob {index}: {err:?}")))?;
+            if computed != commitment.0 {
+                return Err(ApiError::BadRequest(format!(
+                    "Blob {index} does not match its commitment"
+                )));
+            }
+            Ok(())
+        })
 }
 
 /// POST /eth/v2/beacon/blinded_blocks
@@ -926,6 +953,31 @@ mod tests {
             .decompress_vec(&std::fs::read(path).unwrap())
             .unwrap();
         SignedBeaconBlock::from_ssz_bytes(&bytes).unwrap()
+    }
+
+    #[test]
+    fn published_blobs_must_match_the_block_commitments() {
+        let commitment = |blob: &Blob| {
+            KZGCommitment(
+                das_context()
+                    .blob_to_kzg_commitment(&blob.to_fixed_bytes())
+                    .unwrap(),
+            )
+        };
+        let mut blob = Blob::default();
+        blob.inner[31] = 1;
+        let other = Blob::default();
+
+        assert!(check_published_blobs(&[], &[commitment(&blob)]).is_ok());
+        assert!(check_published_blobs(&[blob.clone()], &[commitment(&blob)]).is_ok());
+        assert!(matches!(
+            check_published_blobs(&[blob.clone()], &[commitment(&other)]),
+            Err(ApiError::BadRequest(_))
+        ));
+        assert!(matches!(
+            check_published_blobs(&[blob.clone(), other.clone()], &[commitment(&blob)]),
+            Err(ApiError::BadRequest(_))
+        ));
     }
 
     /// Lighthouse's validator client publishes `SignedBlockContents` as SSZ.
