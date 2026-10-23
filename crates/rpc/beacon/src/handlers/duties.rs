@@ -13,7 +13,10 @@ use ream_api_types_common::error::ApiError;
 use ream_chain_beacon::beacon_chain::{BeaconChain, CachedHead};
 use ream_consensus_beacon::electra::beacon_state::BeaconState;
 use ream_consensus_misc::{
-    constants::beacon::{MIN_SEED_LOOKAHEAD, SLOTS_PER_EPOCH, SLOTS_PER_HISTORICAL_ROOT},
+    constants::beacon::{
+        EPOCHS_PER_SYNC_COMMITTEE_PERIOD, MIN_SEED_LOOKAHEAD, SLOTS_PER_EPOCH,
+        SLOTS_PER_HISTORICAL_ROOT,
+    },
     misc::{compute_epoch_at_slot, compute_start_slot_at_epoch, compute_sync_committee_period},
 };
 use ream_fork_choice_beacon::store::get_ancestor_from_db;
@@ -235,12 +238,45 @@ pub async fn get_sync_committee_duties(
     let head = beacon_chain
         .head()
         .map_err(|err| ApiError::InternalError(format!("Failed to get head root: {err:?}")))?;
-    // A state holds the current and next committees, so it never has to be advanced into a later
-    // period, and the head state serves both without loading a stored state.
-    let state = if sync_committee_for_epoch(head.state.get_current_epoch(), epoch).is_some() {
+    // A state holds the current and next committees, so the head state serves both without
+    // loading a stored state.
+    let head_epoch = head.state.get_current_epoch();
+    let state = if sync_committee_for_epoch(head_epoch, epoch).is_some() {
         head.state.clone()
+    } else if compute_sync_committee_period(epoch) > compute_sync_committee_period(head_epoch) {
+        let spec = beacon_network_spec();
+        let current_slot = tolerant_current_slot(
+            head.current_slot,
+            head.state.genesis_time,
+            now_ms(),
+            spec.slot_duration_ms,
+            spec.maximum_gossip_clock_disparity,
+        );
+        let Some(advance_to) =
+            sync_duties_advance_epoch(head_epoch, compute_epoch_at_slot(current_slot), epoch)
+        else {
+            return Err(ApiError::BadRequest(format!(
+                "Epoch {epoch} is past the next sync committee period"
+            )));
+        };
+        let head_state = head.state.clone();
+        let state = tokio::task::spawn_blocking(move || {
+            let mut state = Arc::unwrap_or_clone(head_state);
+            state
+                .process_slots(compute_start_slot_at_epoch(advance_to))
+                .map(|()| state)
+        })
+        .await
+        .map_err(|err| ApiError::InternalError(format!("State advance task failed: {err}")))?
+        .map_err(|err| ApiError::InternalError(format!("Failed to advance the state: {err}")))?;
+        Arc::new(state)
     } else {
-        let block_root = get_block_root_at_or_before_slot(&db, compute_start_slot_at_epoch(epoch))?;
+        let block_root = head_chain_block_root(
+            &db,
+            head.head_root,
+            &head.state,
+            compute_start_slot_at_epoch(epoch),
+        )?;
         Arc::new(
             db.state_provider()
                 .get(block_root)
@@ -303,6 +339,16 @@ pub async fn get_sync_committee_duties(
 enum SyncCommitteePeriod {
     Current,
     Next,
+}
+
+/// The epoch to advance the head state to for the duties of `epoch`, when the head is still in
+/// the period before the wall clock's, as when the first blocks of a period are missing, and
+/// `epoch` is in the period after the wall clock's. Only that state holds its committee.
+fn sync_duties_advance_epoch(head_epoch: u64, current_epoch: u64, epoch: u64) -> Option<u64> {
+    let head_period = compute_sync_committee_period(head_epoch);
+    (compute_sync_committee_period(current_epoch) == head_period + 1
+        && compute_sync_committee_period(epoch) == head_period + 2)
+        .then_some((head_period + 1) * EPOCHS_PER_SYNC_COMMITTEE_PERIOD)
 }
 
 /// Which committee of a state in `state_epoch` serves `epoch`.
@@ -419,31 +465,10 @@ async fn get_state_and_block_root(
     Ok((state, block_root))
 }
 
-fn get_block_root_at_or_before_slot(db: &BeaconDB, slot: u64) -> Result<B256, ApiError> {
-    for candidate_slot in (0..=slot).rev() {
-        match db
-            .slot_index_provider()
-            .get(candidate_slot)
-            .map_err(|err| {
-                ApiError::InternalError(format!(
-                    "Failed to get block root for slot {candidate_slot}, error: {err:?}"
-                ))
-            })? {
-            Some(block_root) => return Ok(block_root),
-            None => continue,
-        }
-    }
-
-    Err(ApiError::NotFound(format!(
-        "Failed to find block root at or before slot {slot}"
-    )))
-}
-
 #[cfg(test)]
 mod tests {
     use ream_bls::BLSSignature;
     use ream_consensus_beacon::electra::beacon_block::{BeaconBlock, SignedBeaconBlock};
-    use ream_consensus_misc::constants::beacon::EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
     use ream_storage::db::ReamDB;
     use ssz::Decode;
     use tempdir::TempDir;
@@ -489,6 +514,31 @@ mod tests {
     }
 
     #[test]
+    fn sync_duties_advance_the_head_state_only_across_the_current_boundary() {
+        let period = EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
+        let head_epoch = 510 * period - 1;
+        // The wall clock is in period 510, the head still in 509.
+        assert_eq!(
+            sync_duties_advance_epoch(head_epoch, 510 * period, 511 * period + 3),
+            Some(510 * period)
+        );
+        // The head state already holds the next committee.
+        assert_eq!(
+            sync_duties_advance_epoch(head_epoch, 510 * period, 510 * period),
+            None
+        );
+        // Further periods and a head in the wall clock's period are not advanced.
+        assert_eq!(
+            sync_duties_advance_epoch(head_epoch, 510 * period, 512 * period),
+            None
+        );
+        assert_eq!(
+            sync_duties_advance_epoch(head_epoch, 509 * period + 5, 511 * period),
+            None
+        );
+    }
+
+    #[test]
     fn sync_duties_use_next_committee_without_advancing_state() {
         let period = EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
         assert_eq!(
@@ -508,6 +558,26 @@ mod tests {
             sync_committee_for_epoch(510 * period - 1, 510 * period),
             Some(SyncCommitteePeriod::Next)
         );
+    }
+
+    fn get_block_root_at_or_before_slot(db: &BeaconDB, slot: u64) -> Result<B256, ApiError> {
+        for candidate_slot in (0..=slot).rev() {
+            match db
+                .slot_index_provider()
+                .get(candidate_slot)
+                .map_err(|err| {
+                    ApiError::InternalError(format!(
+                        "Failed to get block root for slot {candidate_slot}, error: {err:?}"
+                    ))
+                })? {
+                Some(block_root) => return Ok(block_root),
+                None => continue,
+            }
+        }
+
+        Err(ApiError::NotFound(format!(
+            "Failed to find block root at or before slot {slot}"
+        )))
     }
 
     fn test_db() -> (BeaconDB, TempDir) {
