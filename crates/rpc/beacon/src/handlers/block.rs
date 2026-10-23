@@ -259,7 +259,13 @@ fn get_block_pre_state(
         .state_provider()
         .get(parent_root)
         .map_err(|err| ApiError::InternalError(format!("Failed to get parent state: {err:?}")))?
-        .ok_or_else(|| ApiError::NotFound(format!("No state for parent block {parent_root}")))?;
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "The pre-state of the block at slot {} is not stored: states before the finalized \
+                 block are pruned",
+                beacon_block.message.slot
+            ))
+        })?;
     if beacon_state.slot < beacon_block.message.slot {
         beacon_state
             .process_slots(beacon_block.message.slot)
