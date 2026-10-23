@@ -134,8 +134,8 @@ pub async fn get_block_root_from_id(
 }
 
 /// The canonical block at `slot`, or `None` for an empty slot. Recent slots come from the head
-/// state's block roots, which follow reorgs. Older slots are finalized, so the slot index, which
-/// records every imported block, is right for them.
+/// state's block roots, which follow reorgs. Older ones come from the canonical roots recorded at
+/// finalization, not from the slot index, which keeps blocks of abandoned forks.
 pub fn canonical_block_root_at_slot(
     slot: u64,
     db: &BeaconDB,
@@ -145,9 +145,7 @@ pub fn canonical_block_root_at_slot(
         .head()
         .map_err(|err| ApiError::InternalError(format!("Failed to get head, error: {err:?}")))?;
     let Some(candidate) = latest_block_root_at_or_before(&head.state, head.head_root, slot) else {
-        return db.slot_index_provider().get(slot).map_err(|err| {
-            ApiError::InternalError(format!("Failed to get block root by slot, error: {err:?}"))
-        });
+        return canonical_root_from_db(db, head.head_root, slot);
     };
     let Some(root) = candidate else {
         return Ok(None);
@@ -158,6 +156,23 @@ pub fn canonical_block_root_at_slot(
         .map_err(|err| ApiError::InternalError(format!("Failed to get block, error: {err:?}")))?
         .map(|block| block.message.slot);
     Ok((block_slot == Some(slot)).then_some(root))
+}
+
+/// The block at `slot` on the chain of `head_root`, from the stored canonical history.
+fn canonical_root_from_db(
+    db: &BeaconDB,
+    head_root: B256,
+    slot: u64,
+) -> Result<Option<B256>, ApiError> {
+    Ok(db
+        .canonical_roots_in_range(head_root, slot, slot.saturating_add(1))
+        .map_err(|err| {
+            ApiError::InternalError(format!(
+                "Failed to read the canonical block at slot {slot}: {err:?}"
+            ))
+        })?
+        .into_iter()
+        .find_map(|(block_slot, root)| (block_slot == slot).then_some(root)))
 }
 
 /// Root of the latest canonical block at or before `slot`, from the head's post-state. `None` if
@@ -1205,6 +1220,34 @@ mod tests {
         let state = get_state_by_block_root(&db, resolved).expect("block's post-state");
 
         assert_eq!(state.slot, fixture_state().slot);
+    }
+
+    #[test]
+    fn old_slots_skip_blocks_of_abandoned_forks() {
+        let temp_dir = TempDir::new("ream_rpc_beacon_block").expect("creates temp directory");
+        let db = ReamDB::new(temp_dir.path().to_path_buf())
+            .expect("creates database")
+            .init_beacon_db()
+            .expect("initializes beacon database");
+        let store = |slot: u64, parent_root: B256| {
+            let mut block = SignedBeaconBlock {
+                message: Default::default(),
+                signature: Default::default(),
+            };
+            block.message.slot = slot;
+            block.message.parent_root = parent_root;
+            let root = block.message.tree_hash_root();
+            db.block_provider().insert(root, block).unwrap();
+            root
+        };
+        let first = store(1, B256::ZERO);
+        let orphan = store(2, first);
+        let head = store(3, first);
+        assert_eq!(db.slot_index_provider().get(2).unwrap(), Some(orphan));
+
+        assert_eq!(canonical_root_from_db(&db, head, 1).unwrap(), Some(first));
+        assert_eq!(canonical_root_from_db(&db, head, 2).unwrap(), None);
+        assert_eq!(canonical_root_from_db(&db, head, 3).unwrap(), Some(head));
     }
 
     /// Slots resolve through the head state's block roots, not through whatever block was
