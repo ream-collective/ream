@@ -6,7 +6,7 @@ use std::{
 
 use alloy_primitives::{Address, B256, U256, address, aliases::B32, b256, fixed_bytes};
 use ream_consensus_misc::{
-    blob_parameters::BlobParameters,
+    blob_parameters::{BlobParameters, get_blob_parameters},
     constants::beacon::{FAR_FUTURE_EPOCH, GENESIS_VALIDATORS_ROOT},
     fork::Fork,
     fork_data::{ForkData, compute_fork_digest},
@@ -251,7 +251,42 @@ impl BeaconNetworkSpec {
             current_version: self.current_fork_version(epoch),
             genesis_validators_root,
         };
-        compute_fork_digest(fork_data, &self.blob_schedule, self.fulu_fork_epoch, epoch)
+        compute_fork_digest(
+            fork_data,
+            &self.blob_schedule,
+            self.electra_blob_parameters(),
+            self.fulu_fork_epoch,
+            epoch,
+        )
+    }
+
+    /// The fork digest to publish gossip with now, on a chain whose genesis is at `genesis_time`.
+    pub fn current_fork_digest(&self, genesis_time: u64, genesis_validators_root: B256) -> B32 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        self.fork_digest(self.epoch_at(genesis_time, now), genesis_validators_root)
+    }
+
+    /// The epoch at `now`, a time since the Unix epoch, on a chain whose genesis is at
+    /// `genesis_time`; 0 before genesis. Genesis can be well after `min_genesis_time`: a day on
+    /// Sepolia.
+    pub fn epoch_at(&self, genesis_time: u64, now: Duration) -> u64 {
+        let since_genesis = now.saturating_sub(Duration::from_secs(genesis_time));
+        compute_epoch_at_slot(since_genesis.as_millis() as u64 / self.slot_duration_ms)
+    }
+
+    /// The blob parameters in effect at `epoch` (EIP-7892 `get_blob_parameters`).
+    pub fn blob_parameters(&self, epoch: u64) -> BlobParameters {
+        get_blob_parameters(&self.blob_schedule, self.electra_blob_parameters(), epoch)
+    }
+
+    /// Electra's blob parameters, in effect until the first blob schedule entry.
+    fn electra_blob_parameters(&self) -> BlobParameters {
+        BlobParameters {
+            epoch: self.electra_fork_epoch,
+            max_blobs_per_block: self.max_blobs_per_block_electra,
+        }
     }
 
     pub fn current_fork_version(&self, epoch: u64) -> B32 {
@@ -729,6 +764,56 @@ mod backfill_tests {
         assert_eq!(
             spec.epoch_duration(),
             Duration::from_secs(6 * SLOTS_PER_EPOCH)
+        );
+    }
+
+    #[test]
+    fn blob_parameters_before_the_first_bpo_use_the_networks_electra_epoch() {
+        // Hoodi: Electra at 2048, Fulu at 50688, BPO1 at 52480.
+        for epoch in [HOODI.fulu_fork_epoch, 52479] {
+            assert_eq!(
+                HOODI.blob_parameters(epoch),
+                BlobParameters {
+                    epoch: 2048,
+                    max_blobs_per_block: 9,
+                }
+            );
+        }
+        assert_eq!(HOODI.blob_parameters(52480).max_blobs_per_block, 15);
+        assert_eq!(
+            MAINNET.blob_parameters(MAINNET.fulu_fork_epoch).epoch,
+            364032
+        );
+        // The Fulu digest before BPO1 depends on it, so it differs from one using mainnet's.
+        let mut with_mainnet_electra = (**HOODI).clone();
+        with_mainnet_electra.electra_fork_epoch = MAINNET.electra_fork_epoch;
+        assert_ne!(
+            HOODI.fork_digest(HOODI.fulu_fork_epoch, B256::ZERO),
+            with_mainnet_electra.fork_digest(HOODI.fulu_fork_epoch, B256::ZERO)
+        );
+    }
+
+    #[test]
+    fn publishing_switches_digest_at_the_chains_own_epoch_boundary() {
+        // Hoodi's genesis is 600 s, about 1.5 epochs, after its `min_genesis_time`.
+        let genesis_time = 1742213400;
+        assert_eq!(genesis_time, HOODI.min_genesis_time + HOODI.genesis_delay);
+        let bpo1 = 52480;
+        let bpo1_start =
+            Duration::from_secs(genesis_time + bpo1 * SLOTS_PER_EPOCH * HOODI.seconds_per_slot());
+        let just_before = bpo1_start - Duration::from_secs(1);
+
+        assert_eq!(HOODI.epoch_at(genesis_time, just_before), bpo1 - 1);
+        assert_eq!(HOODI.epoch_at(genesis_time, bpo1_start), bpo1);
+        // A clock started at `min_genesis_time` is already past the boundary.
+        assert!(HOODI.epoch_at(HOODI.min_genesis_time, just_before) >= bpo1);
+        assert_ne!(
+            HOODI.fork_digest(bpo1 - 1, B256::ZERO),
+            HOODI.fork_digest(bpo1, B256::ZERO)
+        );
+        assert_eq!(
+            HOODI.epoch_at(genesis_time, Duration::from_secs(genesis_time - 100)),
+            0
         );
     }
 

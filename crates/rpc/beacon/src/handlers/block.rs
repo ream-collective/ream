@@ -38,6 +38,7 @@ use ream_consensus_misc::{
         GENESIS_SLOT, SLOTS_PER_HISTORICAL_ROOT, WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA,
         genesis_validators_root,
     },
+    misc::compute_epoch_at_slot,
     polynomial_commitments::kzg_commitment::KZGCommitment,
 };
 use ream_execution_rpc_types::get_blobs::Blob;
@@ -721,9 +722,9 @@ async fn publish_and_process_block(
             ApiError::InternalError(format!("Failed to process current slot tick: {err}"))
         })?;
 
-    // Broadcast via P2P
+    // Broadcast via P2P, on the block's fork
     let fork_digest = beacon_network_spec().fork_digest(
-        beacon_network_spec().current_epoch(),
+        compute_epoch_at_slot(signed_block.message.slot),
         genesis_validators_root(),
     );
     let topic = GossipTopic {
@@ -833,6 +834,7 @@ async fn broadcast_data_column_sidecars(
         published_blobs
     };
     let column_sidecars_provider = beacon_chain.db().column_sidecars_provider();
+    let block_epoch = compute_epoch_at_slot(signed_block.message.slot);
 
     let sidecars = match tokio::task::spawn_blocking(move || {
         build_and_store_data_column_sidecars(
@@ -855,10 +857,7 @@ async fn broadcast_data_column_sidecars(
         }
     };
 
-    let fork_digest = beacon_network_spec().fork_digest(
-        beacon_network_spec().current_epoch(),
-        genesis_validators_root(),
-    );
+    let fork_digest = beacon_network_spec().fork_digest(block_epoch, genesis_validators_root());
     for sidecar in sidecars {
         let topic = GossipTopic {
             fork: fork_digest,

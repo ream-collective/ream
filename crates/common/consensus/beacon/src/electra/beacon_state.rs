@@ -18,7 +18,6 @@ use ream_bls::{
 use ream_consensus_misc::{
     attestation_data::AttestationData,
     beacon_block_header::{BeaconBlockHeader, SignedBeaconBlockHeader},
-    blob_parameters::get_blob_parameters,
     checkpoint::Checkpoint,
     consolidation_request::ConsolidationRequest,
     constants::beacon::{
@@ -3219,11 +3218,9 @@ impl BeaconState {
         // Verify commitments are under limit
         ensure!(
             body.blob_kzg_commitments.len()
-                <= get_blob_parameters(
-                    &beacon_network_spec().blob_schedule,
-                    self.get_current_epoch()
-                )
-                .max_blobs_per_block as usize
+                <= beacon_network_spec()
+                    .blob_parameters(self.get_current_epoch())
+                    .max_blobs_per_block as usize
         );
         Ok(())
     }
