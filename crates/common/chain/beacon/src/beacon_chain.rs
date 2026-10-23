@@ -1,9 +1,10 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B64, B256};
 use anyhow::{anyhow, bail};
 use parking_lot::RwLock;
 use ream_consensus_beacon::{
@@ -22,7 +23,11 @@ use ream_consensus_misc::{
 };
 use ream_events_beacon::{BeaconEvent, BeaconEventSender, event::chain::BlockEvent};
 use ream_execution_engine::{ExecutionEngine, engine_trait::ExecutionApi};
-use ream_execution_rpc_types::{forkchoice_update::ForkchoiceStateV1, get_blobs::BlobAndProofV2};
+use ream_execution_rpc_types::{
+    execution_payload::WithdrawalV1,
+    forkchoice_update::{ForkchoiceStateV1, PayloadAttributesV3},
+    get_blobs::{Blob, BlobAndProofV2},
+};
 use ream_fork_choice_beacon::{
     data_availability::{DataAvailabilityChecker, PendingBlock},
     handlers::{
@@ -51,10 +56,74 @@ use ream_storage::{
 };
 use ream_sync_committee_pool::SyncCommitteePool;
 use tokio::sync::{Mutex, Notify, Semaphore, broadcast};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use tree_hash::TreeHash;
 
 pub const BLOCK_IMPORT_EVENT_CHANNEL_CAPACITY: usize = 1024;
+
+/// How long before its slot a proposal's payload is started, as Lighthouse does.
+const PAYLOAD_PREPARATION_LEAD_MS: u64 = 4000;
+
+/// Produced blocks whose blobs are kept for their publication.
+const PRODUCED_BLOBS_KEPT: usize = 4;
+
+/// A payload the execution client is building for one of our proposals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PreparedPayload {
+    slot: u64,
+    head_root: B256,
+    fee_recipient: Address,
+    payload_id: B64,
+}
+
+impl PreparedPayload {
+    /// The payload id, if it was started for this slot, parent and fee recipient. The other
+    /// attributes follow from the parent state and the slot.
+    fn id_for(&self, slot: u64, head_root: B256, fee_recipient: Address) -> Option<B64> {
+        (self.slot == slot && self.head_root == head_root && self.fee_recipient == fee_recipient)
+            .then_some(self.payload_id)
+    }
+}
+
+/// The next slot, when to prepare its payload and when it starts, all in Unix milliseconds.
+fn next_payload_preparation(genesis_ms: u64, slot_ms: u64, now_ms: u64) -> (u64, u64, u64) {
+    let slot = now_ms.saturating_sub(genesis_ms) / slot_ms + 1;
+    let start_ms = genesis_ms + slot * slot_ms;
+    (
+        slot,
+        start_ms.saturating_sub(PAYLOAD_PREPARATION_LEAD_MS),
+        start_ms,
+    )
+}
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+/// Engine API payload attributes for a block at `slot` built on `state`, the parent state
+/// advanced to `slot`.
+pub fn payload_attributes(
+    state: &BeaconState,
+    slot: u64,
+    fee_recipient: Address,
+) -> anyhow::Result<PayloadAttributesV3> {
+    let (withdrawals, _) = state.get_expected_withdrawals()?;
+    Ok(PayloadAttributesV3 {
+        timestamp: state.compute_timestamp_at_slot(slot),
+        prev_randao: state.get_randao_mix(compute_epoch_at_slot(slot)),
+        suggested_fee_recipient: fee_recipient,
+        withdrawals: withdrawals
+            .into_iter()
+            .map(WithdrawalV1::from)
+            .collect::<Vec<_>>()
+            .try_into()
+            .map_err(|err| anyhow!("Failed to convert withdrawals: {err:?}"))?,
+        parent_beacon_block_root: state.latest_block_header.tree_hash_root(),
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use = "block processing may be pending data availability rather than imported"]
@@ -130,6 +199,9 @@ pub struct BeaconChain {
     queued_votes: parking_lot::Mutex<VecDeque<QueuedVote>>,
     /// Wakes `run_vote_application` when queued votes may be ready.
     votes_ready: Notify,
+    prepared_payload: parking_lot::Mutex<Option<PreparedPayload>>,
+    /// Blobs of blocks produced here, by block root, until the validator client publishes them.
+    produced_blobs: parking_lot::Mutex<VecDeque<(B256, Vec<Blob>)>>,
 }
 
 /// A validated gossip attestation or aggregate for fork choice. Gossip validation checked its
@@ -186,6 +258,8 @@ impl BeaconChain {
             checkpoint_state_regen: Semaphore::new(CHECKPOINT_STATE_REGEN_PERMITS),
             queued_votes: parking_lot::Mutex::new(VecDeque::new()),
             votes_ready: Notify::new(),
+            prepared_payload: parking_lot::Mutex::new(None),
+            produced_blobs: parking_lot::Mutex::new(VecDeque::new()),
             force_data_availability_checks: false,
         }
     }
@@ -494,14 +568,145 @@ impl BeaconChain {
             .inspect_err(|err| warn!("Failed to read head for forkchoice update: {err}"))
             .ok()?;
 
-        Some(ForkchoiceStateV1 {
+        Some(self.forkchoice_state_for(&head))
+    }
+
+    /// Starts each proposal's payload `PAYLOAD_PREPARATION_LEAD_MS` before its slot, and again
+    /// if the head changes before the slot starts. Without it the execution client starts the
+    /// payload only when the block is requested and returns it empty.
+    pub async fn run_payload_preparation(self: Arc<Self>) {
+        let slot_ms = beacon_network_spec().slot_duration_ms;
+        loop {
+            let Ok(head) = self.head() else {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            };
+            let (slot, prepare_at_ms, start_ms) =
+                next_payload_preparation(head.state.genesis_time * 1000, slot_ms, unix_now_ms());
+            tokio::time::sleep(Duration::from_millis(
+                prepare_at_ms.saturating_sub(unix_now_ms()),
+            ))
+            .await;
+
+            let mut prepared_on = None;
+            while unix_now_ms() < start_ms {
+                let head_root = self.head().ok().map(|head| head.head_root);
+                if head_root != prepared_on {
+                    prepared_on = head_root;
+                    if let Err(err) = self.prepare_payload(slot).await {
+                        warn!("Failed to prepare the payload for slot {slot}: {err:#}");
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(
+                    start_ms.saturating_sub(unix_now_ms()).min(500),
+                ))
+                .await;
+            }
+        }
+    }
+
+    /// Asks the execution client to start building the payload for `slot` on the current head,
+    /// if a validator that registered through `prepare_beacon_proposer` proposes it.
+    pub async fn prepare_payload(&self, slot: u64) -> anyhow::Result<()> {
+        let Some(execution_engine) = self.execution_engine.as_ref() else {
+            return Ok(());
+        };
+        let head = self.head()?;
+        if head.head_slot >= slot
+            || !head
+                .state
+                .determines_proposers_of(compute_epoch_at_slot(slot))
+        {
+            return Ok(());
+        }
+        let proposer_index = head.state.get_beacon_proposer_index(Some(slot))?;
+        let Some(fee_recipient) = self.operation_pool.get_proposer_preparation(proposer_index)
+        else {
+            return Ok(());
+        };
+
+        let parent_state = head.state.clone();
+        let state = tokio::task::spawn_blocking(move || -> anyhow::Result<BeaconState> {
+            let mut state = Arc::unwrap_or_clone(parent_state);
+            state.process_slots(slot)?;
+            Ok(state)
+        })
+        .await??;
+        let attributes = payload_attributes(&state, slot, fee_recipient)?;
+
+        // Serialized with `update_execution_forkchoice`, so a head imported while the state was
+        // advanced is not rolled back. The loop prepares again on the new head.
+        let mut last_forkchoice = self.execution_forkchoice.lock().await;
+        if self.head()?.head_root != head.head_root {
+            return Ok(());
+        }
+        let forkchoice_state = self.forkchoice_state_for(&head);
+        let response = execution_engine
+            .engine_forkchoice_updated_v3(forkchoice_state, Some(attributes))
+            .await?;
+        *last_forkchoice = Some(forkchoice_state);
+        drop(last_forkchoice);
+        let payload_id = response.payload_id.ok_or_else(|| {
+            anyhow!(
+                "No payload id, payload status {:?}",
+                response.payload_status
+            )
+        })?;
+        *self.prepared_payload.lock() = Some(PreparedPayload {
+            slot,
+            head_root: head.head_root,
+            fee_recipient,
+            payload_id,
+        });
+        info!("Preparing the payload for slot {slot}, proposer {proposer_index}");
+        Ok(())
+    }
+
+    /// The id of a payload started for `slot` on `head_root` for `fee_recipient`, if any.
+    pub fn prepared_payload_id(
+        &self,
+        slot: u64,
+        head_root: B256,
+        fee_recipient: Address,
+    ) -> Option<B64> {
+        self.prepared_payload
+            .lock()
+            .and_then(|prepared| prepared.id_for(slot, head_root, fee_recipient))
+    }
+
+    /// Keeps the blobs of a produced block, so its columns can be built when it is published
+    /// without its blobs.
+    pub fn cache_produced_blobs(&self, block_root: B256, blobs: Vec<Blob>) {
+        if blobs.is_empty() {
+            return;
+        }
+        let mut produced = self.produced_blobs.lock();
+        produced.retain(|(root, _)| *root != block_root);
+        if produced.len() >= PRODUCED_BLOBS_KEPT {
+            produced.pop_front();
+        }
+        produced.push_back((block_root, blobs));
+    }
+
+    /// The blobs of a block produced here, if they are still kept.
+    pub fn produced_blobs(&self, block_root: B256) -> Option<Vec<Blob>> {
+        self.produced_blobs
+            .lock()
+            .iter()
+            .find(|(root, _)| *root == block_root)
+            .map(|(_, blobs)| blobs.clone())
+    }
+
+    /// Engine API block hashes for a head snapshot.
+    pub fn forkchoice_state_for(&self, head: &CachedHead) -> ForkchoiceStateV1 {
+        ForkchoiceStateV1 {
             head_block_hash: Self::execution_block_hash(&self.db, head.head_root),
             safe_block_hash: Self::execution_block_hash(&self.db, head.justified_checkpoint.root),
             finalized_block_hash: Self::execution_block_hash(
                 &self.db,
                 head.finalized_checkpoint.root,
             ),
-        })
+        }
     }
 
     /// Updates the execution head without rolling back an accepted consensus import on failure.
@@ -1408,6 +1613,47 @@ mod tests {
         (data_dir, chain)
     }
 
+    #[test]
+    fn forkchoice_state_uses_execution_block_hashes() {
+        let (_data_dir, chain) = test_chain();
+        let mut roots = Vec::new();
+        for (slot, hash) in [
+            (1, B256::repeat_byte(0x11)),
+            (2, B256::repeat_byte(0x22)),
+            (3, B256::repeat_byte(0x33)),
+        ] {
+            let mut block = empty_block();
+            block.message.slot = slot;
+            block.message.body.execution_payload.block_hash = hash;
+            let root = block.message.tree_hash_root();
+            chain.db.block_provider().insert(root, block).unwrap();
+            roots.push(root);
+        }
+        let head = CachedHead {
+            head_root: roots[2],
+            head_slot: 3,
+            state: Arc::new(fixture_state()),
+            current_slot: 3,
+            justified_checkpoint: Checkpoint {
+                epoch: 0,
+                root: roots[1],
+            },
+            finalized_checkpoint: Checkpoint {
+                epoch: 0,
+                root: roots[0],
+            },
+        };
+
+        let forkchoice_state = chain.forkchoice_state_for(&head);
+
+        assert_eq!(forkchoice_state.head_block_hash, B256::repeat_byte(0x33));
+        assert_eq!(forkchoice_state.safe_block_hash, B256::repeat_byte(0x22));
+        assert_eq!(
+            forkchoice_state.finalized_block_hash,
+            B256::repeat_byte(0x11)
+        );
+    }
+
     fn test_chain_with_anchor(anchor_state: BeaconState) -> (tempfile::TempDir, BeaconChain, B256) {
         test_chain_with_anchor_and_cache(anchor_state, None)
     }
@@ -2043,5 +2289,68 @@ mod tests {
         );
         let names: Vec<&str> = kept.iter().map(|(_, _, name)| *name).collect();
         assert_eq!(names, vec!["small", "next epoch"]);
+    }
+
+    #[test]
+    fn payloads_are_prepared_four_seconds_before_the_next_slot() {
+        let genesis_ms = 1_000_000;
+        assert_eq!(
+            next_payload_preparation(genesis_ms, 12_000, genesis_ms + 12_000 * 5 + 1),
+            (6, genesis_ms + 12_000 * 6 - 4000, genesis_ms + 12_000 * 6)
+        );
+        // Late in the slot the preparation time has passed, so it runs at once.
+        assert_eq!(
+            next_payload_preparation(genesis_ms, 12_000, genesis_ms + 12_000 * 6 - 1000),
+            (6, genesis_ms + 12_000 * 6 - 4000, genesis_ms + 12_000 * 6)
+        );
+    }
+
+    #[test]
+    fn produced_blobs_are_kept_for_the_latest_blocks() {
+        let (_data_dir, chain) = test_chain();
+        let blobs = |byte: u8| {
+            let mut blob = Blob::default();
+            blob.inner[0] = byte;
+            vec![blob]
+        };
+        chain.cache_produced_blobs(B256::repeat_byte(0xff), vec![]);
+        assert!(chain.produced_blobs(B256::repeat_byte(0xff)).is_none());
+
+        for byte in 0..=PRODUCED_BLOBS_KEPT as u8 {
+            chain.cache_produced_blobs(B256::repeat_byte(byte), blobs(byte));
+        }
+        assert!(chain.produced_blobs(B256::repeat_byte(0)).is_none());
+        for byte in 1..=PRODUCED_BLOBS_KEPT as u8 {
+            assert_eq!(
+                chain.produced_blobs(B256::repeat_byte(byte)),
+                Some(blobs(byte))
+            );
+        }
+    }
+
+    #[test]
+    fn a_prepared_payload_is_used_only_for_its_slot_parent_and_fee_recipient() {
+        let prepared = PreparedPayload {
+            slot: 10,
+            head_root: B256::repeat_byte(1),
+            fee_recipient: Address::repeat_byte(2),
+            payload_id: B64::repeat_byte(3),
+        };
+        assert_eq!(
+            prepared.id_for(10, B256::repeat_byte(1), Address::repeat_byte(2)),
+            Some(B64::repeat_byte(3))
+        );
+        assert_eq!(
+            prepared.id_for(11, B256::repeat_byte(1), Address::repeat_byte(2)),
+            None
+        );
+        assert_eq!(
+            prepared.id_for(10, B256::repeat_byte(9), Address::repeat_byte(2)),
+            None
+        );
+        assert_eq!(
+            prepared.id_for(10, B256::repeat_byte(1), Address::ZERO),
+            None
+        );
     }
 }

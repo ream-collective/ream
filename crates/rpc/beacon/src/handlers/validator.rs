@@ -4,10 +4,12 @@ use std::{
 };
 
 use actix_web::{
-    HttpResponse, Responder, get, post,
+    HttpRequest, HttpResponse, Responder, get,
+    http::header,
+    post,
     web::{Data, Json, Path, Query},
 };
-use alloy_primitives::{Address, B256, U256, aliases::B32};
+use alloy_primitives::{Address, B64, B256, aliases::B32};
 use ream_api_types_beacon::{
     block::{FullBlockData, ProduceBlockData, ProduceBlockResponse},
     committee::{BeaconCommitteeSubscription, SyncCommitteeSubscription},
@@ -17,9 +19,13 @@ use ream_api_types_beacon::{
     responses::{BeaconResponse, DataResponse, DataVersionedResponse},
     validator::{ValidatorBalance, ValidatorData, ValidatorStatus},
 };
-use ream_api_types_common::{error::ApiError, id::ID};
+use ream_api_types_common::{
+    content_type::{ContentType, SSZ_CONTENT_TYPE},
+    error::ApiError,
+    id::ID,
+};
 use ream_bls::{BLSSignature, PublicKey, traits::Verifiable};
-use ream_chain_beacon::beacon_chain::BeaconChain;
+use ream_chain_beacon::beacon_chain::{BeaconChain, payload_attributes};
 use ream_consensus_beacon::{
     attestation::Attestation,
     attester_slashing::AttesterSlashing,
@@ -42,8 +48,8 @@ use ream_consensus_misc::{
     attestation_data::AttestationData,
     checkpoint::Checkpoint,
     constants::beacon::{
-        DOMAIN_RANDAO, MAX_COMMITTEES_PER_SLOT, PROPOSER_REWARD_QUOTIENT, SLOTS_PER_EPOCH,
-        SYNC_COMMITTEE_PROPOSER_REWARD_QUOTIENT, SYNC_COMMITTEE_SIZE,
+        CELLS_PER_EXT_BLOB, DOMAIN_RANDAO, MAX_COMMITTEES_PER_SLOT, PROPOSER_REWARD_QUOTIENT,
+        SLOTS_PER_EPOCH, SYNC_COMMITTEE_PROPOSER_REWARD_QUOTIENT, SYNC_COMMITTEE_SIZE,
         WHISTLEBLOWER_REWARD_QUOTIENT, genesis_validators_root,
     },
     deposit::Deposit,
@@ -58,10 +64,11 @@ use ream_events_beacon::{
     BeaconEvent, contribution_and_proof::SignedContributionAndProof,
     event::sync_committee::ContributionAndProofEvent,
 };
-use ream_execution_engine::{ExecutionEngine, engine_trait::ExecutionApi};
+use ream_execution_engine::ExecutionEngine;
 use ream_execution_rpc_types::{
     forkchoice_update::{ForkchoiceStateV1, PayloadAttributesV3},
-    get_payload::Payload,
+    get_blobs::{Blob, BlobAndProofV1},
+    get_payload::{BlobsBundle, Payload},
 };
 use ream_fork_choice_beacon::store::Store;
 use ream_network_manager::{
@@ -1060,8 +1067,20 @@ pub async fn post_contribution_and_proofs(
 struct BlockQuery {
     randao_reveal: BLSSignature,
     graffiti: Option<B256>,
-    skip_randao_verification: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_flag")]
+    skip_randao_verification: bool,
     builder_boost_factor: Option<u64>,
+}
+
+/// A query flag the beacon API sends without a value; `true` and `false` are accepted too.
+fn deserialize_flag<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    match <String as serde::Deserialize>::deserialize(deserializer)?.as_str() {
+        "" | "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(serde::de::Error::custom(format!(
+            "expected no value, `true` or `false`, got `{other}`"
+        ))),
+    }
 }
 
 fn verify_randao_reveal(
@@ -1178,7 +1197,25 @@ async fn get_local_execution_payload(
     fork_name: ForkName,
     forkchoice_state: ForkchoiceStateV1,
     payload_attribute: PayloadAttributesV3,
+    prepared_payload_id: Option<B64>,
 ) -> Result<(Payload, u64), ApiError> {
+    if let Some(payload_id) = prepared_payload_id {
+        match execution_engine
+            .engine_get_payload(&fork_name, payload_id)
+            .await
+        {
+            Ok(payload) => {
+                let execution_value: u64 = (*payload.block_value()).try_into().map_err(|err| {
+                    ApiError::InternalError(format!("Block value too large: {err}"))
+                })?;
+                return Ok((payload, execution_value));
+            }
+            Err(err) => {
+                tracing::warn!("Prepared payload is not available, building a new one: {err}")
+            }
+        }
+    }
+
     let result = execution_engine
         .engine_forkchoice_updated_v3(
             ForkchoiceStateV1 {
@@ -1206,7 +1243,7 @@ async fn get_local_execution_payload(
         .await
         .map_err(|err| ApiError::InternalError(format!("Failed to get payload: {err}")))?;
 
-    let execution_value: u64 = U256::from_be_bytes(payload.block_value().0)
+    let execution_value: u64 = (*payload.block_value())
         .try_into()
         .map_err(|err| ApiError::InternalError(format!("Block value too large: {err}")))?;
 
@@ -1256,8 +1293,30 @@ async fn compare_builder_vs_local(
     }
 }
 
+/// A Fulu bundle carries ``CELLS_PER_EXT_BLOB`` cell proofs per blob, earlier ones one proof.
+fn check_blobs_bundle(bundle: &BlobsBundle) -> Result<(), ApiError> {
+    let commitments = bundle.get_commitments().len();
+    let proofs_per_blob = if bundle.is_fulu() {
+        CELLS_PER_EXT_BLOB as usize
+    } else {
+        1
+    };
+    if bundle.get_blobs().len() != commitments
+        || bundle.get_proofs().len() != commitments * proofs_per_blob
+    {
+        return Err(ApiError::InternalError(format!(
+            "Malformed blobs bundle: {commitments} commitments, {} blobs, {} proofs",
+            bundle.get_blobs().len(),
+            bundle.get_proofs().len()
+        )));
+    }
+    Ok(())
+}
+
 #[get("/validator/blocks/{slot}")]
+#[allow(clippy::too_many_arguments)]
 pub async fn get_blocks_v3(
+    http_request: HttpRequest,
     path: Path<u64>,
     query: Query<BlockQuery>,
     db: Data<BeaconDB>,
@@ -1270,7 +1329,7 @@ pub async fn get_blocks_v3(
     let query_params = query.into_inner();
     let randao_reveal = query_params.randao_reveal;
     let graffiti = query_params.graffiti.unwrap_or_default();
-    let skip_randao_verification = query_params.skip_randao_verification.unwrap_or(false);
+    let skip_randao_verification = query_params.skip_randao_verification;
     let builder_boost_factor = query_params.builder_boost_factor.unwrap_or(100);
 
     let head = beacon_chain
@@ -1317,27 +1376,11 @@ pub async fn get_blocks_v3(
         .get_proposer_preparation(proposer_index)
         .unwrap_or(Address::ZERO);
 
-    let (withdrawals, _) = state.get_expected_withdrawals().map_err(|err| {
-        ApiError::InternalError(format!("Failed to get expected withdrawals: {err}"))
+    let forkchoice_state = beacon_chain.forkchoice_state_for(&head);
+    let prepared_payload_id = beacon_chain.prepared_payload_id(slot, head.head_root, fee_recipient);
+    let payload_attribute = payload_attributes(&state, slot, fee_recipient).map_err(|err| {
+        ApiError::InternalError(format!("Failed to build payload attributes: {err}"))
     })?;
-
-    let forkchoice_state = ForkchoiceStateV1 {
-        head_block_hash: state.latest_execution_payload_header.block_hash,
-        safe_block_hash: state.current_justified_checkpoint.root,
-        finalized_block_hash: state.finalized_checkpoint.root,
-    };
-
-    let payload_attribute = PayloadAttributesV3 {
-        timestamp: state.compute_timestamp_at_slot(slot),
-        prev_randao: state.get_randao_mix(epoch),
-        suggested_fee_recipient: fee_recipient,
-        withdrawals: withdrawals.try_into().map_err(|err| {
-            ApiError::InternalError(format!(
-                "Failed to convert withdrawals to VariableList: {err}"
-            ))
-        })?,
-        parent_beacon_block_root: state.latest_block_header.tree_hash_root(),
-    };
 
     let Some(execution_engine) = execution_engine.get_ref().as_ref() else {
         return Err(ApiError::InternalError(
@@ -1350,6 +1393,7 @@ pub async fn get_blocks_v3(
         fork_name,
         forkchoice_state,
         payload_attribute,
+        prepared_payload_id,
     )
     .await?;
 
@@ -1442,7 +1486,7 @@ pub async fn get_blocks_v3(
             slot,
             proposer_index,
             parent_root: state.latest_block_header.tree_hash_root(),
-            state_root: state.tree_hash_root(),
+            state_root: state.state_root(),
             body: blinded_beacon_block_body,
         };
 
@@ -1454,31 +1498,16 @@ pub async fn get_blocks_v3(
             data: ProduceBlockData::Blinded(blinded_block),
         };
 
-        return Ok(HttpResponse::Ok()
-            .insert_header(("Eth-Consensus-Version", fork_name.to_string()))
-            .insert_header(("Eth-Execution-Payload-Blinded", "true"))
-            .insert_header((
-                "Eth-Execution-Payload-Value",
-                response.execution_payload_value.to_string(),
-            ))
-            .insert_header((
-                "Eth-Consensus-Block-Value",
-                consensus_block_value.to_string(),
-            ))
-            .json(response));
+        return Ok(produce_block_response(&http_request, response));
     }
 
     let execution_payload = local_payload.to_execution_payload();
 
-    let blob_kzg_commitments: Vec<KZGCommitment> = local_payload.blobs_bundle().get_commitments();
-
-    let kzg_proofs: Vec<KZGProof> = local_payload.blobs_bundle().get_proofs();
-
-    if blob_kzg_commitments.len() != kzg_proofs.len() {
-        return Err(ApiError::InternalError(
-            "Mismatch between blob commitments and KZG proofs".into(),
-        ));
-    }
+    let blobs_bundle = local_payload.blobs_bundle();
+    let blob_kzg_commitments: Vec<KZGCommitment> = blobs_bundle.get_commitments();
+    let kzg_proofs: Vec<KZGProof> = blobs_bundle.get_proofs();
+    let blobs: Vec<Blob> = blobs_bundle.get_blobs();
+    check_blobs_bundle(&blobs_bundle)?;
 
     let execution_requests =
         get_execution_requests(local_payload.execution_requests().clone()).unwrap_or_default();
@@ -1508,57 +1537,49 @@ pub async fn get_blocks_v3(
     };
     let mut post_state = state.clone();
     post_state
-        .process_block(&block, &Option::<ExecutionEngine>::None)
+        .process_proposed_block(
+            &block,
+            &Option::<ExecutionEngine>::None,
+            !skip_randao_verification,
+        )
         .await
         .map_err(|err| {
             ApiError::InternalError(format!("Failed to compute post-state root: {err}"))
         })?;
-    block.state_root = post_state.tree_hash_root();
+    block.state_root = post_state.state_root();
 
-    let blob_versioned_hashes: Vec<B256> = blob_kzg_commitments
-        .iter()
-        .map(|c| c.calculate_versioned_hash())
-        .collect();
-
-    let blobs_and_proofs = execution_engine
-        .clone()
-        .engine_get_blobs_v1(blob_versioned_hashes)
-        .await
-        .map_err(|err| {
-            ApiError::InternalError(format!(
-                "Failed to fetch blobs from execution engine: {err}"
-            ))
-        })?;
-
-    if blobs_and_proofs.len() != blob_kzg_commitments.len() {
-        return Err(ApiError::InternalError(
-            "Blob count does not match commitments".to_string(),
-        ));
-    }
-
+    // Kept for the publish path, which builds data columns from them when the block comes back
+    // without its blobs. Before Fulu the bundle also has the blob proofs, so the blobs are stored
+    // to be served as sidecars; a Fulu bundle has cell proofs only.
     let block_root = block.tree_hash_root();
-    let blobs_and_proofs_provider = db.blobs_and_proofs_provider();
-    let mut blobs = Vec::with_capacity(blobs_and_proofs.len());
-    let mut cached_blobs = Vec::with_capacity(blobs_and_proofs.len());
-    for (index, bap) in blobs_and_proofs.into_iter().enumerate() {
-        let blob_and_proof = bap.expect(
-            "Missing blob and proof from execution engine: expected BlobAndProofV1, got None",
-        );
-
-        cached_blobs.push((
-            BlobIdentifier::new(block_root, index as u64),
-            blob_and_proof.clone(),
-        ));
-
-        blobs.push(blob_and_proof.blob);
-    }
-
-    match tokio::task::spawn_blocking(move || blobs_and_proofs_provider.insert_batch(cached_blobs))
+    beacon_chain.cache_produced_blobs(block_root, blobs.clone());
+    if !blobs_bundle.is_fulu() && !blobs.is_empty() {
+        let blobs_and_proofs_provider = db.blobs_and_proofs_provider();
+        let cached_blobs = blobs
+            .iter()
+            .zip(&kzg_proofs)
+            .enumerate()
+            .map(|(index, (blob, proof))| {
+                (
+                    BlobIdentifier::new(block_root, index as u64),
+                    BlobAndProofV1 {
+                        blob: blob.clone(),
+                        proof: *proof,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        match tokio::task::spawn_blocking(move || {
+            blobs_and_proofs_provider.insert_batch(cached_blobs)
+        })
         .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => tracing::error!("Failed to cache blobs for block {block_root:?}: {err}"),
-        Err(err) => tracing::error!("Blob cache task failed for block {block_root:?}: {err}"),
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::error!("Failed to store blobs for block {block_root:?}: {err}")
+            }
+            Err(err) => tracing::error!("Blob store task failed for block {block_root:?}: {err}"),
+        }
     }
 
     let response = ProduceBlockResponse {
@@ -1573,18 +1594,40 @@ pub async fn get_blocks_v3(
         }),
     };
 
-    Ok(HttpResponse::Ok()
-        .insert_header(("Eth-Consensus-Version", fork_name.to_string()))
-        .insert_header(("Eth-Execution-Payload-Blinded", "false"))
+    Ok(produce_block_response(&http_request, response))
+}
+
+/// The produced block as SSZ when the client prefers it, as Lighthouse's validator client does,
+/// otherwise as JSON. The headers carry what the SSZ body leaves out.
+fn produce_block_response(
+    http_request: &HttpRequest,
+    response: ProduceBlockResponse,
+) -> HttpResponse {
+    let mut builder = HttpResponse::Ok();
+    builder
+        .insert_header(("Eth-Consensus-Version", response.version.clone()))
+        .insert_header((
+            "Eth-Execution-Payload-Blinded",
+            response.execution_payload_blinded.to_string(),
+        ))
         .insert_header((
             "Eth-Execution-Payload-Value",
-            local_execution_value.to_string(),
+            response.execution_payload_value.to_string(),
         ))
         .insert_header((
             "Eth-Consensus-Block-Value",
-            consensus_block_value.to_string(),
-        ))
-        .json(response))
+            response.consensus_block_value.to_string(),
+        ));
+    match ContentType::from(http_request.headers().get(header::ACCEPT)) {
+        ContentType::Ssz => {
+            let body = match &response.data {
+                ProduceBlockData::Full(block_contents) => block_contents.as_ssz_bytes(),
+                ProduceBlockData::Blinded(blinded_block) => blinded_block.as_ssz_bytes(),
+            };
+            builder.content_type(SSZ_CONTENT_TYPE).body(body)
+        }
+        ContentType::Json => builder.json(response),
+    }
 }
 
 #[get("/validator/aggregate_attestation")]
@@ -1617,6 +1660,7 @@ mod tests {
 
     use alloy_primitives::B256;
     use ream_consensus_misc::checkpoint::Checkpoint;
+    use ream_execution_rpc_types::get_payload::{BlobsBundleV1, BlobsBundleV2};
     use ssz::Decode;
 
     use super::*;
@@ -1703,9 +1747,120 @@ mod tests {
     }
 
     #[test]
+    fn block_query_accepts_the_bare_skip_randao_flag() {
+        let infinity = format!("0xc0{}", "0".repeat(190));
+        let parse = |flag: &str| {
+            actix_web::web::Query::<BlockQuery>::from_query(&format!(
+                "randao_reveal={infinity}{flag}"
+            ))
+            .map(|query| query.skip_randao_verification)
+        };
+        assert!(!parse("").expect("no flag"));
+        assert!(parse("&skip_randao_verification").expect("bare flag"));
+        assert!(parse("&skip_randao_verification=").expect("empty flag"));
+        assert!(parse("&skip_randao_verification=true").expect("true"));
+        assert!(!parse("&skip_randao_verification=false").expect("false"));
+        assert!(parse("&skip_randao_verification=yes").is_err());
+    }
+
+    #[test]
+    fn blobs_bundle_expects_cell_proofs_from_fulu() {
+        let fulu = |proof_count: usize| {
+            BlobsBundle::V2(BlobsBundleV2 {
+                commitments: vec![KZGCommitment::empty_for_testing()].try_into().unwrap(),
+                proofs: vec![KZGProof::default(); proof_count].try_into().unwrap(),
+                blobs: vec![Blob::default()].try_into().unwrap(),
+            })
+        };
+        assert!(check_blobs_bundle(&fulu(CELLS_PER_EXT_BLOB as usize)).is_ok());
+        assert!(check_blobs_bundle(&fulu(1)).is_err());
+
+        let electra = BlobsBundle::V1(BlobsBundleV1 {
+            blobs: vec![Blob::default()].try_into().unwrap(),
+            commitments: vec![KZGCommitment::empty_for_testing()].try_into().unwrap(),
+            proofs: vec![KZGProof::default()].try_into().unwrap(),
+        });
+        assert!(check_blobs_bundle(&electra).is_ok());
+    }
+
+    #[test]
     fn cached_head_sync_check_preserves_the_two_epoch_tolerance() {
         assert!(!validator_api_is_syncing(100, 36));
         assert!(validator_api_is_syncing(101, 36));
         assert!(!validator_api_is_syncing(36, 100));
+    }
+}
+
+#[cfg(test)]
+mod produce_block_response_tests {
+    use std::path::PathBuf;
+
+    use actix_web::{body::MessageBody, test::TestRequest};
+    use ream_consensus_beacon::electra::beacon_block::SignedBeaconBlock;
+    use ssz::Decode;
+
+    use super::*;
+
+    fn produced_block() -> ProduceBlockResponse {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../../testing/gossip-validation/tests/assets/sepolia/blocks/child_9552076.ssz_snappy",
+        );
+        let bytes = snap::raw::Decoder::new()
+            .decompress_vec(&std::fs::read(path).unwrap())
+            .unwrap();
+        ProduceBlockResponse {
+            version: "fulu".to_string(),
+            execution_payload_blinded: false,
+            execution_payload_value: 7,
+            consensus_block_value: 9,
+            data: ProduceBlockData::Full(FullBlockData {
+                block: SignedBeaconBlock::from_ssz_bytes(&bytes).unwrap().message,
+                kzg_proofs: vec![],
+                blobs: vec![],
+            }),
+        }
+    }
+
+    #[test]
+    fn produced_blocks_are_ssz_when_the_client_prefers_it() {
+        let ssz_request = TestRequest::default()
+            .insert_header((
+                header::ACCEPT,
+                "application/octet-stream;q=1.0,application/json;q=0.9",
+            ))
+            .to_http_request();
+        let response = produce_block_response(&ssz_request, produced_block());
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            SSZ_CONTENT_TYPE
+        );
+        assert_eq!(
+            response.headers().get("eth-consensus-version").unwrap(),
+            "fulu"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("eth-execution-payload-value")
+                .unwrap(),
+            "7"
+        );
+        let body = response.into_body().try_into_bytes().unwrap();
+        let ProduceBlockData::Full(expected) = produced_block().data else {
+            unreachable!()
+        };
+        assert_eq!(
+            FullBlockData::from_ssz_bytes(&body).unwrap().block,
+            expected.block
+        );
+
+        let json_request = TestRequest::default()
+            .insert_header((header::ACCEPT, "application/json"))
+            .to_http_request();
+        let response = produce_block_response(&json_request, produced_block());
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/json"
+        );
     }
 }

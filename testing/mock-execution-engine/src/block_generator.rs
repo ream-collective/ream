@@ -204,7 +204,13 @@ impl ExecutionBlockGenerator {
             fee_recipient: attrs.suggested_fee_recipient,
             prev_randao: attrs.prev_randao,
             timestamp: attrs.timestamp,
-            withdrawals: attrs.withdrawals,
+            withdrawals: attrs
+                .withdrawals
+                .into_iter()
+                .map(Into::into)
+                .collect::<Vec<_>>()
+                .try_into()
+                .map_err(|err| anyhow!("too many withdrawals: {err:?}"))?,
             block_number,
             gas_limit: 30_000_000,
             base_fee_per_gas: U256::from(1),
@@ -262,7 +268,7 @@ impl ExecutionBlockGenerator {
 
         Ok(PayloadV4 {
             execution_payload: ExecutionPayloadV3::from(payload),
-            block_value: B256::with_last_byte(1),
+            block_value: U256::from(1),
             blobs_bundle,
             should_override_builder: false,
             execution_requests: Vec::new(),
@@ -353,9 +359,7 @@ pub fn test_payload_attributes(parent_beacon_block_root: B256) -> PayloadAttribu
 #[cfg(test)]
 mod tests {
     use alloy_primitives::B256;
-    use ream_execution_rpc_types::{
-        execution_payload::WithdrawalV1, forkchoice_update::ForkchoiceStateV1,
-    };
+    use ream_execution_rpc_types::forkchoice_update::ForkchoiceStateV1;
 
     use super::*;
 
@@ -395,15 +399,7 @@ mod tests {
         let expected_timestamp = attrs.timestamp;
         let expected_prev_randao = attrs.prev_randao;
         let expected_fee_recipient = attrs.suggested_fee_recipient;
-        let expected_withdrawals = VariableList::new(
-            attrs
-                .withdrawals
-                .clone()
-                .into_iter()
-                .map(WithdrawalV1::from)
-                .collect(),
-        )
-        .expect("converting a U16-bounded withdrawal list preserves its length");
+        let expected_withdrawals = attrs.withdrawals.clone();
         let mut generator = ExecutionBlockGenerator::new(genesis_hash);
 
         let response = generator

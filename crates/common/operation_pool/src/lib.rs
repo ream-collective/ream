@@ -10,6 +10,8 @@ use ream_consensus_beacon::{
     voluntary_exit::SignedVoluntaryExit,
 };
 use ream_consensus_misc::{
+    attestation_data::AttestationData,
+    checkpoint::Checkpoint,
     constants::beacon::{MIN_ATTESTATION_INCLUSION_DELAY, SYNC_COMMITTEE_SIZE},
     deposit::Deposit,
     misc::{compute_epoch_at_slot, get_committee_indices},
@@ -241,7 +243,9 @@ impl OperationPool {
     /// Select attestations that can be included in the block.
     ///
     /// Only keep attestations whose target epoch is current or previous, whose minimum inclusion
-    /// delay has passed, and aggregate non-overlapping votes by key.
+    /// delay has passed and whose source is the state's justified checkpoint for that epoch, and
+    /// aggregate non-overlapping votes by key. One attestation with another source would make
+    /// `process_attestation` fail the whole block.
     pub fn get_attestations_for_block(&self, state: &BeaconState) -> Vec<Attestation> {
         let current_epoch = state.get_current_epoch();
         let previous_epoch = state.get_previous_epoch();
@@ -259,6 +263,16 @@ impl OperationPool {
         keys.sort_by_key(|key| std::cmp::Reverse(key.slot));
 
         keys.into_iter()
+            .filter(|key| {
+                attestations[key].first().is_some_and(|attestation| {
+                    source_is_justified(
+                        &attestation.data,
+                        current_epoch,
+                        &state.current_justified_checkpoint,
+                        &state.previous_justified_checkpoint,
+                    )
+                })
+            })
             .filter_map(|key| {
                 let already_included = included_attestation_bits
                     .get(key)
@@ -447,10 +461,25 @@ fn aggregate_attestation_group(
     Some(aggregate)
 }
 
+/// Whether `data.source` is the justified checkpoint `process_attestation` requires: the current
+/// one for a current epoch target, the previous one otherwise.
+fn source_is_justified(
+    data: &AttestationData,
+    current_epoch: u64,
+    current_justified: &Checkpoint,
+    previous_justified: &Checkpoint,
+) -> bool {
+    let justified = if data.target.epoch == current_epoch {
+        current_justified
+    } else {
+        previous_justified
+    };
+    data.source == *justified
+}
+
 #[cfg(test)]
 mod tests {
     use alloy_primitives::map::{DefaultHashBuilder, HashSet};
-    use ream_consensus_misc::{attestation_data::AttestationData, checkpoint::Checkpoint};
     use ssz_types::{BitList, BitVector};
 
     use super::*;
@@ -496,6 +525,29 @@ mod tests {
             signature: BLSSignature::infinity(),
             committee_bits,
         }
+    }
+
+    #[test]
+    fn block_attestations_need_the_justified_source_of_their_target_epoch() {
+        let checkpoint = |epoch: u64, byte: u8| Checkpoint {
+            epoch,
+            root: B256::repeat_byte(byte),
+        };
+        let current_justified = checkpoint(9, 1);
+        let previous_justified = checkpoint(8, 2);
+        let data = |target_epoch: u64, source: Checkpoint| AttestationData {
+            source,
+            ..make_attestation(target_epoch * 32, 0, target_epoch, 4, &[0]).data
+        };
+        let matches = |data: &AttestationData| {
+            source_is_justified(data, 10, &current_justified, &previous_justified)
+        };
+
+        assert!(matches(&data(10, current_justified)));
+        assert!(matches(&data(9, previous_justified)));
+        assert!(!matches(&data(10, previous_justified)));
+        assert!(!matches(&data(9, current_justified)));
+        assert!(!matches(&data(10, checkpoint(9, 3))));
     }
 
     #[test]

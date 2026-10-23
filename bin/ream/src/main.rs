@@ -774,6 +774,7 @@ async fn run_beacon_node_inner(
     }
 
     beacon_chain.initialize_execution_forkchoice().await;
+    executor.spawn(beacon_chain.clone().run_payload_preparation());
 
     // Create network manager
     let mut manager_config = ManagerConfig::from(config);
