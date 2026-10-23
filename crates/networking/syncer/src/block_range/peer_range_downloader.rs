@@ -144,14 +144,20 @@ impl PeerRangeDownloader {
     ) -> JoinHandle<anyhow::Result<StreamOutcome<SignedBeaconBlock>>> {
         executor.spawn(async move {
             let (callback, rx) = mpsc::channel(100);
-            p2p_sender
+            if p2p_sender
                 .send(P2PMessage::Request(P2PRequest::BlockRange {
                     peer_id,
                     start: range.start_slot,
                     count: range.count,
                     callback,
                 }))
-                .expect("Failed to send block range request");
+                .is_err()
+            {
+                return StreamOutcome::Failed(DownloadFailure::Transport(
+                    "the network service stopped before the block range request was sent"
+                        .to_string(),
+                ));
+            }
 
             drain_responses(rx, |message| match message {
                 BeaconResponseMessage::BeaconBlocksByRange(block) => Ok(block),
@@ -175,13 +181,19 @@ impl PeerRootsDownloader {
     ) -> JoinHandle<anyhow::Result<StreamOutcome<SignedBeaconBlock>>> {
         executor.spawn(async move {
             let (callback, rx) = mpsc::channel(100);
-            p2p_sender
+            if p2p_sender
                 .send(P2PMessage::Request(P2PRequest::BlockRoots {
                     peer_id,
                     roots,
                     callback,
                 }))
-                .expect("Failed to send block roots request");
+                .is_err()
+            {
+                return StreamOutcome::Failed(DownloadFailure::Transport(
+                    "the network service stopped before the block roots request was sent"
+                        .to_string(),
+                ));
+            }
 
             drain_responses(rx, |message| match message {
                 BeaconResponseMessage::BeaconBlocksByRoot(block) => Ok(block),
@@ -205,13 +217,19 @@ impl PeerBlobIdentifierDownloader {
     ) -> JoinHandle<anyhow::Result<StreamOutcome<BlobSidecar>>> {
         executor.spawn(async move {
             let (callback, rx) = mpsc::channel(100);
-            p2p_sender
+            if p2p_sender
                 .send(P2PMessage::Request(P2PRequest::BlobIdentifiers {
                     peer_id,
                     blob_identifiers,
                     callback,
                 }))
-                .expect("Failed to send blob identifiers request");
+                .is_err()
+            {
+                return StreamOutcome::Failed(DownloadFailure::Transport(
+                    "the network service stopped before the blob identifiers request was sent"
+                        .to_string(),
+                ));
+            }
 
             drain_responses(rx, |message| match message {
                 BeaconResponseMessage::BlobSidecarsByRoot(blob_sidecar) => Ok(blob_sidecar),
@@ -236,7 +254,7 @@ impl PeerDataColumnRangeDownloader {
     ) -> JoinHandle<anyhow::Result<StreamOutcome<DataColumnSidecar>>> {
         executor.spawn(async move {
             let (callback, rx) = mpsc::channel(100);
-            p2p_sender
+            if p2p_sender
                 .send(P2PMessage::Request(P2PRequest::DataColumnRange {
                     peer_id,
                     start: range.start_slot,
@@ -244,7 +262,13 @@ impl PeerDataColumnRangeDownloader {
                     columns,
                     callback,
                 }))
-                .expect("Failed to send data column range request");
+                .is_err()
+            {
+                return StreamOutcome::Failed(DownloadFailure::Transport(
+                    "the network service stopped before the data column range request was sent"
+                        .to_string(),
+                ));
+            }
 
             drain_responses_within(
                 rx,
@@ -272,13 +296,18 @@ impl PeerDataColumnIdentifierDownloader {
     ) -> JoinHandle<anyhow::Result<StreamOutcome<DataColumnSidecar>>> {
         executor.spawn(async move {
             let (callback, rx) = mpsc::channel(100);
-            p2p_sender
+            if p2p_sender
                 .send(P2PMessage::Request(P2PRequest::DataColumnIdentifiers {
                     peer_id,
                     column_identifiers: identifiers,
                     callback,
                 }))
-                .expect("Failed to send data column identifiers request");
+                .is_err()
+            {
+                return StreamOutcome::Failed(DownloadFailure::Transport(
+                    "the network service stopped before the data column identifiers request was sent".to_string(),
+                ));
+            }
 
             drain_responses(rx, |message| match message {
                 BeaconResponseMessage::DataColumnSidecarsByRoot(column) => Ok(column),
@@ -302,6 +331,26 @@ mod tests {
             message: Default::default(),
             signature: Default::default(),
         }
+    }
+
+    #[test]
+    fn a_stopped_network_service_fails_the_download_without_a_panic() {
+        let (p2p_sender, p2p_receiver) = mpsc::unbounded_channel();
+        drop(p2p_receiver);
+        let handle = PeerRangeDownloader::start(
+            PeerId::random(),
+            p2p_sender,
+            ReamExecutor::new().expect("executor should start"),
+            Range {
+                start_slot: 0,
+                count: 1,
+            },
+        );
+
+        assert!(matches!(
+            futures::executor::block_on(handle).expect("the task should not panic"),
+            Ok(StreamOutcome::Failed(DownloadFailure::Transport(_)))
+        ));
     }
 
     #[tokio::test]
