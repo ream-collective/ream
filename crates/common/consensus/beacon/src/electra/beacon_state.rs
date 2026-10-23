@@ -2113,34 +2113,44 @@ impl BeaconState {
     }
 
     pub fn process_sync_aggregate(&mut self, sync_aggregate: &SyncAggregate) -> anyhow::Result<()> {
-        let committee_public_keys = &self.current_sync_committee.public_keys;
-        let mut participant_public_keys = vec![];
+        self.process_sync_aggregate_with(sync_aggregate, true)
+    }
 
-        for (public_key, bit) in committee_public_keys
-            .iter()
-            .zip(sync_aggregate.sync_committee_bits.iter())
-        {
-            if bit {
-                participant_public_keys.push(public_key);
+    fn process_sync_aggregate_with(
+        &mut self,
+        sync_aggregate: &SyncAggregate,
+        verify_signatures: bool,
+    ) -> anyhow::Result<()> {
+        if verify_signatures {
+            let committee_public_keys = &self.current_sync_committee.public_keys;
+            let mut participant_public_keys = vec![];
+
+            for (public_key, bit) in committee_public_keys
+                .iter()
+                .zip(sync_aggregate.sync_committee_bits.iter())
+            {
+                if bit {
+                    participant_public_keys.push(public_key);
+                }
             }
+
+            let previous_slot = max(self.slot, 1) - 1;
+            let domain = self.get_domain(
+                DOMAIN_SYNC_COMMITTEE,
+                Some(compute_epoch_at_slot(previous_slot)),
+            );
+            let signing_root =
+                compute_signing_root(self.get_block_root_at_slot(previous_slot)?, domain);
+
+            ensure!(
+                eth_fast_aggregate_verify(
+                    &participant_public_keys,
+                    signing_root,
+                    &sync_aggregate.sync_committee_signature,
+                )?,
+                "Sync aggregate signature verification failed."
+            );
         }
-
-        let previous_slot = max(self.slot, 1) - 1;
-        let domain = self.get_domain(
-            DOMAIN_SYNC_COMMITTEE,
-            Some(compute_epoch_at_slot(previous_slot)),
-        );
-        let signing_root =
-            compute_signing_root(self.get_block_root_at_slot(previous_slot)?, domain);
-
-        ensure!(
-            eth_fast_aggregate_verify(
-                &participant_public_keys,
-                signing_root,
-                &sync_aggregate.sync_committee_signature,
-            )?,
-            "Sync aggregate signature verification failed."
-        );
 
         let committee_indices = self.get_sync_committee_indices(&self.current_sync_committee)?;
         let (participant_reward, proposer_reward) = self.get_proposer_and_participant_rewards();
@@ -2488,6 +2498,14 @@ impl BeaconState {
     }
 
     pub fn process_attestation(&mut self, attestation: &Attestation) -> anyhow::Result<()> {
+        self.process_attestation_with(attestation, true)
+    }
+
+    fn process_attestation_with(
+        &mut self,
+        attestation: &Attestation,
+        verify_signatures: bool,
+    ) -> anyhow::Result<()> {
         let data = &attestation.data;
         ensure!(
             data.target.epoch == self.get_previous_epoch()
@@ -2540,7 +2558,7 @@ impl BeaconState {
         // drives the participation updates below.
         let indexed_attestation = self.get_indexed_attestation(attestation)?;
         ensure!(
-            self.is_valid_indexed_attestation(&indexed_attestation)?,
+            !verify_signatures || self.is_valid_indexed_attestation(&indexed_attestation)?,
             "Attestation signature must be valid"
         );
 
@@ -2900,6 +2918,14 @@ impl BeaconState {
     }
 
     pub fn process_operations(&mut self, body: &BeaconBlockBody) -> anyhow::Result<()> {
+        self.process_operations_with(body, true)
+    }
+
+    fn process_operations_with(
+        &mut self,
+        body: &BeaconBlockBody,
+        verify_signatures: bool,
+    ) -> anyhow::Result<()> {
         // Disable former deposit mechanism once all prior deposits are processed
         let eth1_deposit_index_limit = min(
             self.eth1_data.deposit_count,
@@ -2921,7 +2947,7 @@ impl BeaconState {
             self.process_attester_slashing(attester_slashing)?;
         }
         for attestation in body.attestations.iter() {
-            self.process_attestation(attestation)?;
+            self.process_attestation_with(attestation, verify_signatures)?;
         }
         for deposit in body.deposits.iter() {
             self.process_deposit(deposit)?;
@@ -3246,26 +3272,27 @@ impl BeaconState {
         self.process_withdrawals(&block.body.execution_payload)?;
         self.process_execution_payload(&block.body, execution_engine)
             .await?;
-        self.process_block_after_execution_payload(&block.body, verify_randao)
+        self.process_block_after_execution_payload(&block.body, verify_randao, true)
     }
 
     fn process_block_after_execution_payload(
         &mut self,
         body: &BeaconBlockBody,
         verify_randao: bool,
+        verify_signatures: bool,
     ) -> anyhow::Result<()> {
         self.process_randao_inner(body, verify_randao)?;
         self.process_eth1_data(body)?;
-        self.process_operations(body)?;
-        self.process_sync_aggregate(&body.sync_aggregate)?;
+        self.process_operations_with(body, verify_signatures)?;
+        self.process_sync_aggregate_with(&body.sync_aggregate, verify_signatures)?;
 
         Ok(())
     }
 
     /// Applies a block that was already imported onto its parent's post-state, to rebuild a state
-    /// that was not stored. The execution engine already accepted its payload and the block
-    /// already matched its state root, so neither is checked again. ``pre_state_root`` is the
-    /// parent block's state root, which saves hashing the state.
+    /// that was not stored. The block was fully checked when it was imported, so its payload,
+    /// state root and its randao, attestation and sync aggregate signatures are not checked again.
+    /// ``pre_state_root`` is the parent block's state root, which saves hashing the state.
     pub fn replay_block(
         &mut self,
         signed_block: &SignedBeaconBlock,
@@ -3278,7 +3305,7 @@ impl BeaconState {
         self.verify_execution_payload_consistency(&block.body)?;
         self.latest_execution_payload_header =
             block.body.execution_payload.to_execution_payload_header();
-        self.process_block_after_execution_payload(&block.body, true)
+        self.process_block_after_execution_payload(&block.body, false, false)
     }
 
     pub async fn state_transition(

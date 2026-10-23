@@ -1021,7 +1021,7 @@ mod tests {
 
     #[test]
     fn rejects_replay_result_with_the_wrong_root() {
-        set_beacon_network_spec(SEPOLIA.clone());
+        set_sepolia_spec();
         let dir = TempDir::new("ream_corrupt_state_replay").unwrap();
         let db = ReamDB::new(dir.path().to_path_buf())
             .unwrap()
@@ -1061,6 +1061,33 @@ mod tests {
         let err = db.state_provider().get_shared(parent_root).unwrap_err();
         assert!(matches!(err, StoreError::StateCorruption(_)));
         assert!(err.to_string().contains("replayed state"));
+    }
+
+    /// The spec can be set only once per test process.
+    fn set_sepolia_spec() {
+        static SPEC: std::sync::Once = std::sync::Once::new();
+        SPEC.call_once(|| set_beacon_network_spec(SEPOLIA.clone()));
+    }
+
+    #[test]
+    fn replay_does_not_check_signatures() {
+        set_sepolia_spec();
+        let mut state = Arc::unwrap_or_clone(sepolia_state());
+        let pre_state_root = sepolia_block("grandparent_9552074").message.state_root;
+        let expected = sepolia_state_file("parent_state_9552075");
+        let mut block = sepolia_block("parent_9552075");
+        // Swapped, so both are well-formed but sign other messages.
+        let body = &mut block.message.body;
+        std::mem::swap(
+            &mut body.attestations[0].signature,
+            &mut body.sync_aggregate.sync_committee_signature,
+        );
+
+        state.replay_block(&block, Some(pre_state_root)).unwrap();
+
+        // Only the header's body root, which commits to the signatures, differs.
+        state.latest_block_header.body_root = expected.latest_block_header.body_root;
+        assert_eq!(state.tree_hash_root(), expected.tree_hash_root());
     }
 
     #[test]
