@@ -30,13 +30,24 @@ static HEAVY_TASKS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(M
 pub(crate) async fn run_blocking<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {
-    let _permit = HEAVY_TASKS
+    run_limited(&HEAVY_TASKS, work).await
+}
+
+async fn run_limited<T: Send + 'static>(
+    limit: &'static tokio::sync::Semaphore,
+    work: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
+) -> Result<T, ApiError> {
+    let permit = limit
         .acquire()
         .await
         .map_err(|err| ApiError::InternalError(format!("Heavy task limit closed: {err}")))?;
-    actix_web::web::block(work)
-        .await
-        .map_err(|err| ApiError::InternalError(format!("Blocking task failed: {err}")))?
+    actix_web::web::block(move || {
+        // Held by the work, which keeps running if the request is dropped meanwhile.
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|err| ApiError::InternalError(format!("Blocking task failed: {err}")))?
 }
 
 #[cfg(test)]
@@ -61,6 +72,24 @@ mod tests {
 
         assert_eq!(slow.unwrap(), 1);
         assert!(fast < Duration::from_millis(400), "timer waited {fast:?}");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_request_keeps_its_slot_until_the_work_ends() {
+        static LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let start = Instant::now();
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(50),
+            run_limited(&LIMIT, || {
+                std::thread::sleep(Duration::from_millis(400));
+                Ok(())
+            }),
+        )
+        .await;
+        assert!(dropped.is_err());
+
+        run_limited(&LIMIT, || Ok(())).await.unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(400));
     }
 
     #[tokio::test]
