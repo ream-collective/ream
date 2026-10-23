@@ -627,9 +627,19 @@ impl BeaconChain {
         })
         .await??;
         let attributes = payload_attributes(&state, slot, fee_recipient)?;
+
+        // Serialized with `update_execution_forkchoice`, so a head imported while the state was
+        // advanced is not rolled back. The loop prepares again on the new head.
+        let mut last_forkchoice = self.execution_forkchoice.lock().await;
+        if self.head()?.head_root != head.head_root {
+            return Ok(());
+        }
+        let forkchoice_state = self.forkchoice_state_for(&head);
         let response = execution_engine
-            .engine_forkchoice_updated_v3(self.forkchoice_state_for(&head), Some(attributes))
+            .engine_forkchoice_updated_v3(forkchoice_state, Some(attributes))
             .await?;
+        *last_forkchoice = Some(forkchoice_state);
+        drop(last_forkchoice);
         let payload_id = response.payload_id.ok_or_else(|| {
             anyhow!(
                 "No payload id, payload status {:?}",
