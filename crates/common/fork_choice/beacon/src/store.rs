@@ -1240,27 +1240,18 @@ impl Store {
 
         // Attestation target must be for a known block. If target block is unknown, delay
         // consideration until block is found
-        ensure!(self.db.block_provider().get(target.root)?.is_some());
+        ensure!(self.db.block_provider().contains_key(target.root)?);
 
         // Attestations must be for a known block. If block is unknown, delay consideration until
         // the block is found
-        ensure!(
-            self.db
-                .block_provider()
-                .get(attestation.data.beacon_block_root)?
-                .is_some()
-        );
+        let (block_slot, _) = self
+            .db
+            .block_provider()
+            .slot_and_parent_root(attestation.data.beacon_block_root)?
+            .ok_or_else(|| anyhow!("block not found"))?;
         // Attestations must not be for blocks in the future. If not, the attestation should not be
         // considered
-        ensure!(
-            self.db
-                .block_provider()
-                .get(attestation.data.beacon_block_root)?
-                .ok_or_else(|| anyhow!("block not found"))?
-                .message
-                .slot
-                <= attestation.data.slot
-        );
+        ensure!(block_slot <= attestation.data.slot);
 
         // LMD vote must be consistent with FFG vote target
         ensure!(
