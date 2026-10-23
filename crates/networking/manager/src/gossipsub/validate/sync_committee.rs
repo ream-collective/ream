@@ -8,12 +8,9 @@ use ream_consensus_misc::{
     misc::{compute_epoch_at_slot, compute_signing_root},
 };
 use ream_network_spec::networks::beacon_network_spec;
-use ream_storage::{
-    cache::{BeaconCacheDB, SyncCommitteeKey, insert_if_unseen},
-    tables::field::REDBField,
-};
+use ream_storage::cache::{BeaconCacheDB, SyncCommitteeKey, insert_if_unseen};
 use ream_validator_beacon::sync_committee::{
-    SyncCommitteeMessage, compute_subnets_for_sync_committee,
+    SyncCommitteeMessage, compute_subnets_for_sync_committee_at_slot,
 };
 
 use super::result::ValidationResult;
@@ -49,15 +46,22 @@ pub async fn validate_sync_committee(
 
     // [IGNORE] The message's slot is for the current slot (with a MAXIMUM_GOSSIP_CLOCK_DISPARITY
     // allowance)
-    let genesis_time = beacon_chain.db().genesis_time_provider().get()?;
-    if !is_current_slot(genesis_time, message.slot, now_ms()) {
+    if !is_current_slot(state.genesis_time, message.slot, now_ms()) {
         return Ok(ValidationResult::Ignore(
             "Message is not from current slot".into(),
         ));
     }
 
-    // [REJECT] The subnet_id is valid for the given validator
-    if !compute_subnets_for_sync_committee(state, message.validator_index)?.contains(&subnet_id) {
+    // [REJECT] The subnet_id is valid for the given validator. The committee is the one of the
+    // message's slot, which the head can still be behind at a period boundary.
+    let Ok(subnets) =
+        compute_subnets_for_sync_committee_at_slot(state, message.slot, message.validator_index)
+    else {
+        return Ok(ValidationResult::Ignore(
+            "The head state has no committee for the message slot".into(),
+        ));
+    };
+    if !subnets.contains(&subnet_id) {
         return Ok(ValidationResult::Reject(
             "Validator not in correct sync subcommittee".into(),
         ));

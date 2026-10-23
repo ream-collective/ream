@@ -9,6 +9,7 @@ use ream_bls::{
 use ream_consensus_beacon::{
     electra::{beacon_block::BeaconBlock, beacon_state::BeaconState},
     sync_aggregate::SyncAggregate,
+    sync_committee::SyncCommittee,
 };
 use ream_consensus_misc::{
     constants::beacon::{
@@ -54,6 +55,26 @@ pub fn compute_sync_committee_period(epoch: u64) -> u64 {
     epoch / EPOCHS_PER_SYNC_COMMITTEE_PERIOD
 }
 
+/// The committee whose members sign at `slot`. Their messages go into the block at `slot + 1`,
+/// so it is the committee of that slot's period, which `state` holds if it is in that period or
+/// the one before.
+pub fn sync_committee_at_slot(state: &BeaconState, slot: u64) -> anyhow::Result<&SyncCommittee> {
+    match signing_committee_offset(state.get_current_epoch(), slot) {
+        Some(0) => Ok(&state.current_sync_committee),
+        Some(1) => Ok(&state.next_sync_committee),
+        _ => bail!(
+            "A state in epoch {} has no sync committee for slot {slot}",
+            state.get_current_epoch()
+        ),
+    }
+}
+
+/// How many periods after the period of `state_epoch` the committee signing at `slot` is.
+fn signing_committee_offset(state_epoch: u64, slot: u64) -> Option<u64> {
+    compute_sync_committee_period(compute_epoch_at_slot(slot.saturating_add(1)))
+        .checked_sub(compute_sync_committee_period(state_epoch))
+}
+
 pub fn is_assigned_to_sync_committee(
     state: &BeaconState,
     epoch: u64,
@@ -90,14 +111,16 @@ pub fn compute_subnets_for_sync_committee(
     state: &BeaconState,
     validator_index: u64,
 ) -> anyhow::Result<HashSet<u64>> {
-    let next_slot_epoch = compute_epoch_at_slot(state.slot + 1);
-    let sync_committee = if compute_sync_committee_period(state.get_current_epoch())
-        == compute_sync_committee_period(next_slot_epoch)
-    {
-        &state.current_sync_committee
-    } else {
-        &state.next_sync_committee
-    };
+    compute_subnets_for_sync_committee_at_slot(state, state.slot, validator_index)
+}
+
+/// `compute_subnets_for_sync_committee` for a message at `slot`, which can be ahead of `state`.
+pub fn compute_subnets_for_sync_committee_at_slot(
+    state: &BeaconState,
+    slot: u64,
+    validator_index: u64,
+) -> anyhow::Result<HashSet<u64>> {
+    let sync_committee = sync_committee_at_slot(state, slot)?;
 
     let Some(target_validator) = state.validators.get(validator_index as usize) else {
         bail!("Validator index out of bounds: {validator_index}");
@@ -191,4 +214,35 @@ pub fn get_sync_committee_message(
         validator_index,
         signature: private_key.sign(signing_root.as_ref())?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH;
+
+    use super::*;
+
+    #[test]
+    fn the_committee_at_a_slot_is_the_one_of_the_next_slot() {
+        let period_slots = EPOCHS_PER_SYNC_COMMITTEE_PERIOD * SLOTS_PER_EPOCH;
+        let period_start = 510 * period_slots;
+        let offset = |state_slot: u64, slot: u64| {
+            signing_committee_offset(compute_epoch_at_slot(state_slot), slot)
+        };
+
+        let state_slot = period_start + 5;
+        assert_eq!(offset(state_slot, period_start + 6), Some(0));
+        assert_eq!(offset(state_slot, period_start - 1), Some(0));
+        // The last slot of a period is signed by the next period's committee.
+        assert_eq!(offset(state_slot, period_start + period_slots - 1), Some(1));
+        assert_eq!(offset(state_slot, period_start + period_slots + 6), Some(1));
+        assert_eq!(offset(state_slot, period_start + 2 * period_slots), Some(2));
+        assert_eq!(offset(state_slot, period_start - 2), None);
+
+        // A head still in the previous period, as when the boundary block is late.
+        let behind = period_start - 2;
+        assert_eq!(offset(behind, period_start - 1), Some(1));
+        assert_eq!(offset(behind, period_start), Some(1));
+        assert_eq!(offset(behind, period_start - 3), Some(0));
+    }
 }
