@@ -18,7 +18,20 @@ pub mod syncing;
 pub mod validator;
 
 mod representation;
+use alloy_primitives::aliases::B32;
 use ream_api_types_common::error::ApiError;
+use ream_consensus_misc::constants::beacon::genesis_validators_root;
+use ream_network_spec::networks::beacon_network_spec;
+use ream_storage::{db::beacon::BeaconDB, tables::field::REDBField};
+
+/// The fork digest to publish gossip with now, on the chain's clock.
+pub(crate) fn gossip_fork_digest(db: &BeaconDB) -> Result<B32, ApiError> {
+    let genesis_time = db
+        .genesis_time_provider()
+        .get()
+        .map_err(|err| ApiError::InternalError(format!("Failed to get genesis time: {err:?}")))?;
+    Ok(beacon_network_spec().current_fork_digest(genesis_time, genesis_validators_root()))
+}
 
 /// Heavy tasks that may run at once. Each can hold a rebuilt beacon state in memory.
 const MAX_HEAVY_TASKS: usize = 2;

@@ -50,7 +50,7 @@ use tracing::warn;
 use crate::handlers::state::get_state_from_id;
 
 fn gossip_fork_digest(state: &BeaconState) -> B32 {
-    beacon_network_spec().current_fork_digest(state.genesis_validators_root)
+    beacon_network_spec().current_fork_digest(state.genesis_time, state.genesis_validators_root)
 }
 
 /// GET /eth/v1/beacon/pool/bls_to_execution_changes

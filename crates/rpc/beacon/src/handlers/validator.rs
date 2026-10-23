@@ -10,7 +10,7 @@ use actix_web::{
     web::{Data, Json, Path, Query},
 };
 use actix_web_lab::extract::Query as ListQuery;
-use alloy_primitives::{Address, B64, B256, aliases::B32};
+use alloy_primitives::{Address, B64, B256};
 use ream_api_types_beacon::{
     block::{FullBlockData, ProduceBlockData, ProduceBlockResponse},
     committee::{BeaconCommitteeSubscription, SyncCommitteeSubscription},
@@ -51,7 +51,7 @@ use ream_consensus_misc::{
     constants::beacon::{
         CELLS_PER_EXT_BLOB, DOMAIN_RANDAO, MAX_COMMITTEES_PER_SLOT, PROPOSER_REWARD_QUOTIENT,
         SLOTS_PER_EPOCH, SYNC_COMMITTEE_PROPOSER_REWARD_QUOTIENT, SYNC_COMMITTEE_SIZE,
-        WHISTLEBLOWER_REWARD_QUOTIENT, genesis_validators_root,
+        WHISTLEBLOWER_REWARD_QUOTIENT,
     },
     deposit::Deposit,
     fork_name::ForkName,
@@ -106,7 +106,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, warn};
 use tree_hash::TreeHash;
 
-use super::{duties::head_chain_block_root, state::get_state_from_id};
+use super::{duties::head_chain_block_root, gossip_fork_digest, state::get_state_from_id};
 
 ///  For slots in Electra and later, this AttestationData must have a committee_index of 0.
 const ELECTRA_COMMITTEE_INDEX: u64 = 0;
@@ -697,6 +697,7 @@ pub async fn post_aggregate_and_proofs_v2(
     aggregates: Json<Vec<SignedAggregateAndProof>>,
 ) -> Result<impl Responder, ApiError> {
     let mut failures = vec![];
+    let fork = gossip_fork_digest(beacon_chain.db())?;
     for (index, signed_aggregate) in aggregates.into_inner().into_iter().enumerate() {
         match validate_aggregate_and_proof(&signed_aggregate, &beacon_chain, &cached_db).await {
             Ok(ValidationResult::Accept) => {}
@@ -722,7 +723,7 @@ pub async fn post_aggregate_and_proofs_v2(
 
         p2p_sender.send_gossip(GossipMessage {
             topic: GossipTopic {
-                fork: current_fork_digest(),
+                fork,
                 kind: GossipTopicKind::AggregateAndProof,
             },
             data: signed_aggregate.as_ssz_bytes(),
@@ -743,13 +744,6 @@ pub async fn post_aggregate_and_proofs_v2(
         })));
     }
     Ok(HttpResponse::Ok().finish())
-}
-
-fn current_fork_digest() -> B32 {
-    beacon_network_spec().fork_digest(
-        beacon_network_spec().current_epoch(),
-        genesis_validators_root(),
-    )
 }
 
 #[post("/validator/beacon_committee_subscriptions")]
@@ -811,10 +805,7 @@ pub async fn post_beacon_committee_subscriptions(
         p2p_sender.attestation_duty_subnets(duty_subnets);
     }
 
-    let fork = beacon_network_spec().fork_digest(
-        beacon_network_spec().current_epoch(),
-        genesis_validators_root(),
-    );
+    let fork = gossip_fork_digest(beacon_chain.db())?;
     for (subnet_id, until_slot) in subnets {
         let topic = GossipTopic {
             fork,
@@ -881,10 +872,7 @@ pub async fn post_sync_committee_subscriptions(
         }
     }
 
-    let fork = beacon_network_spec().fork_digest(
-        beacon_network_spec().current_epoch(),
-        genesis_validators_root(),
-    );
+    let fork = gossip_fork_digest(beacon_chain.db())?;
     for (subnet_id, until_slot) in subnets {
         let topic = GossipTopic {
             fork,
@@ -998,6 +986,7 @@ pub async fn post_contribution_and_proofs(
     contributions: Json<Vec<SignedContributionAndProof>>,
 ) -> Result<impl Responder, ApiError> {
     let mut failures = vec![];
+    let fork = gossip_fork_digest(beacon_chain.db())?;
     for (index, signed_contribution_and_proof) in contributions.into_inner().into_iter().enumerate()
     {
         match validate_sync_committee_contribution_and_proof(
@@ -1030,7 +1019,7 @@ pub async fn post_contribution_and_proofs(
 
         p2p_sender.send_gossip(GossipMessage {
             topic: GossipTopic {
-                fork: current_fork_digest(),
+                fork,
                 kind: GossipTopicKind::SyncCommitteeContributionAndProof,
             },
             data: signed_contribution_and_proof.as_ssz_bytes(),
