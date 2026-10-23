@@ -1538,7 +1538,7 @@ impl BlockRangeSyncer {
         {
             let store = self.beacon_chain.store.lock().await;
             if store.db.block_provider().get(block_root)?.is_some()
-                && store.db.state_provider().get(block_root)?.is_some()
+                && store.db.state_provider().contains_key(block_root)?
             {
                 return Ok(false);
             }

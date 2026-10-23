@@ -40,6 +40,21 @@ impl REDBTable for BeaconBlockTable {
         self.db.clone()
     }
 
+    fn contains_key<'a>(
+        &self,
+        key: <Self::KeyTableDefinition as redb::Value>::SelfType<'a>,
+    ) -> Result<bool, StoreError> {
+        if let Some(cache) = &self.cache
+            && let Ok(cache_lock) = cache.blocks.lock()
+            && cache_lock.contains(&key)
+        {
+            return Ok(true);
+        }
+        let read_txn = self.database().begin_read()?;
+        let table = read_txn.open_table(Self::TABLE_DEFINITION)?;
+        Ok(table.get(key)?.is_some())
+    }
+
     fn get<'a>(
         &self,
         key: <Self::KeyTableDefinition as redb::Value>::SelfType<'a>,
@@ -121,6 +136,23 @@ impl REDBTable for BeaconBlockTable {
 }
 
 impl BeaconBlockTable {
+    /// The block's slot and parent root. A cached block is not cloned: gossip validation walks
+    /// ancestors for every attestation, and a clone copies the whole execution payload.
+    pub fn slot_and_parent_root(
+        &self,
+        block_root: B256,
+    ) -> Result<Option<(u64, B256)>, StoreError> {
+        if let Some(cache) = &self.cache
+            && let Ok(mut cache_lock) = cache.blocks.lock()
+            && let Some(block) = cache_lock.get(&block_root)
+        {
+            return Ok(Some((block.message.slot, block.message.parent_root)));
+        }
+        Ok(self
+            .get(block_root)?
+            .map(|block| (block.message.slot, block.message.parent_root)))
+    }
+
     pub(crate) fn cache_committed(&self, block_root: B256, block: SignedBeaconBlock) {
         if let Some(cache) = &self.cache
             && let Ok(mut cache_lock) = cache.blocks.lock()

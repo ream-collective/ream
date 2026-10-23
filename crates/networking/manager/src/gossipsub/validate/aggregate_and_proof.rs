@@ -285,10 +285,9 @@ pub async fn validate_aggregate_and_proof(
     // [IGNORE] The block being voted for (aggregate.data.beacon_block_root) has been seen (via
     // gossip or non-gossip sources) (a client MAY queue aggregates for processing once block is
     // retrieved).
-    if db
+    if !db
         .block_provider()
-        .get(attestation.data.beacon_block_root)?
-        .is_none()
+        .contains_key(attestation.data.beacon_block_root)?
     {
         return Ok(ValidationResult::Ignore(
             "The block being voted for has not been seen".to_string(),

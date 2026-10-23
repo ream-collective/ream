@@ -18,7 +18,6 @@ use ream_storage::{
     tables::{field::REDBField, table::REDBTable},
 };
 use serde::{Deserialize, Serialize};
-use tree_hash::TreeHash;
 
 pub const SYNC_COMMITTEE_SUBNET_COUNT: u64 = 4;
 
@@ -117,7 +116,7 @@ pub async fn get_state_root(
 ) -> Result<impl Responder, ApiError> {
     let state = get_state_from_id(state_id.into_inner(), &db).await?;
 
-    let state_root = state.tree_hash_root();
+    let state_root = state.state_root();
 
     Ok(HttpResponse::Ok().json(BeaconResponse::new(RootResponse::new(state_root))))
 }

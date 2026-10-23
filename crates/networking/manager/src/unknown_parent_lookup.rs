@@ -153,7 +153,7 @@ pub async fn parent_status(
 ) -> anyhow::Result<ParentStatus> {
     let store = beacon_chain.store.lock().await;
     let imported = store.db.block_provider().get(parent_root)?.is_some()
-        && store.db.state_provider().get(parent_root)?.is_some();
+        && store.db.state_provider().contains_key(parent_root)?;
     if imported {
         return Ok(ParentStatus::Imported);
     }
