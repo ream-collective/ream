@@ -30,6 +30,7 @@ fn load_imported_parent(db: &BeaconDB, parent_root: B256) -> anyhow::Result<Opti
 }
 
 /// Looks up `parent_root` among imported blocks, then among blocks pending data availability.
+/// Loading can rebuild a state, so it runs on a blocking thread, first without the store lock.
 pub async fn find_parent(
     beacon_chain: &BeaconChain,
     parent_root: B256,
@@ -37,7 +38,7 @@ pub async fn find_parent(
     // The importer writes a block and its state in separate transactions, so without the store lock
     // a block can be visible before its state.
     if let Some(parent @ ParentBlock::Imported { state: Some(_), .. }) =
-        load_imported_parent(beacon_chain.db(), parent_root)?
+        load_imported_parent_blocking(beacon_chain.db(), parent_root).await?
     {
         return Ok(Some(parent));
     }
@@ -54,5 +55,15 @@ pub async fn find_parent(
             state: Arc::new(pending.post_state.clone()),
         }));
     }
-    load_imported_parent(&store.db, parent_root)
+    // Under the store lock an import of the parent has finished or not begun, so its block and
+    // state are both visible or both missing. A just-imported state is still in memory.
+    load_imported_parent_blocking(&store.db, parent_root).await
+}
+
+async fn load_imported_parent_blocking(
+    db: &BeaconDB,
+    parent_root: B256,
+) -> anyhow::Result<Option<ParentBlock>> {
+    let db = db.clone();
+    tokio::task::spawn_blocking(move || load_imported_parent(&db, parent_root)).await?
 }
