@@ -1,20 +1,31 @@
+use std::sync::Arc;
+
 use actix_web::{
     HttpResponse, Responder, post,
     web::{Data, Json, Path},
 };
+use alloy_primitives::B256;
 use ream_api_types_beacon::{
     id::ValidatorID,
     rewards::{AttestationRewardsData, AttestationRewardsResponse, IdealReward, TotalReward},
 };
-use ream_api_types_common::{error::ApiError, id::ID};
+use ream_api_types_common::error::ApiError;
+use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::electra::beacon_state::BeaconState;
-use ream_consensus_misc::constants::beacon::{
-    EFFECTIVE_BALANCE_INCREMENT, GENESIS_EPOCH, PARTICIPATION_FLAG_WEIGHTS, SLOTS_PER_EPOCH,
-    TIMELY_HEAD_FLAG_INDEX, TIMELY_SOURCE_FLAG_INDEX, TIMELY_TARGET_FLAG_INDEX, WEIGHT_DENOMINATOR,
+use ream_consensus_misc::{
+    constants::beacon::{
+        EFFECTIVE_BALANCE_INCREMENT, GENESIS_EPOCH, PARTICIPATION_FLAG_WEIGHTS, SLOTS_PER_EPOCH,
+        TIMELY_HEAD_FLAG_INDEX, TIMELY_SOURCE_FLAG_INDEX, TIMELY_TARGET_FLAG_INDEX,
+        WEIGHT_DENOMINATOR,
+    },
+    misc::{compute_epoch_at_slot, compute_start_slot_at_epoch},
 };
-use ream_storage::{db::beacon::BeaconDB, tables::field::REDBField};
+use ream_storage::{
+    db::beacon::BeaconDB,
+    tables::{field::REDBField, table::REDBTable},
+};
 
-use crate::handlers::state::get_state_from_id;
+use crate::handlers::run_blocking;
 
 fn compute_ideal_attestation_rewards(state: &BeaconState) -> Result<Vec<IdealReward>, ApiError> {
     let base_reward_per_increment = state.get_base_reward_per_increment();
@@ -173,9 +184,35 @@ fn compute_total_attestation_rewards(
     Ok(total_rewards)
 }
 
+/// Root of the last block in `epoch` on the chain of `head_root`. Its last slots can be empty,
+/// and blocks of abandoned forks are left out.
+fn latest_block_root_in_epoch(
+    db: &BeaconDB,
+    head_root: B256,
+    epoch: u64,
+) -> Result<B256, ApiError> {
+    let start_slot = compute_start_slot_at_epoch(epoch);
+    db.canonical_roots_in_range(head_root, start_slot, start_slot + SLOTS_PER_EPOCH)
+        .map_err(|err| {
+            ApiError::InternalError(format!(
+                "Failed to read canonical blocks of epoch {epoch}: {err:?}"
+            ))
+        })?
+        .last()
+        .map(|(_, root)| *root)
+        .ok_or_else(|| ApiError::NotFound(format!("No block found in epoch {epoch}")))
+}
+
+/// Rewards for `epoch` are final once `epoch + 1` has ended: until then, its votes can still be
+/// included.
+fn rewards_epoch_has_ended(epoch: u64, current_epoch: u64) -> bool {
+    epoch.saturating_add(1) < current_epoch
+}
+
 #[post("/beacon/rewards/attestations/{epoch}")]
 pub async fn post_attestation_rewards(
     db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<BeaconChain>>,
     epoch: Path<u64>,
     validator_ids: Json<Option<Vec<ValidatorID>>>,
 ) -> Result<impl Responder, ApiError> {
@@ -188,9 +225,40 @@ pub async fn post_attestation_rewards(
         ));
     }
 
-    // Using the last slot of epoch+1 to capture all attestations including late ones
-    let target_slot = (epoch_value + 2) * SLOTS_PER_EPOCH - 1;
-    let state = get_state_from_id(ID::Slot(target_slot), &db).await?;
+    let head = beacon_chain
+        .head()
+        .map_err(|err| ApiError::InternalError(format!("Failed to get head: {err:?}")))?;
+    if !rewards_epoch_has_ended(epoch_value, compute_epoch_at_slot(head.current_slot)) {
+        return Err(ApiError::BadRequest(format!(
+            "Rewards for epoch {epoch_value} are known once epoch {} has ended",
+            epoch_value.saturating_add(1)
+        )));
+    }
+
+    let db = db.get_ref().clone();
+    let validator_ids = validator_ids.into_inner();
+    let response = run_blocking(move || {
+        attestation_rewards(&db, head.head_root, epoch_value, validator_ids.as_ref())
+    })
+    .await?;
+    Ok(HttpResponse::Ok().json(response))
+}
+
+fn attestation_rewards(
+    db: &BeaconDB,
+    head_root: B256,
+    epoch_value: u64,
+    validator_ids: Option<&Vec<ValidatorID>>,
+) -> Result<AttestationRewardsResponse, ApiError> {
+    // The state at the end of epoch + 1 holds every attestation for the epoch, including late ones.
+    let block_root = latest_block_root_in_epoch(db, head_root, epoch_value + 1)?;
+    let state = db
+        .state_provider()
+        .get(block_root)
+        .map_err(|err| ApiError::InternalError(format!("Failed to get state: {err:?}")))?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!("Failed to find state for block {block_root}"))
+        })?;
 
     // Check if the epoch is finalized
     let finalized_checkpoint = db.finalized_checkpoint_provider().get().map_err(|err| {
@@ -236,16 +304,64 @@ pub async fn post_attestation_rewards(
     };
 
     // Compute total rewards for all eligible validators (with optional filtering)
-    let total_rewards = compute_total_attestation_rewards(&state, &deltas, validator_ids.as_ref())?;
+    let total_rewards = compute_total_attestation_rewards(&state, &deltas, validator_ids)?;
 
-    let response = AttestationRewardsResponse {
+    Ok(AttestationRewardsResponse {
         execution_optimistic: false,
         finalized: is_finalized,
         data: AttestationRewardsData {
             ideal_rewards,
             total_rewards,
         },
-    };
+    })
+}
 
-    Ok(HttpResponse::Ok().json(response))
+#[cfg(test)]
+mod tests {
+    use ream_consensus_beacon::electra::beacon_block::{BeaconBlock, SignedBeaconBlock};
+    use ream_storage::db::ReamDB;
+    use tempdir::TempDir;
+    use tree_hash::TreeHash;
+
+    use super::*;
+
+    #[test]
+    fn rewards_state_skips_empty_slots_and_abandoned_forks() {
+        let temp_dir = TempDir::new("ream_rpc_beacon_rewards").expect("creates temp directory");
+        let db = ReamDB::new(temp_dir.path().to_path_buf())
+            .expect("creates database")
+            .init_beacon_db()
+            .expect("initializes beacon database");
+        let store = |slot: u64, parent_root: B256| {
+            let block = SignedBeaconBlock {
+                message: BeaconBlock {
+                    slot,
+                    parent_root,
+                    ..Default::default()
+                },
+                signature: Default::default(),
+            };
+            let root = block.message.tree_hash_root();
+            db.block_provider().insert(root, block).unwrap();
+            root
+        };
+        let first = store(SLOTS_PER_EPOCH + 1, B256::ZERO);
+        let orphan = store(SLOTS_PER_EPOCH + 9, first);
+        let head = store(SLOTS_PER_EPOCH + 8, first);
+        assert_eq!(
+            db.slot_index_provider().get(SLOTS_PER_EPOCH + 9).unwrap(),
+            Some(orphan)
+        );
+
+        assert_eq!(latest_block_root_in_epoch(&db, head, 1).unwrap(), head);
+        assert!(latest_block_root_in_epoch(&db, head, 2).is_err());
+    }
+
+    #[test]
+    fn rewards_wait_for_the_next_epoch_to_end() {
+        assert!(!rewards_epoch_has_ended(10, 10));
+        assert!(!rewards_epoch_has_ended(10, 11));
+        assert!(rewards_epoch_has_ended(10, 12));
+        assert!(!rewards_epoch_has_ended(u64::MAX, 12));
+    }
 }

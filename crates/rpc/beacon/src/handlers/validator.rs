@@ -9,6 +9,7 @@ use actix_web::{
     post,
     web::{Data, Json, Path, Query},
 };
+use actix_web_lab::extract::Query as ListQuery;
 use alloy_primitives::{Address, B64, B256, aliases::B32};
 use ream_api_types_beacon::{
     block::{FullBlockData, ProduceBlockData, ProduceBlockResponse},
@@ -228,8 +229,8 @@ fn find_validator_by_public_key<'a>(
 pub async fn get_validators_from_state(
     db: Data<BeaconDB>,
     state_id: Path<ID>,
-    id_query: Query<IdQuery>,
-    status_query: Query<StatusQuery>,
+    id_query: ListQuery<IdQuery>,
+    status_query: ListQuery<StatusQuery>,
 ) -> Result<impl Responder, ApiError> {
     if let Some(validator_ids) = &id_query.id
         && validator_ids.len() >= MAX_VALIDATOR_COUNT
@@ -408,7 +409,7 @@ pub async fn post_validator_identities_from_state(
 #[get("/beacon/states/{state_id}/validator_balances")]
 pub async fn get_validator_balances_from_state(
     state_id: Path<ID>,
-    query: Query<IdQuery>,
+    query: ListQuery<IdQuery>,
     db: Data<BeaconDB>,
 ) -> Result<impl Responder, ApiError> {
     let state = get_state_from_id(state_id.into_inner(), &db).await?;
@@ -428,9 +429,10 @@ pub async fn get_validator_balances_from_state(
 #[post("/beacon/states/{state_id}/validator_balances")]
 pub async fn post_validator_balances_from_state(
     state_id: Path<ID>,
-    body: Json<IdQuery>,
+    body: Json<Vec<ValidatorID>>,
     db: Data<BeaconDB>,
 ) -> Result<impl Responder, ApiError> {
+    let ids = body.into_inner();
     let state = get_state_from_id(state_id.into_inner(), &db).await?;
     Ok(
         HttpResponse::Ok().json(BeaconResponse::new(build_validator_balances(
@@ -440,7 +442,7 @@ pub async fn post_validator_balances_from_state(
                 .cloned()
                 .zip(state.balances.into_iter())
                 .collect::<Vec<_>>(),
-            body.id.as_ref(),
+            (!ids.is_empty()).then_some(&ids),
         ))),
     )
 }
@@ -1654,7 +1656,13 @@ pub async fn get_aggregate_attestation(
 mod tests {
     use std::path::PathBuf;
 
+    use actix_web_lab::extract::Query as ListQuery;
     use alloy_primitives::B256;
+    use ream_api_types_beacon::{
+        id::ValidatorID,
+        query::{IdQuery, StatusQuery},
+        validator::ValidatorStatus,
+    };
     use ream_consensus_misc::checkpoint::Checkpoint;
     use ream_execution_rpc_types::get_payload::{BlobsBundleV1, BlobsBundleV2};
     use ssz::Decode;
@@ -1777,6 +1785,34 @@ mod tests {
             proofs: vec![KZGProof::default()].try_into().unwrap(),
         });
         assert!(check_blobs_bundle(&electra).is_ok());
+    }
+
+    #[test]
+    fn id_and_status_queries_accept_single_comma_and_repeated_values() {
+        let ids = |query: &str| ListQuery::<IdQuery>::from_query(query).unwrap().0.id;
+        assert_eq!(ids("id=1000"), Some(vec![ValidatorID::Index(1000)]));
+        assert_eq!(
+            ids("id=1000,2000"),
+            Some(vec![ValidatorID::Index(1000), ValidatorID::Index(2000)])
+        );
+        assert_eq!(
+            ids("id=1000&id=2000"),
+            Some(vec![ValidatorID::Index(1000), ValidatorID::Index(2000)])
+        );
+        assert_eq!(ids(""), None);
+        assert!(ListQuery::<IdQuery>::from_query("id=abc").is_err());
+
+        let statuses = ListQuery::<StatusQuery>::from_query("status=active_ongoing,exited")
+            .unwrap()
+            .0
+            .status;
+        assert_eq!(
+            statuses,
+            Some(vec![
+                ValidatorStatus::ActiveOngoing,
+                ValidatorStatus::Exited
+            ])
+        );
     }
 
     #[test]

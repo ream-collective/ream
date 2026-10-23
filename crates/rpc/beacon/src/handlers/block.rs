@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -33,7 +34,10 @@ use ream_consensus_beacon::{
     matrix_entry::{compute_cells_and_kzg_proofs, das_context},
 };
 use ream_consensus_misc::{
-    constants::beacon::{GENESIS_SLOT, WHISTLEBLOWER_REWARD_QUOTIENT, genesis_validators_root},
+    constants::beacon::{
+        GENESIS_SLOT, SLOTS_PER_HISTORICAL_ROOT, WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA,
+        genesis_validators_root,
+    },
     polynomial_commitments::kzg_commitment::KZGCommitment,
 };
 use ream_execution_rpc_types::get_blobs::Blob;
@@ -54,7 +58,9 @@ use ssz::{Decode, Encode};
 use tracing::{error, info, warn};
 use tree_hash::TreeHash;
 
-use crate::handlers::{representation::checkpoint_response, state::get_state_from_id};
+use crate::handlers::{
+    representation::checkpoint_response, run_blocking, state::get_state_by_block_root,
+};
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct BlockRewards {
@@ -113,7 +119,10 @@ pub async fn get_block_root_from_id(
                 .head_root,
         )),
         ID::Genesis => db.slot_index_provider().get(GENESIS_SLOT),
-        ID::Slot(slot) => db.slot_index_provider().get(slot),
+        ID::Slot(slot) => {
+            return canonical_block_root_at_slot(slot, db, beacon_chain)?
+                .ok_or_else(|| ApiError::NotFound(format!("No canonical block at slot {slot}")));
+        }
         ID::Root(root) => Ok(Some(root)),
     }
     .map_err(|err| {
@@ -124,57 +133,147 @@ pub async fn get_block_root_from_id(
     Ok(block_root)
 }
 
-fn get_attestations_rewards(beacon_state: &BeaconState, beacon_block: &SignedBeaconBlock) -> u64 {
-    let mut attester_reward = 0;
-    let attestations = &beacon_block.message.body.attestations;
-    for attestation in attestations {
-        if let Ok(attesting_indices) = beacon_state.get_attesting_indices(attestation) {
-            for index in attesting_indices {
-                attester_reward += beacon_state.get_proposer_reward(index);
-            }
-        }
+/// The canonical block at `slot`, or `None` for an empty slot. Recent slots come from the head
+/// state's block roots, which follow reorgs. Older ones come from the canonical roots recorded at
+/// finalization, not from the slot index, which keeps blocks of abandoned forks.
+pub fn canonical_block_root_at_slot(
+    slot: u64,
+    db: &BeaconDB,
+    beacon_chain: &BeaconChain,
+) -> Result<Option<B256>, ApiError> {
+    let head = beacon_chain
+        .head()
+        .map_err(|err| ApiError::InternalError(format!("Failed to get head, error: {err:?}")))?;
+    let Some(candidate) = latest_block_root_at_or_before(&head.state, head.head_root, slot) else {
+        return canonical_root_from_db(db, head.head_root, slot);
+    };
+    let Some(root) = candidate else {
+        return Ok(None);
+    };
+    let block_slot = db
+        .block_provider()
+        .get(root)
+        .map_err(|err| ApiError::InternalError(format!("Failed to get block, error: {err:?}")))?
+        .map(|block| block.message.slot);
+    Ok((block_slot == Some(slot)).then_some(root))
+}
+
+/// The block at `slot` on the chain of `head_root`, from the stored canonical history.
+fn canonical_root_from_db(
+    db: &BeaconDB,
+    head_root: B256,
+    slot: u64,
+) -> Result<Option<B256>, ApiError> {
+    Ok(db
+        .canonical_roots_in_range(head_root, slot, slot.saturating_add(1))
+        .map_err(|err| {
+            ApiError::InternalError(format!(
+                "Failed to read the canonical block at slot {slot}: {err:?}"
+            ))
+        })?
+        .into_iter()
+        .find_map(|(block_slot, root)| (block_slot == slot).then_some(root)))
+}
+
+/// Root of the latest canonical block at or before `slot`, from the head's post-state. `None` if
+/// the slot is older than the state's block roots; `Some(None)` if it is after the head.
+fn latest_block_root_at_or_before(
+    head_state: &BeaconState,
+    head_root: B256,
+    slot: u64,
+) -> Option<Option<B256>> {
+    if slot > head_state.slot {
+        return Some(None);
     }
-    attester_reward
+    if slot == head_state.slot {
+        return Some(Some(head_root));
+    }
+    if slot + SLOTS_PER_HISTORICAL_ROOT < head_state.slot {
+        return None;
+    }
+    Some(Some(
+        head_state.block_roots[(slot % SLOTS_PER_HISTORICAL_ROOT) as usize],
+    ))
+}
+
+/// What a slashing pays the proposer, who is also the whistleblower: the whole whistleblower
+/// reward. A validator already slashed earlier in the block pays nothing.
+fn slashing_reward(beacon_state: &BeaconState, index: u64, slashed: &mut HashSet<u64>) -> u64 {
+    let Some(validator) = beacon_state.validators.get(index as usize) else {
+        return 0;
+    };
+    if !validator.is_slashable_validator(beacon_state.get_current_epoch()) || !slashed.insert(index)
+    {
+        return 0;
+    }
+    validator.effective_balance / WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA
 }
 
 fn get_proposer_slashing_rewards(
     beacon_state: &BeaconState,
     beacon_block: &SignedBeaconBlock,
+    slashed: &mut HashSet<u64>,
 ) -> u64 {
-    let mut proposer_slashing_reward = 0;
-    let proposer_slashings = &beacon_block.message.body.proposer_slashings;
-    for proposer_slashing in proposer_slashings {
-        let index = proposer_slashing.signed_header_1.message.proposer_index;
-        let reward = beacon_state.validators[index as usize].effective_balance;
-        proposer_slashing_reward += reward;
-    }
-    proposer_slashing_reward
+    beacon_block
+        .message
+        .body
+        .proposer_slashings
+        .iter()
+        .map(|slashing| {
+            slashing_reward(
+                beacon_state,
+                slashing.signed_header_1.message.proposer_index,
+                slashed,
+            )
+        })
+        .sum()
 }
 
 fn get_attester_slashing_rewards(
     beacon_state: &BeaconState,
     beacon_block: &SignedBeaconBlock,
+    slashed: &mut HashSet<u64>,
 ) -> u64 {
-    let mut attester_slashing_reward = 0;
-    let attester_shashings = &beacon_block.message.body.attester_slashings;
-    let current_epoch = beacon_state.get_current_epoch();
-
-    for attester_shashing in attester_shashings {
-        if let Ok((attestation_indices_1, attestation_indices_2)) =
-            beacon_state.get_slashable_attester_indices(attester_shashing)
+    let mut reward = 0;
+    for attester_slashing in &beacon_block.message.body.attester_slashings {
+        if let Ok((indices_1, indices_2)) =
+            beacon_state.get_slashable_attester_indices(attester_slashing)
         {
-            for index in &attestation_indices_1 & &attestation_indices_2 {
-                let validator = &beacon_state.validators[index as usize];
-                if validator.is_slashable_validator(current_epoch) {
-                    let reward = beacon_state.validators[index as usize].effective_balance
-                        / WHISTLEBLOWER_REWARD_QUOTIENT;
-                    attester_slashing_reward += reward;
-                }
+            let mut indices: Vec<u64> = (&indices_1 & &indices_2).into_iter().collect();
+            indices.sort_unstable();
+            for index in indices {
+                reward += slashing_reward(beacon_state, index, slashed);
             }
         }
     }
+    reward
+}
 
-    attester_slashing_reward
+/// The block's pre-state: the parent's post-state advanced to the block's slot.
+fn get_block_pre_state(
+    db: &BeaconDB,
+    beacon_block: &SignedBeaconBlock,
+) -> Result<BeaconState, ApiError> {
+    let parent_root = beacon_block.message.parent_root;
+    let mut beacon_state = db
+        .state_provider()
+        .get(parent_root)
+        .map_err(|err| ApiError::InternalError(format!("Failed to get parent state: {err:?}")))?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "The pre-state of the block at slot {} is not stored: states before the finalized \
+                 block are pruned",
+                beacon_block.message.slot
+            ))
+        })?;
+    if beacon_state.slot < beacon_block.message.slot {
+        beacon_state
+            .process_slots(beacon_block.message.slot)
+            .map_err(|err| {
+                ApiError::InternalError(format!("Failed to advance the parent state: {err}"))
+            })?;
+    }
+    Ok(beacon_state)
 }
 
 pub async fn get_beacon_block_from_id(
@@ -239,6 +338,17 @@ pub async fn get_block_root(
     Ok(HttpResponse::Ok().json(BeaconResponse::new(RootResponse::new(block_root))))
 }
 
+/// Block, and its post-state, for a block id. A root here is a block root, not a state root.
+/// Standard path of the block rewards endpoint.
+#[get("/beacon/rewards/blocks/{block_id}")]
+pub async fn get_rewards_blocks(
+    db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<BeaconChain>>,
+    block_id: Path<ID>,
+) -> Result<impl Responder, ApiError> {
+    block_rewards(block_id.into_inner(), &db, &beacon_chain).await
+}
+
 /// Called by `/beacon/blocks/{block_id}/rewards` to get the block rewards response
 #[get("/beacon/blocks/{block_id}/rewards")]
 pub async fn get_block_rewards(
@@ -246,13 +356,37 @@ pub async fn get_block_rewards(
     beacon_chain: Data<Arc<BeaconChain>>,
     block_id: Path<ID>,
 ) -> Result<impl Responder, ApiError> {
-    let block_id_value = block_id.into_inner();
-    let beacon_block = get_beacon_block_from_id(block_id_value.clone(), &db, &beacon_chain).await?;
-    let beacon_state = get_state_from_id(block_id_value.clone(), &db).await?;
+    block_rewards(block_id.into_inner(), &db, &beacon_chain).await
+}
 
-    let attestation_reward = get_attestations_rewards(&beacon_state, &beacon_block);
-    let attester_slashing_reward = get_attester_slashing_rewards(&beacon_state, &beacon_block);
-    let proposer_slashing_reward = get_proposer_slashing_rewards(&beacon_state, &beacon_block);
+async fn block_rewards(
+    block_id: ID,
+    db: &BeaconDB,
+    beacon_chain: &BeaconChain,
+) -> Result<HttpResponse, ApiError> {
+    let beacon_block = get_beacon_block_from_id(block_id, db, beacon_chain).await?;
+    let db = db.clone();
+    let response = run_blocking(move || compute_block_rewards(&db, &beacon_block)).await?;
+    Ok(HttpResponse::Ok().json(BeaconResponse::new(response)))
+}
+
+fn compute_block_rewards(
+    db: &BeaconDB,
+    beacon_block: &SignedBeaconBlock,
+) -> Result<BlockRewards, ApiError> {
+    let beacon_state = get_block_pre_state(db, beacon_block)?;
+
+    // Same order as `process_operations`.
+    let mut slashed = HashSet::new();
+    let proposer_slashing_reward =
+        get_proposer_slashing_rewards(&beacon_state, beacon_block, &mut slashed);
+    let attester_slashing_reward =
+        get_attester_slashing_rewards(&beacon_state, beacon_block, &mut slashed);
+    let attestation_reward = beacon_state
+        .attestations_proposer_reward(&beacon_block.message.body.attestations)
+        .map_err(|err| {
+            ApiError::InternalError(format!("Failed to compute attestation rewards: {err}"))
+        })?;
     let (_, proposer_reward) = beacon_state.get_proposer_and_participant_rewards();
 
     let sync_aggregate_reward = beacon_block
@@ -268,16 +402,14 @@ pub async fn get_block_rewards(
         + proposer_slashing_reward
         + attester_slashing_reward;
 
-    let response = BlockRewards {
+    Ok(BlockRewards {
         proposer_index: beacon_block.message.proposer_index,
         total,
         attestations: attestation_reward,
         sync_aggregate: sync_aggregate_reward,
         proposer_slashings: proposer_slashing_reward,
         attester_slashings: attester_slashing_reward,
-    };
-
-    Ok(HttpResponse::Ok().json(BeaconResponse::new(response)))
+    })
 }
 
 /// Called by `/blocks/<block_id>` to get the Beacon Block.
@@ -304,20 +436,34 @@ pub async fn post_sync_committee_rewards(
     block_id: Path<ID>,
     validators: Json<Vec<ValidatorID>>,
 ) -> Result<impl Responder, ApiError> {
-    let block_id_value = block_id.into_inner();
-    let beacon_block = get_beacon_block_from_id(block_id_value.clone(), &db, &beacon_chain).await?;
-    let beacon_state = get_state_from_id(block_id_value.clone(), &db).await?;
+    let block_root = get_block_root_from_id(block_id.into_inner(), &db, &beacon_chain).await?;
+    let beacon_block = get_beacon_block_from_id(ID::Root(block_root), &db, &beacon_chain).await?;
+    let db = db.get_ref().clone();
+    let validators = validators.into_inner();
+    let reward_data = run_blocking(move || {
+        let beacon_state = get_state_by_block_root(&db, block_root)?;
+        sync_committee_rewards(&beacon_state, &beacon_block, &validators)
+    })
+    .await?;
 
-    let sync_committee_rewards_map =
-        match beacon_state.compute_sync_committee_rewards(&beacon_block) {
-            Ok(rewards) => rewards,
-            Err(err) => {
-                error!("Failed to compute sync committee rewards, error: {err:?}");
-                return Err(ApiError::InternalError(format!(
-                    "Failed to compute sync committee rewards, error: {err:?}"
-                )));
-            }
-        };
+    Ok(HttpResponse::Ok().json(BeaconResponse::new(reward_data)))
+}
+
+fn sync_committee_rewards(
+    beacon_state: &BeaconState,
+    beacon_block: &SignedBeaconBlock,
+    validators: &[ValidatorID],
+) -> Result<Option<Vec<ValidatorSyncCommitteeReward>>, ApiError> {
+    let sync_committee_rewards_map = match beacon_state.compute_sync_committee_rewards(beacon_block)
+    {
+        Ok(rewards) => rewards,
+        Err(err) => {
+            error!("Failed to compute sync committee rewards, error: {err:?}");
+            return Err(ApiError::InternalError(format!(
+                "Failed to compute sync committee rewards, error: {err:?}"
+            )));
+        }
+    };
     let sync_committee_rewards: Vec<ValidatorSyncCommitteeReward> = sync_committee_rewards_map
         .into_iter()
         .map(|(validator_index, reward)| ValidatorSyncCommitteeReward {
@@ -349,7 +495,7 @@ pub async fn post_sync_committee_rewards(
         )
     };
 
-    Ok(HttpResponse::Ok().json(BeaconResponse::new(reward_data)))
+    Ok(reward_data)
 }
 
 #[get("/beacon/blind_block/{block_id}")]
@@ -941,7 +1087,11 @@ mod tests {
     use std::path::PathBuf;
 
     use ream_network_spec::networks::initialize_test_network_spec;
+    use ream_operation_pool::OperationPool;
+    use ream_storage::{db::ReamDB, tables::table::REDBTable};
+    use ream_sync_committee_pool::SyncCommitteePool;
     use ssz::Decode;
+    use tempdir::TempDir;
 
     use super::*;
 
@@ -1030,6 +1180,122 @@ mod tests {
         assert_eq!(
             genesis.genesis_validators_root,
             state.genesis_validators_root
+        );
+    }
+
+    fn fixture_state() -> BeaconState {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../../testing/gossip-validation/tests/assets/sepolia/states/\
+             grandparent_state_9552074.ssz_snappy",
+        );
+        let compressed = std::fs::read(path).expect("reads fixture state");
+        let bytes = snap::raw::Decoder::new()
+            .decompress_vec(&compressed)
+            .expect("decompresses fixture state");
+        BeaconState::from_ssz_bytes(&bytes).expect("decodes fixture state")
+    }
+
+    #[tokio::test]
+    async fn rewards_resolve_a_block_root_as_a_block_id() {
+        let temp_dir = TempDir::new("ream_rpc_beacon_block").expect("creates temp directory");
+        let db = ReamDB::new(temp_dir.path().to_path_buf())
+            .expect("creates database")
+            .init_beacon_db()
+            .expect("initializes beacon database");
+        let state = fixture_state();
+        let mut block = SignedBeaconBlock {
+            message: Default::default(),
+            signature: Default::default(),
+        };
+        block.message.slot = state.slot;
+        block.message.state_root = state.tree_hash_root();
+        let block_root = block.message.tree_hash_root();
+        db.block_provider().insert(block_root, block).unwrap();
+        db.state_provider().insert(block_root, state).unwrap();
+        let beacon_chain = BeaconChain::new(
+            db.clone(),
+            Arc::new(OperationPool::default()),
+            Arc::new(SyncCommitteePool::default()),
+            None,
+            None,
+        );
+
+        let resolved = get_block_root_from_id(ID::Root(block_root), &db, &beacon_chain)
+            .await
+            .expect("block root resolves");
+        let state = get_state_by_block_root(&db, resolved).expect("block's post-state");
+
+        assert_eq!(state.slot, fixture_state().slot);
+    }
+
+    #[test]
+    fn old_slots_skip_blocks_of_abandoned_forks() {
+        let temp_dir = TempDir::new("ream_rpc_beacon_block").expect("creates temp directory");
+        let db = ReamDB::new(temp_dir.path().to_path_buf())
+            .expect("creates database")
+            .init_beacon_db()
+            .expect("initializes beacon database");
+        let store = |slot: u64, parent_root: B256| {
+            let mut block = SignedBeaconBlock {
+                message: Default::default(),
+                signature: Default::default(),
+            };
+            block.message.slot = slot;
+            block.message.parent_root = parent_root;
+            let root = block.message.tree_hash_root();
+            db.block_provider().insert(root, block).unwrap();
+            root
+        };
+        let first = store(1, B256::ZERO);
+        let orphan = store(2, first);
+        let head = store(3, first);
+        assert_eq!(db.slot_index_provider().get(2).unwrap(), Some(orphan));
+
+        assert_eq!(canonical_root_from_db(&db, head, 1).unwrap(), Some(first));
+        assert_eq!(canonical_root_from_db(&db, head, 2).unwrap(), None);
+        assert_eq!(canonical_root_from_db(&db, head, 3).unwrap(), Some(head));
+    }
+
+    /// Slots resolve through the head state's block roots, not through whatever block was
+    /// imported last at that slot.
+    #[test]
+    fn slots_resolve_through_the_head_chain() {
+        let state = fixture_state();
+        let head_root = B256::repeat_byte(7);
+        let head_slot = state.slot;
+
+        assert_eq!(
+            latest_block_root_at_or_before(&state, head_root, head_slot),
+            Some(Some(head_root))
+        );
+        assert_eq!(
+            latest_block_root_at_or_before(&state, head_root, head_slot + 1),
+            Some(None)
+        );
+        let slot = head_slot - 3;
+        assert_eq!(
+            latest_block_root_at_or_before(&state, head_root, slot),
+            Some(Some(
+                state.block_roots[(slot % SLOTS_PER_HISTORICAL_ROOT) as usize]
+            ))
+        );
+        assert_eq!(
+            latest_block_root_at_or_before(
+                &state,
+                head_root,
+                head_slot - SLOTS_PER_HISTORICAL_ROOT
+            ),
+            Some(Some(
+                state.block_roots[(head_slot % SLOTS_PER_HISTORICAL_ROOT) as usize]
+            ))
+        );
+        assert_eq!(
+            latest_block_root_at_or_before(
+                &state,
+                head_root,
+                head_slot - SLOTS_PER_HISTORICAL_ROOT - 1
+            ),
+            None
         );
     }
 }

@@ -97,12 +97,17 @@ pub async fn get_state_from_id(state_id: ID, db: &BeaconDB) -> Result<BeaconStat
     .map_err(|err| ApiError::InternalError(format!("Failed to get headers, error: {err:?}")))?
     .ok_or_else(|| ApiError::NotFound(format!("Failed to find `block_root` from {state_id:?}")))?;
 
+    get_state_by_block_root(db, block_root)
+}
+
+/// Post-state of the block with `block_root`.
+pub fn get_state_by_block_root(db: &BeaconDB, block_root: B256) -> Result<BeaconState, ApiError> {
     db.state_provider()
         .get(block_root)
         .map_err(|err| {
-            ApiError::InternalError(format!("Failed to get block by block_root, error: {err:?}"))
+            ApiError::InternalError(format!("Failed to get state by block_root, error: {err:?}"))
         })?
-        .ok_or_else(|| ApiError::NotFound(format!("Failed to find `block_root` from {state_id:?}")))
+        .ok_or_else(|| ApiError::NotFound(format!("Failed to find state for block {block_root}")))
 }
 
 #[get("/beacon/states/{state_id}/root")]

@@ -5,8 +5,8 @@ use crate::handlers::{
     blob_sidecar::get_blob_sidecars,
     block::{
         get_blind_block, get_block_attestations, get_block_from_id, get_block_rewards,
-        get_block_root, get_genesis, post_beacon_block, post_blinded_beacon_block,
-        post_sync_committee_rewards,
+        get_block_root, get_genesis, get_rewards_blocks, post_beacon_block,
+        post_blinded_beacon_block, post_sync_committee_rewards,
     },
     committee::get_committees,
     events::get_events,
@@ -38,6 +38,7 @@ pub fn register_beacon_routes(cfg: &mut ServiceConfig) {
     cfg.service(get_blob_sidecars)
         .service(get_events)
         .service(get_block_rewards)
+        .service(get_rewards_blocks)
         .service(get_block_root)
         .service(get_committees)
         .service(get_genesis)
