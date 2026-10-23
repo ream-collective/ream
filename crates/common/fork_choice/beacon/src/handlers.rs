@@ -5,16 +5,20 @@ use std::{
 
 use alloy_primitives::{B256, map::HashSet};
 use anyhow::{anyhow, ensure};
+use ream_bls::{PublicKey, traits::Verifiable};
 use ream_consensus_beacon::{
     attestation::Attestation,
     attester_slashing::AttesterSlashing,
-    electra::{beacon_block::SignedBeaconBlock, beacon_state::BeaconState},
+    electra::{
+        beacon_block::SignedBeaconBlock,
+        beacon_state::{BeaconState, notify_new_payload},
+    },
     predicates::is_slashable_attestation_data,
 };
 use ream_consensus_misc::{
     checkpoint::Checkpoint,
-    constants::beacon::MIN_SEED_LOOKAHEAD,
-    misc::{compute_epoch_at_slot, compute_start_slot_at_epoch},
+    constants::beacon::{DOMAIN_BEACON_PROPOSER, MIN_SEED_LOOKAHEAD},
+    misc::{compute_epoch_at_slot, compute_signing_root, compute_start_slot_at_epoch},
 };
 use ream_data_availability::PendingBlock;
 use ream_execution_engine::engine_trait::ExecutionApi;
@@ -31,6 +35,7 @@ use ream_storage::{
         table::REDBTable,
     },
 };
+use tokio::task::JoinSet;
 use tree_hash::TreeHash;
 
 use crate::store::{
@@ -45,10 +50,10 @@ pub enum OnBlockOutcome {
 }
 
 /// Run ``on_block`` upon receiving a new block.
-pub async fn on_block(
+pub async fn on_block<E: ExecutionApi + Clone + Send + Sync + 'static>(
     store: &mut Store,
     signed_block: &SignedBeaconBlock,
-    execution_engine: &Option<impl ExecutionApi>,
+    execution_engine: &Option<E>,
     verify_data_availability: bool,
 ) -> anyhow::Result<OnBlockOutcome> {
     let block_root = signed_block.message.tree_hash_root();
@@ -62,13 +67,33 @@ pub async fn on_block(
     .await
 }
 
+/// Sends the block's payload to the execution engine once its proposer signature is checked, so
+/// blocks that skipped gossip validation, as in range sync, cannot make the engine work unsigned.
+async fn check_signed_payload(
+    engine: &impl ExecutionApi,
+    signed_block: &SignedBeaconBlock,
+    proposer_key: &PublicKey,
+    domain: B256,
+) -> anyhow::Result<bool> {
+    let header = signed_block.signed_header();
+    let signing_root = compute_signing_root(&header.message, domain);
+    ensure!(
+        header
+            .signature
+            .verify(proposer_key, signing_root.as_ref())?,
+        "Invalid block signature"
+    );
+    let block = &signed_block.message;
+    notify_new_payload(engine, &block.body, block.parent_root, block.slot).await
+}
+
 /// ``on_block`` for a block whose root the caller already computed. Hashing a mainnet block
 /// hashes its whole execution payload, a few milliseconds each time.
-pub async fn on_block_with_root(
+pub async fn on_block_with_root<E: ExecutionApi + Clone + Send + Sync + 'static>(
     store: &mut Store,
     signed_block: &SignedBeaconBlock,
     block_root: B256,
-    execution_engine: &Option<impl ExecutionApi>,
+    execution_engine: &Option<E>,
     verify_data_availability: bool,
 ) -> anyhow::Result<OnBlockOutcome> {
     let block = &signed_block.message;
@@ -148,10 +173,34 @@ pub async fn on_block_with_root(
         ),
     };
     let state_loaded = started.elapsed();
+
+    // The execution engine checks the payload while the consensus state transition runs, as
+    // Lighthouse and Prysm do; the block is only imported once both pass. Dropping the set aborts
+    // the check, so a failed or cancelled import leaves no request behind.
+    let mut payload_check = JoinSet::new();
+    if let Some(engine) = execution_engine.clone() {
+        // Validators and the fork do not change before the block, so the pre-state gives the
+        // proposer's key and domain the transition checks the signature with.
+        let proposer_key = state
+            .validators
+            .get(block.proposer_index as usize)
+            .ok_or_else(|| anyhow!("Invalid block proposer index"))?
+            .public_key
+            .clone();
+        let domain = state.get_domain(DOMAIN_BEACON_PROPOSER, Some(block_epoch));
+        let signed_block = signed_block.clone();
+        payload_check.spawn(async move {
+            check_signed_payload(&engine, &signed_block, &proposer_key, domain).await
+        });
+        // The new task waits in this worker's LIFO slot, which other workers do not steal, so let
+        // it send the request before the state transition holds the worker.
+        tokio::task::yield_now().await;
+    }
+
     let state_transition_timer = BEACON_BLOCK_STATE_TRANSITION_SECONDS.start_timer();
     let epoch_start_state = if advanced_pre_state {
         state
-            .state_transition_from_epoch_start(signed_block, true, execution_engine)
+            .state_transition_from_epoch_start(signed_block, true, &None::<E>)
             .await?;
         epoch_start_state
     } else {
@@ -159,7 +208,7 @@ pub async fn on_block_with_root(
             .state_transition_keeping_epoch_start(
                 signed_block,
                 true,
-                execution_engine,
+                &None::<E>,
                 Some(parent_block.state_root),
             )
             .await?
@@ -167,12 +216,17 @@ pub async fn on_block_with_root(
     };
     state_transition_timer.observe_duration();
     let transitioned = started.elapsed();
+    if let Some(payload_valid) = payload_check.join_next().await {
+        ensure!(payload_valid??, "Execution payload is not valid");
+    }
+    let payload_checked = started.elapsed();
     tracing::debug!(
         target: "ream::timing",
         slot = block_slot,
         checks_and_state_load_ms = state_loaded.as_millis() as u64,
         state_transition_ms = (transitioned - state_loaded).as_millis() as u64,
         advanced_pre_state,
+        payload_wait_ms = (payload_checked - transitioned).as_millis() as u64,
         "timing: on_block"
     );
     // The checkpoint state of the block's epoch is at hand in two cases: the block is at the
@@ -611,22 +665,40 @@ pub fn shares_target_shuffling(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use alloy_primitives::B256;
-    use ream_consensus_beacon::electra::beacon_block::{BeaconBlock, SignedBeaconBlock};
-    use ream_consensus_misc::checkpoint::Checkpoint;
+    use async_trait::async_trait;
+    use ream_consensus_beacon::electra::{
+        beacon_block::{BeaconBlock, SignedBeaconBlock},
+        beacon_state::BeaconState,
+    };
+    use ream_consensus_misc::{
+        checkpoint::Checkpoint, constants::beacon::DOMAIN_BEACON_PROPOSER,
+        misc::compute_epoch_at_slot,
+    };
+    use ream_execution_engine::{
+        engine_trait::ExecutionApi, new_payload_request::NewPayloadRequest,
+    };
+    use ream_execution_rpc_types::get_blobs::{BlobAndProofV1, BlobAndProofV2};
     use ream_network_spec::networks::initialize_test_network_spec;
     use ream_operation_pool::OperationPool;
     use ream_storage::{
         db::ReamDB,
         tables::{field::REDBField, table::REDBTable},
     };
+    use ssz::Decode;
     use tempdir::TempDir;
 
     use super::{
-        Store, get_proposer_boost_root, get_time_at_slot, is_on_chain_of, is_same_dependent_root,
-        shares_target_shuffling,
+        Store, check_signed_payload, get_proposer_boost_root, get_time_at_slot, is_on_chain_of,
+        is_same_dependent_root, shares_target_shuffling,
     };
 
     fn block(slot: u64, parent_root: B256) -> SignedBeaconBlock {
@@ -850,5 +922,82 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    /// Counts the payloads it is sent.
+    #[derive(Default)]
+    struct CountingEngine {
+        new_payloads: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ExecutionApi for CountingEngine {
+        async fn verify_and_notify_new_payload(
+            &self,
+            _new_payload_request: NewPayloadRequest,
+        ) -> anyhow::Result<bool> {
+            self.new_payloads.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        }
+
+        async fn engine_get_blobs_v1(
+            &self,
+            _blob_version_hashes: Vec<B256>,
+        ) -> anyhow::Result<Vec<Option<BlobAndProofV1>>> {
+            unimplemented!()
+        }
+
+        async fn engine_get_blobs_v2(
+            &self,
+            _blob_version_hashes: Vec<B256>,
+        ) -> anyhow::Result<Option<Vec<BlobAndProofV2>>> {
+            unimplemented!()
+        }
+
+        async fn engine_get_blobs_v3(
+            &self,
+            _blob_version_hashes: Vec<B256>,
+        ) -> anyhow::Result<Option<Vec<Option<BlobAndProofV2>>>> {
+            unimplemented!()
+        }
+    }
+
+    fn sepolia_asset<T: Decode>(path: &str) -> T {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../testing/gossip-validation/tests/assets/sepolia")
+            .join(path);
+        let bytes = snap::raw::Decoder::new()
+            .decompress_vec(&std::fs::read(path).unwrap())
+            .unwrap();
+        T::from_ssz_bytes(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_engine_only_sees_payloads_of_correctly_signed_blocks() {
+        let state: BeaconState = sepolia_asset("states/grandparent_state_9552074.ssz_snappy");
+        let mut signed_block: SignedBeaconBlock = sepolia_asset("blocks/parent_9552075.ssz_snappy");
+        let proposer_key = state.validators[signed_block.message.proposer_index as usize]
+            .public_key
+            .clone();
+        let domain = state.get_domain(
+            DOMAIN_BEACON_PROPOSER,
+            Some(compute_epoch_at_slot(signed_block.message.slot)),
+        );
+        let engine = CountingEngine::default();
+
+        assert!(
+            check_signed_payload(&engine, &signed_block, &proposer_key, domain)
+                .await
+                .unwrap()
+        );
+        assert_eq!(engine.new_payloads.load(Ordering::SeqCst), 1);
+
+        signed_block.message.state_root = B256::repeat_byte(1);
+        assert!(
+            check_signed_payload(&engine, &signed_block, &proposer_key, domain)
+                .await
+                .is_err()
+        );
+        assert_eq!(engine.new_payloads.load(Ordering::SeqCst), 1);
     }
 }
