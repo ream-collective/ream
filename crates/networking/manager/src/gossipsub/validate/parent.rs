@@ -30,7 +30,7 @@ fn load_imported_parent(db: &BeaconDB, parent_root: B256) -> anyhow::Result<Opti
 }
 
 /// Looks up `parent_root` among imported blocks, then among blocks pending data availability.
-/// Loading can rebuild a state, so it runs on a blocking thread, never under the store lock.
+/// Loading can rebuild a state, so it runs on a blocking thread, first without the store lock.
 pub async fn find_parent(
     beacon_chain: &BeaconChain,
     parent_root: B256,
@@ -43,22 +43,21 @@ pub async fn find_parent(
         return Ok(Some(parent));
     }
 
-    {
-        let store = beacon_chain.store.lock().await;
-        if let Some(pending) = store.data_availability_checker.pending_block(&parent_root) {
-            if pending.signed_block.message.tree_hash_root() != parent_root {
-                return Err(anyhow!(
-                    "pending availability block root does not match lookup key"
-                ));
-            }
-            return Ok(Some(ParentBlock::PendingAvailability {
-                block: pending.signed_block.clone(),
-                state: Arc::new(pending.post_state.clone()),
-            }));
+    let store = beacon_chain.store.lock().await;
+    if let Some(pending) = store.data_availability_checker.pending_block(&parent_root) {
+        if pending.signed_block.message.tree_hash_root() != parent_root {
+            return Err(anyhow!(
+                "pending availability block root does not match lookup key"
+            ));
         }
+        return Ok(Some(ParentBlock::PendingAvailability {
+            block: pending.signed_block.clone(),
+            state: Arc::new(pending.post_state.clone()),
+        }));
     }
-    // The store lock waited out any import of the parent, so its state is visible now.
-    load_imported_parent_blocking(beacon_chain.db(), parent_root).await
+    // Under the store lock an import of the parent has finished or not begun, so its block and
+    // state are both visible or both missing. A just-imported state is still in memory.
+    load_imported_parent_blocking(&store.db, parent_root).await
 }
 
 async fn load_imported_parent_blocking(
