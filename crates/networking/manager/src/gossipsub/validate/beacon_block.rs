@@ -6,10 +6,11 @@ use ream_consensus_beacon::electra::{beacon_block::SignedBeaconBlock, beacon_sta
 use ream_consensus_misc::misc::{compute_epoch_at_slot, compute_start_slot_at_epoch};
 #[cfg(not(feature = "disable_ancestor_validation"))]
 use ream_fork_choice_beacon::store::get_checkpoint_block_from_db;
-use ream_fork_choice_beacon::store::get_current_slot_from_db;
+use ream_fork_choice_beacon::store::{get_current_slot_at, get_current_slot_from_db};
 use ream_network_spec::networks::{BeaconNetworkSpec, beacon_network_spec};
 use ream_storage::{
     cache::{AddressSlotIdentifier, BeaconCacheDB},
+    db::beacon::BeaconDB,
     tables::field::REDBField,
 };
 
@@ -45,12 +46,34 @@ struct ParentContext {
     pending_availability: bool,
 }
 
+/// Where the future-slot checks read the current time from.
+#[derive(Clone, Copy)]
+enum SlotClock {
+    /// The store's time, which `on_tick` advances under the store lock.
+    Store,
+    /// Whole seconds since the Unix epoch, supplied by the caller.
+    Wall(u64),
+}
+
+impl SlotClock {
+    fn current_slot(self, db: &BeaconDB) -> anyhow::Result<u64> {
+        match self {
+            Self::Store => get_current_slot_from_db(db),
+            Self::Wall(time) => get_current_slot_at(db, time),
+        }
+    }
+}
+
+/// Validates a block received over gossip. `now` is the wall-clock time, in whole seconds, that the
+/// future-slot checks use, so validation does not first have to bring the store's own clock up to
+/// date, which takes the store lock that an import in progress holds.
 pub async fn validate_gossip_beacon_block(
     beacon_chain: &BeaconChain,
     cached_db: &BeaconCacheDB,
     block: &SignedBeaconBlock,
+    now: u64,
 ) -> anyhow::Result<DependencyValidationResult<GossipValidatedBlock>> {
-    validate_block_with_parent(beacon_chain, cached_db, block, true).await
+    validate_block_with_parent(beacon_chain, cached_db, block, true, SlotClock::Wall(now)).await
 }
 
 /// ``validate_gossip_beacon_block`` for a block an unknown-parent lookup releases once its parent
@@ -62,7 +85,7 @@ pub async fn validate_lookup_beacon_block(
     cached_db: &BeaconCacheDB,
     block: &SignedBeaconBlock,
 ) -> anyhow::Result<DependencyValidationResult<GossipValidatedBlock>> {
-    validate_block_with_parent(beacon_chain, cached_db, block, false).await
+    validate_block_with_parent(beacon_chain, cached_db, block, false, SlotClock::Store).await
 }
 
 async fn validate_block_with_parent(
@@ -70,10 +93,11 @@ async fn validate_block_with_parent(
     cached_db: &BeaconCacheDB,
     block: &SignedBeaconBlock,
     enforce_first_seen: bool,
+    clock: SlotClock,
 ) -> anyhow::Result<DependencyValidationResult<GossipValidatedBlock>> {
     let db = beacon_chain.db();
 
-    if block.message.slot > get_current_slot_from_db(db)? {
+    if block.message.slot > clock.current_slot(db)? {
         return Ok(DependencyValidationResult::Ignore(
             "Block is from a future slot".to_string(),
         ));
@@ -124,6 +148,7 @@ async fn validate_block_with_parent(
         &parent.state,
         &parent,
         enforce_first_seen,
+        clock,
     )
     .await?
     {
@@ -173,11 +198,12 @@ async fn validate_beacon_block(
     state: &BeaconState,
     parent: &ParentContext,
     enforce_first_seen: bool,
+    clock: SlotClock,
 ) -> anyhow::Result<ValidationResult> {
     let db = beacon_chain.db();
 
     // [IGNORE] The block is not from a future slot.
-    if block.message.slot > get_current_slot_from_db(db)? {
+    if block.message.slot > clock.current_slot(db)? {
         return Ok(ValidationResult::Ignore(
             "Block is from a future slot".to_string(),
         ));

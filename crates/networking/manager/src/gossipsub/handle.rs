@@ -251,15 +251,52 @@ fn dependency_message_acceptance(
     }
 }
 
+/// The wall-clock time in whole seconds, rounded up: store time has whole-second resolution.
+pub fn wall_clock_secs() -> u64 {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("System time is before UNIX epoch");
+    duration.as_secs() + u64::from(duration.subsec_nanos() > 0)
+}
+
+/// Imports the block that [`handle_gossipsub_message`] left in `valid_block`, if there is one. Call
+/// it once the block's acceptance is reported, so that propagation does not wait for the import.
+pub async fn import_valid_block(
+    beacon_chain: &BeaconChain,
+    valid_block: Option<SignedBeaconBlock>,
+) {
+    let Some(block) = valid_block else {
+        return;
+    };
+    // Store time must reach the block's slot before the block can be imported. The tick takes the
+    // store lock, which an import in progress holds, so it runs here and not before validation.
+    if let Err(err) = beacon_chain.process_tick(wall_clock_secs()).await {
+        warn!("Failed to process tick before importing gossipsub beacon block: {err}");
+    }
+    match beacon_chain.process_block(block).await {
+        Ok(BlockProcessingOutcome::Imported { .. }) => {}
+        Ok(BlockProcessingOutcome::PendingAvailability { .. }) => {}
+        Err(err) => {
+            error!("Failed to process gossipsub beacon block: {err}");
+        }
+    }
+}
+
 /// Dispatches a gossipsub message to its appropriate handler. `on_valid_block` gets each block
 /// that passed gossip validation, before its import starts. The result is counted by topic kind:
 /// gossipsub scores peers down for every REJECT, so the count shows how often that happens.
+///
+/// A block that passed validation is not imported here: it is left in `valid_block` and the
+/// returned acceptance is `Accept`. The caller reports the acceptance first, so that the block
+/// propagates while it imports, and then calls [`import_valid_block`].
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_gossipsub_message(
     message: Message,
     beacon_chain: &BeaconChain,
     cached_db: &BeaconCacheDB,
     pending_item: &mut Option<PendingGossipItem>,
     unknown_parent_block: &mut Option<UnknownParentGossipBlock>,
+    valid_block: &mut Option<SignedBeaconBlock>,
     propagation_source: PeerId,
     on_valid_block: impl FnOnce(&SignedBeaconBlock),
 ) -> MessageAcceptance {
@@ -272,6 +309,7 @@ pub async fn handle_gossipsub_message(
         cached_db,
         pending_item,
         unknown_parent_block,
+        valid_block,
         propagation_source,
         on_valid_block,
     )
@@ -285,12 +323,14 @@ pub async fn handle_gossipsub_message(
     acceptance
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_gossipsub_message(
     message: Message,
     beacon_chain: &BeaconChain,
     cached_db: &BeaconCacheDB,
     pending_item: &mut Option<PendingGossipItem>,
     unknown_parent_block: &mut Option<UnknownParentGossipBlock>,
+    valid_block: &mut Option<SignedBeaconBlock>,
     propagation_source: PeerId,
     on_valid_block: impl FnOnce(&SignedBeaconBlock),
 ) -> MessageAcceptance {
@@ -303,21 +343,11 @@ async fn dispatch_gossipsub_message(
                     signed_block.message.block_root()
                 );
 
-                let tick_time = {
-                    let duration = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .expect("System time is before UNIX epoch");
-                    duration.as_secs() + u64::from(duration.subsec_nanos() > 0)
-                };
-                if let Err(err) = beacon_chain.process_tick(tick_time).await {
-                    warn!("Failed to process gossipsub tick before block validation: {err}");
-                    return MessageAcceptance::Ignore;
-                }
-
                 let validation_result = match validate_gossip_beacon_block(
                     beacon_chain,
                     cached_db,
                     &signed_block,
+                    wall_clock_secs(),
                 )
                 .await
                 {
@@ -335,13 +365,7 @@ async fn dispatch_gossipsub_message(
                             log_block_proposer(genesis_time, &signed_block);
                         }
                         on_valid_block(&signed_block);
-                        match beacon_chain.process_block(*signed_block).await {
-                            Ok(BlockProcessingOutcome::Imported { .. }) => {}
-                            Ok(BlockProcessingOutcome::PendingAvailability { .. }) => {}
-                            Err(err) => {
-                                error!("Failed to process gossipsub beacon block: {err}");
-                            }
-                        }
+                        *valid_block = Some(*signed_block);
                     }
                     DependencyValidationResult::Ignore(reason) => {
                         warn!("Ignoring gossipsub beacon block: {reason}");
@@ -968,12 +992,14 @@ mod tests {
         };
         let mut pending_item = None;
         let mut unknown_parent_block = None;
+        let mut valid_block = None;
         let acceptance = handle_gossipsub_message(
             message,
             &beacon_chain,
             &cached_db,
             &mut pending_item,
             &mut unknown_parent_block,
+            &mut valid_block,
             PeerId::random(),
             |_| {},
         )
