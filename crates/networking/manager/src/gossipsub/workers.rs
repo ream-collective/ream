@@ -17,7 +17,7 @@ use tokio::{
 };
 use tracing::{debug, error};
 
-use super::handle::{UnknownParentGossipBlock, handle_gossipsub_message};
+use super::handle::{UnknownParentGossipBlock, handle_gossipsub_message, import_valid_block};
 use crate::{block_lookup::PendingGossipItem, p2p_sender::P2PSender};
 
 /// Messages waiting for a worker. A full queue sheds new messages as IGNORE, which does not
@@ -156,12 +156,14 @@ impl GossipWorkers {
                     .expect("the gossip worker budget is never closed");
                 let mut pending_item = None;
                 let mut unknown_parent_block = None;
+                let mut valid_block = None;
                 let acceptance = handle_gossipsub_message(
                     work.message,
                     &beacon_chain,
                     &cached_db,
                     &mut pending_item,
                     &mut unknown_parent_block,
+                    &mut valid_block,
                     work.propagation_source,
                     |_| {},
                 )
@@ -179,6 +181,7 @@ impl GossipWorkers {
                     work.propagation_source,
                     acceptance,
                 );
+                import_valid_block(&beacon_chain, valid_block).await;
             }
         });
         Self {
@@ -213,21 +216,25 @@ impl GossipWorkers {
             async move {
                 let mut pending_item = None;
                 let mut unknown_parent_block = None;
+                let mut valid_block = None;
                 let acceptance = handle_gossipsub_message(
                     work.message,
                     &beacon_chain,
                     &cached_db,
                     &mut pending_item,
                     &mut unknown_parent_block,
+                    &mut valid_block,
                     work.propagation_source,
                     |block| on_valid_block(block),
                 )
                 .await;
+                // The block propagates while it imports.
                 p2p_sender.report_gossip_validation(
                     work.message_id,
                     work.propagation_source,
                     acceptance,
                 );
+                import_valid_block(&beacon_chain, valid_block).await;
                 if let Some(block) = unknown_parent_block
                     && unknown_parents
                         .send(UnknownParentWork {
