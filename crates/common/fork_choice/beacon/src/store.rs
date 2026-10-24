@@ -260,24 +260,6 @@ pub struct Store {
     pruning_voluntary_exits: Arc<AtomicBool>,
 }
 
-/// The justified checkpoint of a block of `epoch` whose parent is `parent_root`, without its
-/// state: the epoch processing into `epoch` realized the unrealized justification of the
-/// chain's last block of the previous epoch. `None` when that block is not in `inserted` or the
-/// previous epoch had no block.
-fn realized_from_previous_epoch(
-    inserted: &HashMap<B256, ForkChoiceBlock>,
-    parent_root: B256,
-    epoch: u64,
-) -> Option<Checkpoint> {
-    let epoch_start = compute_start_slot_at_epoch(epoch);
-    let mut ancestor = inserted.get(&parent_root)?;
-    while ancestor.slot >= epoch_start {
-        ancestor = inserted.get(&ancestor.parent_root)?;
-    }
-    (compute_epoch_at_slot(ancestor.slot) + 1 == epoch)
-        .then_some(ancestor.unrealized_justified_checkpoint)
-}
-
 impl Store {
     pub fn new(
         db: BeaconDB,
@@ -512,11 +494,7 @@ impl Store {
         let justified_checkpoint = self.db.justified_checkpoint_provider().get()?;
         let current_epoch = self.get_current_store_epoch()?;
 
-        let started = std::time::Instant::now();
-        let mut inserted = HashMap::new();
-        let anchor =
-            self.fork_choice_block_from_db(finalized_checkpoint.root, current_epoch, &inserted)?;
-        inserted.insert(anchor.root, anchor);
+        let anchor = self.fork_choice_block_from_db(finalized_checkpoint.root, current_epoch)?;
         let mut tree = ForkChoiceTree::new(
             anchor,
             ViabilityContext {
@@ -535,17 +513,10 @@ impl Store {
                 .get(parent_root)?
                 .unwrap_or_default();
             for child_root in children {
-                let block = self.fork_choice_block_from_db(child_root, current_epoch, &inserted)?;
-                inserted.insert(child_root, block);
-                tree.insert(block)?;
+                tree.insert(self.fork_choice_block_from_db(child_root, current_epoch)?)?;
                 queue.push_back(child_root);
             }
         }
-        tracing::info!(
-            blocks = inserted.len(),
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "Built the fork choice tree"
-        );
 
         // Balances must be loaded before votes so they are counted with the right weight.
         self.reconcile_fork_choice_tree(&mut tree)?;
@@ -728,12 +699,10 @@ impl Store {
         Ok(())
     }
 
-    /// `inserted` holds the blocks already in the tree, which are this block's ancestors.
     fn fork_choice_block_from_db(
         &self,
         root: B256,
         current_epoch: u64,
-        inserted: &HashMap<B256, ForkChoiceBlock>,
     ) -> anyhow::Result<ForkChoiceBlock> {
         let block = self
             .db
@@ -742,16 +711,11 @@ impl Store {
             .ok_or_else(|| anyhow!("block {root} not found"))?
             .message;
         let unrealized = self.db.unrealized_justifications_provider().get(root)?;
-        let block_epoch = compute_epoch_at_slot(block.slot);
-        let realized = if block_epoch >= current_epoch {
-            match realized_from_previous_epoch(inserted, block.parent_root, block_epoch) {
-                Some(realized) => Some(realized),
-                None => self
-                    .db
-                    .state_provider()
-                    .get_shared(root)?
-                    .map(|state| state.current_justified_checkpoint),
-            }
+        let realized = if compute_epoch_at_slot(block.slot) >= current_epoch {
+            self.db
+                .state_provider()
+                .get_shared(root)?
+                .map(|state| state.current_justified_checkpoint)
         } else {
             None
         };
@@ -1396,6 +1360,13 @@ pub fn get_current_slot_from_db(db: &BeaconDB) -> anyhow::Result<u64> {
     Ok(GENESIS_SLOT + get_slots_since_genesis_from_db(db)?)
 }
 
+/// The slot that `time`, in whole seconds since the Unix epoch, falls in. Unlike
+/// [`get_current_slot_from_db`] it does not read the store's clock, which only `on_tick` advances
+/// and which therefore takes the store lock to bring up to date.
+pub fn get_current_slot_at(db: &BeaconDB, time: u64) -> anyhow::Result<u64> {
+    Ok(GENESIS_SLOT + get_slots_since_genesis_at(time, db.genesis_time_provider().get()?))
+}
+
 /// Finds the ancestor of `root` at or before `slot` using only database reads, so callers that do
 /// not hold the [`Store`] can walk ancestry.
 pub fn get_ancestor_from_db(db: &BeaconDB, mut root: B256, slot: u64) -> anyhow::Result<B256> {
@@ -1478,45 +1449,6 @@ mod tests {
     use tempdir::TempDir;
 
     use super::*;
-
-    #[test]
-    fn a_blocks_justification_comes_from_the_previous_epochs_last_block() {
-        let checkpoint = |epoch| Checkpoint {
-            epoch,
-            root: B256::repeat_byte(epoch as u8),
-        };
-        let block = |byte: u8, parent: u8, slot, unrealized| ForkChoiceBlock {
-            root: B256::repeat_byte(byte),
-            parent_root: B256::repeat_byte(parent),
-            slot,
-            justified_checkpoint: checkpoint(0),
-            unrealized_justified_checkpoint: checkpoint(unrealized),
-        };
-        // Epoch 1 ends with block 2 at slot 63; blocks 3 and 4 are in epoch 2, block 5 in epoch 4.
-        let inserted = [
-            block(1, 0, 40, 1),
-            block(2, 1, 63, 2),
-            block(3, 2, 64, 3),
-            block(4, 3, 70, 3),
-        ]
-        .into_iter()
-        .map(|block| (block.root, block))
-        .collect::<HashMap<_, _>>();
-        let root = |byte| B256::repeat_byte(byte);
-
-        assert_eq!(
-            realized_from_previous_epoch(&inserted, root(4), 2),
-            Some(checkpoint(2))
-        );
-        assert_eq!(
-            realized_from_previous_epoch(&inserted, root(2), 2),
-            Some(checkpoint(2))
-        );
-        // Epoch 3 had no block on this chain, so the state is needed.
-        assert_eq!(realized_from_previous_epoch(&inserted, root(4), 4), None);
-        // A parent outside the tree, such as the anchor's.
-        assert_eq!(realized_from_previous_epoch(&inserted, root(9), 2), None);
-    }
 
     fn test_db() -> (BeaconDB, TempDir) {
         let temp_dir = TempDir::new("ream_fork_choice_beacon_store").unwrap();
