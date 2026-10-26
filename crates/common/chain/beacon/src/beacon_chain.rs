@@ -30,6 +30,7 @@ use ream_execution_rpc_types::{
     execution_payload::WithdrawalV1,
     forkchoice_update::{ForkchoiceStateV1, PayloadAttributesV3},
     get_blobs::{Blob, BlobAndProofV2},
+    payload_status::PayloadStatus,
 };
 use ream_fork_choice_beacon::{
     data_availability::{DataAvailabilityChecker, PendingBlock},
@@ -187,7 +188,7 @@ pub struct BeaconChain {
     pub execution_engine: Option<ExecutionEngine>,
     pub event_sender: Option<broadcast::Sender<BeaconEvent>>,
     block_import_sender: broadcast::Sender<BlockImportEvent>,
-    execution_forkchoice: Mutex<Option<ForkchoiceStateV1>>,
+    execution_forkchoice: Mutex<Option<SentForkchoice>>,
     force_data_availability_checks: bool,
     /// Blocks with a reconstruction announced and not finished, so each is announced once.
     reconstructions: parking_lot::Mutex<HashSet<B256>>,
@@ -216,6 +217,13 @@ struct QueuedVote {
 
 /// More votes than several slots of gossip on mainnet; the oldest are dropped beyond this.
 const MAX_QUEUED_VOTES: usize = 1 << 17;
+
+/// The last forkchoice state sent to the execution client, and whether it answered VALID.
+#[derive(Clone, Copy)]
+struct SentForkchoice {
+    state: ForkchoiceStateV1,
+    settled: bool,
+}
 
 impl BeaconChain {
     /// Creates a new instance of `BeaconChain`.
@@ -647,7 +655,10 @@ impl BeaconChain {
         let response = execution_engine
             .engine_forkchoice_updated_v3(forkchoice_state, Some(attributes))
             .await?;
-        *last_forkchoice = Some(forkchoice_state);
+        *last_forkchoice = Some(SentForkchoice {
+            state: forkchoice_state,
+            settled: response.payload_status.status == PayloadStatus::Valid,
+        });
         drop(last_forkchoice);
         let payload_id = response.payload_id.ok_or_else(|| {
             anyhow!(
@@ -728,7 +739,10 @@ impl BeaconChain {
         let Some(forkchoice_state) = self.build_forkchoice_state() else {
             return;
         };
-        if last_forkchoice.as_ref() == Some(&forkchoice_state) {
+        // Only a head the execution client accepted is settled. While it is syncing, for example
+        // after a restart that lost its newest blocks, it must keep hearing the head every slot
+        // tick, or it never learns what to sync to.
+        if last_forkchoice.is_some_and(|sent| sent.settled && sent.state == forkchoice_state) {
             return;
         }
 
@@ -737,7 +751,10 @@ impl BeaconChain {
             .await
         {
             Ok(result) => {
-                *last_forkchoice = Some(forkchoice_state);
+                *last_forkchoice = Some(SentForkchoice {
+                    state: forkchoice_state,
+                    settled: result.payload_status.status == PayloadStatus::Valid,
+                });
                 debug!(
                     "Forkchoice updated: execution engine reported {:?}",
                     result.payload_status.status
@@ -1714,6 +1731,38 @@ mod tests {
             None,
         );
         (data_dir, chain)
+    }
+
+    /// A syncing execution client keeps hearing the head every tick; a valid one only on change.
+    #[tokio::test]
+    async fn forkchoice_is_sent_again_until_the_execution_client_reports_valid() {
+        let (data_dir, mut chain, _) = test_chain_with_anchor(fixture_state());
+        let server = ream_mock_execution_engine::server::MockExecutionServer::start(B256::ZERO);
+        let jwt = data_dir.path().join("jwt.hex");
+        std::fs::write(
+            &jwt,
+            "0x2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a",
+        )
+        .expect("jwt secret should be written");
+        chain.execution_engine =
+            Some(ExecutionEngine::new(server.url(), jwt).expect("engine should be built"));
+        let generator = server.generator();
+        let updates = || generator.lock().unwrap().forkchoice_updates;
+
+        generator.lock().unwrap().forkchoice_status = "SYNCING";
+        chain.update_execution_forkchoice(true).await;
+        chain.update_execution_forkchoice(false).await;
+        assert_eq!(updates(), 2, "a syncing client must hear the head again");
+
+        generator.lock().unwrap().forkchoice_status = "VALID";
+        chain.update_execution_forkchoice(false).await;
+        chain.update_execution_forkchoice(false).await;
+        assert_eq!(
+            updates(),
+            3,
+            "an unchanged head is sent once the client is valid"
+        );
+        server.stop().await;
     }
 
     #[test]

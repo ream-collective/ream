@@ -95,6 +95,10 @@ pub struct ExecutionBlockGenerator {
     pending_blobs: HashMap<B256, Vec<(Blob, KZGCommitment)>>,
     blobs_by_versioned_hash: HashMap<B256, Blob>,
     next_blob_seed: u8,
+    /// Reported for every forkchoice update, so tests can play a syncing execution client.
+    pub forkchoice_status: &'static str,
+    /// How many forkchoice updates were received.
+    pub forkchoice_updates: usize,
 }
 
 impl ExecutionBlockGenerator {
@@ -121,6 +125,8 @@ impl ExecutionBlockGenerator {
             pending_blobs: HashMap::new(),
             blobs_by_versioned_hash: HashMap::new(),
             next_blob_seed: 0,
+            forkchoice_status: "VALID",
+            forkchoice_updates: 0,
         }
     }
 
