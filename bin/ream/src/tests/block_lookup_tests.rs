@@ -26,8 +26,7 @@ use ream_fork_choice_beacon::data_availability::{
     AvailabilityEntryStatus, DataAvailabilityChecker,
 };
 use ream_light_client::{
-    finality_update::LightClientFinalityUpdate, header::LightClientHeader,
-    optimistic_update::LightClientOptimisticUpdate,
+    header::LightClientHeader, optimistic_update::LightClientOptimisticUpdate,
 };
 use ream_mock_execution_engine::block_generator::{
     genesis_execution_payload, sample_blob_and_commitment,
@@ -1833,50 +1832,41 @@ async fn test_rpc_column_fetch_rechecks_finality_before_import() {
 
 #[tokio::test]
 #[serial]
-async fn test_a_valid_light_client_update_is_accepted_for_forwarding() {
-    let (mut harness, _genesis_state, _genesis_block) =
+async fn test_only_the_locally_computed_light_client_update_is_forwarded() {
+    let (mut harness, genesis_state, genesis_block) =
         GossipLookupHarness::new("light_client_update_acceptance").await;
-    let mut attested_header = LightClientHeader::default();
-    attested_header.beacon.slot = 1;
-    *harness
-        .cached_db
-        .forwarded_light_client_finality_update
-        .write()
-        .await = Some(LightClientFinalityUpdate {
-        attested_header: attested_header.clone(),
-        finalized_header: LightClientHeader::default(),
-        finality_branch: Default::default(),
-        sync_aggregate: Default::default(),
-        signature_slot: 0,
-    });
-    let update = LightClientOptimisticUpdate {
-        attested_header,
-        sync_aggregate: Default::default(),
-        signature_slot: 0,
-    };
-
-    // Gossipsub forwards only what the handler reports as ACCEPT; the handler publishes nothing.
-    let (acceptance, _) = harness
-        .deliver(
-            GossipTopicKind::LightClientOptimisticUpdate,
-            update.as_ssz_bytes(),
-        )
-        .await;
+    harness.wait_for_slot(2).await;
+    let (block, _) = build_block_without_blobs(&genesis_state, &genesis_block, 1).await;
+    let (acceptance, _) = harness.deliver_block(&block).await;
     assert!(
         matches!(acceptance, MessageAcceptance::Accept),
-        "expected Accept, got {acceptance:?}"
+        "got {acceptance:?}"
     );
-    assert!(harness.p2p_receiver.try_recv().is_err());
 
-    // A copy for an already forwarded slot is not forwarded again.
-    let (acceptance, _) = harness
-        .deliver(
-            GossipTopicKind::LightClientOptimisticUpdate,
-            update.as_ssz_bytes(),
-        )
-        .await;
-    assert!(
-        matches!(acceptance, MessageAcceptance::Ignore),
-        "expected Ignore, got {acceptance:?}"
-    );
+    // The node's own update for slot 1: block 1 signs, and its parent, genesis, is attested.
+    let update = LightClientOptimisticUpdate {
+        attested_header: LightClientHeader::new(&genesis_block).expect("genesis header"),
+        sync_aggregate: block.message.body.sync_aggregate.clone(),
+        signature_slot: 1,
+    };
+    let mut tampered = update.clone();
+    let bits = &mut tampered.sync_aggregate.sync_committee_bits;
+    let first = bits.get(0).expect("bit 0 exists");
+    bits.set(0, !first).expect("bit 0 exists");
+
+    for (sent, expected) in [
+        (&tampered, "Ignore"),
+        (&update, "Accept"),
+        (&update, "Ignore"),
+    ] {
+        let (acceptance, _) = harness
+            .deliver(
+                GossipTopicKind::LightClientOptimisticUpdate,
+                sent.as_ssz_bytes(),
+            )
+            .await;
+        assert_eq!(format!("{acceptance:?}"), expected);
+    }
+    // Gossipsub forwards only what the handler reports as ACCEPT; the handler publishes nothing.
+    assert!(harness.p2p_receiver.try_recv().is_err());
 }

@@ -6,6 +6,7 @@ pub mod blob_sidecar;
 pub mod bls_to_execution_change;
 pub mod data_column_sidecar;
 pub mod light_client_finality_update;
+mod light_client_local;
 pub mod light_client_optimistic_update;
 pub mod parent;
 pub mod proposer_slashing;

@@ -1,4 +1,7 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    future::Future,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::Ok;
 use ream_chain_beacon::beacon_chain::BeaconChain;
@@ -7,7 +10,9 @@ use ream_light_client::finality_update::LightClientFinalityUpdate;
 use ream_network_spec::networks::beacon_network_spec;
 use ream_storage::cache::BeaconCacheDB;
 
-use crate::gossipsub::validate::result::ValidationResult;
+use crate::gossipsub::validate::{
+    light_client_local::local_finality_update_blocking, result::ValidationResult,
+};
 
 const BASIS_POINTS: u64 = 10_000;
 
@@ -41,14 +46,39 @@ pub async fn validate_light_client_finality_update(
     cached_db: &BeaconCacheDB,
 ) -> anyhow::Result<ValidationResult> {
     let genesis_time = beacon_chain.head()?.state.genesis_time;
-    validate_finality_update(update, genesis_time, unix_time_ms(), cached_db).await
+    let local = local_finality_update_blocking(beacon_chain.db().clone(), update.signature_slot);
+    validate_finality_update(update, genesis_time, unix_time_ms(), cached_db, local).await
 }
 
+/// Why an update for `new_slot` is not newer than the last forwarded one, if it is not.
+fn older_than_forwarded(
+    forwarded: Option<(u64, bool)>,
+    new_slot: u64,
+    has_supermajority: bool,
+) -> Option<&'static str> {
+    let (prev_slot, prev_slot_supermajority) = forwarded?;
+    if new_slot < prev_slot {
+        return Some("Finality update slot is less than the last forwarded update slot");
+    }
+    if new_slot == prev_slot {
+        if prev_slot_supermajority {
+            return Some("Finality update already gossiped");
+        }
+        if !has_supermajority {
+            return Some("Worse than previous update");
+        }
+    }
+    None
+}
+
+/// `local` is the update this node computes for the update's signature slot. It is only awaited
+/// for an update that would otherwise be forwarded, because computing it can load a state.
 async fn validate_finality_update(
     update: &LightClientFinalityUpdate,
     genesis_time: u64,
     now_ms: u64,
     cached_db: &BeaconCacheDB,
+    local: impl Future<Output = anyhow::Result<Option<LightClientFinalityUpdate>>>,
 ) -> anyhow::Result<ValidationResult> {
     // [IGNORE] The finalized header is greater than that of all previously forwarded finality
     // updates or it matches the highest previously forwarded slot and also has a supermajority
@@ -69,27 +99,32 @@ async fn validate_finality_update(
         return Ok(ValidationResult::Ignore("Too early".to_string()));
     };
 
-    // Updates are validated concurrently, so the forwarded slot is checked and recorded under one
-    // write lock. Otherwise two updates could both pass, and the older could be recorded last.
-    let mut forwarded_slot = cached_db.seen_forwarded_finality_update_slot.write().await;
-    if let Some((prev_slot, prev_slot_supermajority)) = *forwarded_slot {
-        if new_slot < prev_slot {
+    let forwarded = *cached_db.seen_forwarded_finality_update_slot.read().await;
+    if let Some(reason) = older_than_forwarded(forwarded, new_slot, has_supermajority) {
+        return Ok(ValidationResult::Ignore(reason.into()));
+    }
+
+    // [IGNORE] The received finality_update matches the locally computed one exactly
+    match local.await? {
+        Some(local) if local == *update => {}
+        Some(_) => {
             return Ok(ValidationResult::Ignore(
-                "Finality update slot is less than the last forwarded update slot".into(),
+                "Finality update does not match the locally computed one".into(),
             ));
         }
-
-        if new_slot == prev_slot {
-            if prev_slot_supermajority {
-                return Ok(ValidationResult::Ignore(
-                    "Finality update already gossiped".into(),
-                ));
-            } else if !has_supermajority {
-                return Ok(ValidationResult::Ignore(
-                    "Worse than previous update".into(),
-                ));
-            }
+        None => {
+            return Ok(ValidationResult::Ignore(
+                "No local block at the finality update's signature slot".into(),
+            ));
         }
+    }
+
+    // Updates are validated concurrently, so the forwarded slot is checked again and recorded
+    // under one write lock. Otherwise two updates could both pass, and the older could be
+    // recorded last.
+    let mut forwarded_slot = cached_db.seen_forwarded_finality_update_slot.write().await;
+    if let Some(reason) = older_than_forwarded(*forwarded_slot, new_slot, has_supermajority) {
+        return Ok(ValidationResult::Ignore(reason.into()));
     }
 
     *forwarded_slot = Some((new_slot, has_supermajority));
@@ -133,9 +168,12 @@ mod tests {
             .map(|update| {
                 let cached_db = cached_db.clone();
                 tokio::spawn(async move {
-                    validate_finality_update(&update, 0, unix_time_ms(), &cached_db)
-                        .await
-                        .expect("validation runs")
+                    let local = update.clone();
+                    validate_finality_update(&update, 0, unix_time_ms(), &cached_db, async {
+                        Ok(Some(local))
+                    })
+                    .await
+                    .expect("validation runs")
                 })
             })
             .collect::<Vec<_>>();
@@ -172,6 +210,26 @@ mod tests {
             assert_eq!(recorded_slot.map(|(slot, _)| slot), Some(8));
             assert_eq!(stored_slot, Some(8));
         }
+    }
+
+    #[tokio::test]
+    async fn an_update_that_differs_from_the_local_one_is_ignored() {
+        initialize_test_network_spec();
+        let cached_db = BeaconCacheDB::new();
+        let mut local = finality_update(64);
+        local.signature_slot = 1;
+        let result =
+            validate_finality_update(&finality_update(64), 0, unix_time_ms(), &cached_db, async {
+                Ok(Some(local))
+            })
+            .await
+            .expect("validation runs");
+
+        assert!(matches!(result, ValidationResult::Ignore(_)));
+        assert_eq!(
+            *cached_db.seen_forwarded_finality_update_slot.read().await,
+            None
+        );
     }
 
     #[test]
