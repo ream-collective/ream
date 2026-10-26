@@ -11,7 +11,15 @@ use tree_hash::TreeHash;
 /// The optimistic update this node computes for a sync aggregate signed at `signature_slot`, as
 /// `create_light_client_optimistic_update`: the canonical block at that slot carries the aggregate
 /// and its parent is the attested block. `None` when the node has no block at `signature_slot`.
-fn local_optimistic_update(
+/// Gossip validation and the light client API both use it, so they agree.
+pub fn local_optimistic_update(
+    db: &BeaconDB,
+    signature_slot: u64,
+) -> anyhow::Result<Option<LightClientOptimisticUpdate>> {
+    Ok(optimistic_and_attested_root(db, signature_slot)?.map(|(update, _)| update))
+}
+
+fn optimistic_and_attested_root(
     db: &BeaconDB,
     signature_slot: u64,
 ) -> anyhow::Result<Option<(LightClientOptimisticUpdate, B256)>> {
@@ -36,11 +44,12 @@ fn local_optimistic_update(
 /// The finality update this node computes for `signature_slot`, as
 /// `create_light_client_finality_update`: the finalized block is the one the attested state
 /// names, and the branch proves it in that state.
-fn local_finality_update(
+pub fn local_finality_update(
     db: &BeaconDB,
     signature_slot: u64,
 ) -> anyhow::Result<Option<LightClientFinalityUpdate>> {
-    let Some((optimistic, attested_root)) = local_optimistic_update(db, signature_slot)? else {
+    let Some((optimistic, attested_root)) = optimistic_and_attested_root(db, signature_slot)?
+    else {
         return Ok(None);
     };
     let Some(attested_state) = db.state_provider().get_shared(attested_root)? else {
@@ -87,8 +96,5 @@ pub(crate) async fn local_optimistic_update_blocking(
     db: BeaconDB,
     signature_slot: u64,
 ) -> anyhow::Result<Option<LightClientOptimisticUpdate>> {
-    tokio::task::spawn_blocking(move || {
-        Ok(local_optimistic_update(&db, signature_slot)?.map(|(update, _)| update))
-    })
-    .await?
+    tokio::task::spawn_blocking(move || local_optimistic_update(&db, signature_slot)).await?
 }
