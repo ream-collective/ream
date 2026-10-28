@@ -66,7 +66,8 @@ use crate::{
     gossipsub::{
         cross_seed::publish_reconstructed_columns,
         handle::{
-            UnknownParentGossipBlock, handle_gossipsub_message, init_gossipsub_config_with_topics,
+            UnknownParentGossipBlock, handle_gossipsub_message, import_valid_block,
+            init_gossipsub_config_with_topics,
         },
         workers::{
             GossipWorkerBudget, GossipWorkers, OnValidBlock, PENDING_ITEM_QUEUE_CAPACITY,
@@ -1379,12 +1380,14 @@ impl NetworkManagerService {
                         ReamNetworkEvent::GossipsubMessage { propagation_source, message_id, message } => {
                             let mut pending_item = None;
                             let mut unknown_parent_block = None;
+                            let mut valid_block = None;
                             let acceptance = handle_gossipsub_message(
                                 message,
                                 &beacon_chain,
                                 &cached_db,
                                 &mut pending_item,
                                 &mut unknown_parent_block,
+                                &mut valid_block,
                                 propagation_source,
                                 |block| {
                                     if fetch_execution_blobs {
@@ -1397,6 +1400,8 @@ impl NetworkManagerService {
                                 propagation_source,
                                 acceptance,
                             );
+                            // Gossip blocks go to the block workers, so none comes here today.
+                            import_valid_block(&beacon_chain, valid_block).await;
 
                             if let Some(unknown) = unknown_parent_block {
                                 start_unknown_parent_lookup(

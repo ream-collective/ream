@@ -1396,6 +1396,13 @@ pub fn get_current_slot_from_db(db: &BeaconDB) -> anyhow::Result<u64> {
     Ok(GENESIS_SLOT + get_slots_since_genesis_from_db(db)?)
 }
 
+/// The slot that `time`, in whole seconds since the Unix epoch, falls in. Unlike
+/// [`get_current_slot_from_db`] it does not read the store's clock, which only `on_tick` advances
+/// and which therefore takes the store lock to bring up to date.
+pub fn get_current_slot_at(db: &BeaconDB, time: u64) -> anyhow::Result<u64> {
+    Ok(GENESIS_SLOT + get_slots_since_genesis_at(time, db.genesis_time_provider().get()?))
+}
+
 /// Finds the ancestor of `root` at or before `slot` using only database reads, so callers that do
 /// not hold the [`Store`] can walk ancestry.
 pub fn get_ancestor_from_db(db: &BeaconDB, mut root: B256, slot: u64) -> anyhow::Result<B256> {

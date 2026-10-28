@@ -38,11 +38,12 @@ use ream_network_manager::{
     },
     data_availability_fetch::{ColumnFetchOutcome, fetch_missing_columns},
     gossipsub::{
-        handle::{Message, MessageAcceptance, handle_gossipsub_message},
+        handle::{Message, MessageAcceptance, handle_gossipsub_message, import_valid_block},
         validate::{
             data_column_sidecar::{GossipValidatedDataColumn, validate_data_column_sidecar_full},
             result::DependencyValidationResult,
         },
+        workers::GossipWorkers,
     },
     p2p_sender::P2PSender,
     service::NetworkManagerService,
@@ -287,6 +288,7 @@ impl GossipLookupHarness {
         };
         let mut pending_item = None;
         let mut unknown_parent_block = None;
+        let mut valid_block = None;
         let acceptance = handle_gossipsub_message(
             Message {
                 source: None,
@@ -298,10 +300,15 @@ impl GossipLookupHarness {
             &self.cached_db,
             &mut pending_item,
             &mut unknown_parent_block,
+            &mut valid_block,
             libp2p::PeerId::random(),
             |_| {},
         )
         .await;
+
+        // A block worker reports the acceptance and then imports the block. The harness imports it
+        // in place, so that a test sees the result of delivering a block without a background task.
+        import_valid_block(&self.beacon_chain, valid_block).await;
 
         let mut outcomes = Vec::new();
         if let Some(item) = pending_item {
@@ -1308,6 +1315,7 @@ async fn test_unknown_parent_block_imports_after_parent_arrives() {
     };
     let mut pending_item = None;
     let mut unknown_parent_block = None;
+    let mut valid_block = None;
     let acceptance = handle_gossipsub_message(
         Message {
             source: Some(source_peer),
@@ -1319,12 +1327,17 @@ async fn test_unknown_parent_block_imports_after_parent_arrives() {
         &harness.cached_db,
         &mut pending_item,
         &mut unknown_parent_block,
+        &mut valid_block,
         libp2p::PeerId::random(),
         |_| {},
     )
     .await;
     assert!(matches!(acceptance, MessageAcceptance::Ignore));
     assert!(pending_item.is_none());
+    assert!(
+        valid_block.is_none(),
+        "a block with an unknown parent must not be left for import"
+    );
     let child_proposer = &parent
         .post_state
         .as_ref()
@@ -1869,4 +1882,158 @@ async fn test_only_the_locally_computed_light_client_update_is_forwarded() {
     }
     // Gossipsub forwards only what the handler reports as ACCEPT; the handler publishes nothing.
     assert!(harness.p2p_receiver.try_recv().is_err());
+}
+
+/// A block that passes gossip validation is handed back to the caller to import. Nothing in the
+/// handler imports it, so reporting it as accepted does not wait for `newPayload`.
+#[tokio::test]
+#[serial]
+async fn test_a_valid_gossip_block_is_handed_back_for_import_and_not_imported_inline() {
+    let (harness, genesis_state, genesis_block) =
+        GossipLookupHarness::new("gossip_block_handoff").await;
+    harness.wait_for_slot(1).await;
+
+    let (block, _) = build_block_without_blobs(&genesis_state, &genesis_block, 1).await;
+    let block_root = block.message.tree_hash_root();
+    let topic = GossipTopic {
+        fork: ream_network_spec::networks::beacon_network_spec().fork_digest(
+            ream_consensus_misc::constants::beacon::FULU_FORK_EPOCH,
+            ream_consensus_misc::constants::beacon::genesis_validators_root(),
+        ),
+        kind: GossipTopicKind::BeaconBlock,
+    };
+    let mut pending_item = None;
+    let mut unknown_parent_block = None;
+    let mut valid_block = None;
+    let acceptance = handle_gossipsub_message(
+        Message {
+            source: Some(libp2p::PeerId::random()),
+            data: block.as_ssz_bytes(),
+            sequence_number: None,
+            topic: topic.into(),
+        },
+        &harness.beacon_chain,
+        &harness.cached_db,
+        &mut pending_item,
+        &mut unknown_parent_block,
+        &mut valid_block,
+        libp2p::PeerId::random(),
+        |_| {},
+    )
+    .await;
+
+    assert!(
+        matches!(acceptance, MessageAcceptance::Accept),
+        "expected Accept, got {acceptance:?}"
+    );
+    assert!(pending_item.is_none());
+    assert!(unknown_parent_block.is_none());
+    let valid_block = valid_block.expect("a valid block should be handed back for import");
+    assert_eq!(valid_block.message.tree_hash_root(), block_root);
+    {
+        let store = harness.beacon_chain.store.lock().await;
+        assert!(
+            store
+                .db
+                .block_provider()
+                .get(block_root)
+                .expect("block lookup should succeed")
+                .is_none(),
+            "the handler must not import the block itself"
+        );
+    }
+
+    import_valid_block(&harness.beacon_chain, Some(valid_block)).await;
+    harness.assert_imported(block_root).await;
+}
+
+/// An import in progress holds the store lock through `newPayload`. A block worker must still
+/// validate a new block and report it as accepted, so that it propagates, and import it only once
+/// the lock is free.
+#[tokio::test]
+#[serial]
+async fn test_a_block_worker_reports_accept_while_the_store_is_locked_and_imports_after() {
+    let (mut harness, genesis_state, genesis_block) =
+        GossipLookupHarness::new("block_worker_report_before_import").await;
+    harness.wait_for_slot(1).await;
+
+    let (block, _) = build_block_without_blobs(&genesis_state, &genesis_block, 1).await;
+    let block_root = block.message.tree_hash_root();
+    let topic = GossipTopic {
+        fork: ream_network_spec::networks::beacon_network_spec().fork_digest(
+            ream_consensus_misc::constants::beacon::FULU_FORK_EPOCH,
+            ream_consensus_misc::constants::beacon::genesis_validators_root(),
+        ),
+        kind: GossipTopicKind::BeaconBlock,
+    };
+    let (pending_items, _pending_receiver) = mpsc::channel(4);
+    let (unknown_parents, _unknown_receiver) = mpsc::channel(4);
+    let workers = GossipWorkers::start_blocks(
+        harness.beacon_chain.clone(),
+        harness.cached_db.clone(),
+        harness.p2p_sender.clone(),
+        pending_items,
+        unknown_parents,
+        Arc::new(|_| {}),
+    );
+
+    // Stands in for an import in progress.
+    let store = harness.beacon_chain.store.lock().await;
+    workers.submit(
+        Message {
+            source: None,
+            data: block.as_ssz_bytes(),
+            sequence_number: None,
+            topic: topic.into(),
+        },
+        libp2p::gossipsub::MessageId::new(b"gossip-block"),
+        libp2p::PeerId::random(),
+    );
+
+    let acceptance = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            match harness.p2p_receiver.recv().await {
+                Some(P2PMessage::ReportGossipValidation { acceptance, .. }) => break acceptance,
+                Some(_) => {}
+                None => panic!("the P2P channel closed before the block was reported"),
+            }
+        }
+    })
+    .await
+    .expect("the block is reported while the store lock is held");
+    assert!(
+        matches!(acceptance, MessageAcceptance::Accept),
+        "expected Accept, got {acceptance:?}"
+    );
+    assert!(
+        store
+            .db
+            .block_provider()
+            .get(block_root)
+            .expect("block lookup should succeed")
+            .is_none(),
+        "the block cannot be imported while the store is locked"
+    );
+    drop(store);
+
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let imported = harness
+                .beacon_chain
+                .store
+                .lock()
+                .await
+                .db
+                .block_provider()
+                .get(block_root)
+                .expect("block lookup should succeed")
+                .is_some();
+            if imported {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the worker imports the block once the store is free");
 }

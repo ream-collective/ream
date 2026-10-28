@@ -18,7 +18,7 @@ mod tests {
         beacon_block::{validate_gossip_beacon_block, validate_lookup_beacon_block},
         result::DependencyValidationResult,
     };
-    use ream_network_spec::networks::initialize_test_network_spec;
+    use ream_network_spec::networks::{beacon_network_spec, initialize_test_network_spec};
     use ream_operation_pool::OperationPool;
     use ream_storage::{
         cache::{AddressSlotIdentifier, BeaconCacheDB},
@@ -206,10 +206,14 @@ mod tests {
                 .unwrap()
         );
 
-        let result =
-            validate_gossip_beacon_block(&beacon_chain, &cached_db, &incoming_beacon_block)
-                .await
-                .unwrap();
+        let result = validate_gossip_beacon_block(
+            &beacon_chain,
+            &cached_db,
+            &incoming_beacon_block,
+            CURRENT_TIME,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result, DependencyValidationResult::Accept);
     }
@@ -318,10 +322,14 @@ mod tests {
             );
         }
 
-        let result =
-            validate_gossip_beacon_block(&beacon_chain, &cached_db, &incoming_beacon_block)
-                .await
-                .unwrap();
+        let result = validate_gossip_beacon_block(
+            &beacon_chain,
+            &cached_db,
+            &incoming_beacon_block,
+            CURRENT_TIME,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result, DependencyValidationResult::Accept);
     }
@@ -336,10 +344,14 @@ mod tests {
         )
         .unwrap();
 
-        let result =
-            validate_gossip_beacon_block(&beacon_chain, &cached_db, &incoming_beacon_block)
-                .await
-                .unwrap();
+        let result = validate_gossip_beacon_block(
+            &beacon_chain,
+            &cached_db,
+            &incoming_beacon_block,
+            CURRENT_TIME,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             result,
@@ -359,10 +371,14 @@ mod tests {
         .unwrap();
         incoming_beacon_block.signature = Default::default();
 
-        let result =
-            validate_gossip_beacon_block(&beacon_chain, &cached_db, &incoming_beacon_block)
-                .await
-                .unwrap();
+        let result = validate_gossip_beacon_block(
+            &beacon_chain,
+            &cached_db,
+            &incoming_beacon_block,
+            CURRENT_TIME,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             result,
@@ -396,10 +412,14 @@ mod tests {
             }
         }
 
-        let result =
-            validate_gossip_beacon_block(&beacon_chain, &cached_db, &incoming_beacon_block)
-                .await
-                .unwrap();
+        let result = validate_gossip_beacon_block(
+            &beacon_chain,
+            &cached_db,
+            &incoming_beacon_block,
+            CURRENT_TIME,
+        )
+        .await
+        .unwrap();
 
         assert!(
             matches!(result, DependencyValidationResult::ParentPendingAvailability {
@@ -421,8 +441,100 @@ mod tests {
         let future_slot = beacon_chain.store.lock().await.get_current_slot().unwrap() + 10;
         incoming_beacon_block.message.slot = future_slot;
 
+        let result = validate_gossip_beacon_block(
+            &beacon_chain,
+            &cached_db,
+            &incoming_beacon_block,
+            CURRENT_TIME,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, DependencyValidationResult::Ignore(reason) if reason.contains("future slot"))
+        );
+    }
+
+    /// The store's clock sits at the start of the block's slot (see `insert_mock_data`), so a check
+    /// that read it would accept the block however early `now` is.
+    #[tokio::test]
+    pub async fn test_gossip_future_slot_check_uses_the_supplied_time_not_the_store_clock() {
+        initialize_test_network_spec();
+        let (beacon_chain, cached_db, _block_root, _temp_dir) = db_setup().await;
+        let incoming_beacon_block = read_ssz_snappy_file::<SignedBeaconBlock>(
+            "./assets/sepolia/blocks/child_9552076.ssz_snappy",
+        )
+        .unwrap();
+        let slot_start = SEPOLIA_GENESIS_TIME
+            + incoming_beacon_block.message.slot * beacon_network_spec().seconds_per_slot();
+        assert_eq!(slot_start, CURRENT_TIME);
+
+        // The last second of the previous slot: the block is early.
+        let early = validate_gossip_beacon_block(
+            &beacon_chain,
+            &cached_db,
+            &incoming_beacon_block,
+            slot_start - 1,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(early, DependencyValidationResult::Ignore(reason) if reason.contains("future slot"))
+        );
+
+        // The first second of the block's slot: it is on time. The early attempt was ignored
+        // before the proposer's signature was recorded, so it does not count as a duplicate.
+        let on_time = validate_gossip_beacon_block(
+            &beacon_chain,
+            &cached_db,
+            &incoming_beacon_block,
+            slot_start,
+        )
+        .await
+        .unwrap();
+        assert_eq!(on_time, DependencyValidationResult::Accept);
+    }
+
+    /// A node that is started ahead of genesis has a wall clock below the genesis time.
+    #[tokio::test]
+    pub async fn test_gossip_validation_before_genesis_ignores_the_block() {
+        initialize_test_network_spec();
+        let (beacon_chain, cached_db, _block_root, _temp_dir) = db_setup().await;
+        let incoming_beacon_block = read_ssz_snappy_file::<SignedBeaconBlock>(
+            "./assets/sepolia/blocks/child_9552076.ssz_snappy",
+        )
+        .unwrap();
+
+        let result = validate_gossip_beacon_block(
+            &beacon_chain,
+            &cached_db,
+            &incoming_beacon_block,
+            SEPOLIA_GENESIS_TIME - 1,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, DependencyValidationResult::Ignore(reason) if reason.contains("future slot"))
+        );
+    }
+
+    /// Lookups release blocks at their own pace and import them without a tick of their own, so
+    /// they keep to the store's clock, which an import is checked against.
+    #[tokio::test]
+    pub async fn test_lookup_future_slot_check_still_uses_the_store_clock() {
+        initialize_test_network_spec();
+        let (beacon_chain, cached_db, _block_root, _temp_dir) = db_setup().await;
+        let incoming_beacon_block = read_ssz_snappy_file::<SignedBeaconBlock>(
+            "./assets/sepolia/blocks/child_9552076.ssz_snappy",
+        )
+        .unwrap();
+        beacon_chain
+            .db()
+            .time_provider()
+            .insert(CURRENT_TIME - 1)
+            .unwrap();
+
         let result =
-            validate_gossip_beacon_block(&beacon_chain, &cached_db, &incoming_beacon_block)
+            validate_lookup_beacon_block(&beacon_chain, &cached_db, &incoming_beacon_block)
                 .await
                 .unwrap();
         assert!(
@@ -441,9 +553,10 @@ mod tests {
         .unwrap();
         ancestor_block.message.slot = 0;
 
-        let result = validate_gossip_beacon_block(&beacon_chain, &cached_db, &ancestor_block)
-            .await
-            .unwrap();
+        let result =
+            validate_gossip_beacon_block(&beacon_chain, &cached_db, &ancestor_block, CURRENT_TIME)
+                .await
+                .unwrap();
         assert!(
             matches!(result, DependencyValidationResult::Ignore(reason) if reason.contains("latest finalized slot"))
         );
@@ -462,10 +575,14 @@ mod tests {
         // Mutate proposer index to a very high index
         incoming_beacon_block.message.proposer_index = 999999;
 
-        let result =
-            validate_gossip_beacon_block(&beacon_chain, &cached_db, &incoming_beacon_block)
-                .await
-                .unwrap();
+        let result = validate_gossip_beacon_block(
+            &beacon_chain,
+            &cached_db,
+            &incoming_beacon_block,
+            CURRENT_TIME,
+        )
+        .await
+        .unwrap();
         assert!(
             matches!(result, DependencyValidationResult::Reject(reason) if reason.contains("Validator not found"))
         );
@@ -501,10 +618,14 @@ mod tests {
             );
         }
 
-        let result =
-            validate_gossip_beacon_block(&beacon_chain, &cached_db, &incoming_beacon_block)
-                .await
-                .unwrap();
+        let result = validate_gossip_beacon_block(
+            &beacon_chain,
+            &cached_db,
+            &incoming_beacon_block,
+            CURRENT_TIME,
+        )
+        .await
+        .unwrap();
         assert!(
             matches!(result, DependencyValidationResult::Ignore(reason) if reason.contains("already received"))
         );
@@ -590,10 +711,14 @@ mod tests {
             );
         }
 
-        let result =
-            validate_gossip_beacon_block(&beacon_chain, &cached_db, &incoming_beacon_block)
-                .await
-                .unwrap();
+        let result = validate_gossip_beacon_block(
+            &beacon_chain,
+            &cached_db,
+            &incoming_beacon_block,
+            CURRENT_TIME,
+        )
+        .await
+        .unwrap();
         assert_eq!(result, DependencyValidationResult::Accept);
     }
 
