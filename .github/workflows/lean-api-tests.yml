@@ -12,7 +12,7 @@ on:
       - "bin/ream/**"
       - ".github/workflows/lean-api-tests.yml"
   pull_request:
-    branches: ["master", "develop"]
+    branches: ["master", "develop", "gloas"]
     paths:
       - "crates/rpc/lean/**"
       - "crates/common/api_types/lean/**"

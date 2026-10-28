@@ -2,7 +2,7 @@ name: pr-vs-known-commit
 
 on:
   pull_request:
-    branches: ["master", "develop"]
+    branches: ["master", "develop", "gloas"]
 
 env:
   CARGO_TERM_COLOR: always
