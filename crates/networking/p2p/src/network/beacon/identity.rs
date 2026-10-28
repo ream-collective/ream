@@ -8,7 +8,7 @@ use std::{
 
 use alloy_primitives::hex;
 use anyhow::{Context, anyhow};
-use discv5::enr::{CombinedKey, EnrKey, NodeId, k256::ecdsa::SigningKey};
+use enr::{CombinedKey, EnrKey, NodeId, k256::ecdsa::SigningKey};
 use libp2p_identity::secp256k1;
 use tracing::{info, warn};
 

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use discv5::enr::NodeId;
+use enr::NodeId;
 use ream_consensus_beacon::{
     custody_group::{CustodyAssignment, CustodyConfig, get_validators_custody_requirement},
     electra::beacon_state::BeaconState,

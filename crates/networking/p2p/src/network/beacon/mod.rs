@@ -144,8 +144,9 @@ fn enr_subnet_bitfields(enr: &Enr) -> anyhow::Result<(BitVector<U64>, BitVector<
 }
 
 /// Counts a heartbeat in which `dropped` messages to `peer_id` were dropped because its send queue
-/// was full. Returns true once the peer has been slow for `SLOW_PEER_STRIKES` heartbeats in a row,
-/// each within `SLOW_PEER_WINDOW` of the last, and forgets it.
+/// was full or they timed out in it. Returns true once the peer has been slow for
+/// `SLOW_PEER_STRIKES` heartbeats in a row, each within `SLOW_PEER_WINDOW` of the last, and forgets
+/// it.
 fn record_slow_heartbeat(
     slow_peers: &mut HashMap<PeerId, (u32, Instant)>,
     peer_id: PeerId,
@@ -1351,7 +1352,7 @@ impl Network {
                 if record_slow_heartbeat(
                     &mut self.slow_peers,
                     peer_id,
-                    failed_messages.total_queue_full(),
+                    failed_messages.priority + failed_messages.non_priority,
                     Instant::now(),
                 ) {
                     info!("Disconnecting peer {peer_id}: its gossipsub send queue stays full");
@@ -1642,7 +1643,7 @@ mod tests {
     use std::{fs, net::IpAddr, path::Path};
 
     use alloy_primitives::aliases::B32;
-    use discv5::enr::CombinedKey;
+    use enr::CombinedKey;
     use k256::ecdsa::SigningKey;
     use libp2p_identity::{Keypair, PeerId};
     use ream_consensus_misc::constants::beacon::NUM_CUSTODY_GROUPS;

@@ -50,7 +50,7 @@ pub fn build_transport(local_private_key: Keypair) -> io::Result<Boxed<(PeerId, 
 pub fn peer_id_from_enr(enr: &Enr) -> Option<PeerId> {
     match enr.public_key() {
         CombinedPublicKey::Secp256k1(public_key) => {
-            let encoded_public_key = public_key.to_encoded_point(true);
+            let encoded_public_key = public_key.to_sec1_point(true);
             let public_key = Secp256k1PublicKey::try_from_bytes(encoded_public_key.as_bytes())
                 .ok()?
                 .into();

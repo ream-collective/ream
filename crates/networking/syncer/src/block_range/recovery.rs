@@ -843,7 +843,8 @@ impl Drop for IdleOnDrop<'_> {
 mod tests {
     use std::{path::PathBuf, sync::Arc};
 
-    use discv5::{Enr, enr::CombinedKey};
+    use discv5::Enr;
+    use enr::CombinedKey;
     use libp2p::PeerId;
     use parking_lot::RwLock;
     use ream_p2p::network::beacon::{network_state::NetworkState, peer::CachedPeer};

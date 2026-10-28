@@ -475,7 +475,8 @@ impl PeerManager {
 mod tests {
     use std::path::PathBuf;
 
-    use discv5::{Enr, enr::CombinedKey};
+    use discv5::Enr;
+    use enr::CombinedKey;
     use libp2p_identity::Keypair;
     use parking_lot::RwLock;
     use ream_peer::{ConnectionState, Direction};

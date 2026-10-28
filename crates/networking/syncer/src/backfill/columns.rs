@@ -886,7 +886,7 @@ mod tests {
         db.time_provider()
             .insert((base + 4) * beacon_network_spec().seconds_per_slot())
             .unwrap();
-        let key = discv5::enr::CombinedKey::generate_secp256k1();
+        let key = enr::CombinedKey::generate_secp256k1();
         let enr = discv5::Enr::builder().build(&key).unwrap();
         let network = Arc::new(NetworkState {
             local_enr: enr.into(),

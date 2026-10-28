@@ -8,10 +8,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use alloy_primitives::aliases::B32;
-use discv5::{
-    Enr,
-    enr::{NodeId, k256::ecdsa::VerifyingKey},
-};
+use discv5::Enr;
+use enr::{NodeId, k256::ecdsa::VerifyingKey};
 use libp2p::PeerId;
 use libp2p_identity::PublicKey;
 use ream_consensus_beacon::custody_group::{PeerCustodyGroups, compute_custody_group_for_column};
@@ -209,7 +207,7 @@ pub fn custody_group_enr_predicate(
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
-    use discv5::enr::CombinedKey;
+    use enr::CombinedKey;
     use libp2p_identity::Keypair;
     use ream_consensus_misc::constants::beacon::NUM_CUSTODY_GROUPS;
 

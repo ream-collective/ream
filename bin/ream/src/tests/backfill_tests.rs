@@ -121,7 +121,7 @@ fn backfill_commits_verified_history_down_to_genesis_only_while_running() {
 
     // Two connected peers that advertise full history.
     let enr = discv5::Enr::builder()
-        .build(&discv5::enr::CombinedKey::generate_secp256k1())
+        .build(&enr::CombinedKey::generate_secp256k1())
         .expect("valid enr");
     let network_state = Arc::new(NetworkState {
         local_enr: enr.into(),
