@@ -41,7 +41,7 @@ pub struct GossipValidatedDataColumn {
 }
 
 impl GossipValidatedDataColumn {
-    fn new(sidecar: DataColumnSidecar) -> Self {
+    pub(crate) fn new(sidecar: DataColumnSidecar) -> Self {
         Self {
             sidecar: Box::new(sidecar),
         }

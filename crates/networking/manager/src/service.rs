@@ -889,6 +889,7 @@ impl NetworkManagerService {
                 beacon_chain.clone(),
                 cached_db.clone(),
                 p2p_sender.clone(),
+                pending_item_sender.clone(),
                 fetch_execution_blobs,
             )
         });

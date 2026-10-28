@@ -22,7 +22,7 @@ use ream_storage::{cache::BeaconCacheDB, tables::field::REDBField};
 
 use super::{
     data_column_sidecar::{HeaderVerdict, check_block_header, is_not_from_future_slot},
-    result::ValidationResult,
+    result::DependencyValidationResult,
 };
 
 /// Rejects a message that carries neither a header nor cells, or whose cell and proof counts
@@ -48,16 +48,16 @@ pub async fn validate_partial_data_column_header(
     beacon_chain: &BeaconChain,
     cached_db: &BeaconCacheDB,
     current_time_ms: u64,
-) -> anyhow::Result<ValidationResult> {
+) -> anyhow::Result<DependencyValidationResult<()>> {
     BEACON_PARTIAL_DATA_COLUMN_SIDECAR_HEADER_PROCESSING_REQUESTS_TOTAL.inc();
     let block_header = &header.signed_block_header.message;
     if header.block_root() != block_root {
-        return Ok(ValidationResult::Reject(
+        return Ok(DependencyValidationResult::Reject(
             "Header's block root does not match the group id".to_string(),
         ));
     }
     if header.kzg_commitments.is_empty() {
-        return Ok(ValidationResult::Reject(
+        return Ok(DependencyValidationResult::Reject(
             "Header's kzg_commitments is empty".to_string(),
         ));
     }
@@ -65,12 +65,12 @@ pub async fn validate_partial_data_column_header(
         .blob_parameters(compute_epoch_at_slot(block_header.slot))
         .max_blobs_per_block;
     if header.kzg_commitments.len() as u64 > max_blobs {
-        return Ok(ValidationResult::Reject(
+        return Ok(DependencyValidationResult::Reject(
             "Header's kzg_commitments is too long".to_string(),
         ));
     }
-    if let Some(ignore) = check_slot(header, beacon_chain, current_time_ms)? {
-        return Ok(ignore);
+    if let Some(reason) = check_slot(header, beacon_chain, current_time_ms)? {
+        return Ok(DependencyValidationResult::Ignore(reason));
     }
 
     let finalized_checkpoint = beacon_chain.db().finalized_checkpoint_provider().get()?;
@@ -88,9 +88,10 @@ pub async fn validate_partial_data_column_header(
     .await?
     {
         HeaderVerdict::Valid(checked) => checked,
-        HeaderVerdict::Reject(reason) => return Ok(ValidationResult::Reject(reason)),
-        HeaderVerdict::Ignore(reason) => return Ok(ValidationResult::Ignore(reason)),
+        HeaderVerdict::Reject(reason) => return Ok(DependencyValidationResult::Reject(reason)),
+        HeaderVerdict::Ignore(reason) => return Ok(DependencyValidationResult::Ignore(reason)),
     };
+    let pending_availability = checked.pending_availability;
     checked
         .remember(
             cached_db,
@@ -100,27 +101,32 @@ pub async fn validate_partial_data_column_header(
         )
         .await;
     BEACON_PARTIAL_DATA_COLUMN_SIDECAR_HEADER_PROCESSING_SUCCESSES_TOTAL.inc();
-    Ok(ValidationResult::Accept)
+    if pending_availability {
+        return Ok(DependencyValidationResult::ParentPendingAvailability {
+            parent_root: block_header.parent_root,
+            validated: (),
+        });
+    }
+    Ok(DependencyValidationResult::Accept)
 }
 
-/// Ignores cells or a header of a block from a future slot, or at or before the finalized slot.
+/// Why cells or a header of this block are ignored: a future slot, or one at or before the
+/// finalized slot.
 pub fn check_slot(
     header: &PartialDataColumnHeader,
     beacon_chain: &BeaconChain,
     current_time_ms: u64,
-) -> anyhow::Result<Option<ValidationResult>> {
+) -> anyhow::Result<Option<String>> {
     let slot = header.signed_block_header.message.slot;
     let db = beacon_chain.db();
     if !is_not_from_future_slot(db.genesis_time_provider().get()?, slot, current_time_ms) {
-        return Ok(Some(ValidationResult::Ignore(
-            "Header is from a future slot".to_string(),
-        )));
+        return Ok(Some("Header is from a future slot".to_string()));
     }
     let finalized_checkpoint = db.finalized_checkpoint_provider().get()?;
     if slot <= compute_start_slot_at_epoch(finalized_checkpoint.epoch) {
-        return Ok(Some(ValidationResult::Ignore(
+        return Ok(Some(
             "Header is not from a slot greater than the latest finalized slot".to_string(),
-        )));
+        ));
     }
     Ok(None)
 }

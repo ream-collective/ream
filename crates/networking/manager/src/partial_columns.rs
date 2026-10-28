@@ -5,12 +5,14 @@
 
 use std::{
     collections::HashMap,
+    num::NonZeroUsize,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use alloy_primitives::B256;
 use libp2p::PeerId;
+use lru::LruCache;
 use parking_lot::Mutex;
 use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::{
@@ -26,25 +28,29 @@ use ream_consensus_misc::{
 };
 use ream_execution_rpc_types::get_blobs::BlobAndProofV2;
 use ream_metrics::{
-    BEACON_DATA_COLUMNS_FROM_EL_IMPORTED_TOTAL,
+    BEACON_DATA_COLUMNS_FROM_EL_IMPORTED_TOTAL, BEACON_GOSSIP_PENDING_ITEMS_DROPPED_TOTAL,
     BEACON_PARTIAL_DATA_COLUMN_SIDECAR_GOSSIP_VERIFICATION_SECONDS,
     BEACON_PARTIAL_MESSAGE_CELLS_RECEIVED_TOTAL, BEACON_PARTIAL_MESSAGE_COLUMN_COMPLETIONS_TOTAL,
     BEACON_PARTIAL_MESSAGE_USEFUL_CELLS_TOTAL, BEACON_USEFUL_FULL_COLUMNS_RECEIVED_TOTAL,
 };
 use ream_p2p::gossipsub::beacon::partial::PartialColumnMessage;
 use ream_storage::{cache::BeaconCacheDB, tables::field::REDBField};
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::{
+    block_lookup::PendingGossipItem,
     gossipsub::{
         cross_seed::publish_reconstructed_columns,
         validate::{
+            data_column_sidecar::GossipValidatedDataColumn,
             partial_data_column_sidecar::{
                 check_partial_structure, check_slot, validate_partial_data_column_header,
                 verify_partial_cells,
             },
-            result::ValidationResult,
+            result::{DependencyValidationResult, ValidationResult},
         },
+        workers::try_forward,
     },
     p2p_sender::P2PSender,
     service::publish_execution_columns,
@@ -54,13 +60,22 @@ use crate::{
 /// Blocks whose cells are assembled at once, about four slots' worth with forks.
 const MAX_ASSEMBLIES: usize = 32;
 
+/// Blocks whose blobs were fetched from the execution client, so an evicted block that comes back
+/// is not fetched again.
+const FETCHED_BLOCKS: NonZeroUsize = NonZeroUsize::new(2 * MAX_ASSEMBLIES).unwrap();
+
+/// The Engine API timeout of `engine_getBlobsV3` and `V2`, which bounds the whole fetch.
+const EXECUTION_BLOBS_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// The cells of one block's sampled columns, assembled from partial messages, full columns and
 /// the execution client.
 struct Assembly {
     header: Arc<PartialDataColumnHeader>,
-    local_fetch_started: bool,
     /// The execution client fetch has ended, so cells still missing are requested from peers.
     local_fetch_settled: bool,
+    /// The parent waits on data availability, so completed columns wait in the pending lookups,
+    /// as such gossip columns do.
+    parent_pending: bool,
     columns: HashMap<u64, Arc<PartialColumn>>,
 }
 
@@ -78,8 +93,10 @@ pub struct PartialColumns {
     beacon_chain: Arc<BeaconChain>,
     cached_db: Arc<BeaconCacheDB>,
     p2p_sender: P2PSender,
+    pending_items: mpsc::Sender<PendingGossipItem>,
     fetch_execution_blobs: bool,
     assemblies: Mutex<HashMap<B256, Assembly>>,
+    fetched_blocks: Mutex<LruCache<B256, ()>>,
 }
 
 impl PartialColumns {
@@ -87,14 +104,17 @@ impl PartialColumns {
         beacon_chain: Arc<BeaconChain>,
         cached_db: Arc<BeaconCacheDB>,
         p2p_sender: P2PSender,
+        pending_items: mpsc::Sender<PendingGossipItem>,
         fetch_execution_blobs: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
             beacon_chain,
             cached_db,
             p2p_sender,
+            pending_items,
             fetch_execution_blobs,
             assemblies: Mutex::new(HashMap::new()),
+            fetched_blocks: Mutex::new(LruCache::new(FETCHED_BLOCKS)),
         })
     }
 
@@ -147,18 +167,29 @@ impl PartialColumns {
                 validated
             }
             (Some(received), None) => {
-                let result = validate_partial_data_column_header(
+                let parent_pending = match validate_partial_data_column_header(
                     received,
                     block_root,
                     &self.beacon_chain,
                     &self.cached_db,
                     current_time_ms,
                 )
-                .await?;
-                if result != ValidationResult::Accept {
-                    return Ok(result);
-                }
-                self.on_validated_header(Arc::new(received.clone())).await;
+                .await?
+                {
+                    DependencyValidationResult::Accept => false,
+                    DependencyValidationResult::ParentPendingAvailability { .. } => true,
+                    DependencyValidationResult::Reject(reason) => {
+                        return Ok(ValidationResult::Reject(reason));
+                    }
+                    DependencyValidationResult::Ignore(reason) => {
+                        return Ok(ValidationResult::Ignore(reason));
+                    }
+                    DependencyValidationResult::UnknownParent { .. } => {
+                        unreachable!("partial header validation cannot return unknown-parent")
+                    }
+                };
+                self.on_validated_header(Arc::new(received.clone()), parent_pending)
+                    .await;
                 let Some(header) = self.header(&block_root) else {
                     return Ok(ValidationResult::Ignore(
                         "Block is no longer assembled".to_string(),
@@ -177,8 +208,8 @@ impl PartialColumns {
         if cell_count == 0 {
             return Ok(ValidationResult::Accept);
         }
-        if let Some(ignore) = check_slot(&header, &self.beacon_chain, current_time_ms)? {
-            return Ok(ignore);
+        if let Some(reason) = check_slot(&header, &self.beacon_chain, current_time_ms)? {
+            return Ok(ValidationResult::Ignore(reason));
         }
         if sidecar.cells_present_bitmap.len() != header.kzg_commitments.len() {
             return Ok(ValidationResult::Reject(
@@ -243,7 +274,7 @@ impl PartialColumns {
             }
         };
         let this = self.clone();
-        tokio::spawn(async move { this.on_validated_header(header).await });
+        tokio::spawn(async move { this.on_validated_header(header, false).await });
     }
 
     /// Marks columns obtained whole as complete and advertises them. Returns how many were not
@@ -254,7 +285,7 @@ impl PartialColumns {
         };
         let header = Arc::new(PartialDataColumnHeader::from_sidecar(first));
         let block_root = header.block_root();
-        self.on_validated_header(header).await;
+        self.on_validated_header(header, false).await;
         let messages = {
             let mut assemblies = self.assemblies.lock();
             let Some(assembly) = assemblies.get_mut(&block_root) else {
@@ -291,37 +322,46 @@ impl PartialColumns {
     }
 
     /// Starts assembling a block whose header passed validation, and fetches its blobs from the
-    /// execution client once.
-    async fn on_validated_header(self: &Arc<Self>, header: Arc<PartialDataColumnHeader>) {
+    /// execution client once. A full column or block proves the parent is no longer pending.
+    async fn on_validated_header(
+        self: &Arc<Self>,
+        header: Arc<PartialDataColumnHeader>,
+        parent_pending: bool,
+    ) {
         let block_root = header.block_root();
-        if !self.assemblies.lock().contains_key(&block_root) {
-            let sampling = self.beacon_chain.sampling_columns().await;
-            let blob_count = header.kzg_commitments.len();
-            let mut assemblies = self.assemblies.lock();
-            if !assemblies.contains_key(&block_root) {
-                evict_oldest(&mut assemblies);
-                assemblies.insert(
-                    block_root,
-                    Assembly {
-                        header: header.clone(),
-                        local_fetch_started: false,
-                        local_fetch_settled: false,
-                        columns: sampling
-                            .into_iter()
-                            .map(|index| (index, Arc::new(PartialColumn::empty(index, blob_count))))
-                            .collect(),
-                    },
-                );
-            }
+        if let Some(assembly) = self.assemblies.lock().get_mut(&block_root) {
+            assembly.parent_pending &= parent_pending;
+            return;
         }
-        let start = self
-            .assemblies
-            .lock()
-            .get_mut(&block_root)
-            .is_some_and(|assembly| !std::mem::replace(&mut assembly.local_fetch_started, true));
-        if start {
+        let sampling = self.beacon_chain.sampling_columns().await;
+        let blob_count = header.kzg_commitments.len();
+        let fetch = {
+            let mut assemblies = self.assemblies.lock();
+            if let Some(assembly) = assemblies.get_mut(&block_root) {
+                assembly.parent_pending &= parent_pending;
+                return;
+            }
+            let fetched = self.fetched_blocks.lock().put(block_root, ()).is_some();
+            evict_oldest(&mut assemblies);
+            assemblies.insert(
+                block_root,
+                Assembly {
+                    header: header.clone(),
+                    local_fetch_settled: false,
+                    parent_pending,
+                    columns: sampling
+                        .into_iter()
+                        .map(|index| (index, Arc::new(PartialColumn::empty(index, blob_count))))
+                        .collect(),
+                },
+            );
+            !fetched
+        };
+        if fetch {
             let this = self.clone();
             tokio::spawn(async move { this.fetch_local_cells(block_root, header).await });
+        } else {
+            self.settle_local_fetch(block_root);
         }
     }
 
@@ -332,18 +372,31 @@ impl PartialColumns {
         header: Arc<PartialDataColumnHeader>,
     ) {
         if self.fetch_execution_blobs {
-            match self.beacon_chain.fetch_blobs_from_execution(&header).await {
-                Ok(Some(blobs)) => {
+            match tokio::time::timeout(
+                EXECUTION_BLOBS_TIMEOUT,
+                self.beacon_chain.fetch_blobs_from_execution(&header),
+            )
+            .await
+            {
+                Ok(Ok(Some(blobs))) => {
                     if let Err(err) = self.merge_execution_blobs(block_root, blobs).await {
                         warn!(%block_root, "Failed to build cells from execution blobs: {err:#}");
                     }
                 }
-                Ok(None) => {}
-                Err(err) => {
+                Ok(Ok(None)) => {}
+                Ok(Err(err)) => {
                     warn!(%block_root, "Failed to fetch blobs from the execution client: {err:#}");
+                }
+                Err(_) => {
+                    warn!(%block_root, "Fetching blobs from the execution client timed out");
                 }
             }
         }
+        self.settle_local_fetch(block_root);
+    }
+
+    /// Requests the cells still missing from peers.
+    fn settle_local_fetch(&self, block_root: B256) {
         let messages = {
             let mut assemblies = self.assemblies.lock();
             let Some(assembly) = assemblies.get_mut(&block_root) else {
@@ -445,12 +498,24 @@ impl PartialColumns {
         if columns.is_empty() {
             return;
         }
-        // A column assembled from gossip cells is stored like a gossip column; execution columns
-        // keep the execution path's rule of skipping held columns and imported blocks.
+        // A column assembled from gossip cells is stored like a gossip column, and waits in the
+        // pending lookups like one while its parent waits on availability. Execution columns keep
+        // the execution path's rule of skipping held columns and imported blocks.
         let imported = if source == ColumnSource::ExecutionLayer {
             self.beacon_chain
                 .import_missing_columns(block_root, columns)
                 .await
+        } else if self.parent_pending(&block_root) {
+            for column in columns.iter().cloned() {
+                let item = PendingGossipItem::Column {
+                    column: GossipValidatedDataColumn::new(column),
+                };
+                if !try_forward(&self.pending_items, item) {
+                    debug!(%block_root, "Pending gossip item queue is full, dropping a column");
+                    BEACON_GOSSIP_PENDING_ITEMS_DROPPED_TOTAL.inc();
+                }
+            }
+            Ok(columns)
         } else {
             self.beacon_chain
                 .import_data_column_sidecars_if(columns.clone(), |_| Ok(()))
@@ -500,6 +565,13 @@ impl PartialColumns {
         }
     }
 
+    fn parent_pending(&self, block_root: &B256) -> bool {
+        self.assemblies
+            .lock()
+            .get(block_root)
+            .is_some_and(|assembly| assembly.parent_pending)
+    }
+
     fn header(&self, block_root: &B256) -> Option<Arc<PartialDataColumnHeader>> {
         self.assemblies
             .lock()
@@ -545,8 +617,9 @@ mod tests {
         beacon_block_header::SignedBeaconBlockHeader,
         polynomial_commitments::kzg_commitment::KZGCommitment,
     };
+    use ream_execution_engine::ExecutionEngine;
     use ream_execution_rpc_types::get_blobs::Blob;
-    use ream_network_spec::networks::initialize_test_network_spec;
+    use ream_network_spec::networks::{beacon_network_spec, initialize_test_network_spec};
     use ream_operation_pool::OperationPool;
     use ream_storage::db::ReamDB;
     use ream_sync_committee_pool::SyncCommitteePool;
@@ -558,15 +631,20 @@ mod tests {
 
     const COLUMN: u64 = 5;
 
-    /// A node sampling `COLUMN`, assembling a one-blob block at slot 1. The dir lives as long as
-    /// the node.
-    async fn assembling_node() -> (
-        TempDir,
-        Arc<PartialColumns>,
-        PartialDataColumnHeader,
-        Cell,
-        KZGProof,
-    ) {
+    struct Node {
+        _data_dir: TempDir,
+        partial_columns: Arc<PartialColumns>,
+        pending_items: mpsc::Receiver<PendingGossipItem>,
+        header: PartialDataColumnHeader,
+        cell: Cell,
+        proof: KZGProof,
+    }
+
+    /// A node sampling `COLUMN`, assembling a one-blob block at slot 1.
+    async fn assembling_node(
+        parent_pending: bool,
+        execution_engine: Option<ExecutionEngine>,
+    ) -> Node {
         initialize_test_network_spec();
         let data_dir = tempfile::tempdir().unwrap();
         let db = ReamDB::new(data_dir.path().to_path_buf())
@@ -577,20 +655,23 @@ mod tests {
         db.finalized_checkpoint_provider()
             .insert(Default::default())
             .unwrap();
+        let fetch_execution_blobs = execution_engine.is_some();
         let beacon_chain = Arc::new(BeaconChain::new(
             db,
             Arc::new(OperationPool::default()),
             Arc::new(SyncCommitteePool::default()),
-            None,
+            execution_engine,
             None,
         ));
         beacon_chain.set_sampling_columns([COLUMN]).await;
         let (sender, _receiver) = mpsc::unbounded_channel();
+        let (pending_sender, pending_items) = mpsc::channel(4);
         let partial_columns = PartialColumns::new(
             beacon_chain,
             Arc::new(BeaconCacheDB::default()),
             P2PSender(sender),
-            false,
+            pending_sender,
+            fetch_execution_blobs,
         );
 
         let blob = Blob::default();
@@ -608,16 +689,17 @@ mod tests {
             kzg_commitments_inclusion_proof: Default::default(),
         };
         partial_columns
-            .on_validated_header(Arc::new(header.clone()))
+            .on_validated_header(Arc::new(header.clone()), parent_pending)
             .await;
         let index = COLUMN as usize;
-        (
-            data_dir,
+        Node {
+            _data_dir: data_dir,
             partial_columns,
+            pending_items,
             header,
-            cells[index].clone(),
-            proofs[index],
-        )
+            cell: cells[index].clone(),
+            proof: proofs[index],
+        }
     }
 
     fn message(cell: Cell, proof: KZGProof) -> PartialDataColumnSidecar {
@@ -628,7 +710,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_cell_with_a_bad_proof_is_rejected_and_a_valid_one_completes_the_column() {
-        let (_data_dir, partial_columns, header, cell, proof) = assembling_node().await;
+        let Node {
+            _data_dir,
+            partial_columns,
+            header,
+            cell,
+            proof,
+            ..
+        } = assembling_node(false, None).await;
         let block_root = header.block_root();
         let mut bad_proof = proof;
         bad_proof[0] ^= 1;
@@ -666,7 +755,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_header_that_differs_from_the_validated_one_is_rejected() {
-        let (_data_dir, partial_columns, header, _, _) = assembling_node().await;
+        let Node {
+            _data_dir,
+            partial_columns,
+            header,
+            ..
+        } = assembling_node(false, None).await;
         let mut other = header.clone();
         other.kzg_commitments_inclusion_proof[0] = B256::repeat_byte(1);
         let sidecar = PartialColumn::empty(COLUMN, 1).to_sidecar(None, Some(&other));
@@ -677,5 +771,80 @@ mod tests {
             .unwrap();
 
         assert!(matches!(result, ValidationResult::Reject(_)), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn a_column_completed_while_its_parent_is_pending_waits_in_the_pending_lookups() {
+        let mut node = assembling_node(true, None).await;
+        let block_root = node.header.block_root();
+
+        let result = node
+            .partial_columns
+            .process_message(COLUMN, block_root, &message(node.cell, node.proof))
+            .await
+            .unwrap();
+
+        assert_eq!(result, ValidationResult::Accept);
+        assert!(matches!(
+            node.pending_items.try_recv(),
+            Ok(PendingGossipItem::Column { column }) if column.sidecar().index == COLUMN
+        ));
+        assert!(
+            !node
+                .partial_columns
+                .beacon_chain
+                .db()
+                .column_sidecars_provider()
+                .contains(&ColumnIdentifier::new(block_root, COLUMN))
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_evicted_block_that_comes_back_is_not_fetched_again() {
+        let node = assembling_node(false, None).await;
+        let block_root = node.header.block_root();
+        node.partial_columns.assemblies.lock().remove(&block_root);
+
+        node.partial_columns
+            .on_validated_header(Arc::new(node.header), false)
+            .await;
+
+        // A new fetch would settle the assembly only once its spawned task runs.
+        assert!(
+            node.partial_columns.assemblies.lock()[&block_root].local_fetch_settled,
+            "the assembly should request its missing cells without fetching again"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_execution_client_that_never_answers_get_blobs_times_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let jwt_dir = tempfile::tempdir().unwrap();
+        let jwt_path = jwt_dir.path().join("jwt.hex");
+        std::fs::write(&jwt_path, alloy_primitives::hex::encode([1u8; 32])).unwrap();
+        let engine = ExecutionEngine::new(url.parse().unwrap(), jwt_path).unwrap();
+        let node = assembling_node(false, Some(engine)).await;
+        let mut header = node.header;
+        header.signed_block_header.message.slot =
+            compute_start_slot_at_epoch(beacon_network_spec().fulu_fork_epoch);
+        let block_root = header.block_root();
+
+        let fetch = tokio::spawn(
+            node.partial_columns
+                .clone()
+                .fetch_local_cells(block_root, Arc::new(header)),
+        );
+        // Holds the connection open without answering.
+        let _connection = tokio::time::timeout(EXECUTION_BLOBS_TIMEOUT, listener.accept())
+            .await
+            .expect("the fetch should call the execution client")
+            .unwrap();
+
+        tokio::time::timeout(EXECUTION_BLOBS_TIMEOUT * 2, fetch)
+            .await
+            .expect("the fetch should give up after its timeout")
+            .unwrap();
     }
 }

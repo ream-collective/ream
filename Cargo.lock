@@ -7139,6 +7139,7 @@ dependencies = [
  "ethereum_ssz",
  "ethereum_ssz_derive",
  "libp2p",
+ "lru",
  "parking_lot",
  "rand 0.10.2",
  "ream-bls",
