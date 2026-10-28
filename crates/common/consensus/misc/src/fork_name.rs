@@ -20,6 +20,7 @@ pub enum ForkName {
     Deneb,
     Electra,
     Fulu,
+    Gloas,
 }
 
 impl ForkName {
@@ -32,6 +33,7 @@ impl ForkName {
             ForkName::Deneb,
             ForkName::Electra,
             ForkName::Fulu,
+            ForkName::Gloas,
         ]
     }
 
@@ -45,6 +47,7 @@ impl ForkName {
             ForkName::Deneb => Some(ForkName::Capella),
             ForkName::Electra => Some(ForkName::Deneb),
             ForkName::Fulu => Some(ForkName::Electra),
+            ForkName::Gloas => Some(ForkName::Fulu),
         }
     }
 
@@ -57,7 +60,8 @@ impl ForkName {
             ForkName::Capella => Some(ForkName::Deneb),
             ForkName::Deneb => Some(ForkName::Electra),
             ForkName::Electra => Some(ForkName::Fulu),
-            ForkName::Fulu => None,
+            ForkName::Fulu => Some(ForkName::Gloas),
+            ForkName::Gloas => None,
         }
     }
 
@@ -85,6 +89,10 @@ impl ForkName {
         self >= ForkName::Fulu
     }
 
+    pub fn gloas_enabled(self) -> bool {
+        self >= ForkName::Gloas
+    }
+
     pub fn is_enabled_at(&self, fork: ForkName) -> bool {
         *self >= fork
     }
@@ -102,6 +110,7 @@ impl FromStr for ForkName {
             "deneb" => ForkName::Deneb,
             "electra" => ForkName::Electra,
             "fulu" => ForkName::Fulu,
+            "gloas" => ForkName::Gloas,
             _ => return Err(format!("unknown fork name: {fork_name}")),
         })
     }
@@ -117,6 +126,7 @@ impl Display for ForkName {
             ForkName::Deneb => "deneb".fmt(f),
             ForkName::Electra => "electra".fmt(f),
             ForkName::Fulu => "fulu".fmt(f),
+            ForkName::Gloas => "gloas".fmt(f),
         }
     }
 }

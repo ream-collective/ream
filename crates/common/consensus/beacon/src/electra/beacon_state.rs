@@ -3844,7 +3844,9 @@ pub fn is_valid_deposit_signature(
 }
 
 pub fn fork_name_at_epoch(epoch: u64) -> ForkName {
-    if epoch >= beacon_network_spec().fulu_fork_epoch {
+    if epoch >= beacon_network_spec().gloas_fork_epoch {
+        ForkName::Gloas
+    } else if epoch >= beacon_network_spec().fulu_fork_epoch {
         ForkName::Fulu
     } else if epoch >= beacon_network_spec().electra_fork_epoch {
         ForkName::Electra
@@ -3865,6 +3867,11 @@ pub fn fork_name_from_version(version: [u8; 4]) -> ForkName {
     match version {
         _ if version == beacon_network_spec().electra_fork_version => ForkName::Electra,
         _ if version == beacon_network_spec().fulu_fork_version => ForkName::Fulu,
+        _ if version == beacon_network_spec().gloas_fork_version
+            && beacon_network_spec().gloas_fork_epoch != FAR_FUTURE_EPOCH =>
+        {
+            ForkName::Gloas
+        }
         _ if version == beacon_network_spec().deneb_fork_version => ForkName::Deneb,
         _ if version == beacon_network_spec().capella_fork_version => ForkName::Capella,
         _ if version == beacon_network_spec().bellatrix_fork_version => ForkName::Bellatrix,
