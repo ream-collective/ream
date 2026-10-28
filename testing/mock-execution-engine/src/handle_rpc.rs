@@ -51,12 +51,14 @@ fn handle_rpc_request(
             let forkchoice_state: ForkchoiceStateV1 = parse_param(&request.params, 0)?;
             let payload_attributes: Option<PayloadAttributesV3> = parse_param(&request.params, 1)?;
             let mut generator = lock_generator(generator)?;
+            generator.forkchoice_updates += 1;
+            let status = generator.forkchoice_status;
             let response = generator
                 .forkchoice_updated(forkchoice_state, payload_attributes)
                 .map_err(invalid_params)?;
             Ok(json!({
                 "payloadStatus": {
-                    "status": "VALID",
+                    "status": status,
                     "latestValidHash": response.payload_status.latest_valid_hash,
                     "validationError": response.payload_status.validation_error,
                 },
