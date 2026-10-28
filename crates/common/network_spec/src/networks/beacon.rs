@@ -150,6 +150,11 @@ pub struct BeaconNetworkSpec {
     #[serde(with = "crate::b32_hex")]
     pub fulu_fork_version: B32,
     pub fulu_fork_epoch: u64,
+    // Gloas, unscheduled when a config leaves it out
+    #[serde(with = "crate::b32_hex", default)]
+    pub gloas_fork_version: B32,
+    #[serde(default = "far_future_epoch")]
+    pub gloas_fork_epoch: u64,
 
     // Time parameters
     pub slot_duration_ms: u64,
@@ -219,6 +224,10 @@ pub struct BeaconNetworkSpec {
 
     #[serde(default)]
     pub blob_schedule: Vec<BlobParameters>,
+}
+
+fn far_future_epoch() -> u64 {
+    FAR_FUTURE_EPOCH
 }
 
 impl BeaconNetworkSpec {
@@ -336,6 +345,11 @@ impl BeaconNetworkSpec {
                 current_version: self.fulu_fork_version,
                 epoch: self.fulu_fork_epoch,
             },
+            Fork {
+                previous_version: self.fulu_fork_version,
+                current_version: self.gloas_fork_version,
+                epoch: self.gloas_fork_epoch,
+            },
         ])
     }
 
@@ -422,6 +436,8 @@ pub static MAINNET: LazyLock<Arc<BeaconNetworkSpec>> = LazyLock::new(|| {
         electra_fork_epoch: 364032,
         fulu_fork_version: fixed_bytes!("0x06000000"),
         fulu_fork_epoch: 411392,
+        gloas_fork_version: fixed_bytes!("0x07000000"),
+        gloas_fork_epoch: FAR_FUTURE_EPOCH,
         slot_duration_ms: 12000,
         seconds_per_eth1_block: 14,
         min_validator_withdrawability_delay: 256,
@@ -509,6 +525,8 @@ pub static SEPOLIA: LazyLock<Arc<BeaconNetworkSpec>> = LazyLock::new(|| {
         electra_fork_epoch: 222464,
         fulu_fork_version: fixed_bytes!("0x90000075"),
         fulu_fork_epoch: 272640,
+        gloas_fork_version: fixed_bytes!("0x90000076"),
+        gloas_fork_epoch: 353024,
         slot_duration_ms: 12000,
         seconds_per_eth1_block: 14,
         min_validator_withdrawability_delay: 256,
@@ -596,6 +614,8 @@ pub static HOODI: LazyLock<Arc<BeaconNetworkSpec>> = LazyLock::new(|| {
         electra_fork_epoch: 2048,
         fulu_fork_version: fixed_bytes!("0x70000910"),
         fulu_fork_epoch: 50688,
+        gloas_fork_version: fixed_bytes!("0x80000910"),
+        gloas_fork_epoch: FAR_FUTURE_EPOCH,
         slot_duration_ms: 12000,
         seconds_per_eth1_block: 14,
         min_validator_withdrawability_delay: 256,
@@ -683,6 +703,8 @@ pub static DEV: LazyLock<Arc<BeaconNetworkSpec>> = LazyLock::new(|| {
         electra_fork_epoch: 364032,
         fulu_fork_version: fixed_bytes!("0x06000000"),
         fulu_fork_epoch: 411392,
+        gloas_fork_version: fixed_bytes!("0x07000000"),
+        gloas_fork_epoch: FAR_FUTURE_EPOCH,
         slot_duration_ms: 12000,
         seconds_per_eth1_block: 14,
         min_validator_withdrawability_delay: 256,
@@ -843,6 +865,23 @@ mod backfill_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_config_without_gloas_leaves_it_unscheduled() {
+        let yaml = serde_yaml::to_string(&**MAINNET).expect("mainnet serializes");
+        let without_gloas: String = yaml
+            .lines()
+            .filter(|line| !line.starts_with("GLOAS_"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let spec: BeaconNetworkSpec = serde_yaml::from_str(&without_gloas).expect("config parses");
+        assert_eq!(spec.gloas_fork_epoch, FAR_FUTURE_EPOCH);
+        assert_eq!(spec.fork_schedule().scheduled().count(), 7);
+        assert_eq!(
+            SEPOLIA.current_fork_version(353024),
+            fixed_bytes!("0x90000076")
+        );
+    }
 
     /// Electra at 10, Fulu at 20, BPO forks at 30 and 40, and a pre-Fulu blob entry at 5.
     fn spec() -> BeaconNetworkSpec {
