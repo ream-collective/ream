@@ -408,7 +408,7 @@ where
 
 /// Sends `item` unless the queue is full, and returns whether it was not dropped for that. A
 /// closed queue means the manager loop is shutting down, so its items are not counted as dropped.
-fn try_forward<T>(sender: &mpsc::Sender<T>, item: T) -> bool {
+pub(crate) fn try_forward<T>(sender: &mpsc::Sender<T>, item: T) -> bool {
     !matches!(
         sender.try_send(item),
         Err(mpsc::error::TrySendError::Full(_))
