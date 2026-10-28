@@ -3568,6 +3568,14 @@ impl BeaconState {
         MIN_VALIDATOR_WITHDRAWABILITY_DELAY + epochs_for_validator_set_churn
     }
 
+    /// The state's tree leaves, for inclusion proofs. Outside zkVM builds they come from the field
+    /// root caches, so a proof does not rehash the validator registry.
+    #[cfg(not(feature = "zkvm"))]
+    pub fn merkle_leaves(&self) -> Vec<B256> {
+        self.field_roots().to_vec()
+    }
+
+    #[cfg(feature = "zkvm")]
     pub fn merkle_leaves(&self) -> Vec<B256> {
         vec![
             self.genesis_time.to_le_bytes().tree_hash_root(),
@@ -3655,12 +3663,19 @@ impl BeaconState {
     /// most of the cost on mainnet.
     #[cfg(not(feature = "zkvm"))]
     pub fn state_root(&self) -> B256 {
+        let field_roots = self.field_roots();
+        tree_hash::merkle_root(field_roots.concat().as_slice(), field_roots.len())
+    }
+
+    /// The root of every field in order, the leaves of the state's tree, from the same caches.
+    #[cfg(not(feature = "zkvm"))]
+    fn field_roots(&self) -> [B256; 38] {
         let limit_depth = depth::<ValidatorRegistryLimit>();
         // Leaf chunks hold four `u64`s or 32 `u8`s, so those lists' trees are 2 and 5 levels
         // shallower than the registry limit.
         let (u64_list_depth, u8_list_depth) = (limit_depth - 2, limit_depth - 5);
         let caches = &self.caches.field_roots;
-        let field_roots = [
+        [
             self.genesis_time.tree_hash_root(),
             self.genesis_validators_root.tree_hash_root(),
             self.slot.tree_hash_root(),
@@ -3719,8 +3734,7 @@ impl BeaconState {
                 .pending_consolidations
                 .root(&self.pending_consolidations, depth::<U262144>()),
             self.proposer_lookahead.tree_hash_root(),
-        ];
-        tree_hash::merkle_root(field_roots.concat().as_slice(), field_roots.len())
+        ]
     }
 
     /// zkVM builds hash through a patched ``VariableList`` that treats its 2^29 limit as 2^40,
@@ -3898,6 +3912,21 @@ mod tests {
     use ssz::Decode;
 
     use super::*;
+
+    /// The branch built from the cached field roots proves the finalized root against the
+    /// state's derived hash tree root (gindex 169: depth 7, index 41).
+    #[test]
+    fn the_finality_branch_proves_the_finalized_root() {
+        let state = sepolia_state();
+        let branch = state.finalized_root_inclusion_proof().unwrap();
+        assert!(ream_merkle::is_valid_merkle_branch(
+            state.finalized_checkpoint.root,
+            &branch,
+            7,
+            41,
+            state.tree_hash_root()
+        ));
+    }
 
     fn sepolia_state() -> BeaconState {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
