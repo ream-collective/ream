@@ -1,6 +1,7 @@
 use std::time::Instant;
 
-use discv5::{Enr, enr::NodeId};
+use discv5::Enr;
+use enr::NodeId;
 use libp2p::{Multiaddr, PeerId};
 use ream_peer::{ConnectionState, Direction};
 use ream_req_resp::beacon::messages::{meta_data::GetMetaDataV3, status::Status};
@@ -138,7 +139,7 @@ impl CachedPeer {
 
 #[cfg(test)]
 mod tests {
-    use discv5::enr::CombinedKey;
+    use enr::CombinedKey;
     use ream_discv5::subnet::{CUSTODY_GROUP_COUNT_ENR_KEY, CustodyGroupCount};
 
     use super::*;

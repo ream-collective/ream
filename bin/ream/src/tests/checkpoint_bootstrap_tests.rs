@@ -47,7 +47,7 @@ fn initialize_column_recovery_test(name: &str) -> bool {
 }
 
 fn full_custody() -> PeerCustodyGroups {
-    PeerCustodyGroups::from_advertised(discv5::enr::NodeId::random(), NUM_CUSTODY_GROUPS)
+    PeerCustodyGroups::from_advertised(enr::NodeId::random(), NUM_CUSTODY_GROUPS)
         .expect("full custody is a valid count")
 }
 
@@ -169,7 +169,7 @@ async fn checkpoint_bootstrap_preserves_anchor_signature() {
     );
 
     let enr = discv5::Enr::builder()
-        .build(&discv5::enr::CombinedKey::generate_secp256k1())
+        .build(&enr::CombinedKey::generate_secp256k1())
         .unwrap();
     let network_state = Arc::new(NetworkState {
         local_enr: enr.into(),

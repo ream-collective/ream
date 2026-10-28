@@ -9,7 +9,8 @@ use std::{
 };
 
 use anyhow::{Context, anyhow};
-use discv5::{Enr, enr::CombinedKey};
+use discv5::Enr;
+use enr::CombinedKey;
 use tracing::warn;
 
 const MAX_TEMP_FILE_ATTEMPTS: usize = 64;
@@ -174,12 +175,10 @@ pub(crate) mod test_utils {
 
 #[cfg(test)]
 mod tests {
-    use discv5::enr::k256::ecdsa::SigningKey;
-
     use super::{test_utils::TestDir, *};
 
     fn key() -> CombinedKey {
-        CombinedKey::Secp256k1(SigningKey::random(&mut rand::thread_rng()))
+        CombinedKey::generate_secp256k1()
     }
 
     fn enr(key: &CombinedKey, tcp_port: u16) -> Enr {

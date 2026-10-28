@@ -627,7 +627,7 @@ mod tests {
         db.finish_bootstrap(state.genesis_validators_root, Some(&meta))
             .unwrap();
         let enr = discv5::Enr::builder()
-            .build(&discv5::enr::CombinedKey::generate_secp256k1())
+            .build(&enr::CombinedKey::generate_secp256k1())
             .unwrap();
         let network = Arc::new(NetworkState {
             local_enr: enr.into(),

@@ -16,7 +16,6 @@ use std::{
 use alloy_primitives::hex;
 use anyhow::anyhow;
 use delay_map::{HashMapDelay, HashSetDelay};
-use discv5::multiaddr::Protocol;
 use futures::{StreamExt, stream::FuturesUnordered};
 use libp2p::{
     Multiaddr, SwarmBuilder,
@@ -26,6 +25,7 @@ use libp2p::{
         Event as GossipsubEvent, FailedMessages, IdentTopic, MessageAuthenticity, PublishError,
     },
     identify,
+    multiaddr::Protocol,
     swarm::{
         Config, ConnectionDenied, ConnectionId, NetworkBehaviour, Swarm, SwarmEvent, THandler,
         THandlerInEvent, THandlerOutEvent,
@@ -123,22 +123,17 @@ struct SlowPeerTracker {
     consecutive_events: u32,
     disconnect_attempted: bool,
     total_events: u64,
-    total_publish_failed: usize,
-    total_forward_failed: usize,
     total_priority_queue_full: usize,
+    // Gossipsub also counts messages dropped after their send timeout as non-priority.
     total_non_priority_queue_full: usize,
-    total_timeout: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct SlowPeerSnapshot {
     consecutive_events: u32,
     total_events: u64,
-    total_publish_failed: usize,
-    total_forward_failed: usize,
     total_priority_queue_full: usize,
     total_non_priority_queue_full: usize,
-    total_timeout: usize,
 }
 
 impl SlowPeerTracker {
@@ -155,28 +150,18 @@ impl SlowPeerTracker {
         self.last_event_at = Some(now);
 
         self.total_events = self.total_events.saturating_add(1);
-        self.total_publish_failed = self
-            .total_publish_failed
-            .saturating_add(failed_messages.publish);
-        self.total_forward_failed = self
-            .total_forward_failed
-            .saturating_add(failed_messages.forward);
         self.total_priority_queue_full = self
             .total_priority_queue_full
             .saturating_add(failed_messages.priority);
         self.total_non_priority_queue_full = self
             .total_non_priority_queue_full
             .saturating_add(failed_messages.non_priority);
-        self.total_timeout = self.total_timeout.saturating_add(failed_messages.timeout);
 
         SlowPeerSnapshot {
             consecutive_events: self.consecutive_events,
             total_events: self.total_events,
-            total_publish_failed: self.total_publish_failed,
-            total_forward_failed: self.total_forward_failed,
             total_priority_queue_full: self.total_priority_queue_full,
             total_non_priority_queue_full: self.total_non_priority_queue_full,
-            total_timeout: self.total_timeout,
         }
     }
 }
@@ -1039,19 +1024,12 @@ impl LeanNetworkService {
         if snapshot.consecutive_events == 1 {
             info!(
                 peer = %peer_id,
-                heartbeat_publish_failed = failed_messages.publish,
-                heartbeat_forward_failed = failed_messages.forward,
                 heartbeat_priority_queue_full = failed_messages.priority,
                 heartbeat_non_priority_queue_full = failed_messages.non_priority,
-                heartbeat_timeout = failed_messages.timeout,
-                heartbeat_total_queue_full = failed_messages.total_queue_full(),
                 consecutive_slow_peer_events = snapshot.consecutive_events,
                 total_slow_peer_events = snapshot.total_events,
-                total_publish_failed = snapshot.total_publish_failed,
-                total_forward_failed = snapshot.total_forward_failed,
                 total_priority_queue_full = snapshot.total_priority_queue_full,
                 total_non_priority_queue_full = snapshot.total_non_priority_queue_full,
-                total_timeout = snapshot.total_timeout,
                 peer_score,
                 ?peer_state,
                 ?peer_direction,
@@ -1654,20 +1632,14 @@ mod tests {
     fn test_slow_peer_tracker_records_failed_messages() {
         let mut tracker = SlowPeerTracker::default();
         let snapshot = tracker.record(&FailedMessages {
-            publish: 1,
-            forward: 2,
             priority: 3,
             non_priority: 4,
-            timeout: 5,
         });
 
         assert_eq!(snapshot.consecutive_events, 1);
         assert_eq!(snapshot.total_events, 1);
-        assert_eq!(snapshot.total_publish_failed, 1);
-        assert_eq!(snapshot.total_forward_failed, 2);
         assert_eq!(snapshot.total_priority_queue_full, 3);
         assert_eq!(snapshot.total_non_priority_queue_full, 4);
-        assert_eq!(snapshot.total_timeout, 5);
     }
 
     #[test]
@@ -1675,24 +1647,17 @@ mod tests {
         let mut tracker = SlowPeerTracker::default();
 
         let first = tracker.record(&FailedMessages {
-            publish: 0,
-            forward: 1,
             priority: 0,
             non_priority: 2,
-            timeout: 0,
         });
         let second = tracker.record(&FailedMessages {
-            publish: 0,
-            forward: 1,
             priority: 0,
             non_priority: 2,
-            timeout: 0,
         });
 
         assert_eq!(first.consecutive_events, 1);
         assert_eq!(second.consecutive_events, 2);
         assert_eq!(second.total_events, 2);
-        assert_eq!(second.total_forward_failed, 2);
         assert_eq!(second.total_non_priority_queue_full, 4);
     }
 
@@ -1701,22 +1666,16 @@ mod tests {
         let mut tracker = SlowPeerTracker::default();
 
         let first = tracker.record(&FailedMessages {
-            publish: 0,
-            forward: 1,
             priority: 0,
-            non_priority: 0,
-            timeout: 0,
+            non_priority: 1,
         });
 
         tracker.last_event_at =
             Some(Instant::now() - SLOW_PEER_CONSECUTIVE_WINDOW - Duration::from_millis(1));
 
         let second = tracker.record(&FailedMessages {
-            publish: 0,
-            forward: 1,
             priority: 0,
-            non_priority: 0,
-            timeout: 0,
+            non_priority: 1,
         });
 
         assert_eq!(first.consecutive_events, 1);

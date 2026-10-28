@@ -619,7 +619,7 @@ mod tests {
 
     #[test]
     fn requests_only_the_missing_columns_the_peer_custodies() {
-        let node_id = discv5::enr::NodeId::new(&[4; 32]);
+        let node_id = enr::NodeId::new(&[4; 32]);
         let partial = PeerCustodyGroups::from_advertised(node_id, 4).expect("valid count");
         let full = PeerCustodyGroups::from_advertised(node_id, 128).expect("valid count");
         let none = PeerCustodyGroups::from_advertised(node_id, 0).expect("valid count");

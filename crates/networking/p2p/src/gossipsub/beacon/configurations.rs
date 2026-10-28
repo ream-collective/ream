@@ -34,7 +34,9 @@ impl GossipsubConfig {
             .gossip_lazy(6)
             .history_length(history_length)
             .history_gossip(3)
-            .max_messages_per_rpc(Some(500))
+            .max_publish_messages(500)
+            // Subscription and IHAVE batches from peers on many subnets exceed the 16 KiB default.
+            .max_control_message_size(128 * 1024)
             .duplicate_cache_time(Duration::from_secs(
                 SLOTS_PER_EPOCH * beacon_network_spec().seconds_per_slot() * 2,
             ))

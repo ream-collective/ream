@@ -9,10 +9,8 @@ use std::{
 
 use alloy_primitives::aliases::B32;
 use anyhow::{Result, anyhow};
-use discv5::{
-    Discv5, Enr,
-    enr::{CombinedKey, EnrKey, NodeId, k256::ecdsa::SigningKey},
-};
+use discv5::{Discv5, Enr};
+use enr::{CombinedKey, EnrKey, NodeId, k256::ecdsa::SigningKey};
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use libp2p::{
     Multiaddr, PeerId,

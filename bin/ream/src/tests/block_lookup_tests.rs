@@ -102,7 +102,7 @@ struct BlobBlockFixture {
 fn empty_network_state() -> NetworkState {
     NetworkState {
         local_enr: discv5::Enr::builder()
-            .build(&discv5::enr::CombinedKey::generate_secp256k1())
+            .build(&enr::CombinedKey::generate_secp256k1())
             .expect("valid enr")
             .into(),
         peer_table: Default::default(),
@@ -575,7 +575,7 @@ fn build_network_lookup_chain(
 
 /// Custody of a peer that serves every column, so a fetch requests all missing columns.
 fn full_custody() -> PeerCustodyGroups {
-    PeerCustodyGroups::from_advertised(discv5::enr::NodeId::random(), NUM_CUSTODY_GROUPS)
+    PeerCustodyGroups::from_advertised(enr::NodeId::random(), NUM_CUSTODY_GROUPS)
         .expect("full custody is a valid count")
 }
 
