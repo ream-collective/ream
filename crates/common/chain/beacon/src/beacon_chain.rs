@@ -13,6 +13,7 @@ use ream_consensus_beacon::{
     data_column_sidecar::{ColumnIdentifier, DataColumnSidecar, NUMBER_OF_COLUMNS},
     electra::{beacon_block::SignedBeaconBlock, beacon_state::BeaconState},
     matrix_entry::{data_column_sidecars_from_execution_blobs, reconstruct_data_column_sidecars},
+    partial_data_column_sidecar::PartialDataColumnHeader,
 };
 use ream_consensus_misc::{
     beacon_block_header::SignedBeaconBlockHeader,
@@ -938,6 +939,70 @@ impl BeaconChain {
             .await
     }
 
+    /// The blobs of `header`'s block the execution client holds, by commitment, from
+    /// `engine_getBlobsV3`, or `engine_getBlobsV2` when V3 fails. Returns none in the cases
+    /// [`Self::fetch_columns_from_execution`] skips.
+    pub async fn fetch_blobs_from_execution(
+        &self,
+        header: &PartialDataColumnHeader,
+    ) -> anyhow::Result<Option<Vec<Option<BlobAndProofV2>>>> {
+        let Some(execution_engine) = self.execution_engine.as_ref() else {
+            return Ok(None);
+        };
+        if header.kzg_commitments.is_empty()
+            || compute_epoch_at_slot(header.signed_block_header.message.slot)
+                < beacon_network_spec().fulu_fork_epoch
+            || self.db.block_provider().contains_key(header.block_root())?
+        {
+            return Ok(None);
+        }
+        let versioned_hashes: Vec<B256> = header
+            .kzg_commitments
+            .iter()
+            .map(|commitment| commitment.calculate_versioned_hash())
+            .collect();
+        let blobs = match execution_engine
+            .engine_get_blobs_v3(versioned_hashes.clone())
+            .await
+        {
+            Ok(blobs) => blobs,
+            Err(err) => {
+                debug!("engine_getBlobsV3 failed, trying engine_getBlobsV2: {err:#}");
+                execution_engine
+                    .engine_get_blobs_v2(versioned_hashes)
+                    .await
+                    .inspect_err(|_| BEACON_BLOBS_FROM_EL_ERROR_TOTAL.inc())?
+                    .map(|blobs| blobs.into_iter().map(Some).collect())
+            }
+        };
+        match &blobs {
+            Some(blobs) if blobs.len() == header.kzg_commitments.len() => {
+                if blobs.iter().all(Option::is_some) {
+                    BEACON_BLOBS_FROM_EL_HIT_TOTAL.inc();
+                } else {
+                    BEACON_BLOBS_FROM_EL_MISS_TOTAL.inc();
+                }
+            }
+            Some(blobs) => bail!(
+                "execution client returned {} blobs for {} commitments",
+                blobs.len(),
+                header.kzg_commitments.len()
+            ),
+            None => BEACON_BLOBS_FROM_EL_MISS_TOTAL.inc(),
+        }
+        Ok(blobs)
+    }
+
+    /// The columns this node samples.
+    pub async fn sampling_columns(&self) -> HashSet<u64> {
+        self.store
+            .lock()
+            .await
+            .data_availability_checker
+            .required_columns()
+            .clone()
+    }
+
     /// Builds the columns of `signed_block` from `blobs_and_proofs` and imports the required ones
     /// it does not have yet. Returns the imported columns.
     pub async fn import_columns_from_execution_blobs(
@@ -951,7 +1016,19 @@ impl BeaconChain {
             data_column_sidecars_from_execution_blobs(&block, blobs_and_proofs)
         })
         .await??;
+        let columns = self.import_missing_columns(block_root, columns).await?;
+        BEACON_DATA_COLUMNS_FROM_EL_IMPORTED_TOTAL.inc_by(columns.len() as u64);
+        debug!(%block_root, imported = columns.len(), "Imported data columns from execution blobs");
+        Ok(columns)
+    }
 
+    /// Imports the required columns of `block_root` it does not have yet, unless the block is
+    /// imported. Returns the imported columns.
+    pub async fn import_missing_columns(
+        &self,
+        block_root: B256,
+        columns: Vec<DataColumnSidecar>,
+    ) -> anyhow::Result<Vec<DataColumnSidecar>> {
         // Read after building, so columns that gossip delivered meanwhile are not stored twice.
         let missing = {
             let store = self.store.lock().await;
@@ -968,8 +1045,6 @@ impl BeaconChain {
             .collect::<Vec<_>>();
         self.import_data_column_sidecars_if(columns.clone(), |_| Ok(()))
             .await?;
-        BEACON_DATA_COLUMNS_FROM_EL_IMPORTED_TOTAL.inc_by(columns.len() as u64);
-        debug!(%block_root, imported = columns.len(), "Imported data columns from execution blobs");
         Ok(columns)
     }
 

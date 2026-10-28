@@ -22,6 +22,7 @@ use crate::{
         get_data_column_sidecars_from_column_sidecar,
     },
     electra::beacon_block::SignedBeaconBlock,
+    partial_data_column_sidecar::PartialColumn,
 };
 
 // Gossip and range-sync callers share this pool. Using at most half of the available CPUs and no
@@ -279,6 +280,44 @@ pub fn data_column_sidecars_from_execution_blobs(
         .collect::<Result<Vec<_>>>()?;
     get_data_column_sidecars_from_block(signed_block, cells_and_kzg_proofs)
         .map_err(|err| anyhow!("failed to assemble columns from execution blobs: {err}"))
+}
+
+/// Builds the cells of `columns` from the blobs the execution client returned, `None` for a blob
+/// it lacks, with their proofs taken as given like [`data_column_sidecars_from_execution_blobs`].
+pub fn partial_columns_from_execution_blobs(
+    blobs_and_proofs: Vec<Option<BlobAndProofV2>>,
+    columns: &[u64],
+) -> Result<Vec<PartialColumn>> {
+    let context = das_context();
+    let blob_count = blobs_and_proofs.len();
+    let cells_and_proofs = reconstruction_pool()
+        .install(|| {
+            blobs_and_proofs
+                .into_par_iter()
+                .map(|blob| {
+                    blob.map(|BlobAndProofV2 { blob, proofs }| {
+                        Ok((compute_cells(blob, context)?, proofs))
+                    })
+                    .transpose()
+                })
+                .collect::<Vec<_>>()
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    let mut partial_columns = columns
+        .iter()
+        .map(|index| PartialColumn::empty(*index, blob_count))
+        .collect::<Vec<_>>();
+    for (blob_index, cells_and_proofs) in cells_and_proofs.into_iter().enumerate() {
+        let Some((cells, proofs)) = cells_and_proofs else {
+            continue;
+        };
+        for column in &mut partial_columns {
+            let index = column.index as usize;
+            column.cells[blob_index] = Some((cells[index].clone(), proofs[index]));
+        }
+    }
+    Ok(partial_columns)
 }
 
 fn convert_cell(kzg_cell: KZGCell) -> Cell {
@@ -610,5 +649,25 @@ mod tests {
                 Ok(sidecar)
             })
             .collect()
+    }
+
+    #[test]
+    fn a_partial_execution_response_fills_only_the_blobs_it_returned() {
+        let blob = get_sample_blob(&mut StdRng::seed_from_u64(7));
+        let (cells, proofs) = compute_cells_and_kzg_proofs(&blob, das_context()).unwrap();
+        let returned = BlobAndProofV2 {
+            blob,
+            proofs: FixedVector::new(proofs.clone()).unwrap(),
+        };
+
+        let columns =
+            partial_columns_from_execution_blobs(vec![None, Some(returned)], &[3, 100]).unwrap();
+
+        assert_eq!(columns.len(), 2);
+        for column in columns {
+            let index = column.index as usize;
+            assert_eq!(column.cells[0], None);
+            assert_eq!(column.cells[1], Some((cells[index].clone(), proofs[index])));
+        }
     }
 }

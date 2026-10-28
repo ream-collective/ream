@@ -4,6 +4,7 @@ pub mod custody;
 pub mod data_availability_fetch;
 pub mod gossipsub;
 pub mod p2p_sender;
+pub mod partial_columns;
 pub mod req_resp;
 pub mod service;
 pub mod timing;

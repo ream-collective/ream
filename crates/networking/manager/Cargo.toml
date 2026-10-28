@@ -22,6 +22,7 @@ enr.workspace = true
 ethereum_ssz.workspace = true
 ethereum_ssz_derive.workspace = true
 libp2p.workspace = true
+parking_lot.workspace = true
 rand.workspace = true
 ssz_types.workspace = true
 tokio.workspace = true

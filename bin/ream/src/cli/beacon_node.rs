@@ -122,9 +122,20 @@ pub struct BeaconNodeConfig {
 
     #[arg(
         long,
-        help = "Do not fetch the blobs of gossip blocks from the execution client with engine_getBlobsV2"
+        help = "Do not fetch the blobs of gossip blocks from the execution client, with engine_getBlobsV2, or engine_getBlobsV3 when partial columns are on"
     )]
     pub disable_get_blobs: bool,
+
+    #[arg(
+        long,
+        value_name = "BOOLEAN",
+        help = "Exchange the cells of data columns with peers through gossipsub partial messages, so only cells missing from the execution client's blob pool cross the network. Set to false to opt out",
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_value_t = true,
+        default_missing_value = "true"
+    )]
+    pub enable_partial_columns: bool,
 
     #[arg(
         long,
@@ -175,6 +186,7 @@ impl From<BeaconNodeConfig> for ManagerConfig {
             blob_retention_epochs: config.blob_retention_epochs,
             gossipsub_history_length: None,
             disable_get_blobs: config.disable_get_blobs,
+            enable_partial_columns: config.enable_partial_columns,
             target_peers: config.target_peers,
             disable_peer_scoring: config.disable_peer_scoring,
             supernode: config.supernode,

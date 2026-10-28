@@ -21,6 +21,9 @@ pub struct NetworkConfig {
     /// Active validators at startup, which set the expected message rates of the scored gossip
     /// topics. `None` leaves gossipsub peer scoring off.
     pub active_validators: Option<usize>,
+
+    /// Exchange data column cells with peers through gossipsub partial messages.
+    pub enable_partial_columns: bool,
 }
 
 /// Established connection limits derived from the target peer count, with Lighthouse v8's

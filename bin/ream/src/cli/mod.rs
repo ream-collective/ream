@@ -200,7 +200,23 @@ mod tests {
                 assert_eq!(config.discovery_port, 9002);
                 assert_eq!(config.target_peers, 200);
                 assert!(!config.supernode);
+                assert!(config.enable_partial_columns);
             }
+            _ => unreachable!("This test should only validate the beacon node cli"),
+        }
+    }
+
+    #[test]
+    fn test_cli_beacon_node_opts_out_of_partial_columns() {
+        let cli = Cli::parse_from([
+            "program",
+            "beacon_node",
+            "--enable-partial-columns",
+            "false",
+        ]);
+
+        match cli.command {
+            Commands::BeaconNode(config) => assert!(!config.enable_partial_columns),
             _ => unreachable!("This test should only validate the beacon node cli"),
         }
     }

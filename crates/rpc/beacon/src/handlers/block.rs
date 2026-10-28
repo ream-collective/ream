@@ -32,6 +32,7 @@ use ream_consensus_beacon::{
     },
     genesis::Genesis,
     matrix_entry::{compute_cells_and_kzg_proofs, das_context},
+    partial_data_column_sidecar::{PartialColumn, PartialDataColumnHeader},
 };
 use ream_consensus_misc::{
     constants::beacon::{
@@ -45,7 +46,10 @@ use ream_execution_rpc_types::get_blobs::Blob;
 use ream_network_manager::p2p_sender::P2PSender;
 use ream_network_spec::networks::beacon_network_spec;
 use ream_p2p::{
-    gossipsub::beacon::topics::{GossipTopic, GossipTopicKind},
+    gossipsub::beacon::{
+        partial::PartialColumnMessage,
+        topics::{GossipTopic, GossipTopicKind},
+    },
     network::beacon::channel::GossipMessage,
 };
 use ream_storage::{
@@ -857,6 +861,20 @@ async fn broadcast_data_column_sidecars(
         }
     };
 
+    // Peers that take partial messages get the header, then request the cells they lack.
+    if let Some(first) = sidecars.first() {
+        let header = Arc::new(PartialDataColumnHeader::from_sidecar(first));
+        p2p_sender.publish_partial_columns(
+            sidecars
+                .iter()
+                .map(|sidecar| PartialColumnMessage {
+                    header: header.clone(),
+                    column: Arc::new(PartialColumn::from_sidecar(sidecar)),
+                    request_missing: false,
+                })
+                .collect(),
+        );
+    }
     let fork_digest = beacon_network_spec().fork_digest(block_epoch, genesis_validators_root());
     for sidecar in sidecars {
         let topic = GossipTopic {

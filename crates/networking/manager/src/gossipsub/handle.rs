@@ -1,4 +1,7 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{anyhow, ensure};
 use libp2p::PeerId;
@@ -53,6 +56,7 @@ use crate::{
         sync_committee_contribution_and_proof::validate_sync_committee_contribution_and_proof,
         voluntary_exit::validate_voluntary_exit,
     },
+    partial_columns::PartialColumns,
     timing::{ColumnSource, log_block_proposer, log_columns_received},
 };
 
@@ -298,6 +302,7 @@ pub async fn handle_gossipsub_message(
     unknown_parent_block: &mut Option<UnknownParentGossipBlock>,
     valid_block: &mut Option<SignedBeaconBlock>,
     propagation_source: PeerId,
+    partial_columns: Option<&Arc<PartialColumns>>,
     on_valid_block: impl FnOnce(&SignedBeaconBlock),
 ) -> MessageAcceptance {
     let topic = GossipTopic::from_topic_hash(&message.topic)
@@ -311,6 +316,7 @@ pub async fn handle_gossipsub_message(
         unknown_parent_block,
         valid_block,
         propagation_source,
+        partial_columns,
         on_valid_block,
     )
     .await;
@@ -332,6 +338,7 @@ async fn dispatch_gossipsub_message(
     unknown_parent_block: &mut Option<UnknownParentGossipBlock>,
     valid_block: &mut Option<SignedBeaconBlock>,
     propagation_source: PeerId,
+    partial_columns: Option<&Arc<PartialColumns>>,
     on_valid_block: impl FnOnce(&SignedBeaconBlock),
 ) -> MessageAcceptance {
     match GossipsubMessage::decode(&message.topic, &message.data) {
@@ -749,6 +756,9 @@ async fn dispatch_gossipsub_message(
                                 Some(&propagation_source),
                             );
                         }
+                        if let Some(partial_columns) = partial_columns {
+                            partial_columns.on_gossip_column(&data_column_sidecar).await;
+                        }
                         if let Err(err) =
                             import_validated_data_column(beacon_chain, *data_column_sidecar).await
                         {
@@ -1001,6 +1011,7 @@ mod tests {
             &mut unknown_parent_block,
             &mut valid_block,
             PeerId::random(),
+            None,
             |_| {},
         )
         .await;
