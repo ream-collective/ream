@@ -337,10 +337,12 @@ mod tests {
     fn a_stopped_network_service_fails_the_download_without_a_panic() {
         let (p2p_sender, p2p_receiver) = mpsc::unbounded_channel();
         drop(p2p_receiver);
+        // Kept alive until the task ends: dropping the executor's runtime cancels it.
+        let executor = ReamExecutor::new().expect("executor should start");
         let handle = PeerRangeDownloader::start(
             PeerId::random(),
             p2p_sender,
-            ReamExecutor::new().expect("executor should start"),
+            executor.clone(),
             Range {
                 start_slot: 0,
                 count: 1,
@@ -351,6 +353,7 @@ mod tests {
             futures::executor::block_on(handle).expect("the task should not panic"),
             Ok(StreamOutcome::Failed(DownloadFailure::Transport(_)))
         ));
+        drop(executor);
     }
 
     #[tokio::test]
