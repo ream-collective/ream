@@ -10,7 +10,8 @@ use libp2p::PeerId;
 use rand::seq::SliceRandom;
 use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::{
-    data_column_sidecar::NUMBER_OF_COLUMNS, electra::beacon_block::SignedBeaconBlock,
+    data_column_sidecar::{DataColumnSidecar, NUMBER_OF_COLUMNS},
+    electra::beacon_block::SignedBeaconBlock,
 };
 use ream_consensus_misc::{constants::beacon::SLOTS_PER_EPOCH, misc::compute_start_slot_at_epoch};
 use ream_discv5::{
@@ -71,10 +72,11 @@ use crate::{
         },
         workers::{
             GossipWorkerBudget, GossipWorkers, OnValidBlock, PENDING_ITEM_QUEUE_CAPACITY,
-            is_data_column, is_gossip_block, is_handled_concurrently,
+            PartialColumnWorkers, is_data_column, is_gossip_block, is_handled_concurrently,
         },
     },
     p2p_sender::P2PSender,
+    partial_columns::PartialColumns,
     req_resp::handle_req_resp_message,
     timing::{ColumnSource, log_columns_received},
     unknown_parent_lookup::{
@@ -136,6 +138,8 @@ pub struct NetworkManagerService {
     pub executor: ReamExecutor,
     /// Whether gossip blocks fetch their blobs from the execution client.
     pub fetch_execution_blobs: bool,
+    /// Whether data column cells are exchanged through gossipsub partial messages.
+    pub enable_partial_columns: bool,
     pub backfill_config: ream_syncer::backfill::scheduler::BackfillConfig,
     pub disable_backfill_rate_limiting: bool,
     pub blob_retention_epochs: u64,
@@ -315,6 +319,7 @@ fn spawn_column_reconstruction(
     beacon_chain: &Arc<BeaconChain>,
     cached_db: &Arc<BeaconCacheDB>,
     p2p_sender: &P2PSender,
+    partial_columns: Option<Arc<PartialColumns>>,
     block_root: B256,
 ) {
     let beacon_chain = beacon_chain.clone();
@@ -349,6 +354,9 @@ fn spawn_column_reconstruction(
                                 return;
                             }
                         };
+                    if let Some(partial_columns) = &partial_columns {
+                        partial_columns.on_full_columns(&rebuilt).await;
+                    }
                     let published = publish_reconstructed_columns(
                         rebuilt,
                         finalized_slot,
@@ -449,45 +457,57 @@ fn spawn_execution_column_fetch(
                 return;
             }
         };
-        if let Ok(genesis_time) = beacon_chain.db().genesis_time_provider().get() {
-            log_columns_received(
-                genesis_time,
-                signed_block.message.slot,
-                columns.iter().map(|column| column.index),
-                ColumnSource::ExecutionLayer,
-                None,
-            );
-        }
-        let finalized_slot = match beacon_chain.db().finalized_checkpoint_provider().get() {
-            Ok(checkpoint) => compute_start_slot_at_epoch(checkpoint.epoch),
-            Err(err) => {
-                error!(%block_root, "Cannot publish data columns from execution blobs: {err}");
-                return;
-            }
-        };
-        // Publish in random batches, so columns that arrive over gossip meanwhile are skipped;
-        // sending every column at once delayed the columns of other blocks (Lighthouse v8.2.0's
-        // `publish_data_columns_gradually`, with its defaults).
-        let mut columns = columns;
-        columns.shuffle(&mut rand::rng());
-        let mut published = 0;
-        for (batch_index, batch) in columns
-            .chunks(EXECUTION_COLUMN_PUBLICATION_BATCH_SIZE)
-            .enumerate()
-        {
-            if batch_index > 0 {
-                sleep(EXECUTION_COLUMN_PUBLICATION_INTERVAL).await;
-            }
-            published += publish_reconstructed_columns(
-                batch.to_vec(),
-                finalized_slot,
-                &cached_db,
-                &p2p_sender,
-            )
-            .await;
-        }
-        debug!(%block_root, published, "Published data columns from execution blobs");
+        publish_execution_columns(columns, &beacon_chain, &cached_db, &p2p_sender).await;
     });
+}
+
+/// Logs and publishes the columns of one block built from execution blobs, like reconstructed
+/// columns.
+pub(crate) async fn publish_execution_columns(
+    columns: Vec<DataColumnSidecar>,
+    beacon_chain: &BeaconChain,
+    cached_db: &BeaconCacheDB,
+    p2p_sender: &P2PSender,
+) {
+    let Some(first) = columns.first() else {
+        return;
+    };
+    let slot = first.signed_block_header.message.slot;
+    let block_root = first.signed_block_header.message.tree_hash_root();
+    if let Ok(genesis_time) = beacon_chain.db().genesis_time_provider().get() {
+        log_columns_received(
+            genesis_time,
+            slot,
+            columns.iter().map(|column| column.index),
+            ColumnSource::ExecutionLayer,
+            None,
+        );
+    }
+    let finalized_slot = match beacon_chain.db().finalized_checkpoint_provider().get() {
+        Ok(checkpoint) => compute_start_slot_at_epoch(checkpoint.epoch),
+        Err(err) => {
+            error!(%block_root, "Cannot publish data columns from execution blobs: {err}");
+            return;
+        }
+    };
+    // Publish in random batches, so columns that arrive over gossip meanwhile are skipped;
+    // sending every column at once delayed the columns of other blocks (Lighthouse v8.2.0's
+    // `publish_data_columns_gradually`, with its defaults).
+    let mut columns = columns;
+    columns.shuffle(&mut rand::rng());
+    let mut published = 0;
+    for (batch_index, batch) in columns
+        .chunks(EXECUTION_COLUMN_PUBLICATION_BATCH_SIZE)
+        .enumerate()
+    {
+        if batch_index > 0 {
+            sleep(EXECUTION_COLUMN_PUBLICATION_INTERVAL).await;
+        }
+        published +=
+            publish_reconstructed_columns(batch.to_vec(), finalized_slot, cached_db, p2p_sender)
+                .await;
+    }
+    debug!(%block_root, published, "Published data columns from execution blobs");
 }
 
 /// Margin after a slot start before the slot tick runs. The tick reads the wall clock in whole
@@ -732,6 +752,7 @@ impl NetworkManagerService {
             } else {
                 active_validator_count(&beacon_chain)
             },
+            enable_partial_columns: config.enable_partial_columns,
         };
 
         let (manager_sender, manager_receiver) = mpsc::unbounded_channel();
@@ -765,6 +786,7 @@ impl NetworkManagerService {
             sync_committee_pool,
             executor,
             fetch_execution_blobs: !config.disable_get_blobs,
+            enable_partial_columns: config.enable_partial_columns,
             backfill_config: config.backfill_config,
             disable_backfill_rate_limiting: config.disable_backfill_rate_limiting,
             backfill_custody: ream_syncer::backfill::ColumnCustody {
@@ -794,6 +816,7 @@ impl NetworkManagerService {
             block_range_syncer,
             executor,
             fetch_execution_blobs,
+            enable_partial_columns,
             backfill_config,
             disable_backfill_rate_limiting,
             blob_retention_epochs,
@@ -861,12 +884,24 @@ impl NetworkManagerService {
         let (pending_item_sender, mut pending_item_receiver) =
             mpsc::channel(PENDING_ITEM_QUEUE_CAPACITY);
         let gossip_worker_budget = GossipWorkerBudget::for_current_runtime();
+        let partial_columns = enable_partial_columns.then(|| {
+            PartialColumns::new(
+                beacon_chain.clone(),
+                cached_db.clone(),
+                p2p_sender.clone(),
+                fetch_execution_blobs,
+            )
+        });
+        let mut partial_workers = partial_columns.clone().map(|partial_columns| {
+            PartialColumnWorkers::start(partial_columns, &gossip_worker_budget)
+        });
         let mut gossip_workers = GossipWorkers::start(
             beacon_chain.clone(),
             cached_db.clone(),
             p2p_sender.clone(),
             pending_item_sender.clone(),
             &gossip_worker_budget,
+            partial_columns.clone(),
         );
         let mut column_workers = GossipWorkers::start(
             beacon_chain.clone(),
@@ -874,14 +909,19 @@ impl NetworkManagerService {
             p2p_sender.clone(),
             pending_item_sender.clone(),
             &gossip_worker_budget,
+            partial_columns.clone(),
         );
         let (unknown_parent_sender, mut unknown_parent_receiver) = mpsc::channel(MAX_LOOKUPS);
         let on_valid_block: OnValidBlock = {
             let beacon_chain = beacon_chain.clone();
             let cached_db = cached_db.clone();
             let p2p_sender = p2p_sender.clone();
+            let partial_columns = partial_columns.clone();
             Arc::new(move |block| {
-                if fetch_execution_blobs {
+                // Partial columns fetch the execution client's blobs themselves, with getBlobsV3.
+                if let Some(partial_columns) = &partial_columns {
+                    partial_columns.on_block(block);
+                } else if fetch_execution_blobs {
                     spawn_execution_column_fetch(&beacon_chain, &cached_db, &p2p_sender, block);
                 }
             })
@@ -892,7 +932,8 @@ impl NetworkManagerService {
             p2p_sender.clone(),
             pending_item_sender,
             unknown_parent_sender,
-            on_valid_block,
+            on_valid_block.clone(),
+            partial_columns.clone(),
         );
         let mut syncer_handle = block_range_syncer.start();
         // Avoid polling a completed JoinHandle after the syncer has caught up.
@@ -1048,7 +1089,7 @@ impl NetworkManagerService {
                                     );
                                 }
                                 ream_chain_beacon::beacon_chain::BlockImportEvent::ReconstructionReady { block_root } => {
-                                    spawn_column_reconstruction(&beacon_chain, &cached_db, &p2p_sender, block_root);
+                                    spawn_column_reconstruction(&beacon_chain, &cached_db, &p2p_sender, partial_columns.clone(), block_root);
                                 }
                             }
                             record_removed_lookup_entries(
@@ -1097,7 +1138,7 @@ impl NetworkManagerService {
                             // Skipped events may include a ReconstructionReady, which is sent
                             // once per block.
                             for block_root in beacon_chain.reconstructable_pending_blocks().await {
-                                spawn_column_reconstruction(&beacon_chain, &cached_db, &p2p_sender, block_root);
+                                spawn_column_reconstruction(&beacon_chain, &cached_db, &p2p_sender, partial_columns.clone(), block_root);
                             }
                             record_removed_lookup_entries(
                                 PENDING_AVAILABILITY_LOOKUP,
@@ -1306,7 +1347,7 @@ impl NetworkManagerService {
                             // A reconstruction that gave up after its retries is announced again
                             // only when another column arrives, which may never happen.
                             for block_root in beacon_chain.reserve_unannounced_reconstructions().await {
-                                spawn_column_reconstruction(&beacon_chain, &cached_db, &p2p_sender, block_root);
+                                spawn_column_reconstruction(&beacon_chain, &cached_db, &p2p_sender, partial_columns.clone(), block_root);
                             }
                         }
                         (Err(err), _, _) => error!("Failed to read current slot: {err}"),
@@ -1341,6 +1382,19 @@ impl NetworkManagerService {
                         &mut unknown_parent_lookups,
                     );
                 }
+                Some(err) = async {
+                    match &mut partial_workers {
+                        Some(partial_workers) => partial_workers.stopped().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    // A partial column worker also stops only by panicking.
+                    if err.is_panic() {
+                        std::panic::resume_unwind(err.into_panic());
+                    }
+                    error!("A partial column worker stopped: {err}");
+                    return;
+                }
                 Some(err) = column_workers.stopped() => {
                     // A column worker also stops only by panicking.
                     if err.is_panic() {
@@ -1367,6 +1421,11 @@ impl NetworkManagerService {
                         {
                             column_workers.submit(message, message_id, propagation_source);
                         }
+                        ReamNetworkEvent::PartialDataColumn { peer_id, column_index, block_root, sidecar } => {
+                            if let Some(partial_workers) = &partial_workers {
+                                partial_workers.submit(peer_id, column_index, block_root, sidecar);
+                            }
+                        }
                         ReamNetworkEvent::GossipsubMessage { propagation_source, message_id, message }
                             if is_handled_concurrently(&message.topic) =>
                         {
@@ -1389,11 +1448,8 @@ impl NetworkManagerService {
                                 &mut unknown_parent_block,
                                 &mut valid_block,
                                 propagation_source,
-                                |block| {
-                                    if fetch_execution_blobs {
-                                        spawn_execution_column_fetch(&beacon_chain, &cached_db, &p2p_sender, block);
-                                    }
-                                },
+                                partial_columns.as_ref(),
+                                |block| on_valid_block(block),
                             ).await;
                             p2p_sender.report_gossip_validation(
                                 message_id,

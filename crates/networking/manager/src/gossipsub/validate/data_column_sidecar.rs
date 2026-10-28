@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
 use alloy_primitives::B256;
+use ream_bls::BLSSignature;
 use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::{
     data_column_sidecar::{ColumnIdentifier, DataColumnSidecar},
     electra::beacon_state::BeaconState,
 };
 use ream_consensus_misc::{
+    beacon_block_header::SignedBeaconBlockHeader,
     checkpoint::Checkpoint,
     constants::beacon::GENESIS_SLOT,
     misc::{compute_epoch_at_slot, compute_start_slot_at_epoch},
@@ -155,12 +157,118 @@ async fn validate_data_column_sidecar_full_inner(
         ));
     }
 
+    let checked = match check_block_header(
+        beacon_chain,
+        cached_db,
+        &data_column_sidecar.signed_block_header,
+        header_root,
+        finalized_checkpoint,
+        || {
+            if !data_column_sidecar.verify_inclusion_proof() {
+                return Some("Invalid data column sidecar inclusion proof".to_string());
+            }
+            if !matches!(
+                verify_data_column_sidecar_kzg_proofs(data_column_sidecar),
+                Ok(true)
+            ) {
+                return Some("Invalid KZG proofs for data column sidecar".to_string());
+            }
+            None
+        },
+    )
+    .await?
+    {
+        HeaderVerdict::Valid(checked) => checked,
+        HeaderVerdict::Reject(reason) => return Ok(ValidationResult::Reject(reason)),
+        HeaderVerdict::Ignore(reason) => return Ok(ValidationResult::Ignore(reason)),
+    };
+    let pending_availability = checked.pending_availability;
+
+    // Re-check under the write lock in case another validation inserted the tuple.
+    {
+        let mut seen = cached_db.seen_data_column_sidecars.write().await;
+        if seen.contains(&tuple) {
+            return Ok(ValidationResult::Ignore(
+                "Duplicate data column sidecar for (slot, proposer_index, index)".to_string(),
+            ));
+        }
+        seen.put(tuple, ());
+    }
+
+    checked
+        .remember(
+            cached_db,
+            header_root,
+            &data_column_sidecar.signed_block_header,
+            finalized_checkpoint,
+        )
+        .await;
+
+    if pending_availability {
+        return Ok(ValidationResult::ParentPendingAvailability {
+            parent_root: header.parent_root,
+            validated: GossipValidatedDataColumn::new(data_column_sidecar.clone()),
+        });
+    }
+    Ok(ValidationResult::Accept)
+}
+
+/// Outcome of the block header checks a data column sidecar and a partial column header share.
+pub(crate) enum HeaderVerdict<'a> {
+    Valid(CheckedHeader<'a>),
+    Reject(String),
+    Ignore(String),
+}
+
+/// A header that passed the checks, holding the block's header lock until it is remembered.
+pub(crate) struct CheckedHeader<'a> {
+    header_guard: Option<HeaderLockGuard<'a>>,
+    already_current: bool,
+    pub(crate) pending_availability: bool,
+}
+
+impl CheckedHeader<'_> {
+    /// Records the header as validated for the block's other columns, then releases its lock.
+    pub(crate) async fn remember(
+        self,
+        cached_db: &BeaconCacheDB,
+        header_root: B256,
+        signed_block_header: &SignedBeaconBlockHeader,
+        finalized_checkpoint: Checkpoint,
+    ) {
+        if !self.already_current {
+            cached_db.validated_data_column_headers.write().await.put(
+                header_root,
+                ValidatedDataColumnHeader {
+                    signature: signed_block_header.signature.clone(),
+                    finalized_checkpoint,
+                    parent_pending: self.pending_availability,
+                },
+            );
+        }
+        drop(self.header_guard);
+    }
+}
+
+/// Runs the block header checks of the data column gossip rules: signature, parent, ancestry and
+/// proposer. `body_check` rejects what the header alone cannot, and runs before the proposer
+/// check.
+pub(crate) async fn check_block_header<'a>(
+    beacon_chain: &BeaconChain,
+    cached_db: &'a BeaconCacheDB,
+    signed_block_header: &SignedBeaconBlockHeader,
+    header_root: B256,
+    finalized_checkpoint: Checkpoint,
+    body_check: impl FnOnce() -> Option<String>,
+) -> anyhow::Result<HeaderVerdict<'a>> {
+    let header = &signed_block_header.message;
+    let db = beacon_chain.db();
     // One column per block runs the header checks; the others wait and reuse the result.
     let mut header_guard = None;
     let mut header_check = remembered_header_check(
         cached_db,
         header_root,
-        data_column_sidecar,
+        &signed_block_header.signature,
         finalized_checkpoint,
     )
     .await;
@@ -169,7 +277,7 @@ async fn validate_data_column_sidecar_full_inner(
         header_check = remembered_header_check(
             cached_db,
             header_root,
-            data_column_sidecar,
+            &signed_block_header.signature,
             finalized_checkpoint,
         )
         .await;
@@ -188,7 +296,7 @@ async fn validate_data_column_sidecar_full_inner(
                 if get_checkpoint_block_from_db(db, header.parent_root, finalized_checkpoint.epoch)?
                     != finalized_checkpoint.root
                 {
-                    return Ok(ValidationResult::Reject(
+                    return Ok(HeaderVerdict::Reject(
                         "Finalized checkpoint is not an ancestor of the sidecar's block"
                             .to_string(),
                     ));
@@ -206,7 +314,7 @@ async fn validate_data_column_sidecar_full_inner(
         let parent = match find_parent(beacon_chain, header.parent_root).await? {
             Some(ParentBlock::Imported { block, state }) => {
                 let Some(parent_state) = state else {
-                    return Ok(ValidationResult::Reject(
+                    return Ok(HeaderVerdict::Reject(
                         "Sidecar's parent failed validation".to_string(),
                     ));
                 };
@@ -239,15 +347,15 @@ async fn validate_data_column_sidecar_full_inner(
             .and_then(|index| signature_state.validators.get(index))
             .is_none()
         {
-            return Ok(ValidationResult::Reject(
+            return Ok(HeaderVerdict::Reject(
                 "Sidecar proposer index out of range".to_string(),
             ));
         }
         if !matches!(
-            signature_state.verify_block_header_signature(&data_column_sidecar.signed_block_header),
+            signature_state.verify_block_header_signature(signed_block_header),
             Ok(true)
         ) {
-            return Ok(ValidationResult::Reject(
+            return Ok(HeaderVerdict::Reject(
                 "Invalid proposer signature on data column sidecar's block header".to_string(),
             ));
         }
@@ -258,13 +366,11 @@ async fn validate_data_column_sidecar_full_inner(
             pending_availability,
         }) = parent
         else {
-            return Ok(ValidationResult::Ignore(
-                "Parent block not seen".to_string(),
-            ));
+            return Ok(HeaderVerdict::Ignore("Parent block not seen".to_string()));
         };
 
         if header.slot <= block_slot {
-            return Ok(ValidationResult::Reject(
+            return Ok(HeaderVerdict::Reject(
                 "Sidecar slot not higher than parent block's slot".to_string(),
             ));
         }
@@ -274,7 +380,7 @@ async fn validate_data_column_sidecar_full_inner(
             && get_checkpoint_block_from_db(db, header.parent_root, finalized_checkpoint.epoch)?
                 != finalized_checkpoint.root
         {
-            return Ok(ValidationResult::Reject(
+            return Ok(HeaderVerdict::Reject(
                 "Finalized checkpoint is not an ancestor of the sidecar's block".to_string(),
             ));
         }
@@ -285,19 +391,8 @@ async fn validate_data_column_sidecar_full_inner(
         Some((state, pending_availability))
     };
 
-    if !data_column_sidecar.verify_inclusion_proof() {
-        return Ok(ValidationResult::Reject(
-            "Invalid data column sidecar inclusion proof".to_string(),
-        ));
-    }
-
-    if !matches!(
-        verify_data_column_sidecar_kzg_proofs(data_column_sidecar),
-        Ok(true)
-    ) {
-        return Ok(ValidationResult::Reject(
-            "Invalid KZG proofs for data column sidecar".to_string(),
-        ));
+    if let Some(reason) = body_check() {
+        return Ok(HeaderVerdict::Reject(reason));
     }
 
     let pending_availability = match proposer_check {
@@ -310,7 +405,7 @@ async fn validate_data_column_sidecar_full_inner(
             } else {
                 let mut state = Arc::unwrap_or_clone(state);
                 if let Err(err) = state.process_slots(header.slot) {
-                    return Ok(ValidationResult::Ignore(format!(
+                    return Ok(HeaderVerdict::Ignore(format!(
                         "Could not advance parent state to sidecar slot: {err:?}"
                     )));
                 }
@@ -320,13 +415,13 @@ async fn validate_data_column_sidecar_full_inner(
             match expected {
                 Ok(expected_index) if expected_index == header.proposer_index => {}
                 Ok(expected_index) => {
-                    return Ok(ValidationResult::Reject(format!(
+                    return Ok(HeaderVerdict::Reject(format!(
                         "Wrong proposer index: slot {}: expected {expected_index}, got {}",
                         header.slot, header.proposer_index
                     )));
                 }
                 Err(err) => {
-                    return Ok(ValidationResult::Ignore(format!(
+                    return Ok(HeaderVerdict::Ignore(format!(
                         "Could not get proposer index: {err:?}"
                     )));
                 }
@@ -336,36 +431,11 @@ async fn validate_data_column_sidecar_full_inner(
         None => remembered_parent_pending,
     };
 
-    // Re-check under the write lock in case another validation inserted the tuple.
-    {
-        let mut seen = cached_db.seen_data_column_sidecars.write().await;
-        if seen.contains(&tuple) {
-            return Ok(ValidationResult::Ignore(
-                "Duplicate data column sidecar for (slot, proposer_index, index)".to_string(),
-            ));
-        }
-        seen.put(tuple, ());
-    }
-
-    if !matches!(header_check, Some(RememberedHeader::Current)) {
-        cached_db.validated_data_column_headers.write().await.put(
-            header_root,
-            ValidatedDataColumnHeader {
-                signature: data_column_sidecar.signed_block_header.signature.clone(),
-                finalized_checkpoint,
-                parent_pending: pending_availability,
-            },
-        );
-    }
-    drop(header_guard);
-
-    if pending_availability {
-        return Ok(ValidationResult::ParentPendingAvailability {
-            parent_root: header.parent_root,
-            validated: GossipValidatedDataColumn::new(data_column_sidecar.clone()),
-        });
-    }
-    Ok(ValidationResult::Accept)
+    Ok(HeaderVerdict::Valid(CheckedHeader {
+        header_guard,
+        already_current: matches!(header_check, Some(RememberedHeader::Current)),
+        pending_availability,
+    }))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -378,12 +448,12 @@ enum RememberedHeader {
 async fn remembered_header_check(
     cached_db: &BeaconCacheDB,
     header_root: B256,
-    data_column_sidecar: &DataColumnSidecar,
+    signature: &BLSSignature,
     finalized_checkpoint: Checkpoint,
 ) -> Option<RememberedHeader> {
     let headers = cached_db.validated_data_column_headers.read().await;
     let validated = headers.peek(&header_root)?;
-    if validated.signature != data_column_sidecar.signed_block_header.signature {
+    if validated.signature != *signature {
         return None;
     }
     Some(if validated.parent_pending {
@@ -436,7 +506,7 @@ impl Drop for HeaderLockGuard<'_> {
     }
 }
 
-fn is_not_from_future_slot(genesis_time: u64, slot: u64, current_time_ms: u64) -> bool {
+pub(crate) fn is_not_from_future_slot(genesis_time: u64, slot: u64, current_time_ms: u64) -> bool {
     let network_spec = beacon_network_spec();
     let slots_since_genesis = slot.saturating_sub(GENESIS_SLOT);
     let slot_time_ms = genesis_time

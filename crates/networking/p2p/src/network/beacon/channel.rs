@@ -16,7 +16,7 @@ use ream_req_resp::{
 };
 use tokio::sync::mpsc;
 
-use crate::gossipsub::beacon::topics::GossipTopic;
+use crate::gossipsub::beacon::{partial::PartialColumnMessage, topics::GossipTopic};
 
 pub enum P2PCallbackResponse {
     ResponseMessage(Arc<BeaconResponseMessage>),
@@ -44,6 +44,13 @@ pub enum P2PMessage {
         message_id: MessageId,
         propagation_source: PeerId,
         acceptance: MessageAcceptance,
+    },
+    /// Advertise and serve columns over partial messages. Ignored while partial columns are off.
+    PublishPartialColumns(Vec<PartialColumnMessage>),
+    /// Penalize a peer for an invalid partial message on column `column_index`'s topic.
+    ReportInvalidPartial {
+        peer_id: PeerId,
+        column_index: u64,
     },
     /// Join a subnet topic for a validator duty until `until_slot` has passed.
     SubscribeForDuty {

@@ -21,6 +21,8 @@ pub struct ManagerConfig {
     pub blob_retention_epochs: Option<u64>,
     pub gossipsub_history_length: Option<usize>,
     pub disable_get_blobs: bool,
+    /// Exchange data column cells with peers through gossipsub partial messages.
+    pub enable_partial_columns: bool,
     pub target_peers: usize,
     /// Leaves gossipsub peer scoring off.
     pub disable_peer_scoring: bool,

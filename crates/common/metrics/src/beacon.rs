@@ -319,6 +319,30 @@ lazy_static::lazy_static! {
         "beacon_data_columns_from_el_imported_total", "Data columns built from execution client blobs and imported", default_registry()
     ).expect("failed to create BEACON_DATA_COLUMNS_FROM_EL_IMPORTED_TOTAL int counter");
 
+    // PeerDAS: partial columns, with Lighthouse's names
+    pub static ref BEACON_PARTIAL_DATA_COLUMN_SIDECAR_HEADER_PROCESSING_REQUESTS_TOTAL: IntCounter = register_int_counter_with_registry!(
+        "beacon_partial_data_column_sidecar_header_processing_requests_total", "Partial data column headers validated", default_registry()
+    ).expect("failed to create BEACON_PARTIAL_DATA_COLUMN_SIDECAR_HEADER_PROCESSING_REQUESTS_TOTAL int counter");
+
+    pub static ref BEACON_PARTIAL_DATA_COLUMN_SIDECAR_HEADER_PROCESSING_SUCCESSES_TOTAL: IntCounter = register_int_counter_with_registry!(
+        "beacon_partial_data_column_sidecar_header_processing_successes_total", "Partial data column headers that passed validation", default_registry()
+    ).expect("failed to create BEACON_PARTIAL_DATA_COLUMN_SIDECAR_HEADER_PROCESSING_SUCCESSES_TOTAL int counter");
+
+    pub static ref BEACON_PARTIAL_DATA_COLUMN_SIDECAR_GOSSIP_VERIFICATION_SECONDS: Histogram = {
+        let opts = HistogramOpts::new(
+            "beacon_partial_data_column_sidecar_gossip_verification_seconds",
+            "Time to validate and merge a partial data column message"
+        ).buckets(vec![0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]);
+        register_histogram_with_registry!(
+            opts,
+            default_registry()
+        ).expect("failed to create BEACON_PARTIAL_DATA_COLUMN_SIDECAR_GOSSIP_VERIFICATION_SECONDS")
+    };
+
+    pub static ref BEACON_PARTIAL_COLUMN_PUBLISH_FAILURES_TOTAL: IntCounter = register_int_counter_with_registry!(
+        "gossipsub_failed_partial_publishes_total", "Partial data column publishes gossipsub refused", default_registry()
+    ).expect("failed to create BEACON_PARTIAL_COLUMN_PUBLISH_FAILURES_TOTAL int counter");
+
     // PeerDAS: Engine API — engine_get_blobs_v3 Metrics
     pub static ref BEACON_ENGINE_GET_BLOBS_V3_REQUESTS_TOTAL: IntCounter = register_int_counter_with_registry!(
         "beacon_engine_getBlobsV3_requests_total", "Total engine_getBlobsV3 requests sent", default_registry()

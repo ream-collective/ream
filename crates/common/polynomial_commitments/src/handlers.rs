@@ -143,6 +143,30 @@ pub fn verify_data_column_sidecar_kzg_proofs(sidecar: &DataColumnSidecar) -> any
     )
 }
 
+/// Verifies cells of column `column_index`, each given with its blob index, against
+/// `commitments` (spec: `verify_partial_data_column_sidecar_kzg_proofs`).
+pub fn verify_partial_column_cells_kzg_proofs(
+    column_index: u64,
+    commitments: &[KZGCommitment],
+    cells: &[(usize, Cell, KZGProof)],
+) -> anyhow::Result<bool> {
+    let mut cell_commitments = Vec::with_capacity(cells.len());
+    for (blob_index, _, _) in cells {
+        let Some(commitment) = commitments.get(*blob_index) else {
+            bail!("cell for blob {blob_index} has no commitment");
+        };
+        cell_commitments.push(*commitment);
+    }
+    verify_cell_kzg_proof_batch(
+        &VariableList::new(cell_commitments).map_err(|err| anyhow!("{err:?}"))?,
+        &vec![column_index; cells.len()],
+        &VariableList::new(cells.iter().map(|(_, cell, _)| cell.clone()).collect())
+            .map_err(|err| anyhow!("{err:?}"))?,
+        &VariableList::new(cells.iter().map(|(_, _, proof)| *proof).collect())
+            .map_err(|err| anyhow!("{err:?}"))?,
+    )
+}
+
 /// Most cells in one call of `verify_cell_kzg_proof_batch`, the limit of its lists.
 const MAX_CELLS_PER_KZG_BATCH: usize = 4096;
 
@@ -243,6 +267,38 @@ mod tests {
         columns[77].kzg_proofs[1][0] ^= 1;
         assert!(
             !verify_data_column_sidecars_kzg_proofs(&columns.iter().collect::<Vec<_>>())
+                .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn partial_column_cells_verify_against_their_blobs_commitments() {
+        // A zero blob has the same cell in every column, so each field element gets a value.
+        let mut bytes = vec![0u8; 131072];
+        for (index, element) in bytes.chunks_mut(32).enumerate() {
+            element[31] = (index % 251) as u8 + 1;
+        }
+        let blob = Blob {
+            inner: ssz_types::FixedVector::new(bytes).unwrap(),
+        };
+        let commitment = KZGCommitment(
+            das_context()
+                .blob_to_kzg_commitment(&blob.to_fixed_bytes())
+                .unwrap(),
+        );
+        let (cells, proofs) = compute_cells_and_kzg_proofs(&blob, das_context()).unwrap();
+        let commitments = [commitment, commitment];
+        let mut column_cells = vec![(1, cells[9].clone(), proofs[9])];
+
+        assert!(verify_partial_column_cells_kzg_proofs(9, &commitments, &column_cells).unwrap());
+        assert!(
+            !verify_partial_column_cells_kzg_proofs(8, &commitments, &column_cells)
+                .unwrap_or(false)
+        );
+
+        column_cells[0].2[0] ^= 1;
+        assert!(
+            !verify_partial_column_cells_kzg_proofs(9, &commitments, &column_cells)
                 .unwrap_or(false)
         );
     }

@@ -50,7 +50,9 @@ Options:
       --disable-backfill-rate-limiting
           Allow backfill verification and commits throughout the slot
       --disable-get-blobs
-          Do not fetch the blobs of gossip blocks from the execution client with engine_getBlobsV2
+          Do not fetch the blobs of gossip blocks from the execution client, with engine_getBlobsV2, or engine_getBlobsV3 when partial columns are on
+      --enable-partial-columns [<BOOLEAN>]
+          Exchange the cells of data columns with peers through gossipsub partial messages, so only cells missing from the execution client's blob pool cross the network. Set to false to opt out [default: true] [possible values: true, false]
       --target-peers <TARGET_PEERS>
           Peers to keep connected. Connections are limited to 90% of it inbound, 110% outbound and 130% in total [default: 200]
       --disable-peer-scoring

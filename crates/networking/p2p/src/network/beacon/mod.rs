@@ -14,6 +14,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use alloy_primitives::B256;
 use anyhow::{anyhow, ensure};
 use channel::{P2PCallbackError, P2PCallbackResponse, P2PMessage, P2PRequest, P2PResponse};
 use delay_map::{HashMapDelay, HashSetDelay};
@@ -37,7 +38,11 @@ use network_state::NetworkState;
 use parking_lot::{Mutex, RwLock};
 use peer::CachedPeer;
 use peer_custody::custody_group_enr_predicate;
-use ream_consensus_beacon::custody_group::{CustodyAssignment, CustodyConfig};
+use ream_consensus_beacon::{
+    custody_group::{CustodyAssignment, CustodyConfig},
+    data_column_sidecar::DATA_COLUMN_SIDECAR_SUBNET_COUNT,
+    partial_data_column_sidecar::{PartialDataColumnSidecar, parse_partial_column_group_id},
+};
 use ream_consensus_misc::{
     constants::beacon::{SLOTS_PER_EPOCH, genesis_validators_root},
     misc::{compute_epoch_at_slot, compute_start_slot_at_epoch},
@@ -52,7 +57,8 @@ use ream_discv5::{
 };
 use ream_executor::ReamExecutor;
 use ream_metrics::{
-    BEACON_GOSSIPSUB_LOWEST_PEER_SCORE, BEACON_GOSSIPSUB_PEERS_BY_SCORE, set_peer_count,
+    BEACON_GOSSIPSUB_LOWEST_PEER_SCORE, BEACON_GOSSIPSUB_PEERS_BY_SCORE,
+    BEACON_PARTIAL_COLUMN_PUBLISH_FAILURES_TOTAL, set_peer_count,
 };
 use ream_network_spec::networks::beacon_network_spec;
 use ream_peer::{ConnectionState, Direction};
@@ -73,6 +79,7 @@ use ream_req_resp::{
     handler::{ReqRespMessageError, ReqRespMessageReceived, RespMessage},
     messages::{RequestMessage, ResponseMessage},
 };
+use ssz::Decode;
 use ssz_types::{
     BitVector, VariableList,
     typenum::{U4, U64},
@@ -93,6 +100,7 @@ use crate::{
     gossipsub::{
         GossipsubBehaviour,
         beacon::{
+            partial::{HeaderSentTracker, OutgoingPartialColumn, PartialColumnMessage},
             scoring::{
                 GOSSIP_THRESHOLD, GRAYLIST_THRESHOLD, PUBLISH_THRESHOLD, PeerScoreSettings,
                 peer_score_thresholds,
@@ -275,6 +283,13 @@ pub enum ReamNetworkEvent {
         message_id: MessageId,
         message: Message,
     },
+    /// A partial message with cells or a header for column `column_index` of `block_root`.
+    PartialDataColumn {
+        peer_id: PeerId,
+        column_index: u64,
+        block_root: B256,
+        sidecar: Box<PartialDataColumnSidecar>,
+    },
 }
 
 pub struct Network {
@@ -304,6 +319,12 @@ pub struct Network {
     duty_subnets: HashMap<u64, u64>,
     /// Slow heartbeats per peer whose gossipsub send queue overflows, with the last one's time.
     slow_peers: HashMap<PeerId, (u32, Instant)>,
+    /// Data column topics use gossipsub partial messages.
+    enable_partial_columns: bool,
+    /// Topics partial messages were enabled on, which gossipsub allows once per topic.
+    partial_topics: HashSet<TopicHash>,
+    /// The peers each recent block's partial column header went to.
+    partial_headers_sent: HeaderSentTracker,
 }
 
 impl Network {
@@ -449,6 +470,9 @@ impl Network {
             duty_topics: HashMap::new(),
             duty_subnets: HashMap::new(),
             slow_peers: HashMap::new(),
+            enable_partial_columns: config.enable_partial_columns,
+            partial_topics: HashSet::new(),
+            partial_headers_sent: HeaderSentTracker::default(),
             sampling_columns,
             meta_data_requests: HashMap::new(),
             peer_score_settings,
@@ -622,6 +646,12 @@ impl Network {
                                     debug!("Not publishing a gossip message gossipsub already has");
                                 }
                                 Err(err) => warn!("Failed to publish gossip message: {err}"),
+                            }
+                        }
+                        P2PMessage::PublishPartialColumns(messages) => self.publish_partial_columns(messages),
+                        P2PMessage::ReportInvalidPartial { peer_id, column_index } => {
+                            if let Some(topic) = self.partial_column_topic(column_index) {
+                                self.swarm.behaviour_mut().gossipsub.report_invalid_partial(peer_id, &topic);
                             }
                         }
                         P2PMessage::ReportGossipValidation { message_id, propagation_source, acceptance } => {
@@ -1337,7 +1367,14 @@ impl Network {
                 message_id,
                 message,
             }),
-            GossipsubEvent::Subscribed { peer_id, topic } => {
+            GossipsubEvent::Partial {
+                topic_hash,
+                peer_id,
+                group_id,
+                message,
+                ..
+            } => self.handle_partial_message(topic_hash, peer_id, &group_id, message),
+            GossipsubEvent::Subscribed { peer_id, topic, .. } => {
                 trace!("Peer {peer_id} subscribed to topic: {topic:?}");
                 None
             }
@@ -1361,6 +1398,90 @@ impl Network {
                 None
             }
             _ => None,
+        }
+    }
+
+    /// Decodes a partial message for the manager. An undecodable body is penalized; metadata
+    /// without a body and unknown group id versions are left to gossipsub.
+    fn handle_partial_message(
+        &mut self,
+        topic_hash: TopicHash,
+        peer_id: PeerId,
+        group_id: &[u8],
+        message: Option<Vec<u8>>,
+    ) -> Option<ReamNetworkEvent> {
+        let Ok(GossipTopic {
+            kind: GossipTopicKind::DataColumnSidecar(column_index),
+            ..
+        }) = GossipTopic::from_topic_hash(&topic_hash)
+        else {
+            self.swarm
+                .behaviour_mut()
+                .gossipsub
+                .report_invalid_partial(peer_id, &topic_hash);
+            return None;
+        };
+        let block_root = parse_partial_column_group_id(group_id)?;
+        let sidecar = match PartialDataColumnSidecar::from_ssz_bytes(&message?) {
+            Ok(sidecar) => sidecar,
+            Err(err) => {
+                debug!("Undecodable partial data column from {peer_id}: {err:?}");
+                self.swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .report_invalid_partial(peer_id, &topic_hash);
+                return None;
+            }
+        };
+        Some(ReamNetworkEvent::PartialDataColumn {
+            peer_id,
+            column_index,
+            block_root,
+            sidecar: Box::new(sidecar),
+        })
+    }
+
+    /// The current fork's topic of column `column_index`.
+    fn partial_column_topic(&self, column_index: u64) -> Option<TopicHash> {
+        if !self.enable_partial_columns {
+            return None;
+        }
+        let topic = GossipTopic {
+            fork: beacon_network_spec().fork_digest(
+                beacon_network_spec().current_epoch(),
+                genesis_validators_root(),
+            ),
+            kind: GossipTopicKind::DataColumnSidecar(
+                column_index % DATA_COLUMN_SIDECAR_SUBNET_COUNT,
+            ),
+        };
+        Some(Topic::from(topic).hash())
+    }
+
+    fn publish_partial_columns(&mut self, messages: Vec<PartialColumnMessage>) {
+        for message in messages {
+            let Some(topic) = self.partial_column_topic(message.column.index) else {
+                return;
+            };
+            // Gossipsub serves partials only on topics they were enabled on, the joined ones.
+            if !self.partial_topics.contains(&topic) {
+                continue;
+            }
+            let header_sent = self
+                .partial_headers_sent
+                .for_block(message.header.block_root());
+            match self
+                .swarm
+                .behaviour_mut()
+                .gossipsub
+                .publish_partial(topic, OutgoingPartialColumn::new(message, header_sent))
+            {
+                Ok(()) | Err(PublishError::NoPeersSubscribedToTopic) => {}
+                Err(err) => {
+                    BEACON_PARTIAL_COLUMN_PUBLISH_FAILURES_TOTAL.inc();
+                    debug!("Failed to publish a partial data column: {err}");
+                }
+            }
         }
     }
 
@@ -1461,6 +1582,18 @@ impl Network {
 
     /// Returns true if the node is subscribed afterwards, including when it already was.
     pub fn subscribe_to_topic(&mut self, topic: GossipTopic) -> bool {
+        if self.enable_partial_columns
+            && matches!(topic.kind, GossipTopicKind::DataColumnSidecar(_))
+        {
+            let topic_hash = Topic::from(topic).hash();
+            // Gossipsub enables partials only on a topic it has not joined yet.
+            if self.partial_topics.insert(topic_hash.clone()) {
+                self.swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .enable_partials_for_topic(topic_hash, true);
+            }
+        }
         match self
             .swarm
             .behaviour_mut()
@@ -1826,6 +1959,7 @@ mod tests {
             target_peers,
             // Scoring runs in the network tests as it does on a live node.
             active_validators: Some(64),
+            enable_partial_columns: false,
         };
 
         std::fs::create_dir_all(&config.data_dir)?;
@@ -2076,7 +2210,9 @@ mod tests {
             let network_1_future = async {
                 while let Some(event) = network_1.swarm.next().await {
                     if let SwarmEvent::Behaviour(ReamBehaviourEvent::Gossipsub(
-                        GossipsubEvent::Subscribed { peer_id: _, topic },
+                        GossipsubEvent::Subscribed {
+                            peer_id: _, topic, ..
+                        },
                     )) = &event
                     {
                         let _ = network_1

@@ -302,6 +302,7 @@ impl GossipLookupHarness {
             &mut unknown_parent_block,
             &mut valid_block,
             libp2p::PeerId::random(),
+            None,
             |_| {},
         )
         .await;
@@ -1329,6 +1330,7 @@ async fn test_unknown_parent_block_imports_after_parent_arrives() {
         &mut unknown_parent_block,
         &mut valid_block,
         libp2p::PeerId::random(),
+        None,
         |_| {},
     )
     .await;
@@ -1918,6 +1920,7 @@ async fn test_a_valid_gossip_block_is_handed_back_for_import_and_not_imported_in
         &mut unknown_parent_block,
         &mut valid_block,
         libp2p::PeerId::random(),
+        None,
         |_| {},
     )
     .await;
@@ -1975,6 +1978,7 @@ async fn test_a_block_worker_reports_accept_while_the_store_is_locked_and_import
         pending_items,
         unknown_parents,
         Arc::new(|_| {}),
+        None,
     );
 
     // Stands in for an import in progress.

@@ -8,7 +8,7 @@ use libp2p::{
 };
 use ream_consensus_beacon::custody_group::CustodyAssignment;
 use ream_p2p::{
-    gossipsub::beacon::topics::GossipTopic,
+    gossipsub::beacon::{partial::PartialColumnMessage, topics::GossipTopic},
     network::beacon::channel::{GossipMessage, P2PMessage, P2PResponse},
 };
 use ream_req_resp::{
@@ -46,6 +46,24 @@ impl P2PSender {
     pub fn attestation_duty_subnets(&self, subnets: HashMap<u64, u64>) {
         if let Err(err) = self.0.send(P2PMessage::AttestationDutySubnets(subnets)) {
             warn!("Failed to send attestation duty subnets: {err}");
+        }
+    }
+
+    pub fn publish_partial_columns(&self, messages: Vec<PartialColumnMessage>) {
+        if messages.is_empty() {
+            return;
+        }
+        if let Err(err) = self.0.send(P2PMessage::PublishPartialColumns(messages)) {
+            warn!("Failed to send partial columns: {err}");
+        }
+    }
+
+    pub fn report_invalid_partial(&self, peer_id: PeerId, column_index: u64) {
+        if let Err(err) = self.0.send(P2PMessage::ReportInvalidPartial {
+            peer_id,
+            column_index,
+        }) {
+            warn!("Failed to send an invalid partial report: {err}");
         }
     }
 

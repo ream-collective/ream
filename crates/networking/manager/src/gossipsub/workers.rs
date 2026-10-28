@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use alloy_primitives::B256;
 use libp2p::{
     PeerId,
     gossipsub::{Message, MessageAcceptance, MessageId, TopicHash},
@@ -7,6 +8,7 @@ use libp2p::{
 use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::{
     data_column_sidecar::NUMBER_OF_COLUMNS, electra::beacon_block::SignedBeaconBlock,
+    partial_data_column_sidecar::PartialDataColumnSidecar,
 };
 use ream_metrics::BEACON_GOSSIP_PENDING_ITEMS_DROPPED_TOTAL;
 use ream_p2p::gossipsub::beacon::topics::{GossipTopic, GossipTopicKind};
@@ -18,7 +20,9 @@ use tokio::{
 use tracing::{debug, error};
 
 use super::handle::{UnknownParentGossipBlock, handle_gossipsub_message, import_valid_block};
-use crate::{block_lookup::PendingGossipItem, p2p_sender::P2PSender};
+use crate::{
+    block_lookup::PendingGossipItem, p2p_sender::P2PSender, partial_columns::PartialColumns,
+};
 
 /// Messages waiting for a worker. A full queue sheds new messages as IGNORE, which does not
 /// penalize their senders; mainnet sends thousands of attestations per slot.
@@ -139,6 +143,7 @@ impl GossipWorkers {
         p2p_sender: P2PSender,
         pending_items: mpsc::Sender<PendingGossipItem>,
         budget: &GossipWorkerBudget,
+        partial_columns: Option<Arc<PartialColumns>>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel::<GossipWork>(GOSSIP_QUEUE_CAPACITY);
         let worker_p2p_sender = p2p_sender.clone();
@@ -149,6 +154,7 @@ impl GossipWorkers {
             let p2p_sender = worker_p2p_sender.clone();
             let pending_items = pending_items.clone();
             let permits = permits.clone();
+            let partial_columns = partial_columns.clone();
             async move {
                 let _permit = permits
                     .acquire()
@@ -165,6 +171,7 @@ impl GossipWorkers {
                     &mut unknown_parent_block,
                     &mut valid_block,
                     work.propagation_source,
+                    partial_columns.as_ref(),
                     |_| {},
                 )
                 .await;
@@ -203,6 +210,7 @@ impl GossipWorkers {
         pending_items: mpsc::Sender<PendingGossipItem>,
         unknown_parents: mpsc::Sender<UnknownParentWork>,
         on_valid_block: OnValidBlock,
+        partial_columns: Option<Arc<PartialColumns>>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel::<GossipWork>(BLOCK_QUEUE_CAPACITY);
         let worker_p2p_sender = p2p_sender.clone();
@@ -213,6 +221,7 @@ impl GossipWorkers {
             let pending_items = pending_items.clone();
             let unknown_parents = unknown_parents.clone();
             let on_valid_block = on_valid_block.clone();
+            let partial_columns = partial_columns.clone();
             async move {
                 let mut pending_item = None;
                 let mut unknown_parent_block = None;
@@ -225,6 +234,7 @@ impl GossipWorkers {
                     &mut unknown_parent_block,
                     &mut valid_block,
                     work.propagation_source,
+                    partial_columns.as_ref(),
                     |block| on_valid_block(block),
                 )
                 .await;
@@ -292,6 +302,73 @@ impl GossipWorkers {
                 work.propagation_source,
                 MessageAcceptance::Ignore,
             );
+        }
+    }
+}
+
+/// Partial messages waiting for a worker: a block brings at most a few per column and peer.
+const PARTIAL_QUEUE_CAPACITY: usize = 4096;
+
+struct PartialWork {
+    peer_id: PeerId,
+    column_index: u64,
+    block_root: B256,
+    sidecar: Box<PartialDataColumnSidecar>,
+}
+
+/// Tasks that validate partial data column messages, within the shared gossip budget.
+pub struct PartialColumnWorkers {
+    sender: mpsc::Sender<PartialWork>,
+    tasks: JoinSet<()>,
+}
+
+impl PartialColumnWorkers {
+    pub fn start(partial_columns: Arc<PartialColumns>, budget: &GossipWorkerBudget) -> Self {
+        let (sender, receiver) = mpsc::channel::<PartialWork>(PARTIAL_QUEUE_CAPACITY);
+        let permits = budget.permits.clone();
+        let tasks = spawn_workers(budget.workers, receiver, move |work: PartialWork| {
+            let partial_columns = partial_columns.clone();
+            let permits = permits.clone();
+            async move {
+                let _permit = permits
+                    .acquire()
+                    .await
+                    .expect("the gossip worker budget is never closed");
+                partial_columns
+                    .handle_message(
+                        work.peer_id,
+                        work.column_index,
+                        work.block_root,
+                        &work.sidecar,
+                    )
+                    .await;
+            }
+        });
+        Self { sender, tasks }
+    }
+
+    /// Waits until a worker task ends, which only a panic does while `self` lives.
+    pub async fn stopped(&mut self) -> Option<JoinError> {
+        self.tasks.join_next().await?.err()
+    }
+
+    /// Queues a partial message, or drops it when the queue is full. Gossipsub keeps the peer's
+    /// metadata, so the cells can still be requested later.
+    pub fn submit(
+        &self,
+        peer_id: PeerId,
+        column_index: u64,
+        block_root: B256,
+        sidecar: Box<PartialDataColumnSidecar>,
+    ) {
+        let work = PartialWork {
+            peer_id,
+            column_index,
+            block_root,
+            sidecar,
+        };
+        if self.sender.try_send(work).is_err() {
+            debug!("Partial column queue is full, dropping a message");
         }
     }
 }

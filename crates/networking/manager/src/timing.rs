@@ -16,6 +16,7 @@ pub enum ColumnSource {
     ByRoot,
     ExecutionLayer,
     Reconstructed,
+    PartialMessages,
 }
 
 impl ColumnSource {
@@ -25,6 +26,7 @@ impl ColumnSource {
             ColumnSource::ByRoot => "by_root",
             ColumnSource::ExecutionLayer => "el",
             ColumnSource::Reconstructed => "reconstructed",
+            ColumnSource::PartialMessages => "partial",
         }
     }
 }
