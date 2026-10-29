@@ -3,7 +3,10 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::electra::{beacon_block::SignedBeaconBlock, beacon_state::BeaconState};
-use ream_consensus_misc::misc::{compute_epoch_at_slot, compute_start_slot_at_epoch};
+use ream_consensus_misc::{
+    constants::beacon::SLOTS_PER_EPOCH,
+    misc::{compute_epoch_at_slot, compute_start_slot_at_epoch},
+};
 #[cfg(not(feature = "disable_ancestor_validation"))]
 use ream_fork_choice_beacon::store::get_checkpoint_block_from_db;
 use ream_fork_choice_beacon::store::{get_current_slot_at, get_current_slot_from_db};
@@ -97,7 +100,8 @@ async fn validate_block_with_parent(
 ) -> anyhow::Result<DependencyValidationResult<GossipValidatedBlock>> {
     let db = beacon_chain.db();
 
-    if block.message.slot > clock.current_slot(db)? {
+    let current_slot = clock.current_slot(db)?;
+    if block.message.slot > current_slot {
         return Ok(DependencyValidationResult::Ignore(
             "Block is from a future slot".to_string(),
         ));
@@ -107,6 +111,15 @@ async fn validate_block_with_parent(
     if block.message.slot <= compute_start_slot_at_epoch(finalized_checkpoint.epoch) {
         return Ok(DependencyValidationResult::Ignore(
             "Block is not from a slot greater than the latest finalized slot".to_string(),
+        ));
+    }
+
+    // A gossip block more than an epoch older than the wall clock can no longer become the head.
+    // Its payload may take the execution client many seconds on an old parent, delaying the
+    // timely blocks behind it. A later block that builds on it still fetches it by root.
+    if matches!(clock, SlotClock::Wall(_)) && block.message.slot + SLOTS_PER_EPOCH < current_slot {
+        return Ok(DependencyValidationResult::Ignore(
+            "Block is more than an epoch older than the current slot".to_string(),
         ));
     }
 

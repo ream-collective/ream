@@ -12,6 +12,7 @@ mod tests {
     };
     use ream_consensus_misc::{
         checkpoint::Checkpoint,
+        constants::beacon::SLOTS_PER_EPOCH,
         misc::{compute_epoch_at_slot, compute_start_slot_at_epoch},
     };
     use ream_network_manager::gossipsub::validate::{
@@ -492,6 +493,41 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(on_time, DependencyValidationResult::Accept);
+    }
+
+    /// A gossip block that arrives more than an epoch after its slot is ignored; one an epoch late
+    /// is still checked.
+    #[tokio::test]
+    pub async fn test_gossip_block_more_than_an_epoch_old_is_ignored() {
+        initialize_test_network_spec();
+        let (beacon_chain, cached_db, _block_root, _temp_dir) = db_setup().await;
+        let incoming_beacon_block = read_ssz_snappy_file::<SignedBeaconBlock>(
+            "./assets/sepolia/blocks/child_9552076.ssz_snappy",
+        )
+        .unwrap();
+        let epoch_s = SLOTS_PER_EPOCH * beacon_network_spec().seconds_per_slot();
+
+        let stale = validate_gossip_beacon_block(
+            &beacon_chain,
+            &cached_db,
+            &incoming_beacon_block,
+            CURRENT_TIME + epoch_s + beacon_network_spec().seconds_per_slot(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(stale, DependencyValidationResult::Ignore(reason) if reason.contains("more than an epoch older"))
+        );
+
+        let late = validate_gossip_beacon_block(
+            &beacon_chain,
+            &cached_db,
+            &incoming_beacon_block,
+            CURRENT_TIME + epoch_s,
+        )
+        .await
+        .unwrap();
+        assert_eq!(late, DependencyValidationResult::Accept);
     }
 
     /// A node that is started ahead of genesis has a wall clock below the genesis time.
