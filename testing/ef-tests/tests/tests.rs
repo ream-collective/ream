@@ -65,7 +65,7 @@ test_consensus_type!(ExecutionPayloadHeader);
 test_consensus_type!(Eth1Data);
 test_consensus_type!(Fork);
 test_consensus_type!(ForkData);
-// HistoricalBatch Fulu vectors are not included in v1.7.0-alpha.11.
+// HistoricalBatch Fulu vectors are not included in v1.7.0-beta.4.
 // test_consensus_type!(HistoricalBatch);
 test_consensus_type!(HistoricalSummary);
 test_consensus_type!(IndexedAttestation);
@@ -194,7 +194,7 @@ test_fork_choice!(ex_ante);
 test_fork_choice!(get_head);
 test_fork_choice!(get_proposer_head);
 test_fork_choice!(on_block);
-// should_override_forkchoice_update Fulu vectors are not included in v1.7.0-alpha.11.
+// should_override_forkchoice_update Fulu vectors are not included in v1.7.0-beta.4.
 // test_fork_choice!(should_override_forkchoice_update);
 
 // Testing merkle_proof

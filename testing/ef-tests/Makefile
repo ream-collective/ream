@@ -1,6 +1,6 @@
 TARGET = mainnet.tar.gz
 EXTRACT_DIR = mainnet
-LATEST_RELEASE_URL = https://api.github.com/repos/ethereum/consensus-specs/releases/tags/v1.7.0-alpha.11
+LATEST_RELEASE_URL = https://api.github.com/repos/ethereum/consensus-specs/releases/tags/v1.7.0-beta.4
 
 PEERDAS_REPO = https://github.com/paulmillr/eth-vectors.git
 PEERDAS_DIR = eth-vectors
