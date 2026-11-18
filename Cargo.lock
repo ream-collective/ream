@@ -7096,6 +7096,7 @@ dependencies = [
  "anyhow",
  "ethereum_hashing 0.7.0",
  "serde",
+ "tree_hash",
 ]
 
 [[package]]
