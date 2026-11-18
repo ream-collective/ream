@@ -4,6 +4,7 @@ pub mod multiproof;
 
 use alloy_primitives::B256;
 use anyhow::ensure;
+use tree_hash::MerkleHasher;
 
 mod hash;
 mod index;
@@ -107,8 +108,34 @@ pub fn is_valid_normalized_merkle_branch(
     is_valid_merkle_branch(leaf, &branch[num_extra..], depth, index, root)
 }
 
+/// Root of a progressive Merkle tree: binary subtrees of 1, 4, 16, ... leaves hang off a
+/// zero-terminated spine. https://eips.ethereum.org/EIPS/eip-7916#progressive-merkle-tree
+pub fn merkleize_progressive(chunks: &[B256]) -> B256 {
+    merkleize_progressive_from(chunks, 1)
+}
+
+fn merkleize_progressive_from(chunks: &[B256], num_leaves: usize) -> B256 {
+    if chunks.is_empty() {
+        return B256::ZERO;
+    }
+    let (subtree, rest) = chunks.split_at(chunks.len().min(num_leaves));
+    let mut hasher = MerkleHasher::with_leaves(num_leaves);
+    for chunk in subtree {
+        hasher
+            .write(chunk.as_slice())
+            .expect("subtree has at most num_leaves chunks");
+    }
+    let left = hasher
+        .finish()
+        .expect("subtree has at most num_leaves chunks");
+    let right = merkleize_progressive_from(rest, num_leaves * 4);
+    hash_concat(left.as_slice(), right.as_slice())
+}
+
 #[cfg(test)]
 mod tests {
+    use alloy_primitives::b256;
+
     use super::*;
 
     #[test]
@@ -165,5 +192,27 @@ mod tests {
             (1 << depth) + 3,
             root
         ));
+    }
+
+    /// Expected roots come from a Python copy of the spec `merkleize` and EIP-7916
+    /// `merkleize_progressive` (sha256, zero-padded subtrees); chunk `i` is `[i + 1; 32]`.
+    #[test]
+    fn test_merkleize_progressive() {
+        let lens = [0, 1, 2, 5, 6, 21, 22, 85, 86];
+        let roots = [
+            b256!("0000000000000000000000000000000000000000000000000000000000000000"),
+            b256!("037d6dfb3a369a41e01100fdd53c35ee3fb69ddec5830d61e1138d066a4c2285"),
+            b256!("2dfe47da19ad9ff11afe44dd8de4db8517cefd5a9bddffe6652b26a1b91ea5ac"),
+            b256!("3fd53b812118ddea60b9deab5c72d32b0c4dcfd2c94deda753e6e1d548fbc274"),
+            b256!("2e2a2abd4d0e28498ec0cdd817c715b246aa15e7b34767061b7632337188429e"),
+            b256!("f148f679afbfebfe5616080a45461aee3d1f4ce2cc752ce824c3f067d2707623"),
+            b256!("040be60071c540aafc1d44f366239ab6a41bf8740a38f9d52ab0bbd9cd974c45"),
+            b256!("24ea21562226364be74fd2696d0824a4347cfac7dd4b2ae28cd0e9cc22bc341d"),
+            b256!("b73c4c427974f47c74c2812d353c966f5dadae70c44f6fe9a15e179b86914977"),
+        ];
+        for (len, expected) in lens.into_iter().zip(roots) {
+            let chunks: Vec<B256> = (0..len).map(|i| B256::repeat_byte(i as u8 + 1)).collect();
+            assert_eq!(merkleize_progressive(&chunks), expected, "{len} chunks");
+        }
     }
 }
