@@ -20,7 +20,7 @@ use futures::{StreamExt, stream::FuturesUnordered};
 use libp2p::{
     Multiaddr, SwarmBuilder,
     connection_limits::{self, ConnectionLimits},
-    core::{ConnectedPoint, Endpoint, transport::PortUse, util::unreachable},
+    core::{ConnectedPoint, Endpoint, transport::PortUse},
     gossipsub::{
         Event as GossipsubEvent, FailedMessages, IdentTopic, MessageAuthenticity, PublishError,
     },
@@ -289,7 +289,7 @@ impl NetworkBehaviour for SlowPeerBanBehaviour {
         _: ConnectionId,
         event: THandlerOutEvent<Self>,
     ) {
-        unreachable(event)
+        match event {}
     }
 
     fn poll(
@@ -369,20 +369,31 @@ impl BootnodeRetry {
     }
 }
 
-#[derive(NetworkBehaviour)]
-struct ReamBehaviour {
-    pub identify: identify::Behaviour,
+// Scope the Rust 1.100 lint allowance to libp2p's generated uninhabited-event paths.
+#[allow(unreachable_code)]
+mod derived_behaviour {
+    use super::{
+        GossipsubBehaviour, NetworkBehaviour, ReqResp, SlowPeerBanBehaviour, connection_limits,
+        identify,
+    };
 
-    /// The request-response domain
-    pub req_resp: ReqResp,
+    #[derive(NetworkBehaviour)]
+    pub(super) struct ReamBehaviour {
+        pub identify: identify::Behaviour,
 
-    /// The gossip domain: gossipsub
-    pub gossipsub: GossipsubBehaviour,
+        /// The request-response domain
+        pub req_resp: ReqResp,
 
-    slow_peer_banlist: SlowPeerBanBehaviour,
+        /// The gossip domain: gossipsub
+        pub gossipsub: GossipsubBehaviour,
 
-    pub connection_limits: connection_limits::Behaviour,
+        pub(super) slow_peer_banlist: SlowPeerBanBehaviour,
+
+        pub connection_limits: connection_limits::Behaviour,
+    }
 }
+
+use derived_behaviour::{ReamBehaviour, ReamBehaviourEvent};
 
 pub struct LeanNetworkConfig {
     pub gossipsub_config: LeanGossipsubConfig,

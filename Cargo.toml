@@ -152,7 +152,7 @@ serde_json = "1.0.151"
 serde_yaml = "0.9"
 sha2 = "0.10.9"
 snap = "1.1.2"
-ssz_types = { git = "https://github.com/sigp/ssz_types.git", rev = "5dc2d521ed31f8e38b0065a80bf98af55aac06f8" }
+ssz_types = { git = "https://github.com/sigp/ssz_types.git", rev = "043f8b94c381aba694ad645d34a04c1118d1c119" }
 tempdir = "0.3.7"
 tempfile = "3.27.0"
 thiserror = "2.0.19"
@@ -226,6 +226,12 @@ ream-validator-lean = { path = "crates/common/validator/lean", default-features 
 
 [patch.crates-io]
 ethereum_hashing = { git = "https://github.com/ReamLabs/ethereum_hashing.git", rev = "c14a9ad96436e6b8b631faf49a3666e4558b71ae" }
+# Progressive SSZ support for the EIP-7688 foundation. Keep the trait crates and
+# their derives on matching, pinned revisions across the dependency tree.
+ethereum_ssz = { git = "https://github.com/sigp/ethereum_ssz", rev = "974f78f421fbf70cba4e8f84e0fa28c23ad54f34" }
+ethereum_ssz_derive = { git = "https://github.com/sigp/ethereum_ssz", rev = "974f78f421fbf70cba4e8f84e0fa28c23ad54f34" }
+tree_hash = { git = "https://github.com/sigp/tree_hash", rev = "e5ea1875edddf12438506c3751cbb313f9c52d08" }
+tree_hash_derive = { git = "https://github.com/sigp/tree_hash", rev = "e5ea1875edddf12438506c3751cbb313f9c52d08" }
 
 [patch."https://github.com/leanEthereum/leanSig"]
 leansig = { git = "https://github.com/leanEthereum//leanSig.git", branch = "devnet4" }

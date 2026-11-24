@@ -3,6 +3,7 @@
 - [Introduction](./intro.md)
 - [Quick Start](./quickstart.md)
 - [Developer's Guide](./developer/README.md)
+  - [Progressive SSZ](./developer/eip7688.md)
   - [P2P Networking](./developer/p2p/README.md)
 - [CLI Reference](./cli/cli.md) <!-- CLI_REFERENCE START -->
   - [`ream`](./cli/ream.md)
