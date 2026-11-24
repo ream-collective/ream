@@ -1244,7 +1244,7 @@ checksum = "90dbd31c98227229239363921e60fcf5e558e43ec69094d46fc4996f08d1d5bc"
 dependencies = [
  "bitcoin_hashes",
  "rand 0.8.5",
- "rand_core 0.6.4",
+ "rand_core 0.4.2",
  "serde",
  "unicode-normalization",
 ]
@@ -2624,8 +2624,7 @@ dependencies = [
 [[package]]
 name = "ethereum_ssz"
 version = "0.10.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e462875ad8693755ea8913d6e905715c76ea4836e2254e18c9cf0f7a8f8c2a13"
+source = "git+https://github.com/sigp/ethereum_ssz?rev=974f78f421fbf70cba4e8f84e0fa28c23ad54f34#974f78f421fbf70cba4e8f84e0fa28c23ad54f34"
 dependencies = [
  "alloy-primitives",
  "ethereum_serde_utils",
@@ -2639,8 +2638,7 @@ dependencies = [
 [[package]]
 name = "ethereum_ssz_derive"
 version = "0.10.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "daf022360bdbe9456eda5f35718a50476d5b2a0d51a97ed4eae27420737a6fba"
+source = "git+https://github.com/sigp/ethereum_ssz?rev=974f78f421fbf70cba4e8f84e0fa28c23ad54f34#974f78f421fbf70cba4e8f84e0fa28c23ad54f34"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -8817,8 +8815,8 @@ checksum = "3a0219bd7d979d58245a4f41f695e1ac9f8befdffadd7f61f1bae9e39abc6620"
 
 [[package]]
 name = "ssz_types"
-version = "0.13.0"
-source = "git+https://github.com/sigp/ssz_types.git?rev=5dc2d521ed31f8e38b0065a80bf98af55aac06f8#5dc2d521ed31f8e38b0065a80bf98af55aac06f8"
+version = "0.14.1"
+source = "git+https://github.com/sigp/ssz_types.git?rev=043f8b94c381aba694ad645d34a04c1118d1c119#043f8b94c381aba694ad645d34a04c1118d1c119"
 dependencies = [
  "ethereum_serde_utils",
  "ethereum_ssz",
@@ -9437,8 +9435,7 @@ dependencies = [
 [[package]]
 name = "tree_hash"
 version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7fd51aa83d2eb83b04570808430808b5d24fdbf479a4d5ac5dee4a2e2dd2be4"
+source = "git+https://github.com/sigp/tree_hash?rev=e5ea1875edddf12438506c3751cbb313f9c52d08#e5ea1875edddf12438506c3751cbb313f9c52d08"
 dependencies = [
  "alloy-primitives",
  "ethereum_hashing 0.8.0",
@@ -9450,8 +9447,7 @@ dependencies = [
 [[package]]
 name = "tree_hash_derive"
 version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8840ad4d852e325d3afa7fde8a50b2412f89dce47d7eb291c0cc7f87cd040f38"
+source = "git+https://github.com/sigp/tree_hash?rev=e5ea1875edddf12438506c3751cbb313f9c52d08#e5ea1875edddf12438506c3751cbb313f9c52d08"
 dependencies = [
  "darling",
  "proc-macro2",
