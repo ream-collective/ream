@@ -249,21 +249,31 @@ fn local_sampling_columns(local_enr: &Enr, config: &NetworkConfig) -> Vec<u64> {
     }
 }
 
-#[derive(NetworkBehaviour)]
-pub(crate) struct ReamBehaviour {
-    pub identify: identify::Behaviour,
+// Scope the Rust 1.100 lint allowance to libp2p's generated uninhabited-event paths.
+#[allow(unreachable_code)]
+mod derived_behaviour {
+    use super::{
+        Discovery, GossipsubBehaviour, NetworkBehaviour, ReqResp, connection_limits, identify,
+    };
 
-    /// The discovery domain: discv5
-    pub discovery: Discovery,
+    #[derive(NetworkBehaviour)]
+    pub(crate) struct ReamBehaviour {
+        pub identify: identify::Behaviour,
 
-    /// The request-response domain
-    pub req_resp: ReqResp,
+        /// The discovery domain: discv5
+        pub discovery: Discovery,
 
-    /// The gossip domain: gossipsub
-    pub gossipsub: GossipsubBehaviour,
+        /// The request-response domain
+        pub req_resp: ReqResp,
 
-    pub connection_registry: connection_limits::Behaviour,
+        /// The gossip domain: gossipsub
+        pub gossipsub: GossipsubBehaviour,
+
+        pub connection_registry: connection_limits::Behaviour,
+    }
 }
+
+pub(crate) use derived_behaviour::{ReamBehaviour, ReamBehaviourEvent};
 
 // TODO: these are stub events which needs to be replaced
 #[derive(Debug)]
